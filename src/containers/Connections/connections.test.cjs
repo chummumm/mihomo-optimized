@@ -27,7 +27,7 @@ const { ConnectionsStore } = loadSource('store.ts')
 const { StreamReader } = loadSource('../../lib/streamer.ts')
 const { formatConnection, getConnectionPresentation, isDNSConnection } = loadSource('helper.ts')
 const { getConnectionSourceKey, ALL_CONNECTIONS, INTERNAL_CONNECTIONS, UNKNOWN_CONNECTIONS } = loadSource('source.ts')
-const { ThroughputHistory, RATE_SAMPLE_LIMIT, RATE_WINDOW_MS, RATE_STALE_MS, pruneRateSamples, rateSampleX } = loadSource('throughput-history.ts')
+const { ThroughputHistory, RATE_SAMPLE_LIMIT, RATE_WINDOW_MS, RATE_DRAW_DELAY_MS, RATE_CLOCK_MARGIN_MS, RATE_STALE_MS, pruneRateSamples, rateSampleX } = loadSource('throughput-history.ts')
 
 test('throughput uses elapsed time and accepts empty active-connection snapshots', () => {
     const history = new ThroughputHistory()
@@ -64,8 +64,11 @@ test('high frequency throughput is duration weighted and retains a bounded minut
     for (let now = 1000; now <= 120000; now += 100) history.feed({ uploadTotal: now, downloadTotal: now * 2 }, now)
     assert.ok(history.samples.length <= RATE_SAMPLE_LIMIT)
     assert.ok(history.samples.length >= 59, 'a fast sender still retains the whole minute, not just its last 64 messages')
-    assert.ok(history.samples.every(sample => 120000 - sample.at <= RATE_WINDOW_MS))
-    pruneRateSamples(history.samples, 120000 + RATE_WINDOW_MS + 1)
+    const retainedWindow = RATE_WINDOW_MS + RATE_DRAW_DELAY_MS + RATE_CLOCK_MARGIN_MS
+    const guards = history.samples.filter(sample => 120000 - sample.at > retainedWindow)
+    assert.ok(guards.length <= 2, 'only two controls survive outside the buffered window')
+    assert.ok(history.samples.some(sample => sample.at <= 120000 - retainedWindow), 'the left edge retains its interpolation controls')
+    pruneRateSamples(history.samples, 120000 + retainedWindow + 1)
     assert.equal(history.samples.length, 0, 'paused history expires instead of retaining old samples indefinitely')
 })
 

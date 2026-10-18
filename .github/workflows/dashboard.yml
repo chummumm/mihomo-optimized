@@ -59,6 +59,14 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium webkit
       - name: Verify connection scrolling, counts and memory-only DNS pages
         run: pnpm test:browser
+      - name: Collect throughput edge regression frames
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-throughput-edge-frames
+          path: /tmp/mihomo-throughput-edges/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Verify viewport layout and version display in WebKit
         run: PLAYWRIGHT_BROWSER_NAME=webkit node scripts/test-app-shell.cjs
       - name: Package UI

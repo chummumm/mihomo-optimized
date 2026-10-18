@@ -3,7 +3,7 @@ import { useEffect, useRef } from 'react'
 import { formatRate } from '@components'
 
 import { ThroughputMotion } from './chart-motion'
-import { pruneRateSamples, rateSampleX, RATE_STALE_MS, RATE_WINDOW_MS, type RateSample } from './throughput-history'
+import { pruneRateSamples, rateSampleX, type RateSample } from './throughput-history'
 
 interface ThroughputChartProps {
     samples: React.MutableRefObject<RateSample[]>
@@ -50,6 +50,8 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
         let frame = 0
         let visible = true
         let dirty = true
+        let hasDrawingWork = false
+        let nextChangeAt: number | undefined
         let expiration: ReturnType<typeof setTimeout> | undefined
 
         const readPalette = () => {
@@ -63,6 +65,8 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
         }
 
         const draw = (now: number) => {
+            hasDrawingWork = false
+            nextChangeAt = undefined
             const w = element.clientWidth
             const h = element.clientHeight
             if (w === 0 || h === 0) return
@@ -81,9 +85,13 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
             const padTop = compact ? 6 : 16
             const padBottom = compact ? 4 : 20
             const height = h - padTop - padBottom
+            const plotWidth = Math.max(0, w - 3)
             const latest = history[history.length - 1]
             const progress = reduce.matches || latest === undefined ? 1 : Math.max(0, Math.min(1, (now - latest.at) / 1000))
-            const { ymax, head } = motion.frame(history, now, reduce.matches)
+            const drawing = motion.frame(history, now, reduce.matches)
+            const { endAt, ymax, head, paths } = drawing
+            hasDrawingWork = drawing.active
+            nextChangeAt = drawing.nextChangeAt
 
             ctx.font = '10px "Martian Mono", ui-monospace, monospace'
             ctx.lineWidth = 1
@@ -107,37 +115,41 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
             if (!compact) {
                 ctx.fillStyle = c.label
                 ctx.textBaseline = 'alphabetic'
-                for (const s of [60, 45, 30, 15]) ctx.fillText(`-${s}s`, w - (s / 60) * w + 4, h - 5)
+                for (const s of [60, 45, 30, 15]) {
+                    const age = Math.round((s + (now - endAt) / 1000) * 10) / 10
+                    ctx.fillText(`-${age}s`, plotWidth - (s / 60) * plotWidth + 4, h - 5)
+                }
                 ctx.textAlign = 'right'
                 ctx.fillText(labels.current.nowLabel, w - 4, h - 5)
                 ctx.textAlign = 'left'
             }
-            if (history.length === 0) return
-            const count = history.length
-            const xs = (i: number) => rateSampleX(history[i].at, now, w)
+            if (paths.length === 0) return
+            const xs = (at: number) => rateSampleX(at, endAt, plotWidth)
             const ys = (v: number) => padTop + height - (Math.min(v, ymax) / ymax) * height
             const series: Array<['down' | 'up', string, number, number]> = [['down', c.down, 2.2, 0.34], ['up', c.up, 1.8, 0.16]]
+            ctx.save()
+            ctx.beginPath()
+            ctx.rect(0, padTop, w, height)
+            ctx.clip()
             for (const [key, color, width, fill] of series) {
-                const points = history.map((s, i) => [xs(i), ys(i === count - 1 && head !== undefined ? head[key] : s[key])] as const)
                 const path = new Path2D()
                 const area = new Path2D()
-                let start = 0
-                for (let end = 1; end <= count; end++) {
-                    if (end < count && history[end].segment === history[end - 1].segment) continue
-                    path.moveTo(points[start][0], points[start][1])
-                    area.moveTo(points[start][0], points[start][1])
-                    for (let i = start + 1; i < end; i++) {
-                        const [px, py] = points[i - 1]
-                        const [x, y] = points[i]
-                        path.quadraticCurveTo(px, py, (px + x) / 2, (py + y) / 2)
-                        area.quadraticCurveTo(px, py, (px + x) / 2, (py + y) / 2)
+                for (const { curves } of paths) {
+                    const first = curves[0].from
+                    const last = curves[curves.length - 1].to
+                    path.moveTo(xs(first.at), ys(first[key]))
+                    area.moveTo(xs(first.at), ys(first[key]))
+                    for (const curve of curves) {
+                        const cx = xs(curve.control.at)
+                        const cy = ys(curve.control[key])
+                        const x = xs(curve.to.at)
+                        const y = ys(curve.to[key])
+                        path.quadraticCurveTo(cx, cy, x, y)
+                        area.quadraticCurveTo(cx, cy, x, y)
                     }
-                    path.lineTo(points[end - 1][0], points[end - 1][1])
-                    area.lineTo(points[end - 1][0], points[end - 1][1])
-                    area.lineTo(points[end - 1][0], padTop + height)
-                    area.lineTo(points[start][0], padTop + height)
+                    area.lineTo(xs(last.at), padTop + height)
+                    area.lineTo(xs(first.at), padTop + height)
                     area.closePath()
-                    start = end
                 }
                 const gradient = ctx.createLinearGradient(0, padTop, 0, padTop + height)
                 gradient.addColorStop(0, withAlpha(color, fill))
@@ -155,11 +167,11 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
                 ctx.stroke(path)
                 ctx.restore()
 
-                // The head follows the actual latest sample; paused traffic must
-                // not remain pinned to the "now" edge of the chart.
+                // The head is the intersection with a known, stable curve. If
+                // input stops it ages leftwards; missing time is never filled.
                 if (head !== undefined) {
-                    const headX = Math.min(w - 3, points[count - 1][0])
-                    const headY = points[count - 1][1]
+                    const headX = xs(head.at)
+                    const headY = ys(head[key])
                     ctx.fillStyle = color
                     ctx.beginPath()
                     ctx.arc(headX, headY, 3, 0, Math.PI * 2)
@@ -172,18 +184,20 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
                     }
                 }
             }
+            ctx.restore()
 
-            if (hoverX !== null) {
+            if (hoverX !== null && drawing.samples.length > 0) {
                 let best = 0
                 let distance = Infinity
-                history.forEach((_, i) => {
-                    const d = Math.abs(xs(i) - hoverX!)
+                drawing.samples.forEach((sample, i) => {
+                    const d = Math.abs(xs(sample.at) - hoverX!)
                     if (d < distance) {
                         distance = d
                         best = i
                     }
                 })
-                const x = xs(best)
+                const selected = drawing.samples[best]
+                const x = xs(selected.at)
                 ctx.strokeStyle = c.cross
                 ctx.setLineDash([3, 3])
                 ctx.beginPath()
@@ -192,8 +206,8 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
                 ctx.stroke()
                 ctx.setLineDash([])
                 const lines: Array<[string, string]> = [
-                    [c.down, `${labels.current.names[0]} ${formatRate(history[best].down)}`],
-                    [c.up, `${labels.current.names[1]} ${formatRate(history[best].up)}`],
+                    [c.down, `${labels.current.names[0]} ${formatRate(selected.down)}`],
+                    [c.up, `${labels.current.names[1]} ${formatRate(selected.up)}`],
                 ]
                 ctx.font = '11px "Martian Mono", ui-monospace, monospace'
                 const boxW = Math.max(...lines.map(([, text]) => ctx.measureText(text).width)) + 28
@@ -217,7 +231,7 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
                 for (const [key, color] of [['down', c.down], ['up', c.up]] as const) {
                     ctx.fillStyle = color
                     ctx.beginPath()
-                    ctx.arc(x, ys(history[best][key]), 3.5, 0, Math.PI * 2)
+                    ctx.arc(x, ys(selected[key]), 3.5, 0, Math.PI * 2)
                     ctx.fill()
                 }
             }
@@ -235,14 +249,10 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
                 dirty = false
                 lastFrame = now
             }
-            if (dirty || (!reduce.matches && samples.current.length > 0)) frame = requestAnimationFrame(loop)
-            else if (samples.current.length > 0) {
-                const latest = samples.current[samples.current.length - 1]
-                const staleAt = latest.at + RATE_STALE_MS
-                const expiresAt = samples.current[0].at + RATE_WINDOW_MS
-                // Reduced motion still retires a stale head without new data.
-                const nextChange = staleAt >= now ? Math.min(staleAt, expiresAt) : expiresAt
-                const delay = Math.max(1, nextChange - now + 1)
+            if (dirty || (!reduce.matches && hasDrawingWork)) frame = requestAnimationFrame(loop)
+            else if (nextChangeAt !== undefined) {
+                // Guard points do not schedule already-expired deadlines.
+                const delay = Math.max(1, nextChangeAt - now + 1)
                 expiration = setTimeout(invalidate, delay)
             }
         }

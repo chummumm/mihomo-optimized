@@ -314,7 +314,7 @@ export default function Connections () {
                 <section className="connections-rates connections-panel">
                     <div className="connections-panel-head">
                         <h2>{t('rates.title')}</h2>
-                        <span className="connections-panel-tag">{t('rates.chart')}</span>
+                        <span className="connections-panel-tag" title={t('rates.chartLabel')}>{t('rates.chart')}</span>
                         <span className="connections-legend" aria-hidden="true">
                             <span><i className="is-down" />{t('rates.download')}</span>
                             <span><i className="is-up" />{t('rates.upload')}</span>
