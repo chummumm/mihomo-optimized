@@ -364,7 +364,15 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.16
+              printf '%s\n\n' '## 本次更新：1.0.17
+
+          - /connections 的 HTTP 与 WebSocket 快照新增 sampledAt（进程单调时钟毫秒，可含小数）和 sequence（进程内递增采样序号），原有字段保持兼容。并发采样共享同一时钟与序号顺序；清零流量统计不重置采样时钟，系统墙钟校时不影响采样间隔。
+          - 配套面板 0.4.11 优先按核心实际采样时间计算全局与连接速率，避免集中到达的网络或浏览器回调放大流量读数。旧核心继续使用接收时间回退；恢复统计连接后重新建立速率基线。
+          - 面板在标签页隐藏时暂停统计连接，恢复时不补播旧显示更新。连接变动逐条保留到有上限的历史，展示更新合并；来源筛选、详情选择、已关闭记录和滚动位置保留，隐藏详情停止重写。
+          - 流量图尾部使用短暂视觉过渡，采样值、时间戳和悬浮提示保持真实。纵轴及时容纳新峰值，按实际经过时间平滑收缩；隐藏时停止绘制，恢复时直接定位，不跨采样缺口补点。
+
+          [1.0.17 发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.17/docs/releases.md)'
+              printf '%s\n\n' '## 1.0.16：多上游正常答复优先
 
           - 多上游查询优先采用 NOERROR（含 NODATA）或 NXDOMAIN。FORMERR、NOTIMP 等原先允许透传的失败返回码先作为兜底保存，继续等待其他上游的合格答复，避免快速错误抢先结束整轮查询。
           - 覆盖普通多上游竞速及 DIRECT 优选的 first-ping、fastest-response、fastest-ip 三种响应模式。SERVFAIL、REFUSED 维持原失败处理；单上游与显式本地 rcode:// 策略保持原语义。
@@ -437,3 +445,4 @@ jobs:
           else
             printf 'Build %s is not current main (%s); Latest is unchanged.\n' "$BUILD_SHA" "$current_main"
           fi
+

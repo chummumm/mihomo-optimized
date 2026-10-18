@@ -2,6 +2,7 @@ package statistic
 
 import (
 	"os"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -10,6 +11,15 @@ import (
 )
 
 var DefaultManager *Manager
+
+// The epoch and sequence belong to the process, including zero-value managers
+// and traffic resets. A shared lock keeps timestamps ordered by their sequence
+// even when independent HTTP and WebSocket callers sample concurrently.
+var snapshotSampling = struct {
+	sync.Mutex
+	epoch    time.Time
+	sequence uint64
+}{epoch: time.Now()}
 
 func init() {
 	DefaultManager = &Manager{
@@ -87,11 +97,18 @@ func (m *Manager) Snapshot() *Snapshot {
 		connections = append(connections, c.Info())
 		return true
 	})
+	// Coordinate the sampling point and total reads, not the connection walk.
+	snapshotSampling.Lock()
+	defer snapshotSampling.Unlock()
+	snapshotSampling.sequence++
+	sampledAt := float64(time.Since(snapshotSampling.epoch)) / float64(time.Millisecond)
 	return &Snapshot{
 		UploadTotal:   m.uploadTotal.Load(),
 		DownloadTotal: m.downloadTotal.Load(),
 		Connections:   connections,
 		Memory:        m.memory,
+		SampledAt:     sampledAt,
+		Sequence:      snapshotSampling.sequence,
 	}
 }
 
@@ -126,4 +143,10 @@ type Snapshot struct {
 	UploadTotal   int64          `json:"uploadTotal"`
 	Connections   []*TrackerInfo `json:"connections"`
 	Memory        uint64         `json:"memory"`
+
+	// SampledAt is monotonic milliseconds in this process, not a Unix timestamp.
+	// Sequence orders samples in the same process; traffic resets retain both.
+	SampledAt float64 `json:"sampledAt"`
+	Sequence  uint64  `json:"sequence"`
 }
+
