@@ -363,7 +363,7 @@ const CN = {
             upload: '上行',
             total: '累计',
             chart: '最近 60 秒',
-            chartLabel: '最近 60 秒的下行和上行速率，新采样即时显示，右侧标记为最新已知速率',
+            chartLabel: '最近 60 秒的下行和上行速率，数字和提示读数实时更新，右侧光点平滑跟随最新速率',
             now: '现在',
         },
         sourcesTitle: '来源',

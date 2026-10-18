@@ -29,10 +29,10 @@ let elapsed = 0
 let anchor = 0
 let screenshots = []
 
-function sample(at) {
+function sample(at, rateMiB = rates[Math.floor(at / 1000) % rates.length]) {
     const span = at - sourceTime
     assert.ok(span >= 0, 'fixture source sampling time never moves backwards')
-    download += rates[Math.floor(at / 1000) % rates.length] * MiB * span / 1000
+    download += rateMiB * MiB * span / 1000
     upload += 0.5 * MiB * span / 1000
     sourceTime = at
     current = {
@@ -87,8 +87,8 @@ async function received(expected = sequence) {
     await until(() => page.evaluate(value => window.throughputEdgesFixture.received === value, expected), 'the real local WebSocket delivers the expected source snapshot')
 }
 
-async function send(at) {
-    const snapshot = sample(at)
+async function send(at, rateMiB) {
+    const snapshot = sample(at, rateMiB)
     assert.equal(sockets.size, 1, 'the fixture sends to one statistics socket')
     for (const socket of sockets) socket.send(JSON.stringify(snapshot))
     await received(snapshot.sequence)
@@ -150,35 +150,203 @@ function segments(frame, key = 'down') {
 
 function assertFillClosure(frame, label) {
     assert.equal(frame.fills.length, 2, `${label}: both series have an independent filled area`)
-    for (const fill of frame.fills) {
+    for (const [index, fill] of frame.fills.entries()) {
         const lastStart = fill.operations.findLastIndex(operation => operation[0] === 'moveTo')
         const area = fill.operations.slice(lastStart)
         const closing = area.slice(-4)
         assert.equal(closing[0][0], 'lineTo', `${label}: live fill extends past the visible plot`)
         assert.equal(closing[1][0], 'lineTo', `${label}: live fill closes at the baseline`)
         assert.ok(closing[0][1] > frame.width && closing[1][1] === closing[0][1], `${label}: the active fill's vertical closing edge is outside the clip`)
+        assert.ok(Math.abs(closing[0][2] - chartHeads(frame)[index].y) <= 0.05, `${label}: the live fill closes at the displayed head height`)
         assert.equal(closing[3][0], 'closePath')
     }
     for (const stroke of frame.strokes) assert.ok(!stroke.operations.some(operation => operation[0] === 'closePath'), `${label}: area closing edges are never stroked`)
 }
 
-function latestValueError(frame, tick) {
-    const heads = frame.heads.filter(head => Math.abs(head.radius - 3) < 1e-6)
-    if (heads.length < 2) return Infinity
-    const baseline = frame.height - (frame.height < 120 ? 4 : 20)
-    // The constant upload rate is an independent reference for the actual
-    // current y scale. No chart helper or internally exported scale is used.
-    const expected = baseline - (baseline - heads[1].y) * rates[tick % rates.length] / 0.5
-    return Math.abs(heads[0].y - expected)
+function chartHeads(frame) {
+    return frame.heads.filter(head => Math.abs(head.radius - 3) < 1e-6)
 }
 
-async function assertNewest(tick, deliveredAt) {
-    const frames = await page.evaluate(value => window.throughputEdgesFixture.frames.filter(frame => frame.sequence === value), sequence)
-    const frame = frames.find(frame => latestValueError(frame, tick) <= 0.05)
-    assert.ok(frame, `source sample ${tick}: latest measured value reaches the real chart without a fixed display buffer`)
-    const latency = frame.at - anchor - deliveredAt
-    assert.ok(latency >= 0 && latency <= 128, `source sample ${tick}: newest value is visible within the normal UI publication interval (${latency} ms)`)
-    return latency
+function plot(frame) {
+    const clip = frame.clips.flat().find(operation => operation[0] === 'rect')
+    assert.ok(clip, 'the actual renderer defines the plot bounds')
+    return { top: clip[2], height: clip[4], baseline: clip[2] + clip[4] }
+}
+
+function targetY(frame, rateMiB) {
+    const { top, baseline, height } = plot(frame)
+    // An older constant upload observation reveals the actual scale even while
+    // the live upload marker is moving. The point is outside the last 2 seconds.
+    const reference = yAt(segments(frame, 'up'), frame.width - 48)
+    assert.ok(45 * 60000 / (frame.width - 3) > 2000, 'the scale reference lies outside the variable live suffix')
+    assert.ok(reference !== undefined && reference > top + 0.05 && reference < baseline - 0.05, 'an unclipped historical upload observation supplies the scale')
+    const ymax = 0.5 * height / (baseline - reference)
+    return { y: baseline - Math.min(rateMiB / ymax, 1) * height, ymax }
+}
+
+function assertJoinedHead(frame, label) {
+    const heads = chartHeads(frame)
+    assert.equal(heads.length, 2, `${label}: both displayed heads are present`)
+    for (const [index, key] of ['down', 'up'].entries()) {
+        const onCurve = yAt(segments(frame, key), heads[index].x)
+        assert.ok(onCurve !== undefined && Math.abs(onCurve - heads[index].y) <= 0.05, `${label}: the ${key} stroke and head move together`)
+    }
+    assertFillClosure(frame, label)
+}
+
+async function hoverLatest() {
+    const box = await page.locator('canvas.connections-chart').boundingBox()
+    await page.mouse.move(box.x + box.width - 3, box.y + 30)
+}
+
+async function currentFrames() {
+    return page.evaluate(value => window.throughputEdgesFixture.frames.filter(frame => frame.sequence === value), sequence)
+}
+
+async function assertImmediateReading(rateMiB, deliveredAt, label, historyMiB = rateMiB) {
+    const rateText = await page.locator('.connections-rate.is-down .connections-rate-value').textContent()
+    const expected = rateMiB * MiB
+    assert.ok(Math.abs(bytesPerSecond(rateText) - expected) <= expected * 0.011, `${label}: the number reports the newest source value during head motion`)
+    const frames = await currentFrames()
+    const historyExpected = historyMiB * MiB
+    const rawFrame = frames.find(frame => frame.texts.some(text => text.startsWith('↓ ') && Math.abs(bytesPerSecond(text) - historyExpected) <= historyExpected * 0.011))
+    assert.ok(rawFrame, `${label}: the real tooltip exposes the newest raw sample during head motion`)
+    const latency = rawFrame.at - anchor - deliveredAt
+    assert.ok(latency >= 0 && latency <= 128, `${label}: raw sample availability is not delayed by the head animation (${latency} ms)`)
+    const selected = rawFrame.heads.filter(head => Math.abs(head.radius - 3.5) < 1e-6)
+    assert.equal(selected.length, 2, `${label}: the tooltip identifies actual observations`)
+    assert.ok(selected.every(head => head.x >= rawFrame.width - 3 - (rawFrame.width - 3) / 60), `${label}: the latest raw timestamp remains at the current end of the window`)
+    return { latency, rawFrame }
+}
+
+function assertStableTransition(before, frames, rateMiB, deliveredAt, label) {
+    const startY = chartHeads(before)[0].y
+    const target = targetY(frames.at(-1), rateMiB)
+    const distance = target.y - startY
+    assert.ok(Math.abs(distance) > 1, `${label}: the sample makes a meaningful visible step`)
+    const positions = frames.map(frame => ({ frame, y: chartHeads(frame)[0].y, progress: (chartHeads(frame)[0].y - startY) / distance }))
+    const intermediate = positions.filter(position => position.progress > 0.05 && position.progress < 0.95)
+    assert.ok(intermediate.length >= 2, `${label}: a step visits multiple intermediate head positions instead of jumping directly to the new value`)
+    const firstMotionMs = intermediate[0].frame.at - anchor - deliveredAt
+    assert.ok(firstMotionMs <= 128, `${label}: head motion begins promptly, including an allowed unchanged t=0 frame (${firstMotionMs} ms)`)
+    const settled = positions.find(position => Math.abs(position.y - target.y) <= 0.05)
+    assert.ok(settled, `${label}: the transition reaches the current target`)
+    const settledMs = settled.frame.at - anchor - deliveredAt
+    assert.ok(settledMs <= 300, `${label}: a stable-scale transition finishes within 300 ms (${settledMs} ms)`)
+    let previous = 0
+    let maxStepFraction = 0
+    for (const position of positions) {
+        assert.ok(position.progress >= previous - 0.002 && position.progress <= 1.002, `${label}: motion proceeds monotonically without overshoot or a queued old target`)
+        maxStepFraction = Math.max(maxStepFraction, position.progress - previous)
+        assert.ok(Math.abs(targetY(position.frame, rateMiB).ymax - target.ymax) < 1e-6, `${label}: the existing axis is stable, isolating head motion`)
+        assertJoinedHead(position.frame, label)
+        previous = position.progress
+    }
+    assert.ok(maxStepFraction < 0.85, `${label}: one draw does not consume almost the entire transition`)
+    return { firstMotionMs, settledMs, intermediateFrames: intermediate.length, maxStepFraction }
+}
+
+async function regularMotionSample(tick, deliveredAt, rateMiB = rates[tick % rates.length]) {
+    await advanceTo(deliveredAt)
+    const before = await page.evaluate(() => window.throughputEdgesFixture.latest)
+    await send(tick * 1000, rateMiB)
+    await hoverLatest()
+    await advanceTo(deliveredAt + 128)
+    const raw = await assertImmediateReading(rateMiB, deliveredAt, `sample ${tick}`)
+    await page.mouse.move(0, 0)
+    await advanceTo(deliveredAt + 320)
+    return { rawLatencyMs: raw.latency, ...assertStableTransition(before, await currentFrames(), rateMiB, deliveredAt, `sample ${tick}`) }
+}
+
+function assertVerticalSpeed(frames, label) {
+    let maxStep = 0
+    for (let index = 1; index < frames.length; index++) {
+        const before = frames[index - 1]
+        const after = frames[index]
+        const dt = after.at - before.at
+        assert.ok(dt > 0 && dt <= 80, `${label}: adjacent rendered frames were captured`)
+        for (let series = 0; series < 2; series++) {
+            const step = Math.abs(chartHeads(after)[series].y - chartHeads(before)[series].y)
+            maxStep = Math.max(maxStep, step)
+            // This bound accommodates the maximum speed of a short ease-out.
+            // Separate intermediate-position assertions reject direct steps.
+            assert.ok(step <= plot(after).height * dt * 0.016 + 0.5, `${label}: the head does not jump when the target or y scale changes (${step.toFixed(3)} px in ${dt} ms)`)
+        }
+        assertJoinedHead(after, label)
+    }
+    return maxStep
+}
+
+async function interruptedMotion() {
+    await phase('retarget')
+    await advanceTo(133128)
+    const before = await page.evaluate(() => window.throughputEdgesFixture.latest)
+    await send(133000, 0.5)
+    await hoverLatest()
+    await advanceTo(133224)
+    await assertImmediateReading(0.5, 133128, 'initial target')
+    await advanceTo(133248)
+    const turning = await page.evaluate(() => window.throughputEdgesFixture.latest)
+    const startY = chartHeads(before)[0].y
+    const turnY = chartHeads(turning)[0].y
+    const abandonedY = targetY(turning, 0.5).y
+    assert.ok(turnY > startY + 0.05 && turnY < abandonedY - 0.05, 'the next target arrives while the first transition is still in progress')
+    // This replaces the same one-second source bucket after only 120 ms.
+    await send(133120, 3)
+    await advanceTo(133376)
+    // The number is the new 120 ms rate; the real chart sample retains the
+    // existing duration-weighted one-second bucket semantics.
+    const replacement = (0.5 * 1000 + 3 * 120) / 1120
+    const raw = await assertImmediateReading(3, 133248, 'replacement target', replacement)
+    await page.mouse.move(0, 0)
+    await advanceTo(133568)
+    const frames = await currentFrames()
+    const index = frames.findIndex(frame => frame.at === raw.rawFrame.at)
+    const accepted = frames[index]
+    const next = frames[index + 1]
+    assert.ok(next && chartHeads(next)[0].y < chartHeads(accepted)[0].y - 0.05, 'the next draw after accepting a replacement target reverses direction without queuing the old target')
+    assert.ok(frames.every(frame => Math.abs(chartHeads(frame)[0].y - abandonedY) > 0.05), 'a superseded target is not visited before the replacement')
+    const motion = assertStableTransition(accepted, frames.slice(index), replacement, 133248, 'replacement target')
+    const maxYStepPx = assertVerticalSpeed([turning, ...frames], 'replacement target')
+    await screenshot('retarget-current-value', true)
+    observations.push({ label: 'retarget', replacementAfterMs: 120, instantaneousRateMiBps: 3, bucketRateMiBps: replacement, reverseWithinMs: next.at - anchor - 133248, rawAvailabilityMs: raw.latency, maxYStepPx, ...motion })
+}
+
+async function peakMotion() {
+    await phase('peak-preparation')
+    await regularMotionSample(134, 134128, 0.5)
+    await phase('peak-rescale')
+    await advanceTo(135128)
+    const before = await page.evaluate(() => window.throughputEdgesFixture.latest)
+    await screenshot('peak-before', true)
+    await send(135000, 32)
+    await hoverLatest()
+    await advanceTo(135256)
+    const raw = await assertImmediateReading(32, 135128, 'large peak')
+    await page.mouse.move(0, 0)
+    await screenshot('peak-in-motion', true)
+    await advanceTo(135448)
+    const frames = await currentFrames()
+    const start = (plot(before).baseline - chartHeads(before)[0].y) / plot(before).height
+    const positions = frames.map(frame => {
+        const bounds = plot(frame)
+        const measured = targetY(frame, 32)
+        const current = (bounds.baseline - chartHeads(frame)[0].y) / bounds.height
+        const target = (bounds.baseline - measured.y) / bounds.height
+        return { frame, progress: (current - start) / (target - start), error: Math.abs(chartHeads(frame)[0].y - measured.y) }
+    })
+    const intermediate = positions.filter(position => position.progress > 0.05 && position.progress < 0.95)
+    assert.ok(intermediate.length >= 2, 'a large peak crosses multiple intermediate positions even while the y scale changes')
+    assert.ok(intermediate[0].frame.at - anchor - 135128 <= 128, 'the peak transition starts without a display buffer')
+    const settled = positions.find(position => position.error <= 0.05)
+    assert.ok(settled && settled.frame.at - anchor - 135128 <= 300, 'the peak head reaches its moving scale target promptly')
+    const beforeScale = targetY(before, 0.5).ymax
+    const afterScale = targetY(frames.at(-1), 32).ymax
+    assert.ok(afterScale > beforeScale * 2, 'the peak case really changes the scale substantially')
+    const maxYStepPx = assertVerticalSpeed([before, ...frames], 'large peak')
+    await screenshot('peak-settled', true)
+    observations.push({ label: 'peak-rescale', rawAvailabilityMs: raw.latency, firstMotionMs: intermediate[0].frame.at - anchor - 135128,
+        settledMs: settled.frame.at - anchor - 135128, intermediateFrames: intermediate.length, maxYStepPx, beforeScaleMiBps: beforeScale, afterScaleMiBps: afterScale })
 }
 
 function yAt(geometry, x) {
@@ -205,6 +373,8 @@ function metrics(frames, label, residualLimit) {
     let maxHeadStep = 0
     let maxHeadVelocity = 0
     let maxHeadInsetError = 0
+    let maxHeadYStep = 0
+    let maxHeadYSpeed = 0
     let maxLeftResidual = 0
     let compared = 0
     for (let index = 0; index < usable.length; index++) {
@@ -235,6 +405,11 @@ function metrics(frames, label, residualLimit) {
             maxHeadVelocity = Math.max(maxHeadVelocity, step * 60000 / frame.width / dt)
             // Retain a separate movement bound to diagnose any future drift.
             assert.ok(step <= 2.2 * frame.width * dt / 60000 + 0.15, `${label}: endpoint movement is continuous (${step.toFixed(3)} px in ${dt.toFixed(1)} ms)`)
+            const yStep = Math.abs(heads[head].y - previousHeads[head].y)
+            const plotHeight = plot(frame).height
+            maxHeadYStep = Math.max(maxHeadYStep, yStep)
+            maxHeadYSpeed = Math.max(maxHeadYSpeed, yStep / plotHeight * 1000 / dt)
+            assert.ok(yStep <= plotHeight * dt * 0.016 + 0.5, `${label}: vertical movement has a bounded speed (${yStep.toFixed(3)} px in ${dt} ms)`)
         }
         const beforeGeometry = segments(previous)
         const shift = (frame.width - 3) * dt / 60000
@@ -249,7 +424,7 @@ function metrics(frames, label, residualLimit) {
         }
     }
     assert.ok(compared >= 120, `${label}: continuity was compared across sample boundaries`)
-    return { label, frames: usable.length, comparisons: compared, maxHeadStepPx: maxHeadStep, maxHeadInsetErrorPx: maxHeadInsetError, maxHeadSpeedInWindowsPerMinute: maxHeadVelocity, maxLeftResidualPx: maxLeftResidual }
+    return { label, frames: usable.length, comparisons: compared, maxHeadStepPx: maxHeadStep, maxHeadInsetErrorPx: maxHeadInsetError, maxHeadSpeedInWindowsPerMinute: maxHeadVelocity, maxHeadYStepPx: maxHeadYStep, maxHeadYSpeedInPlotHeightsPerSecond: maxHeadYSpeed, maxLeftResidualPx: maxLeftResidual }
 }
 
 function bytesPerSecond(text) {
@@ -368,7 +543,7 @@ async function main() {
                 drawsAt.set(at, count)
                 if (drawsAt.size > 128) drawsAt.delete(drawsAt.keys().next().value)
                 fixture.maxDrawsPerFrame = Math.max(fixture.maxDrawsPerFrame, count)
-                const frame = { at, phase: fixture.phase, sequence: fixture.received, width: this.canvas.clientWidth, height: this.canvas.clientHeight, strokes: [], fills: [], heads: [], clips: [] }
+                const frame = { at, phase: fixture.phase, sequence: fixture.received, width: this.canvas.clientWidth, height: this.canvas.clientHeight, strokes: [], fills: [], heads: [], clips: [], texts: [] }
                 fixture.latest = frame
                 if (fixture.phase !== 'warmup') {
                     if (fixture.frames.length < 2000) fixture.frames.push(frame)
@@ -411,6 +586,11 @@ async function main() {
             if (isChart(this) && fixture.latest) fixture.latest.heads.push({ x, y, radius, opacity: this.globalAlpha })
             return arc.call(this, x, y, radius, ...args)
         }
+        const fillText = proto.fillText
+        proto.fillText = function(text, ...args) {
+            if (isChart(this) && fixture.latest) fixture.latest.texts.push(String(text))
+            return fillText.call(this, text, ...args)
+        }
         const clip = proto.clip
         proto.clip = function(...args) {
             if (isChart(this) && fixture.latest) fixture.latest.clips.push((pathOperations.get(args[0]) || activePaths.get(this) || []).map(operation => operation.slice()))
@@ -430,7 +610,12 @@ async function main() {
     await page.clock.pauseAt(new Date(await page.evaluate(() => Date.now()) + 1000))
     await page.evaluate(() => window.throughputEdgesFixture.setHidden(true))
     await until(() => sockets.size === 0, 'initial transport closes before the controlled baseline')
+    // Align the controlled origin so the dedicated 120 ms replacement is
+    // unambiguously in the same source bucket on every browser/CI run.
+    const clockPhase = await page.evaluate(() => performance.now() % 1000)
+    await page.clock.runFor((1000 - clockPhase) % 1000)
     anchor = await page.evaluate(() => performance.now())
+    assert.ok(Math.abs(anchor % 1000) < 0.001, 'the controlled display origin is aligned to a second')
     sample(0)
     await advanceTo(500)
     await page.evaluate(() => window.throughputEdgesFixture.setHidden(false))
@@ -458,13 +643,10 @@ async function main() {
         await advanceTo(tick * 1000 + 628)
     }
     await phase('steady')
-    let maxLatestLatency = 0
+    const motions = []
     screenshots = Array.from({ length: 12 }, (_, index) => 67200 + index * 100)
     for (let tick = 65; tick <= 70; tick++) {
-        await advanceTo(tick * 1000 + 500)
-        await send(tick * 1000)
-        await advanceTo(tick * 1000 + 628)
-        maxLatestLatency = Math.max(maxLatestLatency, await assertNewest(tick, tick * 1000 + 500))
+        motions.push(await regularMotionSample(tick, tick * 1000 + 500))
     }
     await screenshot('steady-complete-window')
     let state = await page.evaluate(() => window.throughputEdgesFixture.export())
@@ -474,10 +656,7 @@ async function main() {
     const delays = [500, 250, 0, 400, 100, 500, 0, 350]
     for (let index = 0; index < delays.length; index++) {
         const tick = 71 + index
-        await advanceTo(tick * 1000 + delays[index])
-        await send(tick * 1000)
-        await advanceTo(tick * 1000 + delays[index] + 128)
-        maxLatestLatency = Math.max(maxLatestLatency, await assertNewest(tick, tick * 1000 + delays[index]))
+        motions.push(await regularMotionSample(tick, tick * 1000 + delays[index]))
     }
     await screenshot('delivery-jitter')
     state = await page.evaluate(() => window.throughputEdgesFixture.export())
@@ -485,7 +664,10 @@ async function main() {
     const rateText = await page.locator('.connections-rate.is-down .connections-rate-value').textContent()
     const expectedRate = rates[78 % rates.length] * MiB
     assert.ok(Math.abs(bytesPerSecond(rateText) - expectedRate) <= expectedRate * 0.011, 'top-level rate still reports the newest source sample without the chart delay')
-    observations.push({ label: 'latest-number-and-chart', text: rateText, expectedBytesPerSecond: expectedRate, deliveryDelaysMs: delays, maxLatestChartLatencyMs: maxLatestLatency })
+    observations.push({ label: 'latest-number-and-chart', text: rateText, expectedBytesPerSecond: expectedRate, deliveryDelaysMs: delays,
+        maxRawAvailabilityMs: Math.max(...motions.map(motion => motion.rawLatencyMs)), maxFirstMotionMs: Math.max(...motions.map(motion => motion.firstMotionMs)),
+        maxSettledMs: Math.max(...motions.map(motion => motion.settledMs)), minIntermediateFrames: Math.min(...motions.map(motion => motion.intermediateFrames)),
+        maxStepFraction: Math.max(...motions.map(motion => motion.maxStepFraction)) })
 
     await phase('tail-expiry')
     await advanceTo(79750)
@@ -584,6 +766,8 @@ async function main() {
         await screenshot(scenario.label)
         observations.push({ ...reading, clearedEdgePixels: clearProbe.height, remainingAfterClear: clearProbe.remaining })
     }
+    await interruptedMotion()
+    await peakMotion()
     assert.deepEqual(errors, [])
     await persist()
     console.log(JSON.stringify({ passed: true, browser: browser.version(), controlledClock: true, controlledVisibility: true, frozenPage: true, observations, errors }, null, 2))
