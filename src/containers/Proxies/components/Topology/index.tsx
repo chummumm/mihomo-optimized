@@ -1,12 +1,11 @@
 import classnames from 'classnames'
 import { useAtomValue } from 'jotai'
 import { AnimatePresence, motion, useIsPresent } from 'motion/react'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import { Card, Icon, formatRate, delayStatus, springs, useLineColor } from '@components'
 import { INTERNAL_CONNECTIONS, UNKNOWN_CONNECTIONS } from '@containers/Connections/source'
 import { useConnections } from '@containers/Connections/store'
-import type * as API from '@lib/request'
 import { proxyGroupMapping, proxyMapping, useConnectionStreamReader, useI18n, useProxy } from '@stores'
 
 import { type TopologyLink, type TopologyModel, type TopologyNode, TopologyRenderer } from './draw'
@@ -91,37 +90,11 @@ function TopologyLive () {
     const { t: tc } = translation('Connections')
     const present = useIsPresent()
     const reader = useConnectionStreamReader(present)
-    const { connections, feed } = useConnections(reader)
+    const { connections, rate } = useConnections(reader)
     const { groups } = useProxy()
     const groupByName = useAtomValue(proxyGroupMapping)
     const proxyMap = useAtomValue(proxyMapping)
     const color = useLineColor()
-    const [rate, setRate] = useState({ up: 0, down: 0 })
-    const totals = useRef<{ up: number, down: number, at: number }>()
-
-    useLayoutEffect(() => {
-        if (!present) return
-        totals.current = undefined
-        setRate({ up: 0, down: 0 })
-        function handle (snapshots: API.Snapshot[]) {
-            for (const snapshot of snapshots) {
-                const now = performance.now()
-                const previous = totals.current
-                if (previous !== undefined && now > previous.at) {
-                    const seconds = (now - previous.at) / 1000
-                    setRate({
-                        up: Math.max(0, snapshot.uploadTotal - previous.up) / seconds,
-                        down: Math.max(0, snapshot.downloadTotal - previous.down) / seconds,
-                    })
-                }
-                totals.current = { up: snapshot.uploadTotal, down: snapshot.downloadTotal, at: now }
-                feed(snapshot.connections)
-            }
-        }
-        reader.subscribe('data', handle)
-        return () => reader.unsubscribe('data', handle)
-    }, [reader, feed, present])
-
     const model = useMemo<TopologyModel>(() => {
         interface Tally { rate: number, count: number }
         const tally = (map: Map<string, Tally>, key: string, value: number) => {
@@ -295,3 +268,4 @@ function TopologyLive () {
         </div>
     )
 }
+

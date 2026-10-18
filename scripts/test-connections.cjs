@@ -23,7 +23,8 @@ function connection(index) {
     }
 }
 let connections = Array.from({ length: 400 }, (_, index) => connection(index))
-const snapshot = () => ({ uploadTotal: 10000, downloadTotal: 20000, connections })
+let sequence = 1
+const snapshot = () => ({ uploadTotal: 10000, downloadTotal: 20000, connections, sampledAt: sequence * 1000, sequence })
 const server = http.createServer((req, res) => {
     const pathname = new URL(req.url, 'http://127.0.0.1').pathname
     const api = {
@@ -169,8 +170,11 @@ async function main() {
     async function send(next = connections, rate) {
         connections = next
         if (rate) connections = connections.map(item => ({ ...item, download: item.download + rate(item) }))
+        // Each fixture update represents one source sampling second. Delivery
+        // can be faster without changing the rates used by sorting assertions.
+        sequence++
         for (const socket of sockets) socket.send(JSON.stringify(snapshot()))
-        await page.waitForTimeout(70)
+        await page.waitForTimeout(150)
         await assertSourceCounts('connection snapshot')
     }
     async function position(label) {
@@ -586,3 +590,4 @@ main().catch(error => {
     for (const socket of wss.clients) socket.terminate()
     wss.close(); server.close()
 })
+

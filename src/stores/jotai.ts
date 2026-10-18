@@ -10,6 +10,7 @@ import useSWR from 'swr'
 import { type Get } from 'type-fest'
 
 import { Language, locales, type Lang, getDefaultLanguage, type LocalizedType } from '@i18n'
+import { ConnectionStreamReader } from '@lib/connection-stream'
 import { partition } from '@lib/helper'
 import { useWarpImmerSetter, type WritableDraft } from '@lib/jotai'
 import { isClashX, jsBridge } from '@lib/jsBridge'
@@ -316,10 +317,10 @@ export function useConnectionStreamReader (enabled = true) {
     const protocol = apiInfo.protocol === 'http:' ? 'ws:' : 'wss:'
     const url = `${protocol}//${apiInfo.hostname}:${apiInfo.port}/connections?token=${encodeURIComponent(apiInfo.secret)}`
 
-    const connection = useMemo(() => ({ url, reader: new StreamReader<API.Snapshot>({ bufferLength: 0 }) }), [url])
+    const connection = useMemo(() => ({ url, reader: new ConnectionStreamReader() }), [url])
 
     useEffect(() => {
-        connection.reader.connect(enabled ? connection.url : '')
+        connection.reader.connectWhenVisible(connection.url, enabled)
     }, [connection, enabled])
 
     // Pause the transport without removing listeners during an animated exit.
@@ -328,3 +329,4 @@ export function useConnectionStreamReader (enabled = true) {
 
     return connection.reader
 }
+
