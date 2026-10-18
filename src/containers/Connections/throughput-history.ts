@@ -35,6 +35,16 @@ export class ThroughputHistory {
     private previous: (Totals & { at: number }) | undefined
     private segment = 0
 
+    resetBaseline () {
+        this.previous = undefined
+    }
+
+    shiftTime (milliseconds: number) {
+        if (milliseconds === 0) return
+        for (const sample of this.samples) sample.at += milliseconds
+        if (this.previous !== undefined) this.previous.at += milliseconds
+    }
+
     feed (totals: Totals, now: number): RateReading {
         pruneRateSamples(this.samples, now)
         const previous = this.previous
@@ -63,3 +73,4 @@ export class ThroughputHistory {
         return { up, down, at: now }
     }
 }
+

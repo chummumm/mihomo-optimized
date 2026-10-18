@@ -6,7 +6,6 @@ import { Header, Checkbox, Modal, Icon, Drawer, Card, Button, LineBullet, Static
 import { formatDateTime, fromNow } from '@lib/date'
 import { basePath, formatTraffic } from '@lib/helper'
 import { useObject, useVisible } from '@lib/hook'
-import type * as API from '@lib/request'
 import { useClient, useConnectionStreamReader, useI18n } from '@stores'
 
 import { Devices } from './Devices'
@@ -16,7 +15,6 @@ import { VirtualConnectionTable } from './VirtualTable'
 import { formatConnection } from './helper'
 import { ALL_CONNECTIONS, INTERNAL_CONNECTIONS } from './source'
 import { type Connection, type FormatConnection, useConnections } from './store'
-import { RATE_STALE_MS, ThroughputHistory, type RateReading, type RateSample } from './throughput-history'
 import './style.css'
 
 const Columns = {
@@ -90,12 +88,6 @@ export default function Connections () {
         }
     }, [measureViewport])
 
-    // total
-    const [traffic, setTraffic] = useObject({
-        uploadTotal: 0,
-        downloadTotal: 0,
-    })
-
     // close all connections
     const { visible, show, hide } = useVisible()
     function handleCloseConnections () {
@@ -103,7 +95,7 @@ export default function Connections () {
     }
 
     // connections
-    const { connections, connectionsBySource, devices, feed, save, toggleSave, clearHistory, getConnection, historyLimit, discarded } = useConnections(connStreamReader)
+    const { connections, connectionsBySource, devices, traffic, rate, samples: historySamples, generation, save, toggleSave, clearHistory, getConnection, historyLimit, discarded } = useConnections(connStreamReader)
     // Controls, translated text and source filters can change the space above
     // the table during this commit. Measure before paint so the list and its
     // scroll anchor use the new height even if ResizeObserver arrives later.
@@ -112,30 +104,10 @@ export default function Connections () {
     const selectedConnections = connectionsBySource.get(device) ?? EMPTY_CONNECTIONS
     const data = useMemo(() => selectedConnections.map(formatConnection), [selectedConnections])
 
-    // UI only: live rate from consecutive snapshot totals, the last minute of it for the chart,
-    // each source's share of the live traffic, and which rows just arrived.
-    const samples = useRef<RateSample[]>([])
-    const [rate, setRate] = useState<RateReading>({ up: 0, down: 0, at: 0 })
-    // A second, read-only listener on the same stream: it only turns totals into rates.
-    useLayoutEffect(() => {
-        const history = new ThroughputHistory()
-        samples.current = history.samples
-        setRate({ up: 0, down: 0, at: 0 })
-        let stale: ReturnType<typeof setTimeout> | undefined
-        function sample (snapshots: API.Snapshot[]) {
-            for (const snapshot of snapshots) {
-                setRate(history.feed(snapshot, performance.now()))
-            }
-            if (snapshots.length === 0) return
-            clearTimeout(stale)
-            stale = setTimeout(() => setRate({ up: 0, down: 0, at: performance.now() }), RATE_STALE_MS)
-        }
-        connStreamReader?.subscribe('data', sample)
-        return () => {
-            connStreamReader?.unsubscribe('data', sample)
-            clearTimeout(stale)
-        }
-    }, [connStreamReader])
+    // One store owns sampling and record ingestion. The canvas reads its bounded
+    // history without creating a second stream subscription or a React tick.
+    const samples = useRef(historySamples)
+    samples.current = historySamples
     const sourceRates = useMemo(() => {
         const rates = new Map<string, number>()
         let total = 0
@@ -149,18 +121,21 @@ export default function Connections () {
         rates.set(ALL_CONNECTIONS, total)
         return rates
     }, [connectionsBySource])
-    const seenIDs = useRef<Set<string>>()
+    const seenIDs = useRef<{ ids: Set<string>, generation: number }>()
     const freshIDs = useMemo(() => {
         const previous = seenIDs.current
         const fresh = new Set<string>()
+        // A resumed snapshot catches up the view once; it is not a replay of
+        // every new-connection animation from the time spent in the background.
+        if (previous !== undefined && previous.generation !== generation) return fresh
         for (const connection of connections) {
-            if (previous === undefined || !previous.has(connection.id)) fresh.add(connection.id)
+            if (previous === undefined || !previous.ids.has(connection.id)) fresh.add(connection.id)
         }
         return fresh
-    }, [connections])
+    }, [connections, generation])
     useEffect(() => {
-        seenIDs.current = new Set(connections.map(connection => connection.id))
-    }, [connections])
+        seenIDs.current = { ids: new Set(connections.map(connection => connection.id)), generation }
+    }, [connections, generation])
     const activeCount = useMemo(() => connections.reduce((count, connection) => connection.completed === true ? count : count + 1, 0), [connections])
 
     // table
@@ -221,25 +196,6 @@ export default function Connections () {
         [color, lang, t],
     )
 
-    useLayoutEffect(() => {
-        setTraffic({ uploadTotal: 0, downloadTotal: 0 })
-        function handleConnection (snapshots: API.Snapshot[]) {
-            for (const snapshot of snapshots) {
-                setTraffic({
-                    uploadTotal: snapshot.uploadTotal,
-                    downloadTotal: snapshot.downloadTotal,
-                })
-
-                feed(snapshot.connections)
-            }
-        }
-
-        connStreamReader?.subscribe('data', handleConnection)
-        return () => {
-            connStreamReader?.unsubscribe('data', handleConnection)
-        }
-    }, [connStreamReader, feed, setTraffic])
-
     useEffect(() => {
         setDevice(ALL_CONNECTIONS)
     }, [connStreamReader])
@@ -274,13 +230,14 @@ export default function Connections () {
         client.closeConnection(drawerState.selectedID)
     }
     useEffect(() => {
+        if (!drawerState.visible) return
         const conn = getConnection(drawerState.selectedID)
         if (conn) {
             setDrawerState(d => { d.connection = conn })
         } else if (drawerState.selectedID) {
             setDrawerState(d => { d.connection.completed = true })
         }
-    }, [connections, drawerState.selectedID, getConnection, setDrawerState])
+    }, [connections, drawerState.selectedID, drawerState.visible, getConnection, setDrawerState])
 
     const headers = headerGroup.headers.map((header, idx) => {
         const column = header.column
@@ -425,3 +382,4 @@ export default function Connections () {
         </div>
     )
 }
+

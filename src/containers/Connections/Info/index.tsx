@@ -1,5 +1,5 @@
 import classnames from 'classnames'
-import { useMemo, type ReactNode } from 'react'
+import { memo, useMemo, type ReactNode } from 'react'
 
 import { LineBullet, useLineColor } from '@components'
 import { formatDateTime } from '@lib/date'
@@ -25,7 +25,7 @@ function Stop ({ label, children, kind, line, routed }: { label: string, childre
 }
 
 // The connection drawn as a journey: where it came from, how it was routed, where it went.
-export function ConnectionInfo (props: ConnectionsInfoProps) {
+export const ConnectionInfo = memo(function ConnectionInfo (props: ConnectionsInfoProps) {
     const { translation, lang } = useI18n()
     const t = useMemo(() => translation('Connections').t, [translation])
     const host = getConnectionHost(props.connection.metadata)
@@ -118,4 +118,5 @@ export function ConnectionInfo (props: ConnectionsInfoProps) {
             </dl>
         </div>
     )
-}
+})
+

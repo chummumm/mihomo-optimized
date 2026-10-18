@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 
 import { formatRate } from '@components'
 
+import { ThroughputMotion } from './chart-motion'
 import { pruneRateSamples, rateSampleX, RATE_STALE_MS, RATE_WINDOW_MS, type RateSample } from './throughput-history'
 
 interface ThroughputChartProps {
@@ -43,8 +44,8 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
         if (ctx === null) return
         const reduce = window.matchMedia('(prefers-reduced-motion: reduce)')
         const scheme = window.matchMedia('(prefers-color-scheme: dark)')
+        const motion = new ThroughputMotion()
         let palette: Palette | null = null
-        let ymax = 1
         let hoverX: number | null = null
         let frame = 0
         let visible = true
@@ -82,8 +83,7 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
             const height = h - padTop - padBottom
             const latest = history[history.length - 1]
             const progress = reduce.matches || latest === undefined ? 1 : Math.max(0, Math.min(1, (now - latest.at) / 1000))
-            const target = Math.max(1024, ...history.map(s => Math.max(s.up, s.down))) * 1.2
-            ymax += (target - ymax) * (reduce.matches ? 1 : 0.06)
+            const { ymax, head } = motion.frame(history, now, reduce.matches)
 
             ctx.font = '10px "Martian Mono", ui-monospace, monospace'
             ctx.lineWidth = 1
@@ -118,7 +118,7 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
             const ys = (v: number) => padTop + height - (Math.min(v, ymax) / ymax) * height
             const series: Array<['down' | 'up', string, number, number]> = [['down', c.down, 2.2, 0.34], ['up', c.up, 1.8, 0.16]]
             for (const [key, color, width, fill] of series) {
-                const points = history.map((s, i) => [xs(i), ys(s[key])] as const)
+                const points = history.map((s, i) => [xs(i), ys(i === count - 1 && head !== undefined ? head[key] : s[key])] as const)
                 const path = new Path2D()
                 const area = new Path2D()
                 let start = 0
@@ -157,7 +157,7 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
 
                 // The head follows the actual latest sample; paused traffic must
                 // not remain pinned to the "now" edge of the chart.
-                if (latest !== undefined && now - latest.at <= RATE_STALE_MS) {
+                if (head !== undefined) {
                     const headX = Math.min(w - 3, points[count - 1][0])
                     const headY = points[count - 1][1]
                     ctx.fillStyle = color
@@ -223,20 +223,26 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
             }
         }
 
-        // Normal motion keeps the time axis flowing at thirty frames per second.
+        // Data and pointer changes share the same thirty-frame drawing limit.
+        // Normal motion keeps the time axis flowing between measurements.
         // Reduced motion schedules a single frame for changes, with no idle RAF loop.
-        let lastFrame = 0
+        let lastFrame: number | undefined
         const loop = (now: number) => {
             frame = 0
             if (!visible || document.hidden || !element.isConnected) return
-            if (dirty || now - lastFrame >= 32) {
+            if (lastFrame === undefined || now - lastFrame >= 1000 / 30) {
                 draw(now)
                 dirty = false
                 lastFrame = now
             }
-            if (!reduce.matches && samples.current.length > 0) frame = requestAnimationFrame(loop)
+            if (dirty || (!reduce.matches && samples.current.length > 0)) frame = requestAnimationFrame(loop)
             else if (samples.current.length > 0) {
-                const delay = Math.max(1, samples.current[0].at + RATE_WINDOW_MS - now + 1)
+                const latest = samples.current[samples.current.length - 1]
+                const staleAt = latest.at + RATE_STALE_MS
+                const expiresAt = samples.current[0].at + RATE_WINDOW_MS
+                // Reduced motion still retires a stale head without new data.
+                const nextChange = staleAt >= now ? Math.min(staleAt, expiresAt) : expiresAt
+                const delay = Math.max(1, nextChange - now + 1)
                 expiration = setTimeout(invalidate, delay)
             }
         }
@@ -249,6 +255,8 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
             cancelAnimationFrame(frame)
             frame = 0
             clearTimeout(expiration)
+            lastFrame = undefined
+            motion.reset()
         }
         redraw.current = invalidate
         const observer = typeof IntersectionObserver === 'function'
@@ -297,3 +305,4 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
 
     return <canvas ref={canvas} className="connections-chart" role="img" aria-label={label} />
 }
+

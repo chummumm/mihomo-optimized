@@ -88,6 +88,10 @@ export interface Snapshot {
     uploadTotal: number
     downloadTotal: number
     connections: Connections[] | null
+    // Optional monotonic core sampling time in milliseconds and process-wide
+    // sequence. Older controllers remain supported without these fields.
+    sampledAt?: number
+    sequence?: number
 }
 
 export interface Connections {
@@ -258,3 +262,4 @@ export class Client {
         return await this.getDNS<DNSUpstreams>('/upstreams', signal)
     }
 }
+

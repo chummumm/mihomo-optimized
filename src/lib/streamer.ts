@@ -31,6 +31,14 @@ export class StreamReader<T> {
         )
     }
 
+    protected parseMessage (raw: string): T {
+        return JSON.parse(raw)
+    }
+
+    protected resetSource () {
+        // Specialized streams can invalidate a measurement period at a boundary.
+    }
+
     protected connectWebsocket = () => {
         if (!this.url || this.stopped) {
             return
@@ -44,7 +52,7 @@ export class StreamReader<T> {
             if (this.connection !== socket || this.stopped) return
             let data: T
             try {
-                data = JSON.parse(msg.data)
+                data = this.parseMessage(msg.data)
             } catch (error) {
                 this.EE.emit('error', error)
                 return
@@ -63,11 +71,14 @@ export class StreamReader<T> {
             this.connection = null
             socket.close()
             if (this.retryTimer === undefined) {
-                this.retryTimer = setTimeout(() => {
+                const timer = setTimeout(() => {
+                    if (this.retryTimer !== timer) return
                     this.retryTimer = undefined
                     this.connectWebsocket()
                 }, this.config.retryInterval)
+                this.retryTimer = timer
             }
+            this.resetSource()
         }
         socket.addEventListener('error', err => {
             if (this.connection !== socket || this.stopped) return
@@ -75,6 +86,7 @@ export class StreamReader<T> {
             reconnect()
         })
         socket.addEventListener('close', reconnect)
+        this.resetSource()
     }
 
     connect (url: string) {
@@ -89,6 +101,7 @@ export class StreamReader<T> {
         const previous = this.connection
         this.connection = null
         previous?.close()
+        if (!url) this.resetSource()
         this.connectWebsocket()
     }
 
@@ -115,3 +128,4 @@ export class StreamReader<T> {
         this.innerBuffer = []
     }
 }
+
