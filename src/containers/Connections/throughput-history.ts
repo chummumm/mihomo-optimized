@@ -1,6 +1,10 @@
 export const RATE_WINDOW_MS = 60_000
 export const RATE_STALE_MS = 10_000
-export const RATE_SAMPLE_LIMIT = 64
+// A completed bucket and its neighbour fix the old quadratic. The buffer also
+// allows half a second of delivery jitter, without extrapolating future traffic.
+export const RATE_DRAW_DELAY_MS = 3000
+export const RATE_CLOCK_MARGIN_MS = 1000
+export const RATE_SAMPLE_LIMIT = 68
 
 export interface RateReading {
     up: number
@@ -18,10 +22,25 @@ interface Totals {
     downloadTotal: number
 }
 
+interface HistoryState {
+    shift: number
+    pending?: RateSample
+}
+
+const historyStates = new WeakMap<readonly RateSample[], HistoryState>()
+
+export function rateHistoryState (samples: readonly RateSample[]): Readonly<HistoryState> {
+    return historyStates.get(samples) ?? { shift: 0 }
+}
+
 export function pruneRateSamples (samples: RateSample[], now: number) {
     let expired = 0
-    while (expired < samples.length && now - samples[expired].at > RATE_WINDOW_MS) expired++
-    if (expired > 0) samples.splice(0, expired)
+    const retainedWindow = RATE_WINDOW_MS + RATE_DRAW_DELAY_MS + RATE_CLOCK_MARGIN_MS
+    while (expired < samples.length && now - samples[expired].at > retainedWindow) expired++
+    // Two preceding controls preserve the left-edge shape. When the entire
+    // window expires, its guards must expire as well.
+    const remove = expired === samples.length ? expired : Math.max(0, expired - 2)
+    if (remove > 0) samples.splice(0, remove)
 }
 
 export function rateSampleX (at: number, now: number, width: number) {
@@ -32,15 +51,22 @@ export function rateSampleX (at: number, now: number, width: number) {
 // controller sends snapshots faster than once a second, one minute stays bounded.
 export class ThroughputHistory {
     readonly samples: RateSample[] = []
+    private readonly state: HistoryState = { shift: 0 }
     private previous: (Totals & { at: number }) | undefined
     private segment = 0
 
+    constructor () {
+        historyStates.set(this.samples, this.state)
+    }
+
     resetBaseline () {
         this.previous = undefined
+        this.state.pending = undefined
     }
 
     shiftTime (milliseconds: number) {
         if (milliseconds === 0) return
+        this.state.shift += milliseconds
         for (const sample of this.samples) sample.at += milliseconds
         if (this.previous !== undefined) this.previous.at += milliseconds
     }
@@ -53,6 +79,7 @@ export class ThroughputHistory {
         const elapsed = previous === undefined ? 0 : now - previous.at
         if (!valid || previous === undefined || elapsed <= 0 || elapsed > RATE_STALE_MS || totals.uploadTotal < previous.uploadTotal || totals.downloadTotal < previous.downloadTotal) {
             this.segment++
+            this.state.pending = undefined
             return { up: 0, down: 0, at: now }
         }
 
@@ -70,6 +97,7 @@ export class ThroughputHistory {
             this.samples.push(sample)
             if (this.samples.length > RATE_SAMPLE_LIMIT) this.samples.shift()
         }
+        this.state.pending = sample
         return { up, down, at: now }
     }
 }
