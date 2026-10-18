@@ -1,5 +1,5 @@
 import {
-    rateHistoryState, RATE_CLOCK_MARGIN_MS, RATE_DRAW_DELAY_MS, RATE_STALE_MS, RATE_WINDOW_MS,
+    rateHistoryState, RATE_CLOCK_MARGIN_MS, RATE_STALE_MS, RATE_WINDOW_MS,
     type RateReading, type RateSample,
 } from './throughput-history'
 
@@ -14,12 +14,21 @@ interface ChartPath {
     curves: RateCurve[]
 }
 
+interface DisplayTail {
+    segment: number
+    from: RateReading
+    to: RateReading
+    opacity: number
+}
+
 interface ChartFrame {
     endAt: number
     ymax: number
     paths: ChartPath[]
     head: RateReading | undefined
+    tail: DisplayTail | undefined
     samples: readonly RateSample[]
+    projectAt: (at: number) => number
     active: boolean
     nextChangeAt: number | undefined
 }
@@ -70,9 +79,9 @@ function curvePeak (curve: RateCurve, key: 'up' | 'down') {
     return Math.max(a, c, peak)
 }
 
-// Owns only presentation time and scale. Measured rates and timestamps are never
-// interpolated or rewritten. The same old quadratic is clipped at moving edges;
-// its provisional terminal line is never painted and later reshaped.
+// Only the current end of the old quadratic may change as observations arrive.
+// A short, separate tail displays the latest known value at the right edge; it
+// is not an observation and never enters measured history or tooltip records.
 export class ThroughputMotion {
     private history: readonly RateSample[] | undefined
     private frameAt: number | undefined
@@ -103,54 +112,79 @@ export class ThroughputMotion {
             const correction = Math.min(Math.abs(phase), elapsed * 0.25)
             this.phase = phase - Math.sign(phase) * correction
         }
-        const endAt = now - RATE_DRAW_DELAY_MS + this.phase
+        const endAt = now + this.phase
         const startAt = endAt - RATE_WINDOW_MS
+        const age = latest === undefined ? Infinity : now - latest.at
+        const live = latest !== undefined && state.pending === latest && age >= 0 && age < 2000
+        // A small negative phase must not hide newly received data offscreen.
+        // Compress only the last second of drawing time. Split crossing curves
+        // before projection, so the older prefix and all real timestamps stay put.
+        const anchor = endAt - 1000
+        const project = live && latest.at > endAt
+        const scale = project ? (endAt - anchor) / (latest.at - anchor) : 1
+        const projectAt = (at: number) => !project || at <= anchor ? at : Math.min(endAt, anchor + (at - anchor) * scale)
+        const projectPoint = (point: RateReading): RateReading => ({ at: projectAt(point.at), up: point.up, down: point.down })
+        const rawEndAt = project ? latest.at : endAt
         const paths: ChartPath[] = []
         const eligible: RateSample[] = []
-        let head: RateReading | undefined
+        const tail: DisplayTail | undefined = live ? {
+            segment: latest.segment,
+            from: projectPoint(latest),
+            to: { at: endAt, up: latest.up, down: latest.down },
+            opacity: Math.min(1, (2000 - age) / 500),
+        } : undefined
         let peak = 1024
-        let active = false
+        let active = tail !== undefined
         let nextChangeAt: number | undefined
         const schedule = (at: number) => {
             if (at > now && (nextChangeAt === undefined || at < nextChangeAt)) nextChangeAt = at
         }
 
         if (latest !== undefined) {
-            schedule(latest.at + RATE_STALE_MS)
-            schedule(latest.at + RATE_WINDOW_MS + RATE_DRAW_DELAY_MS + RATE_CLOCK_MARGIN_MS)
+            if (live) {
+                schedule(latest.at + 1500)
+                schedule(latest.at + 2000)
+            }
+            schedule(latest.at + RATE_WINDOW_MS + RATE_CLOCK_MARGIN_MS)
         }
         let start = 0
         while (start < history.length) {
             let end = start + 1
             while (end < history.length && history[end].segment === history[start].segment) end++
-            // A weighted second bucket remains mutable until its successor
-            // arrives. It cannot determine a displayed curve yet.
-            const stableEnd = history[end - 1] === state.pending ? end - 1 : end
             const curves: RateCurve[] = []
             let previous: RateReading = history[start]
-            let stableAt: number | undefined
-            for (let i = start + 1; i < stableEnd; i++) {
+            const append = (curve: RateCurve) => {
+                if (projectAt(curve.to.at) >= startAt) active = true
+                schedule(curve.to.at + RATE_WINDOW_MS)
+                const clipped = clipCurve(curve, startAt, rawEndAt)
+                if (clipped === undefined) return
+                const pieces = project && clipped.from.at < anchor && clipped.to.at > anchor
+                    ? split(clipped, parameterAt(clipped, anchor)) : [clipped]
+                for (const piece of pieces) {
+                    const drawn = { from: projectPoint(piece.from), control: projectPoint(piece.control), to: projectPoint(piece.to) }
+                    curves.push(drawn)
+                    peak = Math.max(peak, curvePeak(drawn, 'up'), curvePeak(drawn, 'down'))
+                }
+            }
+            // Pending buckets are shown immediately. Replacing one only changes
+            // the nearby tail, not the already independent historical curves.
+            for (let i = start + 1; i < end; i++) {
                 const to = between(history[i - 1], history[i], 0.5)
-                const curve = { from: previous, control: history[i - 1], to }
+                append({ from: previous, control: history[i - 1], to })
                 previous = to
-                stableAt = to.at
-                if (to.at >= startAt) active = true
-                schedule(curve.from.at + RATE_DRAW_DELAY_MS)
-                schedule(to.at + RATE_DRAW_DELAY_MS)
-                schedule(to.at + RATE_WINDOW_MS + RATE_DRAW_DELAY_MS)
-                const clipped = clipCurve(curve, startAt, endAt)
-                if (clipped === undefined) continue
-                curves.push(clipped)
-                peak = Math.max(peak, curvePeak(clipped, 'up'), curvePeak(clipped, 'down'))
             }
-            if (curves.length > 0) {
-                paths.push({ segment: history[start].segment, curves })
-                if (history[start].segment === latest?.segment && now - latest.at <= RATE_STALE_MS) head = curves[curves.length - 1].to
+            const last = history[end - 1]
+            if (previous.at < last.at) {
+                // A straight quadratic is the original terminal line, kept
+                // separate from the held-value display tail.
+                append({ from: previous, control: between(previous, last, 0.5), to: last })
             }
-            for (let i = start; i < stableEnd; i++) {
+            if (curves.length > 0) paths.push({ segment: history[start].segment, curves })
+            for (let i = start; i < end; i++) {
                 const sample = history[i]
-                schedule(sample.at + RATE_WINDOW_MS + RATE_DRAW_DELAY_MS)
-                if (sample.at < startAt || sample.at > endAt || stableAt === undefined || sample.at > stableAt) continue
+                schedule(sample.at + RATE_WINDOW_MS)
+                const at = projectAt(sample.at)
+                if (at < startAt || at > endAt) continue
                 eligible.push(sample)
                 peak = Math.max(peak, sample.up, sample.down)
             }
@@ -165,6 +199,6 @@ export class ThroughputMotion {
         this.frameAt = now
         this.shift = state.shift
         this.segment = latest?.segment
-        return { endAt, ymax: this.ymax, paths, head, samples: eligible, active, nextChangeAt }
+        return { endAt, ymax: this.ymax, paths, head: tail?.to, tail, samples: eligible, projectAt, active, nextChangeAt }
     }
 }

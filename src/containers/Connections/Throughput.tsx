@@ -80,7 +80,8 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
             const c = palette
             const history = samples.current
             pruneRateSamples(history, now)
-            ctx.clearRect(0, 0, w, h)
+            // Match the existing clear to the rounded bitmap dimensions.
+            ctx.clearRect(0, 0, element.width / dpr, element.height / dpr)
             const compact = h < 120
             const padTop = compact ? 6 : 16
             const padBottom = compact ? 4 : 20
@@ -89,7 +90,7 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
             const latest = history[history.length - 1]
             const progress = reduce.matches || latest === undefined ? 1 : Math.max(0, Math.min(1, (now - latest.at) / 1000))
             const drawing = motion.frame(history, now, reduce.matches)
-            const { endAt, ymax, head, paths } = drawing
+            const { endAt, ymax, head, tail, paths } = drawing
             hasDrawingWork = drawing.active
             nextChangeAt = drawing.nextChangeAt
 
@@ -123,7 +124,7 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
                 ctx.fillText(labels.current.nowLabel, w - 4, h - 5)
                 ctx.textAlign = 'left'
             }
-            if (paths.length === 0) return
+            if (paths.length === 0 && tail === undefined) return
             const xs = (at: number) => rateSampleX(at, endAt, plotWidth)
             const ys = (v: number) => padTop + height - (Math.min(v, ymax) / ymax) * height
             const series: Array<['down' | 'up', string, number, number]> = [['down', c.down, 2.2, 0.34], ['up', c.up, 1.8, 0.16]]
@@ -134,7 +135,7 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
             for (const [key, color, width, fill] of series) {
                 const path = new Path2D()
                 const area = new Path2D()
-                for (const { curves } of paths) {
+                for (const { segment, curves } of paths) {
                     const first = curves[0].from
                     const last = curves[curves.length - 1].to
                     path.moveTo(xs(first.at), ys(first[key]))
@@ -147,7 +148,11 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
                         path.quadraticCurveTo(cx, cy, x, y)
                         area.quadraticCurveTo(cx, cy, x, y)
                     }
-                    area.lineTo(xs(last.at), padTop + height)
+                    // The live tail is a latest-known-value presentation. Close
+                    // its fill beyond the clip, not as a hard edge inside it.
+                    const fillEnd = tail?.segment === segment ? w + 12 : xs(last.at)
+                    if (tail?.segment === segment) area.lineTo(fillEnd, ys(tail.to[key]))
+                    area.lineTo(fillEnd, padTop + height)
                     area.lineTo(xs(first.at), padTop + height)
                     area.closePath()
                 }
@@ -165,13 +170,22 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
                 ctx.lineWidth = width
                 ctx.lineJoin = 'round'
                 ctx.stroke(path)
+                if (tail !== undefined) {
+                    const held = new Path2D()
+                    held.moveTo(xs(tail.from.at), ys(tail.from[key]))
+                    held.lineTo(xs(tail.to.at), ys(tail.to[key]))
+                    ctx.globalAlpha = tail.opacity
+                    ctx.stroke(held)
+                }
                 ctx.restore()
 
-                // The head is the intersection with a known, stable curve. If
-                // input stops it ages leftwards; missing time is never filled.
+                // This marks the latest known value, not a new observation.
+                // The short held tail fades and expires when updates stop.
                 if (head !== undefined) {
                     const headX = xs(head.at)
                     const headY = ys(head[key])
+                    ctx.save()
+                    ctx.globalAlpha = tail?.opacity ?? 1
                     ctx.fillStyle = color
                     ctx.beginPath()
                     ctx.arc(headX, headY, 3, 0, Math.PI * 2)
@@ -182,6 +196,7 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
                         ctx.arc(headX, headY, 3 + 9 * progress, 0, Math.PI * 2)
                         ctx.fill()
                     }
+                    ctx.restore()
                 }
             }
             ctx.restore()
@@ -190,14 +205,14 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
                 let best = 0
                 let distance = Infinity
                 drawing.samples.forEach((sample, i) => {
-                    const d = Math.abs(xs(sample.at) - hoverX!)
+                    const d = Math.abs(xs(drawing.projectAt(sample.at)) - hoverX!)
                     if (d < distance) {
                         distance = d
                         best = i
                     }
                 })
                 const selected = drawing.samples[best]
-                const x = xs(selected.at)
+                const x = xs(drawing.projectAt(selected.at))
                 ctx.strokeStyle = c.cross
                 ctx.setLineDash([3, 3])
                 ctx.beginPath()
@@ -291,7 +306,10 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
             palette = null
             invalidate()
         }
-        const onVisibility = () => { if (document.hidden) stop(); else invalidate() }
+        const onVisibility = () => {
+            if (document.hidden) { hoverX = null; stop() }
+            else invalidate()
+        }
         element.addEventListener('pointermove', onMove)
         element.addEventListener('pointerleave', onLeave)
         scheme.addEventListener('change', onScheme)
