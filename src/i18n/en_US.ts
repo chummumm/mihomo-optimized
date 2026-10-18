@@ -363,7 +363,7 @@ const EN = {
             upload: 'Upload',
             total: 'Total',
             chart: 'Last 60 seconds',
-            chartLabel: 'Download and upload rates over the last 60 seconds; new samples appear immediately and the right marker shows the latest known rate',
+            chartLabel: 'Download and upload rates over the last 60 seconds; values and tooltips update live while the right marker smoothly follows the latest rate',
             now: 'now',
         },
         sourcesTitle: 'Sources',
