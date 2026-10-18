@@ -129,9 +129,9 @@ async function phase(name) {
 function segments(frame, key = 'down') {
     const result = []
     const width = key === 'down' ? 2.2 : 1.8
+    let section = -1
     for (const stroke of frame.strokes.filter(stroke => Math.abs(stroke.width - width) < 0.01)) {
         let point
-        let section = -1
         for (const [command, ...args] of stroke.operations) {
             if (command === 'moveTo') { point = args.slice(0, 2); section++ }
             else if (command === 'lineTo' && point) {
@@ -146,6 +146,39 @@ function segments(frame, key = 'down') {
         }
     }
     return result
+}
+
+function assertFillClosure(frame, label) {
+    assert.equal(frame.fills.length, 2, `${label}: both series have an independent filled area`)
+    for (const fill of frame.fills) {
+        const lastStart = fill.operations.findLastIndex(operation => operation[0] === 'moveTo')
+        const area = fill.operations.slice(lastStart)
+        const closing = area.slice(-4)
+        assert.equal(closing[0][0], 'lineTo', `${label}: live fill extends past the visible plot`)
+        assert.equal(closing[1][0], 'lineTo', `${label}: live fill closes at the baseline`)
+        assert.ok(closing[0][1] > frame.width && closing[1][1] === closing[0][1], `${label}: the active fill's vertical closing edge is outside the clip`)
+        assert.equal(closing[3][0], 'closePath')
+    }
+    for (const stroke of frame.strokes) assert.ok(!stroke.operations.some(operation => operation[0] === 'closePath'), `${label}: area closing edges are never stroked`)
+}
+
+function latestValueError(frame, tick) {
+    const heads = frame.heads.filter(head => Math.abs(head.radius - 3) < 1e-6)
+    if (heads.length < 2) return Infinity
+    const baseline = frame.height - (frame.height < 120 ? 4 : 20)
+    // The constant upload rate is an independent reference for the actual
+    // current y scale. No chart helper or internally exported scale is used.
+    const expected = baseline - (baseline - heads[1].y) * rates[tick % rates.length] / 0.5
+    return Math.abs(heads[0].y - expected)
+}
+
+async function assertNewest(tick, deliveredAt) {
+    const frames = await page.evaluate(value => window.throughputEdgesFixture.frames.filter(frame => frame.sequence === value), sequence)
+    const frame = frames.find(frame => latestValueError(frame, tick) <= 0.05)
+    assert.ok(frame, `source sample ${tick}: latest measured value reaches the real chart without a fixed display buffer`)
+    const latency = frame.at - anchor - deliveredAt
+    assert.ok(latency >= 0 && latency <= 128, `source sample ${tick}: newest value is visible within the normal UI publication interval (${latency} ms)`)
+    return latency
 }
 
 function yAt(geometry, x) {
@@ -177,6 +210,7 @@ function metrics(frames, label, residualLimit) {
     for (let index = 0; index < usable.length; index++) {
         const frame = usable[index]
         const geometry = segments(frame)
+        assertFillClosure(frame, label)
         assert.ok(frame.clips.some(clip => clip.some(([command, x, , width]) => command === 'rect' && Math.abs(x) < 0.01 && Math.abs(width - frame.width) < 0.01)), `${label}: the plot is clipped to the real viewport`)
         assert.ok(yAt(geometry, 0) !== undefined && yAt(geometry, 2) !== undefined, `${label}: retiring an old point never exposes an empty strip at the left edge`)
         const heads = frame.heads.filter(head => Math.abs(head.radius - 3) < 1e-6)
@@ -184,7 +218,7 @@ function metrics(frames, label, residualLimit) {
         for (const head of heads) {
             const error = Math.abs(head.x - (frame.width - 3))
             maxHeadInsetError = Math.max(maxHeadInsetError, error)
-            assert.ok(error <= 0.15, `${label}: the confirmed curve enters at a stable right edge (${error.toFixed(3)} px inset error)`)
+            assert.ok(error <= 0.15, `${label}: the latest-value head stays at a stable right edge (${error.toFixed(3)} px inset error)`)
         }
         for (const [index, key] of ['down', 'up'].entries()) {
             const onCurve = yAt(segments(frame, key), heads[index].x)
@@ -199,8 +233,7 @@ function metrics(frames, label, residualLimit) {
             const step = Math.abs(heads[head].x - previousHeads[head].x)
             maxHeadStep = Math.max(maxHeadStep, step)
             maxHeadVelocity = Math.max(maxHeadVelocity, step * 60000 / frame.width / dt)
-            // With sufficient buffered data the endpoint is pinned above. Also
-            // retain an explicit movement bound to diagnose any future drift.
+            // Retain a separate movement bound to diagnose any future drift.
             assert.ok(step <= 2.2 * frame.width * dt / 60000 + 0.15, `${label}: endpoint movement is continuous (${step.toFixed(3)} px in ${dt.toFixed(1)} ms)`)
         }
         const beforeGeometry = segments(previous)
@@ -231,6 +264,31 @@ async function persist() {
     fs.writeFileSync(path.join(output, 'geometry.json'), JSON.stringify({ anchor, observations, errors, ...state }))
 }
 
+async function inspectPixels(label) {
+    const result = await page.evaluate(() => {
+        const canvas = document.querySelector('canvas.connections-chart')
+        const ctx = canvas.getContext('2d')
+        const frame = window.throughputEdgesFixture.latest
+        const heads = frame.heads.filter(head => Math.abs(head.radius - 3) < 1e-6)
+        const ratio = Math.min(2, devicePixelRatio)
+        const aboveHead = (Math.min(...heads.map(head => head.y)) - 13) * ratio
+        let strayPixels = 0
+        // A normal pulse reaches at most 12 CSS px from the current head.
+        // A bright, full-height edge above it is not part of the live graphic.
+        for (let x = canvas.width - 3; x < canvas.width; x++) {
+            const pixels = ctx.getImageData(x, 0, 1, canvas.height).data
+            for (let y = 0; y < Math.max(0, aboveHead); y++) {
+                const index = y * 4
+                if (pixels[index + 3] > 60 && pixels[index] < 130 && pixels[index + 2] > 130) strayPixels++
+            }
+        }
+        return { width: canvas.clientWidth, height: canvas.clientHeight, backingWidth: canvas.width, backingHeight: canvas.height, dpr: devicePixelRatio, heads: heads.length, strayPixels }
+    })
+    assert.equal(result.heads, 2, `${label}: both latest-value markers are visible`)
+    assert.equal(result.strayPixels, 0, `${label}: the physical right edge has no bright residue above the current data`)
+    return { label, ...result }
+}
+
 async function main() {
     fs.mkdirSync(output, { recursive: true })
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -251,15 +309,23 @@ async function main() {
         localStorage.setItem('externalControllerIndex', '0')
         const fixture = window.throughputEdgesFixture = {
             hidden: false, phase: 'warmup', received: 0, frames: [], latest: null,
-            drawCount: 0, hiddenDraws: 0, dropped: 0, maxDrawsPerFrame: 0,
+            drawCount: 0, hiddenDraws: 0, dropped: 0, maxDrawsPerFrame: 0, nextClearProbe: false, clearProbes: [],
         }
         Object.defineProperty(document, 'hidden', { configurable: true, get: () => fixture.hidden })
         Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => fixture.hidden ? 'hidden' : 'visible' })
         fixture.setHidden = hidden => { fixture.hidden = hidden; document.dispatchEvent(new Event('visibilitychange')) }
         fixture.export = () => ({
             frames: fixture.frames, latest: fixture.latest, drawCount: fixture.drawCount,
-            hiddenDraws: fixture.hiddenDraws, dropped: fixture.dropped, maxDrawsPerFrame: fixture.maxDrawsPerFrame,
+            hiddenDraws: fixture.hiddenDraws, dropped: fixture.dropped, maxDrawsPerFrame: fixture.maxDrawsPerFrame, clearProbes: fixture.clearProbes,
         })
+        fixture.seedRightColumn = () => {
+            const canvas = document.querySelector('canvas.connections-chart')
+            const ctx = canvas.getContext('2d')
+            const stripe = ctx.createImageData(1, canvas.height)
+            for (let y = 0; y < canvas.height; y++) stripe.data.set([255, 0, 255, 255], y * 4)
+            ctx.putImageData(stripe, canvas.width - 1, 0)
+            fixture.nextClearProbe = true
+        }
 
         const NativeWebSocket = window.WebSocket
         window.WebSocket = class extends NativeWebSocket {
@@ -302,14 +368,22 @@ async function main() {
                 drawsAt.set(at, count)
                 if (drawsAt.size > 128) drawsAt.delete(drawsAt.keys().next().value)
                 fixture.maxDrawsPerFrame = Math.max(fixture.maxDrawsPerFrame, count)
-                const frame = { at, phase: fixture.phase, width: this.canvas.clientWidth, height: this.canvas.clientHeight, strokes: [], heads: [], clips: [] }
+                const frame = { at, phase: fixture.phase, sequence: fixture.received, width: this.canvas.clientWidth, height: this.canvas.clientHeight, strokes: [], fills: [], heads: [], clips: [] }
                 fixture.latest = frame
                 if (fixture.phase !== 'warmup') {
                     if (fixture.frames.length < 2000) fixture.frames.push(frame)
                     else fixture.dropped++
                 }
             }
-            return clear.apply(this, args)
+            const returned = clear.apply(this, args)
+            if (isChart(this) && fixture.nextClearProbe) {
+                fixture.nextClearProbe = false
+                const pixels = this.getImageData(this.canvas.width - 1, 0, 1, this.canvas.height).data
+                let remaining = 0
+                for (let index = 3; index < pixels.length; index += 4) if (pixels[index]) remaining++
+                fixture.clearProbes.push({ width: this.canvas.width, height: this.canvas.height, dpr: devicePixelRatio, remaining })
+            }
+            return returned
         }
         const begin = proto.beginPath
         proto.beginPath = function(...args) { activePaths.set(this, []); return begin.apply(this, args) }
@@ -323,13 +397,18 @@ async function main() {
         const stroke = proto.stroke
         proto.stroke = function(...args) {
             if (isChart(this) && fixture.latest && pathOperations.has(args[0])) {
-                fixture.latest.strokes.push({ width: this.lineWidth, color: this.strokeStyle, operations: pathOperations.get(args[0]).map(operation => operation.slice()) })
+                fixture.latest.strokes.push({ width: this.lineWidth, color: this.strokeStyle, opacity: this.globalAlpha, operations: pathOperations.get(args[0]).map(operation => operation.slice()) })
             }
             return stroke.apply(this, args)
         }
+        const fill = proto.fill
+        proto.fill = function(...args) {
+            if (isChart(this) && fixture.latest && pathOperations.has(args[0])) fixture.latest.fills.push({ operations: pathOperations.get(args[0]).map(operation => operation.slice()) })
+            return fill.apply(this, args)
+        }
         const arc = proto.arc
         proto.arc = function(x, y, radius, ...args) {
-            if (isChart(this) && fixture.latest) fixture.latest.heads.push({ x, y, radius })
+            if (isChart(this) && fixture.latest) fixture.latest.heads.push({ x, y, radius, opacity: this.globalAlpha })
             return arc.call(this, x, y, radius, ...args)
         }
         const clip = proto.clip
@@ -358,19 +437,34 @@ async function main() {
     await received()
     await advanceTo(628)
 
+    await phase('first-sample')
+    await advanceTo(1500)
+    await send(1000)
+    await advanceTo(1628)
+    const firstState = await page.evaluate(() => window.throughputEdgesFixture.export())
+    const firstFrame = firstState.frames.find(frame => frame.sequence === sequence && frame.heads.filter(head => head.radius === 3).length === 2)
+    assert.ok(firstFrame, 'the first valid rate sample draws both markers without waiting for future samples')
+    assert.ok(firstFrame.at - anchor - 1500 <= 128, 'the first sample appears within one normal publication interval')
+    assert.equal(firstFrame.strokes.flatMap(stroke => stroke.operations).filter(operation => operation[0] === 'quadraticCurveTo').length, 0, 'the first-sample check does not rely on a pre-existing curve')
+    observations.push({ label: 'first-sample', visibleWithinMs: firstFrame.at - anchor - 1500, headCount: 2 })
+    await screenshot('first-live-sample')
+    await phase('warmup')
+
     // A stable 500 ms delivery offset is deliberately present initially. Later
     // faster delivery improves the source clock mapping without changing rates.
-    for (let tick = 1; tick <= 64; tick++) {
+    for (let tick = 2; tick <= 64; tick++) {
         await advanceTo(tick * 1000 + 500)
         await send(tick * 1000)
         await advanceTo(tick * 1000 + 628)
     }
     await phase('steady')
+    let maxLatestLatency = 0
     screenshots = Array.from({ length: 12 }, (_, index) => 67200 + index * 100)
     for (let tick = 65; tick <= 70; tick++) {
         await advanceTo(tick * 1000 + 500)
         await send(tick * 1000)
         await advanceTo(tick * 1000 + 628)
+        maxLatestLatency = Math.max(maxLatestLatency, await assertNewest(tick, tick * 1000 + 500))
     }
     await screenshot('steady-complete-window')
     let state = await page.evaluate(() => window.throughputEdgesFixture.export())
@@ -383,6 +477,7 @@ async function main() {
         await advanceTo(tick * 1000 + delays[index])
         await send(tick * 1000)
         await advanceTo(tick * 1000 + delays[index] + 128)
+        maxLatestLatency = Math.max(maxLatestLatency, await assertNewest(tick, tick * 1000 + delays[index]))
     }
     await screenshot('delivery-jitter')
     state = await page.evaluate(() => window.throughputEdgesFixture.export())
@@ -390,7 +485,16 @@ async function main() {
     const rateText = await page.locator('.connections-rate.is-down .connections-rate-value').textContent()
     const expectedRate = rates[78 % rates.length] * MiB
     assert.ok(Math.abs(bytesPerSecond(rateText) - expectedRate) <= expectedRate * 0.011, 'top-level rate still reports the newest source sample without the chart delay')
-    observations.push({ label: 'latest-number', text: rateText, expectedBytesPerSecond: expectedRate, deliveryDelaysMs: delays })
+    observations.push({ label: 'latest-number-and-chart', text: rateText, expectedBytesPerSecond: expectedRate, deliveryDelaysMs: delays, maxLatestChartLatencyMs: maxLatestLatency })
+
+    await phase('tail-expiry')
+    await advanceTo(79750)
+    const fading = await page.evaluate(() => window.throughputEdgesFixture.latest.heads.filter(head => head.radius === 3))
+    assert.equal(fading.length, 2, 'a briefly delayed sample retains the short latest-value marker')
+    for (const head of fading) assert.ok(head.opacity > 0 && head.opacity < 0.8, 'the marker fades between 1.5 and 2 seconds of source age')
+    await advanceTo(80080)
+    assert.equal(await page.evaluate(() => window.throughputEdgesFixture.latest.heads.filter(head => head.radius === 3).length), 0, 'the held-value marker expires after two seconds without inventing observations')
+    observations.push({ label: 'held-tail-expiry', fadedOpacity: fading[0].opacity, expiredWithinMs: 2080 })
 
     await phase('gap')
     await advanceTo(90000)
@@ -450,6 +554,36 @@ async function main() {
     const resumed = state.frames.filter(frame => frame.phase === 'resume')
     assert.ok(resumed.length > 20 && resumed.length <= 170, 'resume draws bounded current frames instead of replaying thirty seconds of animations')
     observations.push({ label: 'resume', baselineRate, frames: resumed.length, hiddenDraws: state.hiddenDraws, maxDrawsPerFrame: state.maxDrawsPerFrame })
+
+    // Only two targeted raster cases: a short graph at 125% scaling and a
+    // regular graph at 150%. This does not claim to reproduce a user's GPU.
+    const rasterCases = [
+        { label: 'compact-dpr125', width: 1440, height: 700, dpr: 1.25 },
+        { label: 'regular-dpr150', width: 1444, height: 900, dpr: 1.5 },
+    ]
+    for (let index = 0; index < rasterCases.length; index++) {
+        const scenario = rasterCases[index]
+        await phase(scenario.label)
+        await page.setViewportSize({ width: scenario.width, height: scenario.height })
+        await cdp.send('Emulation.setDeviceMetricsOverride', { width: scenario.width, height: scenario.height, deviceScaleFactor: scenario.dpr, mobile: false })
+        const tick = 131 + index
+        await advanceTo(tick * 1000 + 128)
+        await send(tick * 1000)
+        await advanceTo(tick * 1000 + 256)
+        const reading = await inspectPixels(scenario.label)
+        if (index === 0) assert.ok(reading.height < 120, 'the compact case exercises the existing short-chart branch')
+        assert.equal(reading.dpr, scenario.dpr)
+        assertFillClosure(await page.evaluate(() => window.throughputEdgesFixture.latest), scenario.label)
+        // Seed one physical edge column, then inspect the next normal clear.
+        // This asserts pixel removal, independently of how clearRect is called.
+        await page.evaluate(() => window.throughputEdgesFixture.seedRightColumn())
+        await advanceTo(tick * 1000 + 320)
+        const clearProbe = await page.evaluate(() => window.throughputEdgesFixture.clearProbes.at(-1))
+        assert.ok(clearProbe, 'the next actual chart draw performed the edge-clear probe')
+        assert.equal(clearProbe.remaining, 0, `${scenario.label}: the normal clear removes every seeded physical edge pixel`)
+        await screenshot(scenario.label)
+        observations.push({ ...reading, clearedEdgePixels: clearProbe.height, remainingAfterClear: clearProbe.remaining })
+    }
     assert.deepEqual(errors, [])
     await persist()
     console.log(JSON.stringify({ passed: true, browser: browser.version(), controlledClock: true, controlledVisibility: true, frozenPage: true, observations, errors }, null, 2))

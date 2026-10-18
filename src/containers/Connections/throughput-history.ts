@@ -1,10 +1,7 @@
 export const RATE_WINDOW_MS = 60_000
 export const RATE_STALE_MS = 10_000
-// A completed bucket and its neighbour fix the old quadratic. The buffer also
-// allows half a second of delivery jitter, without extrapolating future traffic.
-export const RATE_DRAW_DELAY_MS = 3000
 export const RATE_CLOCK_MARGIN_MS = 1000
-export const RATE_SAMPLE_LIMIT = 68
+export const RATE_SAMPLE_LIMIT = 64
 
 export interface RateReading {
     up: number
@@ -35,7 +32,7 @@ export function rateHistoryState (samples: readonly RateSample[]): Readonly<Hist
 
 export function pruneRateSamples (samples: RateSample[], now: number) {
     let expired = 0
-    const retainedWindow = RATE_WINDOW_MS + RATE_DRAW_DELAY_MS + RATE_CLOCK_MARGIN_MS
+    const retainedWindow = RATE_WINDOW_MS + RATE_CLOCK_MARGIN_MS
     while (expired < samples.length && now - samples[expired].at > retainedWindow) expired++
     // Two preceding controls preserve the left-edge shape. When the entire
     // window expires, its guards must expire as well.
