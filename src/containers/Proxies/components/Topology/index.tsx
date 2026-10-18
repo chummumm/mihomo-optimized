@@ -1,7 +1,7 @@
 import classnames from 'classnames'
 import { useAtomValue } from 'jotai'
 import { AnimatePresence, motion, useIsPresent } from 'motion/react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Card, Icon, formatRate, delayStatus, springs, useLineColor } from '@components'
 import { INTERNAL_CONNECTIONS, UNKNOWN_CONNECTIONS } from '@containers/Connections/source'
