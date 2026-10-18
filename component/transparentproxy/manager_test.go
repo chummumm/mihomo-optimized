@@ -147,7 +147,7 @@ func managerRecoveryLogs(t *testing.T) func() []string {
 	t.Helper()
 	subscription := log.Subscribe()
 	t.Cleanup(func() { log.UnSubscribe(subscription) })
-	return func() []string {
+	collect := func() []string {
 		// A marker follows all earlier events through the same observable,
 		// so checking for absent/duplicate logs never depends on a sleep.
 		marker := "transparent proxy recovery log barrier: " + t.Name()
@@ -172,6 +172,10 @@ func managerRecoveryLogs(t *testing.T) func() []string {
 			}
 		}
 	}
+	// A log call can return before its received event is broadcast. Drain up
+	// to a first marker before the caller starts producing the measured logs.
+	_ = collect()
+	return collect
 }
 
 func TestManagerSysctlRecoveryLogsOnlyAfterCompleteApply(t *testing.T) {
