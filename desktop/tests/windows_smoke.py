@@ -285,7 +285,8 @@ class WebViewDriver:
         self.port = free_port()
         self.session = None
         self.output = tempfile.TemporaryFile()
-        self.process = subprocess.Popen([str(driver), f"--port={self.port}", "--log-level=SEVERE", "--silent"],
+        # EdgeDriver inherits Chromium's mutually exclusive log-level/silent flags.
+        self.process = subprocess.Popen([str(driver), f"--port={self.port}", "--log-level=SEVERE"],
                                         stdin=subprocess.DEVNULL, stdout=self.output, stderr=subprocess.STDOUT,
                                         env=child_environment(), creationflags=subprocess.CREATE_NO_WINDOW)
         try:
