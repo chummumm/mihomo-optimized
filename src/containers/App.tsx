@@ -14,7 +14,7 @@ import SideBar from '@containers/Sidebar'
 import { isClashX } from '@lib/jsBridge'
 import { useLogsStreamReader } from '@stores'
 
-import { DesktopDialogs, DesktopExitGuard, DesktopStatusBar, DesktopUnavailable } from '../platform/DesktopUI'
+import { DesktopDialogs, DesktopExitGuard, DesktopStatusBar, DesktopUnavailable, DesktopUpdateNotice } from '../platform/DesktopUI'
 import { isDesktop, useDesktop } from '../platform/desktop'
 
 export default function App () {
@@ -37,7 +37,7 @@ export default function App () {
         <div className={classnames('app', { 'not-clashx': !isClashX(), 'is-desktop': isDesktop() })}>
             <SideBar routes={routes} />
             <main className="page-container">
-                {isDesktop() && <DesktopStatusBar />}
+                {isDesktop() && <><DesktopStatusBar /><DesktopUpdateNotice /></>}
                 <div className="route-view" key={location.pathname}>
                     {isDesktop() && desktop.status?.phase !== 'running' && location.pathname !== '/settings'
                         ? <DesktopUnavailable />

@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 
 import { Button, ButtonSelect, Card, Icon, Input, Modal, Switch, error as toastError, success } from '@components'
 import { MAX_CONFIG_FILE_BYTES, configFits } from '@containers/Settings/config-editor-model'
 import { ConfigEditor } from '@containers/Settings/ConfigEditor'
 import { useI18n } from '@stores'
 
-import { cancelDesktopExit, confirmDesktopExit, desktopAction, desktopInvoke, desktopSnapshot, refreshDesktop, setDesktopDialog, useDesktop, useDesktopDirty } from './desktop'
-import { desktopError, type DesktopConfigDocument, type DesktopUpdate } from './model'
+import { cancelDesktopExit, checkDesktopUpdate, confirmDesktopExit, desktopAction, desktopInvoke, desktopSnapshot, dismissDesktopUpdate, installDesktopUpdate, refreshDesktop, setDesktopDialog, useDesktop, useDesktopDirty } from './desktop'
+import { desktopError, type DesktopConfigDocument } from './model'
 import './desktop.css'
 
 function runAction (command: string, args?: Record<string, unknown>) {
@@ -32,6 +32,25 @@ export function DesktopStatusBar () {
         <div className="desktop-status-actions">
             <Button size="sm" icon={phase === 'running' ? 'pause' : 'play'} disabled={busy || !desktop.status} onClick={() => runAction(phase === 'running' ? 'desktop_stop' : 'desktop_start')}>{t(phase === 'running' ? 'stop' : 'start')}</Button>
             <Button size="sm" icon="nav-settings" ariaLabel={t('settings')} onClick={() => navigate('/settings')} />
+        </div>
+    </div>
+}
+
+export function DesktopUpdateNotice () {
+    const desktop = useDesktop()
+    const { translation } = useI18n()
+    const { t } = translation('Desktop')
+    const navigate = useNavigate()
+    const update = desktop.update
+    if (!update?.available || !update.version || update.version === desktop.updateDismissedVersion) return null
+    return <div className="desktop-update-notice" role="status" aria-live="polite">
+        <span className="desktop-update-notice-text"><Icon type="update" size={16} />{t('updateAvailable')} · <b>{update.version}</b></span>
+        <div className="desktop-update-notice-actions">
+            <Button size="sm" onClick={() => {
+                dismissDesktopUpdate()
+                navigate({ pathname: '/settings', hash: '#desktop-app-update' })
+            }}>{t('viewUpdate')}</Button>
+            <Button size="sm" icon="close" ariaLabel={t('dismissUpdate')} onClick={dismissDesktopUpdate} />
         </div>
     </div>
 }
@@ -258,38 +277,20 @@ export function DesktopAppUpdate () {
     const desktop = useDesktop()
     const { translation } = useI18n()
     const { t } = translation('Desktop')
-    const [update, setUpdate] = useState<DesktopUpdate>()
-    const [busy, setBusy] = useState<'checking' | 'installing' | null>(null)
-    const [problem, setProblem] = useState('')
-    const active = useRef(true)
-    useEffect(() => { active.current = true; return () => { active.current = false } }, [])
-
-    async function check () {
-        if (busy) return
-        setBusy('checking'); setProblem('')
-        try {
-            const value = await desktopInvoke<DesktopUpdate>('desktop_check_update')
-            if (active.current) setUpdate(value)
-        } catch (reason) { if (active.current) setProblem(desktopError(reason).message) } finally { if (active.current) setBusy(null) }
-    }
-
-    async function install () {
-        if (busy || !update?.available || desktop.dirty) return
-        if (!update.canInstall) {
-            if (update.releaseUrl) {
-                try { await desktopInvoke('desktop_open_external', { url: update.releaseUrl }) } catch (reason) { if (active.current) setProblem(desktopError(reason).message) }
-            }
-            return
-        }
-        setBusy('installing'); setProblem('')
-        try {
-            await desktopAction('desktop_install_update')
-        } catch (reason) { if (active.current) setProblem(desktopError(reason).message) } finally { if (active.current) setBusy(null) }
-    }
-
+    const location = useLocation()
+    const card = useRef<HTMLDivElement>(null)
+    const update = desktop.update
+    const busy = desktop.updateBusy
+    const runtimeBusy = !!desktop.busy || !desktop.status || desktop.writing ||
+        desktop.status.phase === 'starting' || desktop.status.phase === 'stopping'
+    useEffect(() => {
+        if (location.hash !== '#desktop-app-update') return
+        card.current?.scrollIntoView({ block: 'start' })
+        card.current?.focus({ preventScroll: true })
+    }, [location.hash, location.key])
     const progress = busy ? desktop.updateProgress : null
     const ratio = progress?.total && progress.downloaded !== undefined ? Math.min(1, Math.max(0, progress.downloaded / progress.total)) : undefined
-    return <Card className="settings-card desktop-app-update">
+    return <Card ref={card} id="desktop-app-update" tabIndex={-1} aria-label={t('appUpdate')} className="settings-card desktop-app-update">
         <div className="settings-row settings-update-row">
             <div className="settings-update-name"><span className="label">{t('appUpdate')}</span><span className="settings-update-version">{update?.currentVersion ?? desktop.status?.appVersion ?? '—'}</span></div>
             <div className="settings-update-result">
@@ -300,11 +301,11 @@ export function DesktopAppUpdate () {
         <p className="settings-hint desktop-inset">{t('updateHint')}</p>
         {update?.canInstall === false && <p className="settings-hint desktop-inset">{t('portableUpdateHint')}</p>}
         {update?.body && <details className="desktop-update-notes desktop-inset"><summary>{update.version}</summary><pre>{update.body}</pre></details>}
-        {problem && <p className="desktop-error desktop-inset" role="alert">{problem}</p>}
+        {desktop.updateError && <p className="desktop-error desktop-inset" role="alert">{desktop.updateError.message}</p>}
         {desktop.dirty && <p className="settings-hint desktop-inset">{t('saveBeforeUpdate')}</p>}
         <div className="settings-row settings-row-action">
-            <Button icon="update" loading={busy === 'checking'} disabled={!!busy} onClick={() => { void check() }}>{t('checkUpdate')}</Button>
-            {update?.available && <Button type="primary" icon="arrow-down" loading={busy === 'installing'} disabled={!!busy || desktop.dirty || (!update.canInstall && !update.releaseUrl)} onClick={() => { void install() }}>{t(update.canInstall ? 'installUpdate' : 'downloadInstaller')}</Button>}
+            <Button icon="update" loading={busy === 'checking'} disabled={!!busy} onClick={() => { void checkDesktopUpdate() }}>{t('checkUpdate')}</Button>
+            {update?.available && <Button type="primary" icon="arrow-down" loading={busy === 'installing'} disabled={!!busy || runtimeBusy || desktop.dirty || (!update.canInstall && !update.releaseUrl)} onClick={() => { void installDesktopUpdate() }}>{t(update.canInstall ? 'installUpdate' : 'downloadInstaller')}</Button>}
         </div>
     </Card>
 }

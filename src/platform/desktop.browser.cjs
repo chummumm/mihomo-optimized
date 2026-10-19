@@ -28,6 +28,173 @@ async function until(predicate, message) {
     assert.ok(await predicate(), message)
 }
 
+async function verifyStartupUpdates(origin, initializeFixture) {
+    async function open(fixtureCase, route = '/connections') {
+        const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: 'zh-CN', reducedMotion: 'reduce' })
+        await context.addInitScript(initializeFixture, { origin, secret })
+        await context.route('**/*', route => {
+            if (route.request().url().startsWith(origin)) return route.continue()
+            pageErrors.push('Unexpected external request: ' + route.request().url())
+            return route.abort()
+        })
+        const page = await context.newPage()
+        page.setDefaultTimeout(7000)
+        page.on('pageerror', error => pageErrors.push(error.message))
+        await page.clock.install({ time: new Date('2026-10-19T00:00:00Z') })
+        await page.clock.pauseAt(new Date('2026-10-19T00:00:01Z'))
+        await page.goto(origin + '/?fixture=' + fixtureCase + '#' + route)
+        await until(() => page.evaluate(() => window.__desktopFixture.commands.some(item => item.command === 'desktop_status')), 'startup reads native status')
+        await page.clock.runFor(100)
+        return { context, page }
+    }
+    const count = (page, command) => page.evaluate(command => window.__desktopFixture.commands.filter(item => item.command === command).length, command)
+    async function route(page, target) {
+        await page.evaluate(target => { location.hash = '#' + target }, target)
+        await page.clock.runFor(100)
+    }
+    async function noInstall(page) {
+        assert.equal(await count(page, 'desktop_install_update'), 0, 'checking never installs an update')
+        assert.equal(await count(page, 'desktop_open_external'), 0, 'checking never opens a download page')
+    }
+
+    // Hold the real UI's IPC response to expose duplicate requests and accidental
+    // coupling between a background check, core startup, and route lifetimes.
+    {
+        const { context, page } = await open('update-held')
+        try {
+            assert.equal(await count(page, 'desktop_check_update'), 0, 'initial rendering does not wait for a release request')
+            await page.clock.runFor(6000)
+            await until(() => count(page, 'desktop_check_update').then(value => value === 1), 'startup checks without opening Settings')
+            await noInstall(page)
+            await page.getByRole('button', { name: '启动内核', exact: true }).first().click()
+            await until(() => page.evaluate(() => window.__desktopFixture.status.phase === 'running'), 'a slow update check does not block core startup')
+            await route(page, '/settings')
+            assert.equal(await page.getByRole('button', { name: '检查应用更新', exact: true }).isEnabled(), false, 'manual check shares the pending startup request')
+            await route(page, '/connections')
+            await page.clock.runFor(60000)
+            assert.equal(await count(page, 'desktop_check_update'), 1, 'route changes and elapsed time do not duplicate a pending check')
+            await page.evaluate(() => { window.__desktopFixture.holdUpdateCheck = false; window.__desktopFixture.finishUpdateCheck() })
+            const notice = page.locator('.desktop-update-notice')
+            await notice.waitFor()
+            assert.ok((await notice.innerText()).includes('0.2.0'), 'the global notice identifies the available version')
+            await noInstall(page)
+            if (process.env.DESKTOP_UPDATE_SCREENSHOT) await page.screenshot({ path: process.env.DESKTOP_UPDATE_SCREENSHOT, fullPage: true })
+            await notice.getByRole('button', { name: '查看更新', exact: true }).click()
+            await page.clock.runFor(100)
+            await page.getByRole('button', { name: '安装并重新启动', exact: true }).waitFor()
+            assert.equal(await count(page, 'desktop_check_update'), 1, 'opening update details reuses the startup result')
+            const cardInView = await page.locator('.desktop-app-update').evaluate(element => {
+                const rect = element.getBoundingClientRect()
+                return rect.top < innerHeight && rect.bottom > 50
+            })
+            assert.equal(cardInView, true, 'View update scrolls the result into the visible settings area')
+            await route(page, '/connections')
+            await page.clock.runFor(60000)
+            assert.equal(await notice.count(), 0, 'a viewed version does not reappear after navigation')
+            await route(page, '/settings')
+            assert.equal(await page.getByRole('button', { name: '安装并重新启动', exact: true }).isVisible(), true, 'dismissing the notice preserves the update in Settings')
+            await page.evaluate(() => { window.__desktopFixture.holdUpdateInstall = true })
+            await page.getByRole('button', { name: '安装并重新启动', exact: true }).click()
+            await until(() => count(page, 'desktop_install_update').then(value => value === 1), 'installation requires an explicit click')
+            await route(page, '/connections')
+            await route(page, '/settings')
+            assert.equal(await page.getByRole('button', { name: '检查应用更新', exact: true }).isEnabled(), false, 'leaving Settings cannot bypass an active installation')
+            assert.equal(await page.getByRole('button', { name: '安装并重新启动', exact: true }).isEnabled(), false, 'an installation cannot be submitted twice')
+            assert.equal(await count(page, 'desktop_check_update'), 1, 'installation cannot race another metadata check')
+            await page.evaluate(() => { window.__desktopFixture.finishUpdateInstall() })
+            await until(() => page.getByRole('button', { name: '检查应用更新', exact: true }).isEnabled(), 'the shared update operation finishes')
+        } finally { await context.close() }
+    }
+
+    {
+        const { context, page } = await open('update-failure')
+        try {
+            await page.clock.runFor(6000)
+            await until(() => count(page, 'desktop_check_update').then(value => value === 1), 'startup attempts a check while the update network is unavailable')
+            assert.equal(await page.locator('.desktop-update-notice').count(), 0, 'an automatic failure does not show a new-version notice')
+            assert.equal(await page.getByText('Fixture update network failure', { exact: true }).count(), 0, 'automatic failure does not become a core error or popup')
+            await page.getByRole('button', { name: '启动内核', exact: true }).first().click()
+            await until(() => page.evaluate(() => window.__desktopFixture.status.phase === 'running'), 'core controls still work after an update network failure')
+            await page.evaluate(() => {
+                window.__desktopFixture.emit('desktop-visibility', { visible: false })
+                window.__desktopFixture.emit('desktop-visibility', { visible: true })
+            })
+            await page.clock.runFor(60000)
+            assert.equal(await count(page, 'desktop_check_update'), 1, 'a failed startup check is not retried on a timer or tray show')
+            await route(page, '/settings')
+            await page.locator('.desktop-app-update').getByText('Fixture update network failure', { exact: true }).waitFor()
+            await page.evaluate(() => { window.__desktopFixture.updateError = false })
+            await page.getByRole('button', { name: '检查应用更新', exact: true }).click()
+            await page.getByRole('button', { name: '安装并重新启动', exact: true }).waitFor()
+            assert.equal(await count(page, 'desktop_check_update'), 2, 'a failed startup check can be retried manually')
+            await noInstall(page)
+            await page.evaluate(() => { window.__desktopFixture.updateError = true })
+            await page.getByRole('button', { name: '检查应用更新', exact: true }).click()
+            await page.locator('.desktop-app-update').getByText('Fixture update network failure', { exact: true }).waitFor()
+            assert.equal(await page.getByRole('button', { name: '安装并重新启动', exact: true }).count(), 0, 'a failed recheck cannot install a cleared native candidate')
+            assert.equal(await page.locator('.desktop-update-notice').count(), 0, 'a failed recheck clears a stale available-version notice')
+        } finally { await context.close() }
+    }
+
+    {
+        const { context, page } = await open('update-manual', '/settings')
+        try {
+            await page.getByRole('button', { name: '检查应用更新', exact: true }).click()
+            await page.getByRole('button', { name: '安装并重新启动', exact: true }).waitFor()
+            await page.clock.runFor(60000)
+            assert.equal(await count(page, 'desktop_check_update'), 1, 'a manual check before the startup timer consumes this launch check')
+            await noInstall(page)
+        } finally { await context.close() }
+    }
+
+    {
+        const { context, page } = await open('update-none')
+        try {
+            await page.clock.runFor(6000)
+            await until(() => count(page, 'desktop_check_update').then(value => value === 1), 'startup checks an already-current application')
+            assert.equal(await page.locator('.desktop-update-notice').count(), 0, 'the latest version does not display an update prompt')
+            await route(page, '/settings')
+            await page.locator('.desktop-app-update').getByText('已是最新版本', { exact: true }).waitFor()
+            await noInstall(page)
+        } finally { await context.close() }
+    }
+
+    {
+        const { context, page } = await open('update-starting')
+        try {
+            await page.clock.runFor(10000)
+            assert.equal(await count(page, 'desktop_check_update'), 0, 'automatic checks wait for a starting core to settle')
+            await page.evaluate(() => window.__desktopFixture.phase('running'))
+            await page.clock.runFor(2000)
+            await until(() => count(page, 'desktop_check_update').then(value => value === 1), 'the settled core allows the single startup check')
+            await page.locator('.desktop-update-notice').waitFor()
+            await page.getByRole('button', { name: '关闭更新提示', exact: true }).click()
+            await route(page, '/settings')
+            await route(page, '/connections')
+            assert.equal(await page.locator('.desktop-update-notice').count(), 0, 'closing the notice suppresses that version for the rest of this launch')
+            assert.equal(await count(page, 'desktop_check_update'), 1, 'closing a notice never schedules another request')
+            await noInstall(page)
+        } finally { await context.close() }
+    }
+
+    {
+        const { context, page } = await open('update-starting')
+        try {
+            await page.clock.runFor(60000)
+            assert.equal(await count(page, 'desktop_check_update'), 0, 'a persistently starting core does not cause an endless background check loop')
+            await page.evaluate(() => window.__desktopFixture.phase('running'))
+            await page.clock.runFor(60000)
+            assert.equal(await count(page, 'desktop_check_update'), 0, 'an expired startup attempt stays consumed')
+            await route(page, '/settings')
+            await page.getByRole('button', { name: '检查应用更新', exact: true }).click()
+            await page.locator('.desktop-app-update').getByText('发现新版本 · 0.2.0', { exact: true }).waitFor()
+            assert.equal(await count(page, 'desktop_check_update'), 1, 'manual checking remains available after startup readiness expires')
+            await noInstall(page)
+        } finally { await context.close() }
+    }
+    process.stdout.write('Desktop startup update regression passed: one check per launch, background core access, shared route state, notice/dismissal, failure/retry, installation exclusion, manual-first and readiness deadlines.\n')
+}
+
 async function main() {
     assert.ok(fs.existsSync(path.join(dist, 'index.html')), 'build the desktop UI first')
     const ws = new WebSocketServer({ noServer: true })
@@ -93,17 +260,21 @@ async function main() {
 
     browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined, args: ['--no-sandbox'] })
     const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: 'zh-CN', reducedMotion: 'reduce' })
-    await context.addInitScript(({ origin, secret }) => {
+    const initializeFixture = ({ origin, secret }) => {
         localStorage.setItem('language', JSON.stringify('zh_CN'))
         localStorage.setItem('externalControllers', JSON.stringify([{ hostname: 'untrusted.invalid', port: 9999, secret: 'untrusted-storage' }]))
+        const fixtureCase = new URL(location.href).searchParams.get('fixture')
         const callbacks = new Map()
         const listeners = new Map()
         let nextID = 0
         const mock = window.__desktopFixture = {
             commands: [], dirty: false, exited: false, failProxy: false, conflict: false, reloadFails: false, canInstall: true,
+            updateAvailable: fixtureCase !== 'update-none', updateError: fixtureCase === 'update-failure',
+            holdUpdateCheck: fixtureCase === 'update-held', holdUpdateInstall: false,
+            finishUpdateCheck: null, finishUpdateInstall: null,
             file: { path: 'C:\\Users\\Fixture\\AppData\\Local\\mihomo\\config.yaml', content: 'mode: rule\nproxies: []\n', revision: 'revision-1', max_size: 4194304, writable: true },
             status: {
-                appVersion: '0.1.0', phase: 'stopped', systemProxy: false, tun: false, autostart: false,
+                appVersion: '0.1.0', phase: fixtureCase === 'update-starting' ? 'starting' : 'stopped', systemProxy: false, tun: false, autostart: false,
                 controller: null, lastError: null, coreVersion: null,
                 configPath: 'C:\\Users\\Fixture\\AppData\\Local\\mihomo\\config.yaml', logPath: 'C:\\Users\\Fixture\\AppData\\Local\\mihomo\\logs',
                 service: { installed: false, running: false },
@@ -158,10 +329,21 @@ async function main() {
                     if (mock.dirty && !args.force) mock.emit('desktop-exit-requested', {})
                     else mock.exited = true
                     return
-                } else if (command === 'desktop_check_update') return { currentVersion: '0.1.0', available: true, canInstall: mock.canInstall, releaseUrl: 'https://github.com/chummumm/mihomo-optimized/releases/tag/mihomo-desktop-v0.2.0', version: '0.2.0', body: 'Fixture release notes' }
-                else if (command === 'desktop_install_update') {
+                } else if (command === 'desktop_check_update') {
+                    mock.emit('desktop-update-progress', { stage: 'checking' })
+                    if (mock.holdUpdateCheck) await new Promise(resolve => { mock.finishUpdateCheck = resolve })
+                    if (mock.updateError) {
+                        mock.emit('desktop-update-progress', { stage: 'error', message: 'Fixture update network failure' })
+                        throw { code: 'update_check_failed', message: 'Fixture update network failure' }
+                    }
+                    mock.emit('desktop-update-progress', { stage: 'ready' })
+                    return { currentVersion: '0.1.0', available: mock.updateAvailable, canInstall: mock.canInstall,
+                        ...(mock.updateAvailable ? { releaseUrl: 'https://github.com/chummumm/mihomo-optimized/releases/tag/mihomo-desktop-v0.2.0', version: '0.2.0', body: 'Fixture release notes' } : {}),
+                    }
+                } else if (command === 'desktop_install_update') {
                     if (mock.dirty) throw { code: 'config_busy', message: 'Unsaved changes' }
                     mock.emit('desktop-update-progress', { stage: 'downloading', downloaded: 100, total: 200 })
+                    if (mock.holdUpdateInstall) await new Promise(resolve => { mock.finishUpdateInstall = resolve })
                     mock.emit('desktop-update-progress', { stage: 'ready', downloaded: 200, total: 200 })
                     return
                 } else throw { code: 'unknown_command', message: command }
@@ -170,7 +352,8 @@ async function main() {
             },
         }
         window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener(event, id) { listeners.get(event)?.delete(id) } }
-    }, { origin, secret })
+    }
+    await context.addInitScript(initializeFixture, { origin, secret })
 
     const page = await context.newPage()
     page.on('pageerror', error => pageErrors.push(error.message))
@@ -298,6 +481,8 @@ async function main() {
         await page.evaluate(async () => { await document.fonts.ready; document.querySelector('.page-container').scrollTop = 0 })
         await page.screenshot({ path: process.env.DESKTOP_SCREENSHOT, fullPage: true })
     }
+    await context.close()
+    await verifyStartupUpdates(origin, initializeFixture)
     assert.deepEqual(pageErrors, [], 'desktop runs without unhandled errors or remote requests')
     process.stdout.write('Desktop UI integration passed: controlled controller, offline editor/draft recovery, native settings/import/update, PWA isolation, tray pause/resume.\n')
 }

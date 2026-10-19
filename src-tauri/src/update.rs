@@ -27,6 +27,7 @@ const REPOSITORY_ID: &str = "1410715865";
 const TAG_PREFIX: &str = "mihomo-desktop-v";
 const WORKFLOW: &str = "chummumm/mihomo-optimized/.github/workflows/windows-desktop.yml";
 const SOURCE_REF: &str = "refs/heads/clash-dashboard";
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_INSTALLER: u64 = 512 * 1024 * 1024;
 const MAX_BUNDLE: u64 = 4 * 1024 * 1024;
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized";
@@ -190,9 +191,25 @@ fn client(proxy: Option<String>) -> Result<Client> {
         .map_err(|_| AppError::new("update_network_failed", "无法初始化更新连接"))
 }
 
-fn api(client: &Client, path: &str) -> Result<serde_json::Value> {
+fn remaining_check_time(deadline: Instant) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            AppError::new(
+                "update_check_failed",
+                "检查桌面更新超时，请检查网络或稍后重试",
+            )
+        })
+}
+
+fn api(client: &Client, path: &str, deadline: Instant) -> Result<serde_json::Value> {
+    let remaining = remaining_check_time(deadline)?;
     let response = client
         .get(format!("https://api.github.com/repos/{REPOSITORY}/{path}"))
+        // Covers connection through the response body. Pages and tag lookups
+        // share one deadline; installer downloads retain the client timeout.
+        .timeout(remaining)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
@@ -215,8 +232,8 @@ fn api(client: &Client, path: &str) -> Result<serde_json::Value> {
         .map_err(|_| AppError::new("update_metadata_invalid", "更新信息格式无效"))
 }
 
-fn commit_for_tag(client: &Client, tag: &str) -> Result<String> {
-    let mut value = api(client, &format!("git/ref/tags/{tag}"))?;
+fn commit_for_tag(client: &Client, tag: &str, deadline: Instant) -> Result<String> {
+    let mut value = api(client, &format!("git/ref/tags/{tag}"), deadline)?;
     for _ in 0..4 {
         let object = value
             .get("object")
@@ -229,7 +246,7 @@ fn commit_for_tag(client: &Client, tag: &str) -> Result<String> {
             .to_owned();
         match object.get("type").and_then(|v| v.as_str()) {
             Some("commit") => return Ok(sha),
-            Some("tag") => value = api(client, &format!("git/tags/{sha}"))?,
+            Some("tag") => value = api(client, &format!("git/tags/{sha}"), deadline)?,
             _ => break,
         }
     }
@@ -266,6 +283,7 @@ fn asset(release: &Release, name: &str, maximum: u64) -> Result<Asset> {
 }
 
 fn check(app: &AppHandle, proxy: Option<String>) -> Result<UpdateInfo> {
+    let deadline = Instant::now() + CHECK_TIMEOUT;
     *CANDIDATE
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -276,7 +294,11 @@ fn check(app: &AppHandle, proxy: Option<String>) -> Result<UpdateInfo> {
         .map_err(|_| AppError::new("update_version_invalid", "当前版本号无效"))?;
     let mut releases = Vec::new();
     for page in 1..=3 {
-        let value = api(&client, &format!("releases?per_page=100&page={page}"))?;
+        let value = api(
+            &client,
+            &format!("releases?per_page=100&page={page}"),
+            deadline,
+        )?;
         let page_releases: Vec<Release> = serde_json::from_value(value)
             .map_err(|_| AppError::new("update_metadata_invalid", "版本列表无效"))?;
         let finished = page_releases.len() < 100;
@@ -312,7 +334,7 @@ fn check(app: &AppHandle, proxy: Option<String>) -> Result<UpdateInfo> {
         let name = format!("mihomo-desktop-{version}-windows-x64-setup.exe");
         let candidate = Candidate {
             version: version.to_string(),
-            source_sha: commit_for_tag(&client, &release.tag_name)?,
+            source_sha: commit_for_tag(&client, &release.tag_name, deadline)?,
             installer: asset(release, &name, MAX_INSTALLER)?,
             bundle: asset(release, &format!("{name}.sigstore.json"), MAX_BUNDLE)?,
         };
@@ -906,6 +928,27 @@ pub async fn desktop_install_update(app: AppHandle, state: State<'_, HostState>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_requests_refuse_an_exhausted_shared_deadline() {
+        let client = client(None).unwrap();
+        let deadline = Instant::now();
+        let page = api(&client, "releases?per_page=100&page=2", deadline).unwrap_err();
+        let tag = commit_for_tag(&client, "mihomo-desktop-v9.0.0", deadline).unwrap_err();
+        for error in [page, tag] {
+            assert_eq!(error.code, "update_check_failed");
+            assert_eq!(error.message, "检查桌面更新超时，请检查网络或稍后重试");
+        }
+    }
+
+    #[test]
+    fn metadata_requests_use_only_the_remaining_budget() {
+        let budget = Duration::from_secs(2);
+        let deadline = Instant::now() + budget;
+        let remaining = remaining_check_time(deadline).unwrap();
+        assert!(remaining <= budget);
+        assert!(remaining < CHECK_TIMEOUT);
+    }
 
     #[test]
     fn verified_installer_cannot_be_rewritten_or_renamed_while_locked() {

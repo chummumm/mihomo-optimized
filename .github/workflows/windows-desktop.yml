@@ -73,6 +73,13 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           pnpm build:desktop
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Test desktop startup updates and native UI commands
+        shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+          if (-not (Test-Path $env:PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH)) { throw 'Microsoft Edge is required for desktop UI tests' }
+          pnpm test:desktop
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Exercise managed core on Windows
         working-directory: core-src
         run: go test -tags with_gvisor -count=1 -timeout=5m ./component/desktop ./hub/route . -run Desktop

@@ -21,6 +21,10 @@
 .desktop-status-details { display: flex; gap: 15px; color: var(--text-3); }
 .desktop-status-details b { color: var(--text-2); font-weight: 500; }
 .desktop-status-actions { display: flex; gap: 7px; margin-left: auto; }
+.desktop-update-notice { position: sticky; top: 50px; z-index: 4; display: flex; align-items: center; flex-wrap: wrap; gap: 10px; min-height: 50px; padding: 8px 28px; border-bottom: 1px solid var(--hair); background: var(--panel); color: var(--text-2); font-size: var(--t-sm); }
+.desktop-update-notice-text { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+.desktop-update-notice-text > svg { color: var(--accent); }
+.desktop-update-notice-actions { display: flex; gap: 7px; margin-left: auto; }
 .app.is-desktop .route-view { min-height: calc(100% - 50px); }
 .desktop-controls { margin-bottom: var(--sp-6); }
 .desktop-service-status { margin-left: auto; color: var(--text-3); font-size: var(--t-sm); }
@@ -47,8 +51,8 @@
 .desktop-yaml:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
 .desktop-import-discard { border-top: 1px solid var(--hair); padding-top: 16px; color: var(--text); }
 .desktop-import-discard p { color: var(--text-3); font-size: var(--t-sm); }
-.desktop-app-update { margin-bottom: 14px; }
+.desktop-app-update { margin-bottom: 14px; scroll-margin-top: 64px; }
 .desktop-update-notes { color: var(--text-2); font-size: var(--t-sm); }
 .desktop-update-notes pre { max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
 .desktop-download-progress { display: block; width: calc(100% - 40px); height: 5px; margin: 0 20px 10px; accent-color: var(--accent); }
-@media (max-width: 900px) { .desktop-statusbar { gap: 10px; padding-right: 20px; padding-left: 20px; } .desktop-status-details { display: none; } }
+@media (max-width: 900px) { .desktop-statusbar, .desktop-update-notice { gap: 10px; padding-right: 20px; padding-left: 20px; } .desktop-status-details { display: none; } }

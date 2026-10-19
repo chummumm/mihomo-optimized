@@ -1,6 +1,6 @@
 import { useEffect, useSyncExternalStore } from 'react'
 
-import { DesktopError, desktopError, readDesktopStatus, type DesktopStatus, type DesktopUpdateProgress } from './model'
+import { DesktopError, desktopError, readDesktopStatus, type DesktopStatus, type DesktopUpdate, type DesktopUpdateProgress } from './model'
 
 export function isDesktop () {
     return typeof __DESKTOP__ !== 'undefined' && __DESKTOP__
@@ -16,12 +16,17 @@ interface DesktopView {
     writing: boolean
     exitRequested: boolean
     dialog: 'config' | 'import' | null
+    update: DesktopUpdate | null
+    updateBusy: 'checking' | 'installing' | null
+    updateError: DesktopError | null
+    updateDismissedVersion: string | null
     updateProgress: DesktopUpdateProgress | null
 }
 
 let current: DesktopView = {
     ready: !isDesktop(), status: null, error: null, busy: null,
-    visible: true, dirty: false, writing: false, exitRequested: false, dialog: null, updateProgress: null,
+    visible: true, dirty: false, writing: false, exitRequested: false, dialog: null,
+    update: null, updateBusy: null, updateError: null, updateDismissedVersion: null, updateProgress: null,
 }
 const subscribers = new Set<() => void>()
 const drafts = new Set<string>()
@@ -30,6 +35,12 @@ let initializing: Promise<void> | undefined
 let dirtyWrite = Promise.resolve()
 let statusEvent = 0
 let statusRead = 0
+const STARTUP_UPDATE_DELAY_MS = 5000
+const STARTUP_UPDATE_RETRY_MS = 1000
+const STARTUP_UPDATE_MAX_WAIT_MS = 30000
+let startupUpdateConsumed = false
+let startupUpdateTimer: ReturnType<typeof setTimeout> | undefined
+let updateCheckInFlight: Promise<void> | undefined
 
 function publish (patch: Partial<DesktopView>) {
     current = { ...current, ...patch }
@@ -89,6 +100,77 @@ export async function desktopAction (command: string, args?: Record<string, unkn
     }
 }
 
+function runtimeIsBusy () {
+    return !current.status || !!current.busy || current.writing ||
+        current.status.phase === 'starting' || current.status.phase === 'stopping'
+}
+
+function consumeStartupUpdate () {
+    startupUpdateConsumed = true
+    if (startupUpdateTimer !== undefined) clearTimeout(startupUpdateTimer)
+    startupUpdateTimer = undefined
+}
+
+function scheduleStartupUpdate () {
+    if (startupUpdateConsumed || startupUpdateTimer !== undefined) return
+    const deadlineMs = Date.now() + STARTUP_UPDATE_DELAY_MS + STARTUP_UPDATE_MAX_WAIT_MS
+    function checkWhenStable () {
+        startupUpdateTimer = undefined
+        if (startupUpdateConsumed) return
+        if (runtimeIsBusy()) {
+            if (Date.now() >= deadlineMs) consumeStartupUpdate()
+            else startupUpdateTimer = setTimeout(checkWhenStable, STARTUP_UPDATE_RETRY_MS)
+            return
+        }
+        void checkDesktopUpdate()
+    }
+    startupUpdateTimer = setTimeout(checkWhenStable, STARTUP_UPDATE_DELAY_MS)
+}
+
+// Checking has its own state: networking must not hold the core action lock.
+// The same promise and candidate survive settings-page navigation.
+export function checkDesktopUpdate (): Promise<void> {
+    consumeStartupUpdate()
+    if (updateCheckInFlight) return updateCheckInFlight
+    if (current.updateBusy) return Promise.resolve()
+    updateCheckInFlight = desktopInvoke<DesktopUpdate>('desktop_check_update').then(update => {
+        publish({ update })
+    }).catch(reason => {
+        publish({ updateError: desktopError(reason) })
+    }).finally(() => {
+        updateCheckInFlight = undefined
+        publish({ updateBusy: null })
+    })
+    // Native discards its old candidate at the start of every new check.
+    publish({ update: null, updateBusy: 'checking', updateError: null, updateProgress: null })
+    return updateCheckInFlight
+}
+
+export async function installDesktopUpdate (): Promise<void> {
+    const update = current.update
+    if (!update?.available || current.updateBusy || current.dirty || runtimeIsBusy()) return
+    if (!update.canInstall && !update.releaseUrl) return
+    publish({ updateBusy: 'installing', updateError: null, updateProgress: null })
+    try {
+        if (!update.canInstall) {
+            await desktopInvoke('desktop_open_external', { url: update.releaseUrl })
+            return
+        }
+        await dirtyWrite
+        // An editor or core action may have changed while dirty state synced.
+        if (current.dirty || runtimeIsBusy()) return
+        await desktopAction('desktop_install_update')
+    } catch (reason) {
+        publish({ updateError: desktopError(reason) })
+    } finally {
+        publish({ updateBusy: null })
+    }
+}
+
+export function dismissDesktopUpdate () {
+    if (current.update?.version) publish({ updateDismissedVersion: current.update.version })
+}
+
 function setVisibility (visible: boolean) {
     if (visible === current.visible) return
     document.documentElement.setAttribute('data-desktop-hidden', String(!visible))
@@ -128,6 +210,7 @@ export async function initializeDesktop () {
                 })
             })
             await refreshDesktop()
+            if (current.status && !current.error) scheduleStartupUpdate()
         } catch (reason) {
             publish({ ready: true, error: desktopError(reason) })
         }

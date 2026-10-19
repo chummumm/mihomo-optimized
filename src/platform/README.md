@@ -91,6 +91,28 @@ existing resource update panel remains available for rules and geographic data,
 with kernel/UI self-update rows hidden. Configuration must be saved or discarded
 before installing an application update.
 
+## Startup update checks
+
+Desktop 0.1.3 schedules at most one background `desktop_check_update` per
+application startup. It waits briefly after initialization and defers while the
+core is starting or stopping, or a desktop operation or configuration write is
+in progress. Continued activity can skip that startup check; a prior manual
+check also consumes the startup opportunity. Route changes, core status changes,
+and showing the tray window again do not schedule another startup check. A newer
+version produces a dismissible notice; settings retain the update result and
+provide manual checks and retry.
+
+Checking fetches release information only. Downloads and installation begin
+after the user chooses to install an update. Portable apps instead open the
+verified release URL through `desktop_open_external`, so the user can download
+the full installer or a new portable archive. Existing dirty-configuration and
+native installation checks still apply.
+
+A failed or timed-out background check does not stop or restart the core,
+change system proxy settings, or block the startup recovery controls. The error
+belongs to the update UI, and the user can retry from settings after connectivity
+returns. The browser dashboard keeps its existing update behavior.
+
 ## Verification
 
 ```sh
@@ -113,7 +135,9 @@ of browser visibility. `desktop.browser.cjs` runs the production desktop build
 against a deterministic native IPC fixture and authenticated HTTP/WS server. It
 covers offline editing, draft survival through core failure/restart, revision
 conflicts, saved-file reload recovery, dirty exit, native settings/import/update,
-file size rejection, URL/storage isolation, no PWA, and tray pause/resume.
+file size rejection, URL/storage isolation, no PWA, and tray pause/resume. Update
+coverage includes the single startup check, dismissing the notice, explicit
+installation, and manual retry after a failed background check.
 The original ten browser regression suites continue to exercise the web build.
 
 These browser fixtures verify UI behavior and the IPC contract. Windows EXE,
