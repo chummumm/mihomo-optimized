@@ -4,7 +4,7 @@ import { Card } from '@components'
 import type { Client } from '@lib/request'
 
 import { DNSStatus } from './Status'
-import { DNSTrend } from './Trend'
+import { DNSTrend } from './DNSTrend'
 import { cacheHitRatio, completedMinuteQPS, formatDNSNumber } from './helpers'
 import { useDNSI18n, useDNSResource } from './hooks'
 import type { DNSTopEntry } from './types'

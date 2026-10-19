@@ -29,6 +29,7 @@ const WORKFLOW: &str = "chummumm/mihomo-optimized/.github/workflows/windows-desk
 const SOURCE_REF: &str = "refs/heads/clash-dashboard";
 const MAX_INSTALLER: u64 = 512 * 1024 * 1024;
 const MAX_BUNDLE: u64 = 4 * 1024 * 1024;
+const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized";
 static BUSY: AtomicBool = AtomicBool::new(false);
 static CANDIDATE: OnceLock<Mutex<Option<Candidate>>> = OnceLock::new();
 
@@ -90,6 +91,54 @@ pub struct UpdateInfo {
     published_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
+}
+
+/// The GUI first checks the protected executable layout. The monitor runs from a
+/// staging copy, so it supplies the original, process-identity-checked application
+/// path instead. Both paths must match the same administrator-owned NSIS record.
+fn installed_update_dir(original_application: Option<&Path>) -> Result<PathBuf> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
+    let unavailable = || {
+        AppError::new(
+            "update_installation_required",
+            "此程序路径没有匹配的 Windows 安装记录，请从可信发布页下载完整安装包并完成安装后再更新",
+        )
+    };
+    let directory = if let Some(application) = original_application {
+        crate::windows::reject_reparse_path(application)?;
+        crate::windows::require_admin_protected(application)?;
+        let directory = application.parent().ok_or_else(unavailable)?;
+        crate::windows::require_admin_protected(directory)?;
+        directory.canonicalize().map_err(|_| unavailable())?
+    } else {
+        crate::windows::protected_install_dir()?
+    };
+    // Pinned tauri-cli-v2.12.3 NSIS: perMachine selects HKLM, x64 selects the
+    // 64-bit view, and InstallLocation is written as a quoted "$INSTDIR" string.
+    let key = winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(UNINSTALL_KEY, KEY_READ | KEY_WOW64_64KEY)
+        .map_err(|_| unavailable())?;
+    let location: String = key
+        .get_value("InstallLocation")
+        .map_err(|_| unavailable())?;
+    let binary: String = key.get_value("MainBinaryName").map_err(|_| unavailable())?;
+    if binary != "mihomo-optimized.exe" {
+        return Err(unavailable());
+    }
+    let location = location.trim();
+    let unquoted = location
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(location);
+    let registered = Path::new(unquoted);
+    if !registered.is_absolute() {
+        return Err(unavailable());
+    }
+    crate::windows::reject_reparse_path(registered)?;
+    if registered.canonicalize().map_err(|_| unavailable())? != directory {
+        return Err(unavailable());
+    }
+    Ok(directory)
 }
 
 fn emit(app: &AppHandle, stage: &str, downloaded: Option<u64>, total: Option<u64>, message: &str) {
@@ -253,7 +302,7 @@ fn check(app: &AppHandle, proxy: Option<String>) -> Result<UpdateInfo> {
     let mut info = UpdateInfo {
         current_version: current.to_string(),
         available: false,
-        can_install: crate::windows::protected_install_dir().is_ok(),
+        can_install: installed_update_dir(None).is_ok(),
         release_url: None,
         version: None,
         published_at: None,
@@ -709,10 +758,7 @@ fn monitor() -> Result<()> {
     let directory = monitor_exe
         .parent()
         .ok_or_else(|| AppError::new("update_monitor_invalid", "更新目录无效"))?;
-    let application_directory = plan
-        .application
-        .parent()
-        .ok_or_else(|| AppError::new("update_monitor_invalid", "应用目录无效"))?;
+    let application_directory = installed_update_dir(Some(&plan.application))?;
     let input_locks = lock_update_inputs(directory, &plan.candidate)?;
     verify_at(
         &application_directory.join("mihomo-update-verify.exe"),
@@ -754,7 +800,7 @@ fn monitor() -> Result<()> {
     // before failing. Reopen the installed path if available to report the outcome;
     // this does not promise a complete rollback of the previous application files.
     quiet_command(&plan.application)
-        .current_dir(application_directory)
+        .current_dir(&application_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -820,7 +866,7 @@ pub async fn desktop_install_update(app: AppHandle, state: State<'_, HostState>)
     let manager = state.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _operation = operation;
-        if crate::windows::protected_install_dir().is_err() {
+        if installed_update_dir(None).is_err() {
             return Err(AppError::new("update_installation_required", "便携版或未受保护的安装目录不能直接安装更新，请从可信发布页下载完整安装包并完成安装"));
         }
         let candidate = CANDIDATE.get_or_init(|| Mutex::new(None)).lock().map_err(|_| AppError::new("update_state_failed", "更新状态不可用"))?
