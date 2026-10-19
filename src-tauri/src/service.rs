@@ -167,6 +167,7 @@ fn install(owner_sid: &str) -> Result<()> {
         Err(error) => return Err(service_error(error)),
     };
     service.set_description("Runs only the bundled Mihomo core for the installed user's TUN mode; stops the core when the desktop session disconnects.").map_err(service_error)?;
+    windows::configure_tun_firewall(&directory, true)?;
     if service.query_status().map_err(service_error)?.current_state == ServiceState::Stopped {
         service.start::<&str>(&[]).map_err(service_error)?;
     }
@@ -184,7 +185,7 @@ fn install(owner_sid: &str) -> Result<()> {
 }
 
 fn set_installed_running(running: bool) -> Result<()> {
-    windows::protected_install_dir()?;
+    let directory = windows::protected_install_dir()?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(service_error)?;
     let service = match manager.open_service(
@@ -197,6 +198,9 @@ fn set_installed_running(running: bool) -> Result<()> {
         }
         Err(error) => return Err(service_error(error)),
     };
+    if running {
+        windows::configure_tun_firewall(&directory, true)?;
+    }
     let current = service.query_status().map_err(service_error)?.current_state;
     if running && current == ServiceState::Stopped {
         service.start::<&str>(&[]).map_err(service_error)?;
@@ -223,34 +227,40 @@ fn set_installed_running(running: bool) -> Result<()> {
 }
 
 fn uninstall() -> Result<()> {
-    windows::protected_install_dir()?;
+    let directory = windows::protected_install_dir()?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(service_error)?;
     let service = match manager.open_service(
         SERVICE_NAME,
         ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
     ) {
-        Ok(service) => service,
-        Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1060) => {
-            return Ok(())
-        }
+        Ok(service) => Some(service),
+        Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1060) => None,
         Err(error) => return Err(service_error(error)),
     };
-    if service.query_status().map_err(service_error)?.current_state != ServiceState::Stopped {
-        service.stop().map_err(service_error)?;
-        let started = Instant::now();
-        while service.query_status().map_err(service_error)?.current_state != ServiceState::Stopped
-        {
-            if started.elapsed() > Duration::from_secs(40) {
-                return Err(AppError::new(
-                    "service_stop_timeout",
-                    "服务尚未停止，请稍后重试卸载",
-                ));
+    if let Some(service) = &service {
+        if service.query_status().map_err(service_error)?.current_state != ServiceState::Stopped {
+            service.stop().map_err(service_error)?;
+            let started = Instant::now();
+            while service.query_status().map_err(service_error)?.current_state
+                != ServiceState::Stopped
+            {
+                if started.elapsed() > Duration::from_secs(40) {
+                    return Err(AppError::new(
+                        "service_stop_timeout",
+                        "服务尚未停止，请稍后重试卸载",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(100));
             }
-            thread::sleep(Duration::from_millis(100));
         }
     }
-    service.delete().map_err(service_error)?;
+    // A previous partial uninstall may have already removed the SCM entry.
+    // Always remove this installation's firewall rules before clearing ownership.
+    windows::configure_tun_firewall(&directory, false)?;
+    if let Some(service) = service {
+        service.delete().map_err(service_error)?;
+    }
     let owner = windows::service_data_dir()?.join("owner.sid");
     if owner.exists() {
         fs::remove_file(owner).map_err(|e| AppError::io("无法清理服务所有者", e))?;

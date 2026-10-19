@@ -31,8 +31,8 @@ use windows_sys::Win32::{
         },
     },
     UI::Shell::{
-        FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
-        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_System,
+        SHGetKnownFolderPath, ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     },
 };
 
@@ -161,6 +161,170 @@ pub fn service_data_dir() -> Result<PathBuf> {
     Ok(known_folder(&FOLDERID_ProgramData)?
         .join("Mihomo Optimized")
         .join("service"))
+}
+
+// The script is fixed code; the verified executable path and action are data in
+// the child environment. Import only the protected Windows NetSecurity module,
+// never a module found through a user's PSModulePath.
+const TUN_FIREWALL_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+try {
+    Import-Module (Join-Path $PSHOME 'Modules\NetSecurity\NetSecurity.psd1') -Force -ErrorAction Stop
+    $name = $env:MIHOMO_DESKTOP_FIREWALL_NAME
+    $program = $env:MIHOMO_DESKTOP_FIREWALL_PROGRAM
+    $action = $env:MIHOMO_DESKTOP_FIREWALL_ACTION
+    $group = 'Mihomo Optimized TUN'
+    function Test-CoreProgram([string] $value) {
+        if ($value.StartsWith('\\?\', [StringComparison]::Ordinal)) { $value = $value.Substring(4) }
+        return [String]::Equals($value, $program, [StringComparison]::OrdinalIgnoreCase)
+    }
+    $allRules = @(NetSecurity\Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop)
+    $owned = @($allRules | Where-Object { $_.Name -eq $name })
+    if ($owned.Count -gt 1) { exit 21 }
+    foreach ($rule in $owned) {
+        $application = @($rule | NetSecurity\Get-NetFirewallApplicationFilter -ErrorAction Stop)
+        if ($application.Count -ne 1 -or !(Test-CoreProgram $application[0].Program) -or $rule.Group -ne $group) { exit 21 }
+    }
+    if ($action -eq 'install') {
+        $parameters = @{
+            PolicyStore = 'PersistentStore'; Name = $name; DisplayName = 'Mihomo Optimized TUN TCP';
+            Description = 'TCP system-stack access for the protected bundled Mihomo core, managed with its TUN service.';
+            Program = $program; Direction = 'Inbound'; Action = 'Allow'; Protocol = 'TCP';
+            Profile = 'Any'; Enabled = 'True'; EdgeTraversalPolicy = 'Block';
+            LocalAddress = 'Any'; RemoteAddress = 'Any'; LocalPort = 'Any'; RemotePort = 'Any'; InterfaceType = 'Any';
+            ErrorAction = 'Stop'
+        }
+        if ($owned.Count -eq 0) {
+            $parameters.Group = $group
+            $null = NetSecurity\New-NetFirewallRule @parameters
+        } else {
+            $parameters.Remove('DisplayName')
+            $parameters.NewDisplayName = 'Mihomo Optimized TUN TCP'
+            $null = NetSecurity\Set-NetFirewallRule @parameters
+        }
+        $verified = @(NetSecurity\Get-NetFirewallRule -PolicyStore PersistentStore -Name $name -ErrorAction Stop)
+        if ($verified.Count -ne 1 -or $verified[0].Enabled -ne 'True' -or $verified[0].Direction -ne 'Inbound' -or $verified[0].Action -ne 'Allow') { exit 23 }
+        $application = @($verified[0] | NetSecurity\Get-NetFirewallApplicationFilter -ErrorAction Stop)
+        if ($application.Count -ne 1 -or ![String]::Equals($application[0].Program, $program, [StringComparison]::OrdinalIgnoreCase)) { exit 23 }
+    } elseif ($action -eq 'remove') {
+        if ($owned.Count -eq 1) {
+            NetSecurity\Remove-NetFirewallRule -PolicyStore PersistentStore -Name $name -ErrorAction Stop
+        }
+        # sing-tun also attempts its own rule, using argv[0] as the display name.
+        # Remove only its exact names for this installation and this executable.
+        $automaticNames = @(('sing-tun (' + $program + ')'), ('sing-tun (\\?\' + $program + ')'))
+        foreach ($rule in $allRules) {
+            if ($automaticNames -notcontains $rule.DisplayName -or $rule.Group) { continue }
+            $application = @($rule | NetSecurity\Get-NetFirewallApplicationFilter -ErrorAction Stop)
+            $ports = @($rule | NetSecurity\Get-NetFirewallPortFilter -ErrorAction Stop)
+            if ($application.Count -eq 1 -and (Test-CoreProgram $application[0].Program) -and $ports.Count -eq 1 -and $ports[0].Protocol -eq 'TCP' -and $rule.Direction -eq 'Inbound' -and $rule.Action -eq 'Allow') {
+                NetSecurity\Remove-NetFirewallRule -PolicyStore PersistentStore -Name $rule.Name -ErrorAction Stop
+            }
+        }
+    } else { exit 22 }
+    exit 0
+} catch { exit 23 }
+"#;
+
+pub fn configure_tun_firewall(directory: &Path, install: bool) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::{
+        os::windows::process::CommandExt,
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let executable = directory.join("mihomo-core.exe");
+    reject_reparse_path(&executable)?;
+    reject_hard_links(&executable)?;
+    require_admin_protected(&executable)?;
+    let canonical = executable
+        .canonicalize()
+        .map_err(|error| AppError::io("无法确认防火墙程序路径", error))?;
+    let program = canonical
+        .to_str()
+        .ok_or_else(|| AppError::new("firewall_path_invalid", "防火墙程序路径无法编码"))?;
+    // Windows Firewall application filters require a normal DOS executable path,
+    // not the extended-length spelling returned by Rust's canonicalize().
+    let program = program.strip_prefix(r"\\?\").unwrap_or(program);
+    let bytes = program.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1..3] != *b":\\" {
+        return Err(AppError::new(
+            "firewall_path_invalid",
+            "TUN 防火墙规则需要本地安装程序路径",
+        ));
+    }
+    let digest = hex::encode(Sha256::digest(program.to_lowercase().as_bytes()));
+    let name = format!("com.chummumm.mihomo-optimized.tun.tcp.{}", &digest[..16]);
+    let powershell = known_folder(&FOLDERID_System)?
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    reject_reparse_path(&powershell)?;
+    require_admin_protected(&powershell)?;
+    let mut command = Command::new(&powershell);
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            TUN_FIREWALL_SCRIPT,
+        ])
+        .env("MIHOMO_DESKTOP_FIREWALL_NAME", name)
+        .env("MIHOMO_DESKTOP_FIREWALL_PROGRAM", program)
+        .env(
+            "MIHOMO_DESKTOP_FIREWALL_ACTION",
+            if install { "install" } else { "remove" },
+        )
+        .env("PSModulePath", powershell.parent().unwrap().join("Modules"))
+        .current_dir(powershell.parent().unwrap())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x08000000);
+    let mut child = command
+        .spawn()
+        .map_err(|error| AppError::io("无法管理 TUN 防火墙规则", error))?;
+    let _job = match create_kill_job(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let started = Instant::now();
+    loop {
+        match child
+            .try_wait()
+            .map_err(|error| AppError::io("无法读取防火墙操作结果", error))?
+        {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) if status.code() == Some(21) => {
+                return Err(AppError::new(
+                    "firewall_rule_conflict",
+                    "同名 TUN 防火墙规则属于其他程序，请在 Windows 防火墙中检查",
+                ))
+            }
+            Some(_) => {
+                return Err(AppError::new(
+                    "firewall_rule_failed",
+                    "无法管理配套内核的 TUN 防火墙规则，请检查管理员权限或组织网络策略",
+                ))
+            }
+            None if started.elapsed() >= Duration::from_secs(30) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AppError::new(
+                    "firewall_rule_timeout",
+                    "管理 TUN 防火墙规则超时，请重试",
+                ));
+            }
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    }
 }
 
 pub fn protected_install_dir() -> Result<PathBuf> {

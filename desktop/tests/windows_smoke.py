@@ -280,6 +280,21 @@ def service_installed() -> bool:
     return result.returncode == 0
 
 
+def owned_firewall_rule_count(core: Path) -> int:
+    environment = child_environment()
+    environment["MIHOMO_DIAG_CORE"] = str(core)
+    result = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", r"""
+$ErrorActionPreference = 'Stop'
+$rules = @(Get-NetFirewallApplicationFilter -Program $env:MIHOMO_DIAG_CORE -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'com.chummumm.mihomo-optimized.tun.tcp.*' -and $_.Group -eq 'Mihomo Optimized TUN' })
+$rules.Count | ConvertTo-Json -Compress
+"""], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            timeout=15, env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
+    require(result.returncode == 0 and len(result.stdout) <= 128, "owned_firewall_query_failed")
+    count = json.loads(result.stdout)
+    require(isinstance(count, int) and 0 <= count <= 100, "owned_firewall_count_invalid")
+    return count
+
+
 class WebViewDriver:
     def __init__(self, driver: Path, app: Path) -> None:
         self.port = free_port()
@@ -396,12 +411,16 @@ class SocksHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         stream = self.request
         stream.settimeout(5)
+        stage = "greeting"
+        with self.server.lock:
+            self.server.accepted += 1
         try:
             version, count = receive_exact(stream, 2)
             methods = receive_exact(stream, count)
             if version != 5 or 0 not in methods:
                 return
             stream.sendall(b"\x05\x00")
+            stage = "connect_request"
             version, command, reserved, kind = receive_exact(stream, 4)
             if kind == 1:
                 host = socket.inet_ntoa(receive_exact(stream, 4))
@@ -418,6 +437,7 @@ class SocksHandler(socketserver.BaseRequestHandler):
                 stream.sendall(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
                 return
             stream.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
+            stage = "http_request"
             request = bytearray()
             while b"\r\n\r\n" not in request and len(request) <= 8192:
                 chunk = stream.recv(1024)
@@ -430,7 +450,9 @@ class SocksHandler(socketserver.BaseRequestHandler):
             stream.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
             with self.server.lock:
                 self.server.forwarded += 1
-        except (OSError, ValueError, UnicodeError):
+        except (OSError, ValueError, UnicodeError) as error:
+            with self.server.lock:
+                self.server.last_error = socket_diagnostic(stage, error)
             return
 
 
@@ -441,7 +463,11 @@ class SocksFixture(socketserver.ThreadingTCPServer):
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.targets: list[tuple[str, int]] = []
+        self.accepted = 0
         self.forwarded = 0
+        self.attempts = 0
+        self.last_error = None
+        self.last_roundtrip = None
         super().__init__(("127.0.0.1", 0), SocksHandler)
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
@@ -449,22 +475,42 @@ class SocksFixture(socketserver.ThreadingTCPServer):
     def roundtrip(self) -> bool:
         # A raw AF_INET socket cannot use HTTP_PROXY, WinInet, or a SOCKS option.
         # Only the /32 route into the real TUN interface can reach this fixture.
+        self.attempts += 1
+        stage = "connect"
         try:
             with socket.create_connection((TUN_TARGET, 80), timeout=2) as stream:
+                stage = "send"
                 stream.sendall(f"GET /mihomo-tun-smoke HTTP/1.1\r\nHost: {TUN_TARGET}\r\nConnection: close\r\n\r\n".encode())
+                stage = "response_headers"
                 response = http.client.HTTPResponse(stream)
                 response.begin()
+                stage = "response_body"
                 body = response.read(4096)
                 require(response.status == 200 and body == TUN_BODY, "tun_unexpected_response")
             with self.lock:
                 return self.forwarded >= 1 and (TUN_TARGET, 80) in self.targets
-        except (OSError, http.client.HTTPException):
+        except (OSError, http.client.HTTPException) as error:
+            self.last_roundtrip = socket_diagnostic(stage, error)
             return False
+
+    def diagnostics(self) -> dict:
+        with self.lock:
+            return {"attempts": self.attempts, "accepted": self.accepted,
+                    "expectedTargets": sum(target == (TUN_TARGET, 80) for target in self.targets),
+                    "unexpectedTargets": sum(target != (TUN_TARGET, 80) for target in self.targets),
+                    "forwarded": self.forwarded, "lastSocketError": self.last_roundtrip,
+                    "lastFixtureError": self.last_error}
 
     def close(self) -> None:
         self.shutdown()
         self.server_close()
         self.thread.join(timeout=3)
+
+
+def socket_diagnostic(stage: str, error: Exception) -> dict:
+    # Never retain exception messages: native/HTTP errors can echo request data.
+    return {"stage": stage, "type": type(error).__name__,
+            "errno": getattr(error, "errno", None), "winerror": getattr(error, "winerror", None)}
 
 
 def profile(mixed: int, socks: int) -> str:
@@ -474,7 +520,7 @@ socks-port: 0
 allow-lan: false
 bind-address: 127.0.0.1
 mode: rule
-log-level: warning
+log-level: info
 ipv6: false
 find-process-mode: 'off'
 geo-auto-update: false
@@ -574,6 +620,83 @@ class Acceptance:
             parents.add(self.driver.process.pid)
         for identity in self.processes.descendants(parents):
             self.owned_children[identity.pid] = identity
+
+    def capture_tun_failure(self, status: dict, core_pid: int) -> None:
+        """Keep bounded observations before cleanup removes the failing route."""
+        evidence = {"fixture": self.socks.diagnostics()}
+        self.report["tunDiagnostics"] = evidence
+        print("TUN fixture: " + json.dumps(evidence["fixture"], sort_keys=True), flush=True)
+        controller = status.get("controller", {})
+        try:
+            url = urlsplit(controller.get("url", ""))
+            require(url.hostname == "127.0.0.1" and url.port, "diagnostic_controller_invalid")
+            connection = http.client.HTTPConnection("127.0.0.1", url.port, timeout=3)
+            try:
+                connection.request("GET", "/configs", headers={"Authorization": "Bearer " + controller["secret"], "Connection": "close"})
+                response = connection.getresponse()
+                payload = response.read(128 * 1024 + 1)
+                require(response.status == 200 and len(payload) <= 128 * 1024, "diagnostic_configs_unavailable")
+                config = json.loads(payload)
+            finally:
+                connection.close()
+            # /configs also includes controller settings. Only these fixture
+            # fields enter the report; never serialize the complete response.
+            fields = ("enable", "stack", "device", "auto-route", "auto-detect-interface",
+                      "strict-route", "route-address", "route-exclude-address", "inet4-address",
+                      "inet6-address", "dns-hijack")
+            tun = config.get("tun", {})
+            effective = {"mixedPort": config.get("mixed-port"),
+                         "tun": {key: tun[key] for key in fields if key in tun}}
+            require(len(json.dumps(effective)) <= 4096, "diagnostic_configs_too_large")
+            evidence["effectiveConfig"] = effective
+        except Exception as error:
+            evidence["configDiagnosticError"] = type(error).__name__
+
+        try:
+            environment = child_environment()
+            environment["MIHOMO_DIAG_CORE"] = str(self.core)
+            environment["MIHOMO_DIAG_PID"] = str(core_pid)
+            result = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*Mihomo*' -or $_.InterfaceDescription -like '*Wintun*' } | Select-Object -First 8 Name, ifIndex, Status, InterfaceDescription)
+$rules = @(Get-NetFirewallApplicationFilter -Program $env:MIHOMO_DIAG_CORE -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'com.chummumm.mihomo-optimized.tun.tcp.*' -and $_.Group -eq 'Mihomo Optimized TUN' } | Select-Object -First 8 Name, DisplayName, Group, Enabled, Direction, Action, Profile, EdgeTraversalPolicy)
+[ordered]@{
+  route = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '198.18.77.77/32' -ErrorAction SilentlyContinue | Select-Object -First 8 DestinationPrefix, InterfaceAlias, ifIndex, NextHop, RouteMetric)
+  adapters = $adapters
+  coreListeners = @(Get-NetTCPConnection -OwningProcess ([int]$env:MIHOMO_DIAG_PID) -State Listen -ErrorAction SilentlyContinue | Select-Object -First 8 LocalAddress, LocalPort, OwningProcess)
+  firewallProfiles = @(Get-NetFirewallProfile | Select-Object Name, Enabled, DefaultInboundAction)
+  coreFirewallRules = $rules
+} | ConvertTo-Json -Depth 5 -Compress
+"""], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=20, env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
+            require(result.returncode == 0 and len(result.stdout) <= 32 * 1024, "diagnostic_windows_query_failed")
+            evidence["windows"] = json.loads(result.stdout.decode("utf-8-sig"))
+        except Exception as error:
+            evidence["windowsDiagnosticError"] = type(error).__name__
+
+        try:
+            directory = Path(os.environ["PROGRAMDATA"]) / "Mihomo Optimized" / "service" / "logs"
+            require(Path(status["logPath"]).resolve() == directory.resolve(), "diagnostic_log_directory_mismatch")
+            with (directory / "core.log").open("rb") as log:
+                log.seek(0, os.SEEK_END)
+                log.seek(max(0, log.tell() - 64 * 1024))
+                tail = log.read(64 * 1024).decode("utf-8", errors="replace")
+            lines = []
+            for line in tail.splitlines():
+                if not re.search(r"tun|tcp|smoke-socks|route|error|warn|fatal", line, re.IGNORECASE):
+                    continue
+                if re.search(r"secret|authorization", line, re.IGNORECASE):
+                    continue
+                for secret in self.secrets:
+                    line = line.replace(secret, "[redacted]")
+                line = re.sub(r"\x1b\[[0-9;]*m", "", line)
+                line = re.sub(r"[A-Za-z0-9_-]{32,}", "[redacted]", line)
+                lines.append(line[:600])
+            evidence["coreLogTail"] = lines[-30:]
+        except Exception as error:
+            evidence["logDiagnosticError"] = type(error).__name__
 
     def run(self) -> None:
         require(self.core.is_file() and self.helper.is_file(), "installed_sidecars_missing")
@@ -675,8 +798,13 @@ class Acceptance:
         self.driver.invoke("desktop_start")
         tun = self.phase("running")
         require(tun.get("tun") is True and tun.get("service", {}).get("running") is True, "tun_service_not_running")
-        self.managed_core(tun)
-        wait_until(self.socks.roundtrip, "tun_forwarding_timeout")
+        tun_core = self.managed_core(tun)
+        try:
+            require(owned_firewall_rule_count(self.core) == 1, "tun_firewall_rule_not_installed")
+            wait_until(self.socks.roundtrip, "tun_forwarding_timeout")
+        except Exception:
+            self.capture_tun_failure(tun, tun_core["pid"])
+            raise
         with self.socks.lock:
             require(all(target == (TUN_TARGET, 80) for target in self.socks.targets), "tun_fixture_received_unexpected_target")
             self.report["tun"] = {"route": TUN_TARGET + "/32", "socksConnections": len(self.socks.targets), "forwardedRequests": self.socks.forwarded}
@@ -687,6 +815,7 @@ class Acceptance:
         self.driver.invoke("desktop_set_tun", {"enabled": False})
         self.driver.invoke("desktop_uninstall_service")
         wait_until(lambda: not service_installed(), "tun_service_not_removed")
+        require(owned_firewall_rule_count(self.core) == 0, "tun_firewall_rule_not_removed")
         wait_until(lambda: not self.processes.at_paths([self.core]) and all(not listening(port) for port in self.ports), "core_survived_stop")
         require(self.wininet.read() == self.proxy_before, "proxy_changed_during_tun_test")
         self.mark("stop_cleanup")
@@ -728,11 +857,10 @@ class Acceptance:
             attempt("driver_close", self.driver.close)
         if self.service_owned:
             def uninstall():
-                if service_installed():
-                    result = subprocess.run([str(self.helper), "--uninstall"], stdin=subprocess.DEVNULL,
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                            timeout=65, creationflags=subprocess.CREATE_NO_WINDOW)
-                    require(result.returncode == 0, "cleanup_service_uninstall_failed")
+                result = subprocess.run([str(self.helper), "--uninstall"], stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        timeout=65, creationflags=subprocess.CREATE_NO_WINDOW)
+                require(result.returncode == 0, "cleanup_service_uninstall_failed")
                 wait_until(lambda: not service_installed(), "cleanup_service_still_installed", 15)
             attempt("service_uninstall", uninstall)
         for identity in self.processes.at_paths([self.app, self.core, self.helper]):
@@ -757,6 +885,8 @@ class Acceptance:
         attempt("autostart_restore_check", lambda: require(read_autostart() == self.autostart_before, "autostart_not_restored"))
         attempt("process_cleanup_check", lambda: require(not self.processes.at_paths([self.app, self.core, self.helper]), "owned_process_remains"))
         attempt("service_cleanup_check", lambda: require(not service_installed(), "owned_service_remains"))
+        if self.service_owned:
+            attempt("firewall_cleanup_check", lambda: require(owned_firewall_rule_count(self.core) == 0, "owned_firewall_rule_remains"))
         self.report["tests"]["final_cleanup"] = not errors
         self.report["diagnostics"].extend({"stage": "cleanup", "code": code} for code in errors)
         print("FAIL: final_cleanup" if errors else "PASS: final_cleanup", flush=True)
