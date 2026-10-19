@@ -34,10 +34,13 @@ def main():
     version = config["version"]
     release = ROOT / "src-tauri/target" / TARGET / "release"
     prefix = f"mihomo-desktop-{version}-windows-x64"
-    setup = list((release / "bundle/nsis").glob("*.exe"))
-    if len(setup) != 1:
-        raise ValueError(f"Expected exactly one NSIS installer, got {len(setup)}")
-    shutil.copy2(setup[0], output / f"{prefix}-setup.exe")
+    # The compilation cache can contain installers from older versions. Tauri
+    # 2.12.3 names NSIS output by product, version and architecture; select the
+    # exact current build instead of treating cached installers as candidates.
+    setup = release / "bundle/nsis" / f"{config['productName']}_{version}_x64-setup.exe"
+    if not setup.is_file():
+        raise ValueError(f"Current-version NSIS installer is missing: {setup.name}")
+    shutil.copy2(setup, output / f"{prefix}-setup.exe")
     with zipfile.ZipFile(output / f"{prefix}-portable.zip", "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
         bundle.write(release / "mihomo-optimized.exe", "Mihomo Optimized/mihomo-optimized.exe")
         for name in ["mihomo-core", "mihomo-desktop-service", "mihomo-update-verify"]:
