@@ -341,6 +341,7 @@ class RestrictedDesktop:
                 | win32security.TOKEN_ASSIGN_PRIMARY | win32security.TOKEN_ADJUST_DEFAULT)
             user = win32security.GetTokenInformation(source, win32security.TokenUser)[0]
             self.sid = win32security.ConvertSidToStringSid(user)
+            self.source_context = self.token_context(source)
             administrator = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
             stage = "create_restricted_token"
             # LUA_TOKEN is 0x4 in winnt.h; pywin32 311 does not export that flag.
@@ -359,6 +360,127 @@ class RestrictedDesktop:
         finally:
             if source is not None:
                 source.Close()
+
+    @staticmethod
+    def token_context(token) -> dict:
+        import win32security
+
+        logon_groups = []
+        for sid, attributes in win32security.GetTokenInformation(token, win32security.TokenGroups):
+            attributes = int(attributes) & 0xFFFFFFFF
+            if attributes & 0xC0000000 == 0xC0000000:  # SE_GROUP_LOGON_ID
+                logon_groups.append({"sid": win32security.ConvertSidToStringSid(sid),
+                                     "attributesHex": f"0x{attributes:08X}",
+                                     "enabled": bool(attributes & 0x4),
+                                     "denyOnly": bool(attributes & 0x10)})
+        return {"sessionId": win32security.GetTokenInformation(token, win32security.TokenSessionId),
+                "logonGroups": logon_groups}
+
+    def probe_access(self, output: Path) -> dict:
+        """Observe desktop access without changing any ACL or launch setting."""
+        import pywintypes
+        import win32api
+        import win32con
+        import win32security
+        import win32service
+
+        evidence = {"sourceToken": self.source_context, "restrictedToken": self.token_context(self.token),
+                    "cases": []}
+        parent_station = parent_desktop = None
+        stage = "parent_window_station"
+
+        def close_owned(handle, method):
+            getattr(handle, method)()
+            # These pywin32 311 methods do not invalidate the wrapper themselves.
+            handle.Detach()
+
+        def probe(api, mask, open_handle, close_method):
+            result = {"api": api, "mask": f"0x{mask:08X}", "opened": False}
+            handle = None
+            operation = "ImpersonateLoggedOnUser"
+            try:
+                try:
+                    win32security.ImpersonateLoggedOnUser(self.token)
+                    operation = api
+                    handle = open_handle(mask)
+                    result["opened"] = True
+                    result["winError"] = 0
+                except pywintypes.error as error:
+                    result.update({"failedApi": operation, "winError": error.winerror})
+                finally:
+                    try:
+                        win32security.RevertToSelf()
+                    except pywintypes.error as error:
+                        raise SmokeFailure(f"desktop_probe_revert_winerror_{error.winerror}") from None
+            finally:
+                if handle is not None:
+                    close_owned(handle, close_method)
+            return result
+
+        try:
+            parent_station = win32service.GetProcessWindowStation()
+            station_name = win32service.GetUserObjectInformation(parent_station, win32con.UOI_NAME)
+            stage = "parent_thread_desktop"
+            parent_desktop = win32service.GetThreadDesktop(win32api.GetCurrentThreadId())
+            desktop_name = win32service.GetUserObjectInformation(parent_desktop, win32con.UOI_NAME)
+            evidence["parent"] = {"windowStation": station_name, "desktop": desktop_name}
+            targets = [(station_name, desktop_name, "parent"), ("winsta0", "default", "requested")]
+            for station, desktop, label in targets:
+                case = {"context": label, "windowStation": station, "desktop": desktop,
+                        "windowStationAccess": [], "desktopAccess": []}
+                evidence["cases"].append(case)
+                # Higher masks diagnose additional rights; denial is evidence,
+                # not an assertion that GUI startup requires every listed right.
+                for level, mask in (("basic", 0x23), ("runtime", 0x37F), ("full", 0xF037F)):
+                    result = probe("OpenWindowStation", mask,
+                                   lambda access: win32service.OpenWindowStation(station, False, access),
+                                   "CloseWindowStation")
+                    case["windowStationAccess"].append({"level": level, **result})
+                target_station = None
+                switched = False
+                operation = "OpenWindowStation_supervisor"
+                try:
+                    if station.casefold() != station_name.casefold():
+                        # OpenDesktop resolves against the PROCESS station.
+                        # Bind briefly as supervisor; every access check below
+                        # still impersonates the exact restricted primary token.
+                        case["bindingMask"] = "0x00020003"  # READ_CONTROL, enum, read attributes
+                        target_station = win32service.OpenWindowStation(station, False, 0x20003)
+                        operation = "SetProcessWindowStation"
+                        target_station.SetProcessWindowStation()
+                        switched = True
+                    for level, mask in (("basic", 0x83), ("runtime", 0x1FF), ("full", 0xF01FF)):
+                        result = probe("OpenDesktop", mask,
+                                       lambda access: win32service.OpenDesktop(desktop, 0, False, access),
+                                       "CloseDesktop")
+                        case["desktopAccess"].append({"level": level, **result})
+                except pywintypes.error as error:
+                    case["bindingError"] = {"api": operation, "winError": error.winerror}
+                finally:
+                    try:
+                        if switched:
+                            try:
+                                parent_station.SetProcessWindowStation()
+                                case["parentStationRestored"] = True
+                            except pywintypes.error as error:
+                                case["restoreError"] = error.winerror
+                                # Never close a handle that is still current.
+                                target_station.Detach()
+                                target_station = None
+                                raise SmokeFailure(f"desktop_station_restore_winerror_{error.winerror}") from None
+                    finally:
+                        if target_station is not None:
+                            close_owned(target_station, "CloseWindowStation")
+        except pywintypes.error as error:
+            evidence["diagnosticError"] = {"stage": stage, "winError": error.winerror}
+        finally:
+            # Get* returns borrowed handles wrapped with owning destructors.
+            if parent_desktop is not None:
+                parent_desktop.Detach()
+            if parent_station is not None:
+                parent_station.Detach()
+            output.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+        return evidence
 
     def check_token(self, token) -> dict:
         import win32security
@@ -530,6 +652,7 @@ class WebViewDriver:
         self.startup_path = artifacts / "edgedriver-startup.json"
         self.startup = {"ready": False, "requestedDesktop": r"winsta0\default",
                         "requestedToken": desktop.check_token(desktop.token),
+                        "desktopAccessFile": "desktop-access.json",
                         "logFile": self.log_path.name, "logLevel": "SEVERE"}
         self.write_startup_evidence()
         # EdgeDriver inherits Chromium's mutually exclusive log-level/silent flags.
@@ -1026,13 +1149,16 @@ class Acceptance:
         self.mutations_started = True
         (self.directory / "config.yaml").write_text(BAD_CONFIG, encoding="utf-8", newline="")
         (self.directory / "preferences.json").write_text(json.dumps({"desiredRunning": True, "systemProxy": False, "tun": False}), encoding="utf-8")
+        self.stage = "non_elevated_gui"
+        self.desktop = RestrictedDesktop()
+        # Probe before starting fixture threads or child processes. Station
+        # changes are synchronous, temporary, and always restored before launch.
+        self.report["desktopAccess"] = self.desktop.probe_access(self.artifacts / "desktop-access.json")
         self.socks = SocksFixture()
         mixed = free_port()
         self.ports.add(mixed)
         valid = profile(mixed, self.socks.server_address[1])
 
-        self.stage = "non_elevated_gui"
-        self.desktop = RestrictedDesktop()
         self.driver = WebViewDriver(self.driver_path, self.app, self.processes, self.desktop, self.artifacts)
         gui = wait_until(lambda: self.processes.at_paths([self.app]), "gui_process_not_found")
         require(len(gui) == 1, "multiple_gui_processes")
