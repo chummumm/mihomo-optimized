@@ -1,8 +1,10 @@
 # SignPath 接入准备：Windows 桌面版
 
-状态：**申请准备与设计参考，尚未接入 SignPath，也没有完成 Authenticode 签名验证。** 本文和同目录的 `.yml.example` 不会启用 GitHub Actions 工作流，不会改变现有 Windows 发行或 core 的 latest 标记。
+状态：**申请准备与设计参考，申请尚未提交或获批，生产 SignPath 签名未启用。** 本文和同目录的 `.yml.example` 不会启用 GitHub Actions 工作流，不会改变现有 Windows 发行或 core 的 latest 标记。
 
-审查基线为桌面合并提交 `ff075b4ab96232cdc409c905a3cda34503e3c439`。该版本的 `desktop/core.json` 固定引用 `e16270b1a00b3ea3a6b999760655f4299c4ffcdb`；本文不要求修改该 Go 核心源码。获批后的实际实现、版本更新和 CI 验证需要另一个可审阅的 PR。
+原设计审查基线为桌面合并提交 `ff075b4ab96232cdc409c905a3cda34503e3c439`。该版本的 `desktop/core.json` 固定引用 `e16270b1a00b3ea3a6b999760655f4299c4ffcdb`；本文不要求修改该 Go 核心源码。获批后的实际实现、版本更新和 CI 验证需要另一个可审阅的 PR。
+
+桌面 0.1.1 已公开发布，最终源码、正式 Windows 验收运行、公开下载哈希及静态 PE 证书表检查结果集中记录在[申请稿的发行证据](signpath-application.md#evidence-about-the-desktop-release)。该静态检查不等于 Windows 证书链或时间戳验证，本次发行未使用 SignPath 证书签名。
 
 申请材料见 [signpath-application.md](signpath-application.md)，待确认的团队和公开政策见 [code-signing-policy.draft.md](code-signing-policy.draft.md)。官方要求与本文项目实施建议分别标明；申请、邀请、审批成员和凭据仍需真实配置。
 

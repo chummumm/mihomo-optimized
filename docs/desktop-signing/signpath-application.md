@@ -2,9 +2,9 @@
 
 Prepared on 2026-10-19 for the maintainer of `chummumm/mihomo-optimized`.
 
-**Status: preparation only.** This document does not establish that an application has been submitted, accepted, or that a certificate has been made available. GitHub and SignPath MFA have not been verified. The publication status of the proposed desktop release linked below must be checked before submission. Personal contact details and unconfirmed names are deliberately excluded from this public document.
+**Status: preparation only.** This document does not establish that an application has been submitted, accepted, or that a certificate has been made available. GitHub and SignPath MFA have not been verified. Desktop 0.1.1 is publicly released; its verified release evidence is recorded below. Personal contact details and unconfirmed names are deliberately excluded from this public document.
 
-The proposed desktop 0.1.1 repair release has not yet been built or inspected for signatures. The existing desktop signing check concerns the earlier 0.1.0 samples: the installer and the three project-built executables inside its portable ZIP have no embedded Authenticode certificate table. This evidence does not establish the signature status of the future 0.1.1 artifacts.
+Static inspection of the published desktop 0.1.1 installer and the three project-built executables inside its portable ZIP found no embedded Authenticode certificate tables. The exact assets, hashes, build and inspection scope are recorded in [Evidence about the desktop release](#evidence-about-the-desktop-release). This release does not use SignPath signing; an unsigned public release does not establish Foundation acceptance.
 
 ## Official application and references
 
@@ -43,6 +43,33 @@ The intended Windows distribution contains an NSIS installer and a portable ZIP.
 
 The desktop build pins the core source commit in `desktop/core.json`; `build-info.json` records the UI/desktop source and core commit used for a package. Core and dashboard/desktop source live in different branches of the same repository. This arrangement should be included in the Foundation's origin-verification review.
 
+### Evidence about the desktop release
+
+The public [desktop 0.1.1 release](https://github.com/chummumm/mihomo-optimized/releases/tag/mihomo-desktop-v0.1.1), release ID `416995836`, was published at `2026-10-19T07:02:13Z`. The release metadata checked on 2026-10-19 reports `draft: false` and `prerelease: false`.
+
+- Tag and desktop/UI source: [`e2597a790cccb807de2b1ac58d3ba62346f94f7b`](https://github.com/chummumm/mihomo-optimized/tree/e2597a790cccb807de2b1ac58d3ba62346f94f7b).
+- Pinned core source: [`e16270b1a00b3ea3a6b999760655f4299c4ffcdb`](https://github.com/chummumm/mihomo-optimized/tree/e16270b1a00b3ea3a6b999760655f4299c4ffcdb).
+- Successful production build and release: [Windows desktop run `39212119028`](https://github.com/chummumm/mihomo-optimized/actions/runs/39212119028). It passed 10 native tests, 6 desktop-managed core tests and 11 installed GUI/service acceptance checks. The GUI checks used medium integrity with the administrator group disabled for allowed access, and exercised the service's allowed identity query and denied mutation rights.
+- Published source record: [`build-info.json`](https://github.com/chummumm/mihomo-optimized/releases/download/mihomo-desktop-v0.1.1/build-info.json).
+
+The following files were downloaded from the public release on 2026-10-19. Their SHA256 values matched both GitHub's asset digests and the published [`SHA256SUMS`](https://github.com/chummumm/mihomo-optimized/releases/download/mihomo-desktop-v0.1.1/SHA256SUMS). Portable ZIP integrity and its embedded build-info were also checked against the published source record.
+
+| Public download | Bytes | SHA256 |
+| --- | --- | --- |
+| [Windows x64 installer](https://github.com/chummumm/mihomo-optimized/releases/download/mihomo-desktop-v0.1.1/mihomo-desktop-0.1.1-windows-x64-setup.exe) | 31676367 | `64326bf2d2672cfc76fbb1c1dbd25138a438ee0e78751ab72ac2a91a62f84690` |
+| [Windows x64 portable ZIP](https://github.com/chummumm/mihomo-optimized/releases/download/mihomo-desktop-v0.1.1/mihomo-desktop-0.1.1-windows-x64-portable.zip) | 43224131 | `7a1c33425f0fe118700828eb3749f36ed92d5647fc3afe01128c75817a0a9e07` |
+
+A separate static inspection read the PE `IMAGE_DIRECTORY_ENTRY_SECURITY` entry of the installer and the following files under `Mihomo Optimized/` in that portable ZIP. This inspection did not execute the downloaded programs.
+
+| Inspected project PE file | SHA256 | Certificate table file offset | Certificate table size |
+| --- | --- | --- | --- |
+| `mihomo-desktop-0.1.1-windows-x64-setup.exe` | `64326bf2d2672cfc76fbb1c1dbd25138a438ee0e78751ab72ac2a91a62f84690` | 0 | 0 |
+| `mihomo-optimized.exe` | `9d073fde5724af114555ca517b90556e3cea128f6733de4507e64f04f2e3472e` | 0 | 0 |
+| `mihomo-core.exe` | `734c59effb6bc32e12b6a9ee93b2609535340a94229fe57f7b4739f851080148` | 0 | 0 |
+| `mihomo-desktop-service.exe` | `10d256961ee55d8cda7641ea2aa0a206c5ea1164a44aa1d700c6117d60f1d7ba` | 0 | 0 |
+
+These results establish that these exact four files have no embedded Authenticode certificate table. They are not a Windows certificate-chain, timestamp or external-catalog signature validation, and do not establish the signature status of third-party components or the installed uninstaller. The release's GitHub/Sigstore build attestation and SHA256 manifest establish different properties from a Windows publisher signature. The SignPath application remains unsubmitted and unapproved, and production SignPath signing remains disabled.
+
 ### Evidence about the upstream Windows binary
 
 On 2026-10-19, a read-only check downloaded the following asset from the official [MetaCubeX v1.19.32 release](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.32):
@@ -66,7 +93,7 @@ The main README also reproduces an upstream statement concerning downstream use 
 | Project Name | Yes | `Mihomo Optimized` — current product identity; subject to the naming clarification above. |
 | Repository URL | Yes | `https://github.com/chummumm/mihomo-optimized` |
 | Homepage URL | Yes | `https://github.com/chummumm/mihomo-optimized/tree/clash-dashboard` |
-| Download URL | No | `https://github.com/chummumm/mihomo-optimized/releases/tag/mihomo-desktop-v0.1.1` — verify that the desktop release is publicly published before using this as evidence. |
+| Download URL | No | `https://github.com/chummumm/mihomo-optimized/releases/tag/mihomo-desktop-v0.1.1` — public release verified on 2026-10-19; see the desktop release evidence above. |
 | Privacy Policy URL | No, but applicable when user data is collected | Publish the reviewed privacy section from the companion policy and use its final public URL. Do not imply that a proposed URL already exists. |
 | Wikipedia URL (optional) | No | Leave blank; no article has been verified. |
 | Tagline | Yes | Use the text below. |
@@ -97,11 +124,11 @@ Mihomo Optimized provides a desktop interface for managing user-selected proxy c
 
 This is an early-stage independent project. We provide public source history, documented upstream provenance, release records, checksums and automated Windows build and acceptance-test results for review. We do not claim a large independent user base or transfer the upstream project's reputation to this derivative. The Windows tests cover the installed WebView2 interface, configuration recovery, proxy restoration, service lifecycle and isolated TUN traffic. Please evaluate this evidence and advise whether further project history or usage evidence is needed for admission.
 
-Evidence links to verify before submission:
+Public evidence links; recheck their availability before submission:
 
 - Public source: <https://github.com/chummumm/mihomo-optimized>
 - Release history: <https://github.com/chummumm/mihomo-optimized/releases>
-- Desktop release, **publication status to verify**: <https://github.com/chummumm/mihomo-optimized/releases/tag/mihomo-desktop-v0.1.1>
+- Published desktop 0.1.1 release: <https://github.com/chummumm/mihomo-optimized/releases/tag/mihomo-desktop-v0.1.1>; exact source, successful run and download checks are recorded in [Evidence about the desktop release](#evidence-about-the-desktop-release).
 - Desktop build history: <https://github.com/chummumm/mihomo-optimized/actions/workflows/windows-desktop.yml>
 - Initial desktop implementation review: <https://github.com/chummumm/mihomo-optimized/pull/49>
 

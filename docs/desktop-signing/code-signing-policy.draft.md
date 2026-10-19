@@ -8,9 +8,9 @@ Prepared: 2026-10-19
 
 This is a proposed policy for a SignPath Foundation application. **No application submission, Foundation acceptance, certificate availability, or completed MFA verification is asserted by this document.** Production SignPath signing is not enabled by publishing this draft.
 
-The proposed desktop repair release is [`mihomo-desktop-v0.1.1`](https://github.com/chummumm/mihomo-optimized/releases/tag/mihomo-desktop-v0.1.1). It has not yet been built or inspected for signatures. Its publication status must be verified before the link is used as application evidence.
+The desktop repair release [`mihomo-desktop-v0.1.1`](https://github.com/chummumm/mihomo-optimized/releases/tag/mihomo-desktop-v0.1.1) is publicly published. Its publication metadata, exact source commits, successful Windows build and acceptance run, and public-download hashes are recorded in the application draft's [desktop release evidence](signpath-application.md#evidence-about-the-desktop-release).
 
-Static inspection of the earlier desktop **0.1.0 samples** found empty PE certificate tables in the installer and the three project-built executables inside its portable ZIP. Their SHA256 manifest establishes file identity, not a Windows publisher signature. This earlier check does not establish the signature status of the future 0.1.1 artifacts.
+Static inspection of the published **0.1.1** installer and the three project-built executables inside its portable ZIP found empty PE certificate tables. The linked evidence records the exact checked files and scope; this was not Windows certificate-chain or timestamp validation. SHA256 and GitHub/Sigstore build attestations do not establish a Windows publisher signature. This release does not use SignPath signing, and the application remains unsubmitted and unapproved.
 
 After acceptance and actual use of Foundation signing, the live policy and release pages will carry this attribution:
 
