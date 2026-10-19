@@ -14,8 +14,12 @@ use windows_sys::Win32::{
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            ConvertStringSidToSidW, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo,
+            EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE,
+            SE_KERNEL_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
         },
-        GetTokenInformation, SetFileSecurityW, TokenUser, DACL_SECURITY_INFORMATION,
+        GetTokenInformation, IsValidAcl, SetFileSecurityW, TokenUser, DACL_SECURITY_INFORMATION,
+        NO_INHERITANCE,
         PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
     },
     System::{
@@ -136,6 +140,94 @@ pub fn process_path(pid: u32) -> Result<PathBuf> {
         Ok(PathBuf::from(String::from_utf16_lossy(
             &buffer[..size as usize],
         )))
+    }
+}
+
+/// Let the configured desktop user authenticate this SYSTEM service's image path.
+/// Merge only limited process-query access; retain the existing DACL entries,
+/// owner, token permissions and integrity label. Call before accepting clients.
+pub fn allow_service_identity_query(owner_sid: &str) -> Result<()> {
+    unsafe {
+        let mut sid = std::ptr::null_mut();
+        if ConvertStringSidToSidW(wide(owner_sid).as_ptr(), &mut sid) == 0 {
+            return Err(last_error("无法读取服务查询用户"));
+        }
+        let mut descriptor = std::ptr::null_mut();
+        let mut old_acl = std::ptr::null_mut();
+        let mut new_acl = std::ptr::null_mut();
+        let result = (|| {
+            // GetCurrentProcess returns a pseudo handle; it must not be closed.
+            let process = GetCurrentProcess();
+            let code = GetSecurityInfo(
+                process,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut old_acl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            );
+            if code != 0 {
+                return Err(AppError::io(
+                    "无法读取服务进程访问控制",
+                    std::io::Error::from_raw_os_error(code as i32),
+                ));
+            }
+            if old_acl.is_null() || IsValidAcl(old_acl) == 0 || (*old_acl).AceCount == 0 {
+                return Err(AppError::new(
+                    "service_identity_acl_invalid",
+                    "服务进程访问控制无效，已停止启动",
+                ));
+            }
+            let entry = EXPLICIT_ACCESS_W {
+                grfAccessPermissions: PROCESS_QUERY_LIMITED_INFORMATION,
+                grfAccessMode: GRANT_ACCESS,
+                grfInheritance: NO_INHERITANCE,
+                Trustee: TRUSTEE_W {
+                    pMultipleTrustee: std::ptr::null_mut(),
+                    MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                    TrusteeForm: TRUSTEE_IS_SID,
+                    TrusteeType: TRUSTEE_IS_USER,
+                    ptstrName: sid.cast(),
+                },
+            };
+            let code = SetEntriesInAclW(1, &entry, old_acl, &mut new_acl);
+            if code != 0 {
+                return Err(AppError::io(
+                    "无法合并服务进程查询权限",
+                    std::io::Error::from_raw_os_error(code as i32),
+                ));
+            }
+            // A null DACL would grant full access to everyone. Never pass one.
+            if new_acl.is_null() || IsValidAcl(new_acl) == 0 {
+                return Err(AppError::new(
+                    "service_identity_acl_invalid",
+                    "服务进程查询权限无效，已停止启动",
+                ));
+            }
+            let code = SetSecurityInfo(
+                process,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                new_acl,
+                std::ptr::null_mut(),
+            );
+            if code != 0 {
+                return Err(AppError::io(
+                    "无法设置服务进程查询权限",
+                    std::io::Error::from_raw_os_error(code as i32),
+                ));
+            }
+            Ok(())
+        })();
+        // old_acl is owned by descriptor, not a separate allocation.
+        LocalFree(new_acl.cast());
+        LocalFree(descriptor);
+        LocalFree(sid);
+        result
     }
 }
 

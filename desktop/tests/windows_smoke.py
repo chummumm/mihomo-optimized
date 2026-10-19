@@ -9,6 +9,9 @@ and https://learn.microsoft.com/en-us/microsoft-edge/webdriver/capabilities-edge
 setup-windows.ps1 supplies MIHOMO_TEST_APP and MIHOMO_TEST_DRIVER. This test changes
 the runner's own proxy/autostart settings and installs the app's TUN service; it
 refuses to run outside a disposable GitHub Actions Windows runner.
+An elevated supervisor handles installation/cleanup. EdgeDriver and the actual
+GUI use a same-SID filtered primary token at medium integrity; this is not an
+interactive UAC-consent test or a separate standard-user-account test.
 """
 
 from __future__ import annotations
@@ -29,7 +32,6 @@ import socketserver
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from urllib.parse import quote, urlsplit
@@ -268,6 +270,177 @@ class Processes:
             self.api.CloseHandle(handle)
 
 
+class RestrictedProcess:
+    """Own the exact process handle returned by CreateProcessAsUser."""
+
+    def __init__(self, handle, pid: int, arguments: list[str]) -> None:
+        self.handle, self.pid, self.arguments = handle, pid, arguments
+        self.returncode = None
+
+    def poll(self) -> int | None:
+        import win32event
+        import win32process
+
+        if self.handle is not None:
+            state = win32event.WaitForSingleObject(self.handle, 0)
+            require(state in (win32event.WAIT_OBJECT_0, win32event.WAIT_TIMEOUT), "restricted_process_wait_failed")
+            if state == win32event.WAIT_OBJECT_0:
+                self.returncode = win32process.GetExitCodeProcess(self.handle)
+        return self.returncode
+
+    def wait(self, timeout: float) -> int:
+        import win32event
+
+        if self.poll() is None:
+            state = win32event.WaitForSingleObject(self.handle, int(timeout * 1000))
+            if state == win32event.WAIT_TIMEOUT:
+                raise subprocess.TimeoutExpired(self.arguments, timeout)
+            require(state == win32event.WAIT_OBJECT_0, "restricted_process_wait_failed")
+        result = self.poll()
+        require(result is not None, "restricted_process_exit_code_missing")
+        return result
+
+    def close(self) -> None:
+        import pywintypes
+        import win32process
+
+        if self.handle is None:
+            return
+        try:
+            if self.poll() is None:
+                try:
+                    win32process.TerminateProcess(self.handle, 87)
+                except pywintypes.error:
+                    # The owned process may have exited since poll().
+                    if self.poll() is None:
+                        raise
+                self.wait(5)
+        finally:
+            self.handle.Close()
+            self.handle = None
+
+
+class RestrictedDesktop:
+    """Simulate a filtered administrator of the same SID, not a second account.
+
+    Hosted Windows runners disable UAC, so a linked token is not assumed. The
+    administrator supervisor retains installation and cleanup responsibilities.
+    """
+
+    def __init__(self) -> None:
+        import pywintypes
+        import win32api
+        import win32security
+
+        self.token = None
+        source = None
+        stage = "open_supervisor_token"
+        try:
+            source = win32security.OpenProcessToken(win32api.GetCurrentProcess(),
+                win32security.TOKEN_QUERY | win32security.TOKEN_DUPLICATE
+                | win32security.TOKEN_ASSIGN_PRIMARY | win32security.TOKEN_ADJUST_DEFAULT)
+            user = win32security.GetTokenInformation(source, win32security.TokenUser)[0]
+            self.sid = win32security.ConvertSidToStringSid(user)
+            administrator = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
+            stage = "create_restricted_token"
+            # LUA_TOKEN is 0x4 in winnt.h; pywin32 311 does not export that flag.
+            self.token = win32security.CreateRestrictedToken(source,
+                win32security.DISABLE_MAX_PRIVILEGE | 0x4, [(administrator, 0)], None, None)
+            stage = "set_medium_integrity"
+            medium = win32security.ConvertStringSidToSid("S-1-16-8192")
+            win32security.SetTokenInformation(self.token, win32security.TokenIntegrityLevel,
+                                             (medium, win32security.SE_GROUP_INTEGRITY))
+            self.check_token(self.token)
+        except BaseException as error:
+            self.close()
+            if isinstance(error, pywintypes.error):
+                raise SmokeFailure(f"{stage}_winerror_{error.winerror}") from None
+            raise
+        finally:
+            if source is not None:
+                source.Close()
+
+    def check_token(self, token) -> dict:
+        import win32security
+
+        user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+        require(win32security.ConvertSidToStringSid(user) == self.sid, "restricted_user_sid_changed")
+        require(win32security.GetTokenInformation(token, win32security.TokenType) == 1,
+                "restricted_token_not_primary")
+        groups = win32security.GetTokenInformation(token, win32security.TokenGroups)
+        administrators = [attributes for sid, attributes in groups
+                          if win32security.ConvertSidToStringSid(sid) == "S-1-5-32-544"]
+        require(len(administrators) == 1
+                and not administrators[0] & win32security.SE_GROUP_ENABLED
+                and administrators[0] & win32security.SE_GROUP_USE_FOR_DENY_ONLY,
+                "gui_administrator_sid_not_deny_only")
+        integrity = win32security.GetTokenInformation(token, win32security.TokenIntegrityLevel)[0]
+        require(win32security.ConvertSidToStringSid(integrity) == "S-1-16-8192", "gui_not_medium_integrity")
+        debug = win32security.LookupPrivilegeValue(None, "SeDebugPrivilege")
+        privileges = win32security.GetTokenInformation(token, win32security.TokenPrivileges)
+        debug_enabled = any(luid == debug and attributes & win32security.SE_PRIVILEGE_ENABLED
+                            for luid, attributes in privileges)
+        require(not debug_enabled, "gui_debug_privilege_enabled")
+        return {"mode": "same_sid_filtered_primary", "sameUserSid": True,
+                "administratorEnabled": False, "administratorDenyOnly": True,
+                "integrity": "medium", "seDebugPrivilegeEnabled": False}
+
+    def check_process(self, process) -> dict:
+        import win32security
+
+        token = win32security.OpenProcessToken(process, win32security.TOKEN_QUERY)
+        try:
+            return self.check_token(token)
+        finally:
+            token.Close()
+
+    def check_gui(self, expected: ProcessIdentity, processes: Processes) -> dict:
+        import win32api
+
+        process = win32api.OpenProcess(0x1000, False, expected.pid)
+        try:
+            require(processes.from_handle(int(process), expected.pid) == expected, "gui_identity_changed_before_token_check")
+            return self.check_process(process)
+        finally:
+            process.Close()
+
+    def spawn(self, arguments: list[str], cwd: Path) -> RestrictedProcess:
+        import pywintypes
+        import win32con
+        import win32process
+
+        process = thread = None
+        stage = "create_restricted_process"
+        try:
+            startup = win32process.STARTUPINFO()
+            startup.lpDesktop = r"winsta0\default"
+            # No supervisor handles or ambient credentials reach the child.
+            # Start suspended to inspect even a short-lived second instance.
+            process, thread, pid, _tid = win32process.CreateProcessAsUser(
+                self.token, arguments[0], subprocess.list2cmdline(arguments), None, None, False,
+                win32con.CREATE_SUSPENDED | win32con.CREATE_NO_WINDOW,
+                child_environment(), str(cwd), startup)
+            stage = "inspect_restricted_process"
+            self.check_process(process)
+            stage = "resume_restricted_process"
+            require(win32process.ResumeThread(thread) == 1, "restricted_process_resume_failed")
+            result = RestrictedProcess(process, pid, arguments)
+            process = None  # Ownership moves to the wrapper.
+            return result
+        except pywintypes.error as error:
+            raise SmokeFailure(f"{stage}_winerror_{error.winerror}") from None
+        finally:
+            if thread is not None:
+                thread.Close()
+            if process is not None:
+                RestrictedProcess(process, pid, arguments).close()
+
+    def close(self) -> None:
+        if self.token is not None:
+            self.token.Close()
+            self.token = None
+
+
 def read_autostart():
     import winreg
     try:
@@ -348,14 +521,11 @@ def owned_firewall_rule_count(core: Path) -> int:
 
 
 class WebViewDriver:
-    def __init__(self, driver: Path, app: Path, processes: Processes) -> None:
+    def __init__(self, driver: Path, app: Path, processes: Processes, desktop: RestrictedDesktop) -> None:
         self.port = free_port()
         self.session = None
-        self.output = tempfile.TemporaryFile()
         # EdgeDriver inherits Chromium's mutually exclusive log-level/silent flags.
-        self.process = subprocess.Popen([str(driver), f"--port={self.port}", "--log-level=SEVERE"],
-                                        stdin=subprocess.DEVNULL, stdout=self.output, stderr=subprocess.STDOUT,
-                                        env=child_environment(), creationflags=subprocess.CREATE_NO_WINDOW)
+        self.process = desktop.spawn([str(driver), f"--port={self.port}", "--log-level=SEVERE"], driver.parent)
         try:
             self.identity = processes.identity(self.process.pid)
             require(self.identity and self.identity.path == os.path.normcase(str(driver.resolve())), "edgedriver_process_mismatch")
@@ -441,14 +611,7 @@ class WebViewDriver:
             with contextlib.suppress(Exception):
                 self.request("DELETE", self.path(""), timeout=8)
             self.session = None
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
-        self.output.close()
+        self.process.close()
 
 
 def receive_exact(stream: socket.socket, count: int) -> bytes:
@@ -623,6 +786,7 @@ class Acceptance:
         self.proxy_before = self.wininet.read()
         self.autostart_before = read_autostart()
         self.original_files: dict[Path, bytes | None] = {}
+        self.desktop: RestrictedDesktop | None = None
         self.driver: WebViewDriver | None = None
         self.socks: SocksFixture | None = None
         self.gui: ProcessIdentity | None = None
@@ -648,6 +812,74 @@ class Acceptance:
 
     def phase(self, wanted: str) -> dict:
         return wait_until(lambda: (status if (status := self.status()).get("phase") == wanted else None), "core_phase_timeout_" + wanted)
+
+    def service_action(self, action: str) -> None:
+        # Hosted runners cannot exercise an interactive UAC consent prompt.
+        # Only installation/removal is elevated; all operational IPC uses GUI.
+        require(action in ("install", "uninstall"), "invalid_supervisor_service_action")
+        arguments = [str(self.helper), "--" + action]
+        if action == "install":
+            arguments += ["--owner-sid", self.desktop.sid]
+        result = subprocess.run(arguments, cwd=self.helper.parent, env=child_environment(),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=65, creationflags=subprocess.CREATE_NO_WINDOW)
+        require(result.returncode == 0, "supervisor_service_" + action + "_failed")
+
+    def service_process_access(self) -> dict:
+        """Exercise the owner-only query grant without using any mutation right."""
+        import pywintypes
+        import win32api
+        import win32security
+        import win32service
+
+        manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
+        try:
+            service = win32service.OpenService(manager, SERVICE_NAME, win32service.SERVICE_QUERY_STATUS)
+            try:
+                status = win32service.QueryServiceStatusEx(service)
+            finally:
+                win32service.CloseServiceHandle(service)
+        finally:
+            win32service.CloseServiceHandle(manager)
+        require(status["CurrentState"] == win32service.SERVICE_RUNNING and status["ProcessId"] > 0,
+                "service_identity_not_running")
+        pid = status["ProcessId"]
+        identity = self.processes.identity(pid)
+        require(identity and identity.path == os.path.normcase(str(self.helper.resolve())), "service_process_path_mismatch")
+        process = win32api.OpenProcess(0x1000, False, pid)
+        try:
+            token = win32security.OpenProcessToken(process, win32security.TOKEN_QUERY)
+            try:
+                user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+                require(win32security.ConvertSidToStringSid(user) == "S-1-5-18", "service_not_local_system")
+            finally:
+                token.Close()
+        finally:
+            process.Close()
+
+        denied = {"terminate": 0x0001, "vmRead": 0x0010, "vmWrite": 0x0020,
+                  "duplicateHandle": 0x0040, "writeDacl": 0x00040000}
+        win32security.ImpersonateLoggedOnUser(self.desktop.token)
+        try:
+            # The effective thread token now has the same restrictions as GUI.
+            process = win32api.OpenProcess(0x1000, False, pid)
+            try:
+                require(self.processes.from_handle(int(process), pid) == identity,
+                        "service_query_limited_identity_mismatch")
+            finally:
+                process.Close()
+            for name, access in denied.items():
+                try:
+                    unexpected = win32api.OpenProcess(access, False, pid)
+                except pywintypes.error as error:
+                    require(error.winerror == 5, "service_access_probe_unexpected_error_" + name)
+                else:
+                    unexpected.Close()
+                    raise SmokeFailure("service_excess_process_access_" + name)
+        finally:
+            win32security.RevertToSelf()
+        return {"serviceAccount": "LocalSystem", "caller": "same_sid_filtered_primary",
+                "queryLimitedInformation": True, "deniedRights": list(denied)}
 
     def managed_core(self, status: dict) -> dict:
         require(status.get("phase") == "running", "core_not_running")
@@ -772,11 +1004,15 @@ class Acceptance:
         self.ports.add(mixed)
         valid = profile(mixed, self.socks.server_address[1])
 
-        self.stage = "startup_recovery"
-        self.driver = WebViewDriver(self.driver_path, self.app, self.processes)
+        self.stage = "non_elevated_gui"
+        self.desktop = RestrictedDesktop()
+        self.driver = WebViewDriver(self.driver_path, self.app, self.processes, self.desktop)
         gui = wait_until(lambda: self.processes.at_paths([self.app]), "gui_process_not_found")
         require(len(gui) == 1, "multiple_gui_processes")
         self.gui = gui[0]
+        self.report["guiToken"] = self.desktop.check_gui(self.gui, self.processes)
+        self.mark("non_elevated_gui")
+        self.stage = "startup_recovery"
         wait_until(lambda: self.driver.execute("return typeof window.__TAURI_INTERNALS__?.invoke === 'function' && !!document.querySelector('.desktop-statusbar');"), "desktop_ui_not_loaded")
         failed = self.phase("error")
         require(bool(failed.get("lastError")) and failed.get("controller") is None, "startup_failure_not_reported")
@@ -828,8 +1064,7 @@ class Acceptance:
         self.driver.invoke("desktop_start")
         running = self.phase("running")
         identity = self.managed_core(running)
-        duplicate = subprocess.Popen([str(self.app)], cwd=self.app.parent, env=child_environment(),
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        duplicate = self.desktop.spawn([str(self.app)], self.app.parent)
         try:
             require(duplicate.wait(timeout=12) == 0, "second_instance_exit_failed")
         except subprocess.TimeoutExpired:
@@ -838,6 +1073,8 @@ class Acceptance:
                 self.processes.kill(instance)
                 duplicate.wait(timeout=5)
             raise SmokeFailure("second_instance_did_not_exit") from None
+        finally:
+            duplicate.close()
         require(self.status().get("controller") == running["controller"], "second_instance_changed_controller")
         require(self.managed_core(self.status()).get("pid") == identity.get("pid"), "second_instance_replaced_core")
         require(len(self.processes.at_paths([self.app])) == 1, "second_gui_survived")
@@ -852,13 +1089,19 @@ class Acceptance:
         tun = {}
         tun_core_pid = 0
         try:
-            installed = self.driver.invoke("desktop_install_service")
+            self.service_action("install")
+            installed = self.status()
             require(installed.get("service", {}).get("installed") and service_installed(), "tun_service_not_installed")
+            self.stage = "tun_service_identity"
+            self.report["serviceProcessAccess"] = self.service_process_access()
+            self.report["tunGuiToken"] = self.desktop.check_gui(self.gui, self.processes)
             self.driver.invoke("desktop_set_tun", {"enabled": True})
             self.driver.invoke("desktop_start")
             tun = self.phase("running")
             require(tun.get("tun") is True and tun.get("service", {}).get("running") is True, "tun_service_not_running")
             tun_core_pid = self.managed_core(tun)["pid"]
+            self.mark("tun_service_identity")
+            self.stage = "tun_forwarding"
             wait_until(self.socks.roundtrip, "tun_forwarding_timeout")
             require(owned_firewall_rule_count(self.core) == 1, "tun_firewall_rule_not_installed")
         except Exception:
@@ -874,7 +1117,7 @@ class Acceptance:
         self.stage = "stop_cleanup"
         self.driver.invoke("desktop_stop")
         self.driver.invoke("desktop_set_tun", {"enabled": False})
-        self.driver.invoke("desktop_uninstall_service")
+        self.service_action("uninstall")
         wait_until(lambda: not service_installed(), "tun_service_not_removed")
         require(owned_firewall_rule_count(self.core) == 0, "tun_firewall_rule_not_removed")
         wait_until(lambda: not self.processes.at_paths([self.core]) and all(not listening(port) for port in self.ports), "core_survived_stop")
@@ -919,10 +1162,7 @@ class Acceptance:
             attempt("driver_close", self.driver.close)
         if self.service_owned:
             def uninstall():
-                result = subprocess.run([str(self.helper), "--uninstall"], stdin=subprocess.DEVNULL,
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                        timeout=65, creationflags=subprocess.CREATE_NO_WINDOW)
-                require(result.returncode == 0, "cleanup_service_uninstall_failed")
+                self.service_action("uninstall")
                 wait_until(lambda: not service_installed(), "cleanup_service_still_installed", 15)
             attempt("service_uninstall", uninstall)
         for identity in self.processes.at_paths([self.app, self.core, self.helper]):
@@ -949,6 +1189,8 @@ class Acceptance:
         attempt("service_cleanup_check", lambda: require(not service_installed(), "owned_service_remains"))
         if self.service_owned:
             attempt("firewall_cleanup_check", lambda: require(owned_firewall_rule_count(self.core) == 0, "owned_firewall_rule_remains"))
+        if self.desktop:
+            attempt("restricted_token_close", self.desktop.close)
         self.report["tests"]["final_cleanup"] = not errors
         self.report["diagnostics"].extend({"stage": "cleanup", "code": code} for code in errors)
         print("FAIL: final_cleanup" if errors else "PASS: final_cleanup", flush=True)
@@ -987,7 +1229,8 @@ def main() -> int:
             except Exception as error:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": "unexpected_" + type(error).__name__})
             required = {"startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
-                        "single_instance_and_webview2_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup"}
+                        "single_instance_and_webview2_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
+                        "non_elevated_gui", "tun_service_identity"}
             acceptance.report["passed"] = all(acceptance.report["tests"].get(name) is True for name in required) and not acceptance.report["diagnostics"]
             (artifacts / "verification.json").write_text(json.dumps(acceptance.report, indent=2) + "\n", encoding="utf-8")
     return 0 if acceptance and acceptance.report["passed"] else 1

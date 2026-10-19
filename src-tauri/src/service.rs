@@ -337,6 +337,7 @@ fn run_service() -> Result<()> {
         if !valid_user_sid(owner) {
             return Err(AppError::new("invalid_owner", "服务所有者记录损坏"));
         }
+        windows::allow_service_identity_query(owner)?;
         let server = Server::new(owner.into(), directory.join("mihomo-optimized.exe"))?;
         let mut core = CoreSupervisor::new(
             directory.join("mihomo-core.exe"),

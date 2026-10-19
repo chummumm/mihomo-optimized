@@ -1,6 +1,6 @@
 [package]
 name = "mihomo-desktop"
-version = "0.1.0"
+version = "0.1.1"
 description = "Windows desktop host for Mihomo Optimized"
 edition = "2021"
 rust-version = "1.85"
