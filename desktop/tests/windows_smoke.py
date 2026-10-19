@@ -347,6 +347,17 @@ class RestrictedDesktop:
             # LUA_TOKEN is 0x4 in winnt.h; pywin32 311 does not export that flag.
             self.token = win32security.CreateRestrictedToken(source,
                 win32security.DISABLE_MAX_PRIVILEGE | 0x4, [(administrator, 0)], None, None)
+            stage = "set_restricted_default_dacl"
+            default_dacl = win32security.GetTokenInformation(self.token, win32security.TokenDefaultDacl)
+            require(default_dacl is not None and default_dacl.IsValid(), "restricted_default_dacl_invalid")
+            original_ace_count = default_dacl.GetAceCount()
+            # A filtered administrator must retain access to its own newly
+            # created objects. Preserve every existing ACE and add only TokenUser.
+            default_dacl.AddAccessAllowedAceEx(default_dacl.GetAclRevision(), 0, 0x10000000,
+                win32security.GetTokenInformation(self.token, win32security.TokenUser)[0])  # GENERIC_ALL
+            require(default_dacl.IsValid() and default_dacl.GetAceCount() == original_ace_count + 1,
+                    "restricted_default_dacl_merge_invalid")
+            win32security.SetTokenInformation(self.token, win32security.TokenDefaultDacl, default_dacl)
             stage = "set_medium_integrity"
             medium = win32security.ConvertStringSidToSid("S-1-16-8192")
             win32security.SetTokenInformation(self.token, win32security.TokenIntegrityLevel,
