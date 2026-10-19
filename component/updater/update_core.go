@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/desktop"
 	mihomoHttp "github.com/metacubex/mihomo/component/http"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -77,6 +78,13 @@ func (u *CoreUpdater) updateContext(ctx context.Context, currentExePath string, 
 }
 
 func (u *CoreUpdater) updateTransaction(ctx context.Context, currentExePath string, channel string, force bool, automatic *coreAutomaticUpdate, manual *coreManualUpdate) (err error) {
+	if desktop.Enabled() {
+		// A reserved manual caller already holds the gate.
+		if manual != nil {
+			u.mu.Unlock()
+		}
+		return desktop.ErrManaged
+	}
 	if manual == nil && !u.mu.TryLock() {
 		return ErrCoreUpdateBusy
 	}

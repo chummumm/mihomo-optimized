@@ -19,6 +19,7 @@ import (
 
 	"github.com/metacubex/mihomo/common/cmd"
 	"github.com/metacubex/mihomo/component/age"
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/component/generator"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/config"
@@ -35,6 +36,7 @@ import (
 var (
 	version                       bool
 	testConfig                    bool
+	desktopManaged                bool
 	geodataMode                   bool
 	homeDir                       string
 	configFile                    string
@@ -75,6 +77,8 @@ func init() {
 	flag.BoolVar(&geodataMode, "m", false, "set geodata mode")
 	flag.BoolVar(&version, "v", false, "show current version of mihomo")
 	flag.BoolVar(&testConfig, "t", false, "test configuration and exit")
+	managedEnv, _ := strconv.ParseBool(os.Getenv("CLASH_DESKTOP_MANAGED"))
+	flag.BoolVar(&desktopManaged, "desktop-managed", managedEnv, "delegate process and program updates to a desktop supervisor")
 }
 
 func main() {
@@ -131,6 +135,17 @@ func main() {
 		}
 		C.SetHomeDir(homeDir)
 	}
+	if desktopManaged {
+		if configString != "" || configFile == "-" || postUp != "" || postDown != "" {
+			log.Fatalln("desktop-managed requires a configuration file and does not allow post-up/post-down scripts")
+			return
+		}
+		if err := desktop.Enable(desktop.Options{Home: homeDir, Controller: externalController, Secret: secret}); err != nil {
+			log.Fatalln("%s", err)
+			return
+		}
+		C.SetHomeDir(desktop.Home())
+	}
 
 	if geodataMode {
 		geodata.SetGeodataMode(true)
@@ -167,6 +182,10 @@ func main() {
 			configFile = filepath.Join(C.Path.HomeDir(), C.Path.Config())
 		}
 		C.SetConfig(configFile)
+		if err := desktop.CheckPath(configFile); err != nil {
+			log.Fatalln("Invalid managed configuration path: %s", err)
+			return
+		}
 
 		if err := config.Init(C.Path.HomeDir()); err != nil {
 			log.Fatalln("Initial configuration directory error: %s", err.Error())
@@ -250,6 +269,9 @@ func runDaemon(options []hub.Option) error {
 	select {
 	case <-stopRequests:
 		return nil
+	case <-desktop.ShutdownRequests():
+		executor.RequestShutdown()
+		return nil
 	default:
 	}
 	if postUp != "" {
@@ -260,6 +282,9 @@ func runDaemon(options []hub.Option) error {
 	for {
 		select {
 		case <-stopRequests:
+			return nil
+		case <-desktop.ShutdownRequests():
+			executor.RequestShutdown()
 			return nil
 		case <-hupSign:
 			if err := hub.Parse(configBytes, options...); err != nil {

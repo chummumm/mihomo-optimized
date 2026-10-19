@@ -4,12 +4,19 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/metacubex/mihomo/component/desktop"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 )
 
 // Init prepare necessary files
 func Init(dir string) error {
+	if err := desktop.CheckPath(dir); err != nil {
+		return err
+	}
+	if err := desktop.CheckPath(C.Path.Config()); err != nil {
+		return err
+	}
 	// initial homedir
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		if err := os.MkdirAll(dir, 0o777); err != nil {

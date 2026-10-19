@@ -14,7 +14,7 @@ case "${1:-test}" in
     CGO_ENABLED=0 go test -tags with_gvisor -count=1 -timeout=5m \
       ./adapter ./common/arc/... ./common/lru/... ./common/net/... ./common/singleflight/... ./component/trie/... ./component/fakeip/... ./component/dnsmessage/... ./component/dnsstats/... ./component/process/... ./component/resolver/... ./component/resource/... ./component/geodata/... ./component/mmdb/... ./component/updater/... ./context/... ./dns/... ./listener/sing_tun/... ./transport/socks4/... ./transport/socks5/... \
       ./tunnel/... ./rules/logic/... ./rules/provider/... ./adapter/provider/... ./config/... \
-      ./hub/route/... ./hub/executor/...
+      ./hub/route/... ./hub/executor/... ./component/desktop/...
     CGO_ENABLED=0 go test -tags with_gvisor -count=1 -timeout=5m \
       . ./component/transparentproxy ./component/dialer ./listener ./listener/redir ./listener/tproxy
     CGO_ENABLED=1 go test -race -tags with_gvisor -count=1 -timeout=5m \

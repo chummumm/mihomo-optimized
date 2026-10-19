@@ -16,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/component/ech"
 	"github.com/metacubex/mihomo/component/updater"
 	C "github.com/metacubex/mihomo/constant"
@@ -94,6 +95,14 @@ func (c Cors) Apply(r chi.Router) {
 }
 
 func ReCreateServer(cfg *Config) {
+	if desktop.Enabled() {
+		owned := *cfg
+		owned.Addr, owned.Secret = desktop.Controller()
+		owned.TLSAddr, owned.UnixAddr, owned.PipeAddr, owned.DohServer = "", "", "", ""
+		owned.RoutingMark, owned.IsDebug = 0, false
+		owned.Cors = Cors{AllowOrigins: desktop.AllowedOrigins()}
+		cfg = &owned
+	}
 	go start(cfg)
 	go startTLS(cfg)
 	go startUnix(cfg)
@@ -107,6 +116,11 @@ func ReCreateServer(cfg *Config) {
 func SetUIPath(_ string) {}
 
 func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
+	if desktop.Enabled() {
+		_, secret = desktop.Controller()
+		isDebug, dohServer = false, ""
+		cors = Cors{AllowOrigins: desktop.AllowedOrigins()}
+	}
 	r := chi.NewRouter()
 	r.Use(configFileNoStore)
 	cors.Apply(r)
@@ -130,6 +144,9 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 		r.Get("/traffic", traffic)
 		r.Get("/memory", memory)
 		r.Get("/version", version)
+		if desktop.Enabled() {
+			r.Mount("/desktop", desktopRouter())
+		}
 		r.Mount("/configs", configRouter())
 		r.Mount("/proxies", proxyRouter())
 		r.Mount("/group", groupRouter())
@@ -148,13 +165,15 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 
 	})
 
-	r.Group(func(r chi.Router) {
-		fs := http.StripPrefix("/ui", http.FileServer(uiFileSystem{root: updater.UIPath()}))
-		r.Get("/ui", http.RedirectHandler("/ui/", http.StatusTemporaryRedirect).ServeHTTP)
-		r.Get("/ui/*", func(w http.ResponseWriter, r *http.Request) {
-			fs.ServeHTTP(w, r)
+	if !desktop.Enabled() {
+		r.Group(func(r chi.Router) {
+			fs := http.StripPrefix("/ui", http.FileServer(uiFileSystem{root: updater.UIPath()}))
+			r.Get("/ui", http.RedirectHandler("/ui/", http.StatusTemporaryRedirect).ServeHTTP)
+			r.Get("/ui/*", func(w http.ResponseWriter, r *http.Request) {
+				fs.ServeHTTP(w, r)
+			})
 		})
-	})
+	}
 	if len(dohServer) > 0 && dohServer[0] == '/' {
 		r.Mount(dohServer, dohRouter())
 	}

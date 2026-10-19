@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -179,11 +180,18 @@ func (c *zeroTierPacketConn) WriteTo(packet []byte, destination net.Addr) (int, 
 }
 
 func (f zeroTierStateFS) Open(name string) (fs.File, error) {
-	return os.Open(filepath.Join(f.directory, filepath.FromSlash(name)))
+	path := filepath.Join(f.directory, filepath.FromSlash(name))
+	if err := desktop.CheckPath(path); err != nil {
+		return nil, err
+	}
+	return os.Open(path)
 }
 
 func (f zeroTierStateFS) WriteFile(name string, data []byte, perm fs.FileMode) error {
 	path := filepath.Join(f.directory, filepath.FromSlash(name))
+	if err := desktop.CheckPath(path); err != nil {
+		return err
+	}
 	err := os.MkdirAll(filepath.Dir(path), 0700)
 	if err == nil {
 		err = os.WriteFile(path, data, perm)
@@ -195,7 +203,11 @@ func (f zeroTierStateFS) WriteFile(name string, data []byte, perm fs.FileMode) e
 }
 
 func (f zeroTierStateFS) Remove(name string) error {
-	return os.Remove(filepath.Join(f.directory, filepath.FromSlash(name)))
+	path := filepath.Join(f.directory, filepath.FromSlash(name))
+	if err := desktop.CheckPath(path); err != nil {
+		return err
+	}
+	return os.Remove(path)
 }
 
 func NewZeroTier(option ZeroTierOption) (*ZeroTier, error) {
@@ -471,6 +483,9 @@ func (z *ZeroTier) startLocked() error {
 	z.stateMu.RUnlock()
 	if started {
 		return nil
+	}
+	if err := desktop.CheckPath(z.option.StateDir); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(z.option.StateDir, 0700); err != nil {
 		return err

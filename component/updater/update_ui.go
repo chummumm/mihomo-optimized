@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/metacubex/mihomo/component/desktop"
 	mihomoHttp "github.com/metacubex/mihomo/component/http"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -176,8 +177,8 @@ func NewFixedUIUpdater(autoUpdate bool, updateInterval int) *UIUpdater {
 		updateInterval = defaultUIUpdateInterval
 	}
 	return &UIUpdater{
-		externalUIURL: UIArchiveURL, externalUIPath: UIPath(), autoDownloadUI: true,
-		autoUpdateUI: autoUpdate, updateInterval: updateInterval,
+		externalUIURL: UIArchiveURL, externalUIPath: UIPath(), autoDownloadUI: !desktop.Enabled(),
+		autoUpdateUI: autoUpdate && !desktop.Enabled(), updateInterval: updateInterval,
 	}
 }
 
@@ -217,6 +218,9 @@ func (u *UIUpdater) operationContext(parent context.Context, limit time.Duration
 }
 
 func (u *UIUpdater) Status(ctx context.Context, check bool) UIUpdateStatus {
+	if desktop.Enabled() {
+		return UIUpdateStatus{Reason: "desktop_managed"}
+	}
 	state := u.state()
 	s := UIUpdateStatus{Updating: state.updating.Load(), AutoUpdate: u.AutoUpdate(), UpdateInterval: u.UpdateInterval(), NextCheck: u.nextAutomaticCheck()}
 	if u.externalUIPath == "" {
@@ -265,6 +269,9 @@ func (u *UIUpdater) check(ctx context.Context) (uiSnapshot, error) {
 // belongs to its automatic policy, so disabling or rescheduling that policy also
 // interrupts its download without canceling a manual installation.
 func (u *UIUpdater) checkWithLifetime(ctx, lifetime context.Context) (uiSnapshot, error) {
+	if desktop.Enabled() {
+		return uiSnapshot{}, desktop.ErrManaged
+	}
 	state, key := u.state(), u.key()
 	for {
 		if err := ctx.Err(); err != nil {
@@ -618,7 +625,7 @@ func (u *UIUpdater) StartAutoDownloadUI() {
 }
 
 func (u *UIUpdater) needsInitialDownload() bool {
-	if !u.autoDownloadUI {
+	if desktop.Enabled() || !u.autoDownloadUI {
 		return false
 	}
 	entries, err := os.ReadDir(u.externalUIPath)
@@ -677,6 +684,9 @@ func (u *UIUpdater) installUIContext(ctx context.Context, onlyNewer, onlyEmpty b
 }
 
 func (u *UIUpdater) installUICheckContext(ctx context.Context, onlyNewer, onlyEmpty bool, result *UIUpdateResult) (err error) {
+	if desktop.Enabled() {
+		return desktop.ErrManaged
+	}
 	state, key := u.state(), u.key()
 	if !state.operation.TryLock() {
 		return ErrUIUpdateBusy

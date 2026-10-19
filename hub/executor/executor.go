@@ -19,6 +19,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/component/auth"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/dnsstats"
 	"github.com/metacubex/mihomo/component/geodata"
@@ -74,6 +75,9 @@ var updaterResetDone <-chan struct{}
 var dnsResolverOwner *dns.Resolvers
 
 func readConfig(path string) ([]byte, error) {
+	if err := desktop.CheckPath(path); err != nil {
+		return nil, err
+	}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil, err
 	}
@@ -116,6 +120,7 @@ func ApplyConfig(cfg *config.Config, force bool) error {
 	if ShutdownRequested() {
 		return ErrShuttingDown
 	}
+	config.ApplyDesktopPolicy(cfg)
 	wasManaged := transparentproxy.IsEnabled()
 	if err := beginTransparentProxyApply(cfg.General.TransparentProxy, transparentProxyRuntime(cfg)); err != nil {
 		return fmt.Errorf("apply transparent-proxy: %w", err)

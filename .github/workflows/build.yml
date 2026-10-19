@@ -291,6 +291,8 @@ jobs:
         run: go test -tags with_gvisor -count=1 -timeout=5m ./component/updater ./component/resource ./component/mmdb ./component/geodata ./rules/provider
       - name: Verify native configuration editing and private UI staging
         run: go test -tags with_gvisor -count=1 -timeout=5m ./hub/route -run 'ConfigFile|UIUpdater|UnifiedUpgrade|UpgradeSchedule'
+      - name: Verify desktop supervisor authentication, confinement and lifecycle contracts
+        run: go test -tags with_gvisor -count=1 -timeout=3m ./component/desktop ./hub/route . -run Desktop
 
   release:
     name: Publish GitHub release

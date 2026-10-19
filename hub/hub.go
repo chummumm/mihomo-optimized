@@ -53,6 +53,7 @@ func WithSecret(secret string) Option {
 
 // ApplyConfig dispatch configure to all parts include ExternalController
 func ApplyConfig(cfg *config.Config) error {
+	config.ApplyDesktopPolicy(cfg)
 	if err := executor.ApplyConfig(cfg, true); err != nil {
 		return err
 	}

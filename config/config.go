@@ -673,6 +673,7 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 }
 
 func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+	applyDesktopRawPolicy(rawCfg)
 	var parsed *Config
 	err := geodata.WithInitializationContext(context.Background(), nil, func() (err error) {
 		parsed, err = parseRawConfig(rawCfg)
