@@ -285,7 +285,8 @@ def owned_firewall_rule_count(core: Path) -> int:
     environment["MIHOMO_DIAG_CORE"] = str(core)
     result = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", r"""
 $ErrorActionPreference = 'Stop'
-$rules = @(Get-NetFirewallApplicationFilter -Program $env:MIHOMO_DIAG_CORE -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'com.chummumm.mihomo-optimized.tun.tcp.*' -and $_.Group -eq 'Mihomo Optimized TUN' })
+$policy = New-Object -ComObject HNetCfg.FwPolicy2
+$rules = @($policy.Rules | Where-Object { $_.Name -like 'com.chummumm.mihomo-optimized.tun.tcp.*' -and $_.Grouping -eq 'Mihomo Optimized TUN' -and $_.ApplicationName -eq $env:MIHOMO_DIAG_CORE })
 $rules.Count | ConvertTo-Json -Compress
 """], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             timeout=15, env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -623,10 +624,27 @@ class Acceptance:
 
     def capture_tun_failure(self, status: dict, core_pid: int) -> None:
         """Keep bounded observations before cleanup removes the failing route."""
-        evidence = {"fixture": self.socks.diagnostics()}
+        evidence = {"fixture": self.socks.diagnostics(),
+                    "host": {"phase": status.get("phase"), "service": status.get("service")}}
         self.report["tunDiagnostics"] = evidence
         print("TUN fixture: " + json.dumps(evidence["fixture"], sort_keys=True), flush=True)
-        controller = status.get("controller", {})
+        # Capture the helper's failure before a successful cleanup overwrites it.
+        try:
+            native_log = Path(os.environ["PROGRAMDATA"]) / "Mihomo Optimized" / "service" / "firewall-status.json"
+            with native_log.open("rb") as log:
+                payload = log.read(4097)
+            require(len(payload) <= 4096, "diagnostic_firewall_status_too_large")
+            native = json.loads(payload)
+            require(all(isinstance(native.get(key), str) and re.fullmatch(r"[a-zA-Z0-9_]{1,80}", native[key])
+                        for key in ("stage", "code")), "diagnostic_firewall_status_invalid")
+            hresult = native.get("hresult")
+            require(hresult is None or isinstance(hresult, str) and re.fullmatch(r"0x[0-9a-fA-F]{8}", hresult),
+                    "diagnostic_firewall_hresult_invalid")
+            evidence["nativeFirewall"] = {"stage": native["stage"], "code": native["code"], "hresult": hresult}
+            print("TUN native firewall: " + json.dumps(evidence["nativeFirewall"], sort_keys=True), flush=True)
+        except Exception as error:
+            evidence["nativeFirewallDiagnosticError"] = type(error).__name__
+        controller = status.get("controller") or {}
         try:
             url = urlsplit(controller.get("url", ""))
             require(url.hostname == "127.0.0.1" and url.port, "diagnostic_controller_invalid")
@@ -661,12 +679,16 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*Mihomo*' -or $_.InterfaceDescription -like '*Wintun*' } | Select-Object -First 8 Name, ifIndex, Status, InterfaceDescription)
-$rules = @(Get-NetFirewallApplicationFilter -Program $env:MIHOMO_DIAG_CORE -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'com.chummumm.mihomo-optimized.tun.tcp.*' -and $_.Group -eq 'Mihomo Optimized TUN' } | Select-Object -First 8 Name, DisplayName, Group, Enabled, Direction, Action, Profile, EdgeTraversalPolicy)
+$policy = New-Object -ComObject HNetCfg.FwPolicy2
+$rules = @($policy.Rules | Where-Object { $_.Name -like 'com.chummumm.mihomo-optimized.tun.tcp.*' -and $_.Grouping -eq 'Mihomo Optimized TUN' -and $_.ApplicationName -eq $env:MIHOMO_DIAG_CORE } | Select-Object -First 8 Name, Grouping, ApplicationName, Enabled, Direction, Action, Profiles, Protocol, EdgeTraversal)
+$profiles = @(1, 2, 4 | ForEach-Object { [ordered]@{ type = $_; enabled = $policy.FirewallEnabled($_); defaultInboundAction = $policy.DefaultInboundAction($_) } })
+$listeners = @()
+if ([int]$env:MIHOMO_DIAG_PID -gt 0) { $listeners = @(Get-NetTCPConnection -OwningProcess ([int]$env:MIHOMO_DIAG_PID) -State Listen -ErrorAction SilentlyContinue | Select-Object -First 8 LocalAddress, LocalPort, OwningProcess) }
 [ordered]@{
   route = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '198.18.77.77/32' -ErrorAction SilentlyContinue | Select-Object -First 8 DestinationPrefix, InterfaceAlias, ifIndex, NextHop, RouteMetric)
   adapters = $adapters
-  coreListeners = @(Get-NetTCPConnection -OwningProcess ([int]$env:MIHOMO_DIAG_PID) -State Listen -ErrorAction SilentlyContinue | Select-Object -First 8 LocalAddress, LocalPort, OwningProcess)
-  firewallProfiles = @(Get-NetFirewallProfile | Select-Object Name, Enabled, DefaultInboundAction)
+  coreListeners = $listeners
+  firewallProfiles = $profiles
   coreFirewallRules = $rules
 } | ConvertTo-Json -Depth 5 -Compress
 """], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -678,7 +700,6 @@ $rules = @(Get-NetFirewallApplicationFilter -Program $env:MIHOMO_DIAG_CORE -Erro
 
         try:
             directory = Path(os.environ["PROGRAMDATA"]) / "Mihomo Optimized" / "service" / "logs"
-            require(Path(status["logPath"]).resolve() == directory.resolve(), "diagnostic_log_directory_mismatch")
             with (directory / "core.log").open("rb") as log:
                 log.seek(0, os.SEEK_END)
                 log.seek(max(0, log.tell() - 64 * 1024))
@@ -792,18 +813,22 @@ $rules = @(Get-NetFirewallApplicationFilter -Program $env:MIHOMO_DIAG_CORE -Erro
         self.driver.invoke("desktop_stop")
         self.driver.invoke("desktop_set_system_proxy", {"enabled": False})
         self.service_owned = True  # Includes partial installation on a failed IPC.
-        installed = self.driver.invoke("desktop_install_service")
-        require(installed.get("service", {}).get("installed") and service_installed(), "tun_service_not_installed")
-        self.driver.invoke("desktop_set_tun", {"enabled": True})
-        self.driver.invoke("desktop_start")
-        tun = self.phase("running")
-        require(tun.get("tun") is True and tun.get("service", {}).get("running") is True, "tun_service_not_running")
-        tun_core = self.managed_core(tun)
+        tun = {}
+        tun_core_pid = 0
         try:
+            installed = self.driver.invoke("desktop_install_service")
+            require(installed.get("service", {}).get("installed") and service_installed(), "tun_service_not_installed")
+            self.driver.invoke("desktop_set_tun", {"enabled": True})
+            self.driver.invoke("desktop_start")
+            tun = self.phase("running")
+            require(tun.get("tun") is True and tun.get("service", {}).get("running") is True, "tun_service_not_running")
+            tun_core_pid = self.managed_core(tun)["pid"]
             require(owned_firewall_rule_count(self.core) == 1, "tun_firewall_rule_not_installed")
             wait_until(self.socks.roundtrip, "tun_forwarding_timeout")
         except Exception:
-            self.capture_tun_failure(tun, tun_core["pid"])
+            with contextlib.suppress(Exception):
+                tun = self.status()
+            self.capture_tun_failure(tun, tun_core_pid)
             raise
         with self.socks.lock:
             require(all(target == (TUN_TARGET, 80) for target in self.socks.targets), "tun_fixture_received_unexpected_target")

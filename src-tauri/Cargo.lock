@@ -2085,6 +2085,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",
+ "windows",
  "windows-service",
  "windows-sys 0.61.2",
  "winreg 0.55.0",

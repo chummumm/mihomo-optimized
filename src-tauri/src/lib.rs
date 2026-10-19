@@ -6,6 +6,8 @@ pub mod core;
 pub mod desktop;
 pub mod error;
 #[cfg(windows)]
+mod firewall;
+#[cfg(windows)]
 pub mod proxy;
 #[cfg(windows)]
 pub mod service;
