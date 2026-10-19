@@ -1,3 +1,4 @@
+import { isPageVisible } from '../../lib/activity'
 import { useEffect, useRef } from 'react'
 
 import { formatRate } from '@components'
@@ -258,7 +259,7 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
         let lastFrame: number | undefined
         const loop = (now: number) => {
             frame = 0
-            if (!visible || document.hidden || !element.isConnected) return
+            if (!visible || !isPageVisible() || !element.isConnected) return
             if (lastFrame === undefined || now - lastFrame >= 1000 / 30) {
                 draw(now)
                 dirty = false
@@ -274,7 +275,7 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
         const invalidate = () => {
             dirty = true
             clearTimeout(expiration)
-            if (frame === 0 && visible && !document.hidden) frame = requestAnimationFrame(loop)
+            if (frame === 0 && visible && isPageVisible()) frame = requestAnimationFrame(loop)
         }
         const stop = () => {
             cancelAnimationFrame(frame)
@@ -307,7 +308,7 @@ export function ThroughputChart ({ samples, updatedAt, label, now: nowLabel, nam
             invalidate()
         }
         const onVisibility = () => {
-            if (document.hidden) { hoverX = null; stop() }
+            if (!isPageVisible()) { hoverX = null; stop() }
             else invalidate()
         }
         element.addEventListener('pointermove', onMove)

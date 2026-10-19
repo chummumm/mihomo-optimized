@@ -14,8 +14,12 @@ import SideBar from '@containers/Sidebar'
 import { isClashX } from '@lib/jsBridge'
 import { useLogsStreamReader } from '@stores'
 
+import { DesktopDialogs, DesktopExitGuard, DesktopStatusBar, DesktopUnavailable } from '../platform/DesktopUI'
+import { isDesktop, useDesktop } from '../platform/desktop'
+
 export default function App () {
     useLogsStreamReader()
+    const desktop = useDesktop()
 
     const location = useLocation()
 
@@ -30,14 +34,17 @@ export default function App () {
     ]
 
     const layout = (
-        <div className={classnames('app', { 'not-clashx': !isClashX() })}>
+        <div className={classnames('app', { 'not-clashx': !isClashX(), 'is-desktop': isDesktop() })}>
             <SideBar routes={routes} />
             <main className="page-container">
+                {isDesktop() && <DesktopStatusBar />}
                 <div className="route-view" key={location.pathname}>
-                    <Outlet />
+                    {isDesktop() && desktop.status?.phase !== 'running' && location.pathname !== '/settings'
+                        ? <DesktopUnavailable />
+                        : <Outlet />}
                 </div>
             </main>
-            <ExternalControllerModal />
+            {isDesktop() ? <><DesktopDialogs /><DesktopExitGuard /></> : <ExternalControllerModal />}
         </div>
     )
 

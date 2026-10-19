@@ -21,13 +21,14 @@ export interface ButtonSelectProps<T = string> extends BaseComponentProps {
 
     // accessible name of the group
     label?: string
+    disabled?: boolean
 
     // select callback
     onSelect?: (value: T) => void
 }
 
 export function ButtonSelect (props: ButtonSelectProps) {
-    const { options, value, onSelect, label, className } = props
+    const { options, value, onSelect, label, className, disabled = false } = props
     const indicator = useId()
 
     return (
@@ -38,6 +39,7 @@ export function ButtonSelect (props: ButtonSelectProps) {
                         type="button"
                         value={option.value}
                         key={option.value}
+                        disabled={disabled}
                         aria-pressed={value === option.value}
                         className={classnames('button-select-options', { actived: value === option.value })}
                         onClick={() => onSelect?.(option.value)}>

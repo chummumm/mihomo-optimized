@@ -1,5 +1,6 @@
 import type { Snapshot } from './request'
 import { StreamReader } from './streamer'
+import { isPageVisible } from './activity'
 
 export interface ConnectionSnapshot extends Snapshot {
     stream: {
@@ -44,7 +45,7 @@ export class ConnectionStreamReader extends StreamReader<ConnectionSnapshot> {
 
     private refreshPage = () => {
         const active = this.enabled && !this.pageHidden && !this.frozen &&
-            this.page?.document.visibilityState !== 'hidden'
+            this.page !== undefined && isPageVisible(this.page.document)
         const url = active ? this.pageURL : ''
         if (!url && !this.url) return
         super.connect(url)

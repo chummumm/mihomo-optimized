@@ -22,6 +22,7 @@ import type * as Models from '@models'
 import { LOG_HISTORY_LIMIT, type Log } from '@models/Log'
 
 import { currentClientAtom, useAPIInfo, useClient } from './request'
+import { isDesktop, useDesktop } from '../platform/desktop'
 
 // A controller switch hides old data immediately. Writers retain the client
 // that started their operation, so late requests and callbacks cannot publish
@@ -286,6 +287,7 @@ const logsAtom = atom(new StreamReader<Log>({ bufferLength: LOG_HISTORY_LIMIT })
 
 export function useLogsStreamReader () {
     const apiInfo = useAPIInfo()
+    const desktop = useDesktop()
     const { general } = useGeneral()
     const { data: { logLevel } } = useConfig()
     const item = useAtomValue(logsAtom)
@@ -298,15 +300,15 @@ export function useLogsStreamReader () {
     const apiInfoRef = useSyncedRef(apiInfo)
 
     useEffect(() => {
-        if (!level || level.toLowerCase() === 'silent') {
+        const apiInfo = apiInfoRef.current
+        if (!apiInfo.enabled || (isDesktop() && !desktop.visible) || !level || level.toLowerCase() === 'silent') {
             item.connect('')
             return
         }
-        const apiInfo = apiInfoRef.current
         const protocol = apiInfo.protocol === 'http:' ? 'ws:' : 'wss:'
         const logUrl = `${protocol}//${apiInfo.hostname}:${apiInfo.port}/logs?level=${level}&token=${encodeURIComponent(apiInfo.secret)}`
         item.connect(logUrl)
-    }, [apiInfoRef, item, level, previousKey])
+    }, [apiInfo.enabled, desktop.visible, apiInfoRef, item, level, previousKey])
 
     return item
 }
@@ -315,7 +317,7 @@ export function useConnectionStreamReader (enabled = true) {
     const apiInfo = useAPIInfo()
 
     const protocol = apiInfo.protocol === 'http:' ? 'ws:' : 'wss:'
-    const url = `${protocol}//${apiInfo.hostname}:${apiInfo.port}/connections?token=${encodeURIComponent(apiInfo.secret)}`
+    const url = apiInfo.enabled ? `${protocol}//${apiInfo.hostname}:${apiInfo.port}/connections?token=${encodeURIComponent(apiInfo.secret)}` : ''
 
     const connection = useMemo(() => ({ url, reader: new ConnectionStreamReader() }), [url])
 

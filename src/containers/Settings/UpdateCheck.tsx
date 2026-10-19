@@ -1,3 +1,4 @@
+import { isPageVisible } from '../../lib/activity'
 import classnames from 'classnames'
 import { useSetAtom } from 'jotai'
 import { motion } from 'motion/react'
@@ -103,13 +104,13 @@ function UpdateRow ({ item, label, version, idle, clock, stale, uncertain = fals
     </div>
 }
 
-export function UpdateCheck ({ client, kernelVersion }: { client: Client, kernelVersion: string }) {
+export function UpdateCheck ({ client, kernelVersion, resourcesOnly = false }: { client: Client, kernelVersion: string, resourcesOnly?: boolean }) {
     const { translation } = useI18n()
     const { t } = translation('Settings')
     const task = useUpdateTask(client)
     const [, refreshClock] = useState(0)
     useEffect(() => {
-        const refresh = () => { if (!document.hidden) refreshClock(value => value + 1) }
+        const refresh = () => { if (isPageVisible()) refreshClock(value => value + 1) }
         const timer = window.setInterval(refresh, 30000)
         document.addEventListener('visibilitychange', refresh)
         return () => {
@@ -187,19 +188,19 @@ export function UpdateCheck ({ client, kernelVersion }: { client: Client, kernel
     }
 
     return <Card className="settings-card settings-update" aria-busy={busy}>
-        <UpdateRow item={completedCore} label={t('update.kernel')} version={currentCore?.current_version ? currentCore.current_version : task.loading ? '' : kernelVersion} idle={idle} clock={clock} stale={staleSchedule} uncertain={task.restart === 'unconfirmed' || task.unconfirmedStart} />
-        <UpdateRow item={ui} label={t('update.dashboard')} version={__UI_VERSION__} idle={idle} clock={clock} stale={staleSchedule} uncertain={task.restart !== undefined || task.unconfirmedStart} />
-        {uiInstalled && uiInstalled !== __UI_VERSION__ && <div className="settings-update-installed">
+        {!resourcesOnly && <UpdateRow item={completedCore} label={t('update.kernel')} version={currentCore?.current_version ? currentCore.current_version : task.loading ? '' : kernelVersion} idle={idle} clock={clock} stale={staleSchedule} uncertain={task.restart === 'unconfirmed' || task.unconfirmedStart} />}
+        {!resourcesOnly && <UpdateRow item={ui} label={t('update.dashboard')} version={__UI_VERSION__} idle={idle} clock={clock} stale={staleSchedule} uncertain={task.restart !== undefined || task.unconfirmedStart} />}
+        {!resourcesOnly && uiInstalled && uiInstalled !== __UI_VERSION__ && <div className="settings-update-installed">
             <span>{t('update.installedVersion')} {uiInstalled}</span>
             {reloadAvailable && <button type="button" className="settings-update-link" onClick={() => window.location.reload()}>{t('update.reloadPage')}<Icon type="update" size={12} /></button>}
         </div>}
         {group(geodata, t('update.geodata'))}
         {group(providers, t('update.ruleProviders'))}
         <div className="settings-update-sources">
-            <span>{t('update.policyHint')}</span>
+            <span>{resourcesOnly ? translation('Desktop').t('resourcesHint') : t('update.policyHint')}</span>
             <span>{t('update.scheduleHint')}</span>
-            <a className="settings-update-link" href={RELEASES} target="_blank" rel="noreferrer noopener">{t('update.coreReleases')}<Icon type="arrow-square-out" size={12} /></a>
-            <a className="settings-update-link" href={DASHBOARD_SOURCE} target="_blank" rel="noreferrer noopener">{t('update.uiReleases')}<Icon type="arrow-square-out" size={12} /></a>
+            {!resourcesOnly && <a className="settings-update-link" href={RELEASES} target="_blank" rel="noreferrer noopener">{t('update.coreReleases')}<Icon type="arrow-square-out" size={12} /></a>}
+            {!resourcesOnly && <a className="settings-update-link" href={DASHBOARD_SOURCE} target="_blank" rel="noreferrer noopener">{t('update.uiReleases')}<Icon type="arrow-square-out" size={12} /></a>}
         </div>
         <div className="settings-row settings-row-action settings-update-footer">
             <span className="settings-update-summary" role={task.problem && !task.disconnected ? 'alert' : 'status'}>

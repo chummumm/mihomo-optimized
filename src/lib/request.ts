@@ -3,6 +3,9 @@ import axios, { type AxiosInstance } from 'axios'
 import type { DNSObservability, DNSQueries, DNSQueryParams, DNSStats, DNSUpstreams } from '@containers/DNS/types'
 import type { UpdateSnapshot } from '@containers/Settings/update-state'
 
+import { invokeConfig, isDesktop } from '../platform/desktop'
+import type { DesktopConfigDocument } from '../platform/model'
+
 import { DEFAULT_PROBE_URL, normalizeProbeURL } from './probe'
 
 export interface Config {
@@ -120,11 +123,17 @@ export interface Connections {
 export class Client {
     private readonly axiosClient: AxiosInstance
 
-    constructor (url: string, secret?: string) {
+    constructor (url: string, secret?: string, enabled = true) {
         this.axiosClient = axios.create({
             baseURL: url,
             headers: secret ? { Authorization: `Bearer ${secret}` } : {},
         })
+        if (!enabled) {
+            // Never try a default controller while the managed core is stopped.
+            this.axiosClient.interceptors.request.use(() => {
+                throw new Error('Local core is not running')
+            })
+        }
     }
 
     async getConfig () {
@@ -132,20 +141,30 @@ export class Client {
     }
 
     async updateConfig (config: Partial<Config>) {
+        if (isDesktop()) {
+            await invokeConfig('desktop_patch_config', { patch: config })
+            return { data: undefined }
+        }
         return await this.axiosClient.patch<void>('configs', config)
     }
 
     async reloadConfig (signal?: AbortSignal, force = false) {
+        if (isDesktop()) {
+            await invokeConfig('desktop_reload_config', { force }, signal)
+            return { data: undefined }
+        }
         // The core may still finish after a timeout. Callers report an
         // unconfirmed reload and retain the saved file for an explicit retry.
         return await this.axiosClient.put<void>('configs', {}, { signal, timeout: 30000, params: force ? { force: true } : undefined })
     }
 
     async getConfigFile (signal?: AbortSignal) {
+        if (isDesktop()) return { data: await invokeConfig<DesktopConfigDocument>('desktop_read_config', undefined, signal) }
         return await this.axiosClient.get<ConfigFile>('configs/file', { signal, timeout: 15000 })
     }
 
     async saveConfigFile (content: string, revision: string, signal?: AbortSignal) {
+        if (isDesktop()) return { data: await invokeConfig<DesktopConfigDocument>('desktop_save_config', { content, expectedRevision: revision }, signal) }
         return await this.axiosClient.put<ConfigFile>('configs/file', { content, revision }, { signal, timeout: 30000 })
     }
 

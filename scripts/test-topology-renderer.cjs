@@ -9,6 +9,10 @@ const filename = path.resolve(__dirname, '../src/containers/Proxies/components/T
 const compiled = ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
 }).outputText
+const activityFilename = path.resolve(__dirname, '../src/lib/activity.ts')
+const activityCompiled = ts.transpileModule(fs.readFileSync(activityFilename, 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+}).outputText
 
 class Events {
     listeners = new Map()
@@ -114,6 +118,12 @@ function fixture({ dark = false, bitmaps = false } = {}) {
         getComputedStyle() { return { getPropertyValue: name => name === '--panel-solid' ? (dark ? '#0c1426' : '#ffffff') : '#0090c4' } },
         ...(bitmaps ? { OffscreenCanvas } : {}),
     })
+    const activityModule = { exports: {} }
+    vm.runInContext(`(function (module, exports) { ${activityCompiled} })`, context, { filename: activityFilename })(activityModule, activityModule.exports)
+    context.require = name => {
+        assert.equal(name, '../../../../lib/activity')
+        return activityModule.exports
+    }
     vm.runInContext(compiled, context, { filename })
     const picked = []
     const renderer = new module.exports.TopologyRenderer(canvas, tooltip, { onPick: target => picked.push(target) })

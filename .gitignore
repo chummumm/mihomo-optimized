@@ -9,3 +9,13 @@ tests/**/*.jsx
 CLAUDE.md
 CLAUDE.local.md
 .impeccable/
+dist-desktop/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
+src-tauri/resources/build-info.json
+src-tauri/resources/licenses/
+desktop-cache/
+core-src/
+__pycache__/

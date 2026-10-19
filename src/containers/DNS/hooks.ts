@@ -2,10 +2,9 @@ import { isAxiosError } from 'axios'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { useI18n } from '@stores'
+import { isPageVisible } from '../../lib/activity'
 
 export type DNSError = 'unsupported' | 'unauthorized' | 'network'
-
-const isPageVisible = () => document.visibilityState !== 'hidden'
 
 interface Resource<T> {
     data?: T

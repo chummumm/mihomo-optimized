@@ -1,0 +1,10 @@
+{
+  "githubCli": {
+    "version": "2.102.0",
+    "url": "https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_windows_amd64.zip",
+    "sha256": "ae64e556ecc240b200f7eba60d550e4bb60d78e860e69dd88c449405b86067f4",
+    "linuxUrl": "https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz",
+    "linuxSha256": "bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386",
+    "purpose": "Offline verification of GitHub Actions artifact attestations"
+  }
+}

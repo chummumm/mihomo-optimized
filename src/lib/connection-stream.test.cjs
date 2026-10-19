@@ -273,3 +273,27 @@ test('ordinary log streams retain their original delivery, buffer and lifecycle 
     assert.equal(f.document.listenerCount(), 0)
     reader.destory()
 })
+
+test('native window hiding pauses statistics even when WebView visibility remains visible', () => {
+    const f = fixture()
+    let nativeHidden = false
+    f.document.documentElement = { getAttribute: name => name === 'data-desktop-hidden' ? String(nativeHidden) : null }
+    const received = []
+    f.reader.subscribe('data', values => received.push(...values))
+    f.reader.connectWhenVisible(URL_A)
+    f.sockets[0].message(snapshot([], 1))
+    const baseline = received[0].stream.generation
+    nativeHidden = true
+    f.document.emit('visibilitychange')
+    assert.equal(f.document.visibilityState, 'visible')
+    assert.equal(f.sockets[0].readyState, 3)
+    f.sockets[0].message(snapshot([], 99))
+    assert.equal(received.length, 1)
+    f.document.emit('resume')
+    assert.equal(f.sockets.length, 1, 'page lifecycle cannot bypass the native hidden state')
+    nativeHidden = false
+    f.document.emit('visibilitychange')
+    f.sockets[1].message(snapshot([], 2))
+    assert.ok(received[1].stream.generation > baseline, 'native resume establishes a fresh rate baseline')
+    f.reader.destory()
+})

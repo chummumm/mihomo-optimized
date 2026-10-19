@@ -1,3 +1,4 @@
+import { isPageVisible } from '../../lib/activity'
 import { useLayoutEffect, useMemo, useSyncExternalStore } from 'react'
 
 import type * as API from '@lib/request'
@@ -96,10 +97,10 @@ export class ConnectionsStore {
         const delay = Math.max(0, PUBLICATION_INTERVAL_MS - (performance.now() - this.lastPublishedAt))
         this.publication = setTimeout(() => {
             this.publication = undefined
-            if (document.hidden) return
+            if (!isPageVisible()) return
             this.frame = requestAnimationFrame(() => {
                 this.frame = undefined
-                if (!document.hidden) this.publish()
+                if (isPageVisible()) this.publish()
             })
         }, delay)
     }
@@ -261,7 +262,7 @@ export class ConnectionsStore {
         this.stale = undefined
         this.clock.reset()
         this.clearRate()
-        if (publish && !document.hidden) this.schedulePublication()
+        if (publish && isPageVisible()) this.schedulePublication()
     }
 
     clearHistory = () => {

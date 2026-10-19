@@ -1,3 +1,4 @@
+import { isPageVisible } from '../../lib/activity'
 import axios from 'axios'
 import { useEffect, useRef, useState } from 'react'
 
@@ -58,7 +59,7 @@ export function useUpdateTask (client: Client) {
 
     function schedule (current: Session, delay = 1500) {
         clearTimeout(current.timer)
-        if (current.abort.signal.aborted || document.hidden) return
+        if (current.abort.signal.aborted || !isPageVisible()) return
         current.timer = setTimeout(() => { void read(current) }, delay)
     }
 
@@ -118,7 +119,7 @@ export function useUpdateTask (client: Client) {
         setState({ client, view: INITIAL })
         void read(current)
         const visible = () => {
-            if (document.hidden) clearTimeout(current.timer)
+            if (!isPageVisible()) clearTimeout(current.timer)
             else void read(current)
         }
         document.addEventListener('visibilitychange', visible)

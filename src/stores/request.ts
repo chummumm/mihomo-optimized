@@ -7,6 +7,9 @@ import { isIP } from '@lib/ip'
 import { isClashX, jsBridge } from '@lib/jsBridge'
 import { Client } from '@lib/request'
 
+import { isDesktop, useDesktop } from '../platform/desktop'
+import { desktopAPIInfo } from '../platform/model'
+
 const clashxConfigAtom = atom(async () => {
     if (!isClashX()) {
         return null
@@ -47,26 +50,34 @@ function getControllerFromLocation (): string | null {
 }
 
 // jotai v2 use initialValue first avoid hydration warning, but we don't want that
-const hostsStorageOrigin = localStorage.getItem('externalControllers') ??
+const hostsStorageOrigin = isDesktop() ? '[]' : localStorage.getItem('externalControllers') ??
     getControllerFromLocation() ??
     '[{ "hostname": "127.0.0.1", "port": 7890, "secret": "" }]'
-const hostSelectIdxStorageOrigin = localStorage.getItem('externalControllerIndex') ?? '0'
+const hostSelectIdxStorageOrigin = isDesktop() ? '0' : localStorage.getItem('externalControllerIndex') ?? '0'
 
-export const hostsStorageAtom = atomWithStorage<Array<{
+type ControllerHosts = Array<{
     hostname: string
     port: string
     secret: string
-}>>('externalControllers', JSON.parse(hostsStorageOrigin))
-export const hostSelectIdxStorageAtom = atomWithStorage<number>('externalControllerIndex', parseInt(hostSelectIdxStorageOrigin))
+}>
+export const hostsStorageAtom = isDesktop()
+    ? atom<ControllerHosts>([])
+    : atomWithStorage<ControllerHosts>('externalControllers', JSON.parse(hostsStorageOrigin))
+export const hostSelectIdxStorageAtom = isDesktop()
+    ? atom(0)
+    : atomWithStorage<number>('externalControllerIndex', parseInt(hostSelectIdxStorageOrigin))
 
 export function useAPIInfo () {
+    const desktop = useDesktop()
     const clashx = useAtomValue(clashxConfigAtom)
     const location = useLocation()
     const hostSelectIdxStorage = useAtomValue(hostSelectIdxStorageAtom)
     const hostsStorage = useAtomValue(hostsStorageAtom)
 
+    if (isDesktop()) return desktopAPIInfo(desktop.status)
+
     if (clashx != null) {
-        return clashx
+        return { ...clashx, enabled: true }
     }
 
     let url: URL | undefined
@@ -85,7 +96,7 @@ export function useAPIInfo () {
     const secret = qs.get('secret') ?? hostsStorage?.[hostSelectIdxStorage]?.secret ?? url?.username ?? ''
     const protocol = controllerProtocol(qs.get('protocol'), hostname, url?.protocol, window.location.protocol)
 
-    return { hostname, port, secret, protocol }
+    return { hostname, port, secret, protocol, enabled: true }
 }
 
 const clientAtom = atom({
@@ -103,16 +114,26 @@ export function useClient () {
         port,
         secret,
         protocol,
+        enabled,
     } = useAPIInfo()
 
     const [item, setItem] = useAtom(clientAtom)
-    const key = `${protocol}//${hostname}:${port}?secret=${secret}`
+    const key = `${protocol}//${hostname}:${port}?secret=${secret}&enabled=${enabled}`
     if (item.key === key) {
         return item.instance!
     }
 
-    const client = new Client(`${protocol}//${hostname}:${port}`, secret)
+    const client = new Client(`${protocol}//${hostname}:${port}`, secret, enabled)
     setItem({ key, instance: client })
 
     return client
+}
+
+// Editing the persistent source file must survive a managed core restart.
+// HTTP clients still rotate to invalidate stale data for the running controller.
+const nativeConfigClient = new Client('http://127.0.0.1:1', undefined, false)
+
+export function useConfigClient () {
+    const client = useClient()
+    return isDesktop() ? nativeConfigClient : client
 }
