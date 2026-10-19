@@ -1,0 +1,70 @@
+name: Windows desktop diagnostics
+
+on:
+  push:
+    branches: [codex/windows-gui-diagnostics]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-desktop-diagnostics
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    name: Exercise existing 0.1.1 candidate with non-elevated GUI
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned Windows API bindings
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311
+      - name: Download the exact already-built candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: mihomo-desktop-windows-x64
+          run-id: 39206154968
+          github-token: ${{ github.token }}
+          path: artifacts/desktop
+      - name: Verify candidate identity and package hashes
+        shell: python
+        run: |
+          import hashlib, json, pathlib, re
+          root = pathlib.Path('artifacts/desktop')
+          info = json.loads((root / 'build-info.json').read_text())
+          assert info['repository'] == 'chummumm/mihomo-optimized'
+          assert info['desktopVersion'] == '0.1.1'
+          assert info['uiCommit'] == '0c5b2fdf63e9928d07b54776f129a0229cd3fa49'
+          assert info['coreCommit'] == 'e16270b1a00b3ea3a6b999760655f4299c4ffcdb'
+          assert info['coreDirty'] is False
+          expected = {'README.zh-CN.md', 'build-info.json',
+                      'mihomo-desktop-0.1.1-windows-x64-setup.exe',
+                      'mihomo-desktop-0.1.1-windows-x64-portable.zip'}
+          seen = set()
+          for line in (root / 'SHA256SUMS').read_text().splitlines():
+              digest, name = line.split('  ', 1)
+              assert re.fullmatch('[a-f0-9]{64}', digest)
+              assert name in expected and name not in seen
+              assert hashlib.sha256((root / name).read_bytes()).hexdigest() == digest
+              seen.add(name)
+          assert seen == expected
+      - name: Install candidate and matching WebView2 driver
+        run: ./desktop/tests/setup-windows.ps1
+      - name: Diagnose non-elevated GUI and exercise TUN
+        run: python desktop/tests/windows_smoke.py
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-desktop-diagnostics
+          path: artifacts/verification/
+          if-no-files-found: ignore
+          retention-days: 14
