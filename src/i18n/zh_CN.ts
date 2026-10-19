@@ -1,4 +1,7 @@
+import { desktopCN } from '../platform/translations'
+
 const CN = {
+    Desktop: desktopCN,
     SideBar: {
         Proxies: '代理',
         Overview: '总览',

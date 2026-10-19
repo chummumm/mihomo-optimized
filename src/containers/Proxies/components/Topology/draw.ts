@@ -1,3 +1,4 @@
+import { isPageVisible } from '../../../../lib/activity'
 // Canvas renderer for the live traffic map: sources on the left, policy groups in
 // the middle, exits on the right. Links thicken with traffic and carry particles
 // whose rate and speed follow it. Boxes ease to new places when the ranking changes.
@@ -381,7 +382,7 @@ export class TopologyRenderer {
     }
 
     private readonly onVisibility = () => {
-        if (!this.visible || document.hidden) {
+        if (!this.visible || !isPageVisible()) {
             cancelAnimationFrame(this.frame)
             this.running = false
             this.particles.length = 0
@@ -459,14 +460,14 @@ export class TopologyRenderer {
     }
 
     private schedule () {
-        if (this.destroyed || this.running || !this.visible || document.hidden) return
+        if (this.destroyed || this.running || !this.visible || !isPageVisible()) return
         this.running = true
         this.last = performance.now()
         this.frame = requestAnimationFrame(this.tick)
     }
 
     private readonly tick = (now: number) => {
-        if (this.destroyed || !this.visible || document.hidden || !this.canvas.isConnected) {
+        if (this.destroyed || !this.visible || !isPageVisible() || !this.canvas.isConnected) {
             this.running = false
             return
         }

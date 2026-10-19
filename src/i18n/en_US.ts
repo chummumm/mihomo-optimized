@@ -1,4 +1,7 @@
+import { desktopEN } from '../platform/translations'
+
 const EN = {
+    Desktop: desktopEN,
     SideBar: {
         Proxies: 'Proxies',
         Overview: 'Overview',

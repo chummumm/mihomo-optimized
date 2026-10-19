@@ -13,6 +13,7 @@ export default defineConfig(
     env => ({
         define: {
             __UI_VERSION__: JSON.stringify(version),
+            __DESKTOP__: env.mode === 'desktop',
         },
         plugins: [
             // only use react-fresh
@@ -20,7 +21,7 @@ export default defineConfig(
                 babel: { plugins: [jotaiDebugLabel, jotaiReactRefresh] },
             }),
             tsConfigPath(),
-            VitePWA({
+            env.mode !== 'desktop' && VitePWA({
                 injectRegister: 'inline',
                 registerType: 'autoUpdate',
                 manifest: {

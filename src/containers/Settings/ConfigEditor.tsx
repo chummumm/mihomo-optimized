@@ -5,7 +5,10 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 
 import { Button, Icon, Modal, springs } from '@components'
 import { type Client } from '@lib/request'
-import { useClient, useGeneral, useI18n } from '@stores'
+import { useConfigClient, useGeneral, useI18n } from '@stores'
+
+import { isDesktop, useDesktop, useDesktopDirty } from '../../platform/desktop'
+import { DesktopError } from '../../platform/model'
 
 import { MAX_CONFIG_FILE_BYTES, configCursor, configDisplayText, configFits, configLineStarts, configSaveText, readConfigFile, type EditableConfigFile } from './config-editor-model'
 import './config-editor.css'
@@ -18,6 +21,14 @@ interface ConfigEditorProps {
 type EditorError = 'unsupported' | 'unauthorized' | 'fileAccess' | 'readOnly' | 'tooLarge' | 'invalid' | 'conflict' | 'format' | 'path' | 'busy' | 'network' | 'invalidResponse' | 'reloadInvalid' | 'reload'
 
 function classifyError (reason: unknown): EditorError {
+    if (reason instanceof DesktopError) {
+        const errors: Record<string, EditorError> = {
+            config_conflict: 'conflict', config_read_only: 'readOnly', config_too_large: 'tooLarge',
+            config_invalid: 'invalid', config_missing: 'fileAccess', reload_invalid: 'reloadInvalid',
+            desktop_busy: 'busy', config_busy: 'busy', config_path: 'path',
+        }
+        return errors[reason.code] ?? 'network'
+    }
     const status = axios.isAxiosError(reason) ? reason.response?.status : undefined
     if (status === 404 || status === 405) return 'unsupported'
     if (status === 403 && axios.isAxiosError(reason) && reason.response?.data?.code === 'config_file_read_only') return 'readOnly'
@@ -35,7 +46,7 @@ function classifyError (reason: unknown): EditorError {
 }
 
 export function ConfigEditor ({ show, onClose }: ConfigEditorProps) {
-    const client = useClient()
+    const client = useConfigClient()
     const { translation } = useI18n()
     const { t } = translation('Settings')
     const closeHandler = useRef<(() => void) | null>(null)
@@ -62,6 +73,8 @@ function EditorSession ({ client, onClose, closeHandler }: {
     const { translation } = useI18n()
     const { t } = translation('Settings')
     const { update: fetchGeneral } = useGeneral()
+    const { t: td } = translation('Desktop')
+    const desktop = useDesktop()
     const [file, setFile] = useState<EditableConfigFile | null>(null)
     const [text, setText] = useState('')
     const [cursor, setCursor] = useState({ line: 1, column: 1 })
@@ -86,6 +99,8 @@ function EditorSession ({ client, onClose, closeHandler }: {
     const lines = useMemo(() => configLineStarts(text), [text])
     const limit = file?.max_size ?? MAX_CONFIG_FILE_BYTES
     const readOnly = file?.writable === false
+
+    useDesktopDirty('config-editor', dirty, saving)
 
     const load = useCallback(async () => {
         if (requestRef.current !== null) return
@@ -251,7 +266,7 @@ function EditorSession ({ client, onClose, closeHandler }: {
         } catch (reason) {
             if (!active.current || request.signal.aborted || requestRef.current !== request) return
             const error = fileSaved
-                ? axios.isAxiosError(reason) && reason.response?.status === 400 ? 'reloadInvalid' : 'reload'
+                ? (axios.isAxiosError(reason) && reason.response?.status === 400) || (reason instanceof DesktopError && (reason.code === 'reload_invalid' || reason.code === 'config_invalid')) ? 'reloadInvalid' : 'reload'
                 : classifyError(reason)
             setProblem(error)
             if (error === 'conflict') setConflict(true)
@@ -326,7 +341,7 @@ function EditorSession ({ client, onClose, closeHandler }: {
                 </span>
             </div>
             <div className={classnames('config-editor-notice', { 'is-error': problem !== null, 'is-saved': saved })} role={problem !== null ? 'alert' : 'status'}>
-                {problem !== null ? t(`editor.errors.${problem}`) : readOnly ? t('editor.readOnlyNote') : saved ? t('editor.saved') : t('editor.note')}
+                {problem !== null ? t(`editor.errors.${problem}`) : readOnly ? t('editor.readOnlyNote') : saved ? (isDesktop() && desktop.status?.phase !== 'running' ? td('configSavedStopped') : t('editor.saved')) : t('editor.note')}
             </div>
             <div className={classnames('config-editor-frame', { 'is-held': confirmation !== null })} aria-busy={loading || saving}>
                 <pre ref={lineMeasure} className="config-editor-line-measure" aria-hidden="true">{'0\n0\n0\n0\n0\n0\n0\n0'}</pre>

@@ -9,7 +9,12 @@ import { type Lang } from '@i18n'
 import { useObject } from '@lib/hook'
 import { jsBridge } from '@lib/jsBridge'
 import { DEFAULT_PROBE_URL, normalizeProbeURL } from '@lib/probe'
+import type { Config } from '@lib/request'
 import { useI18n, useClashXData, useGeneral, useVersion, useClient, useConfig, identityAtom, hostSelectIdxStorageAtom, hostsStorageAtom, useAPIInfo } from '@stores'
+
+import { DesktopAppUpdate, DesktopControls } from '../../platform/DesktopUI'
+import { desktopAction, isDesktop as inDesktop, setDesktopDialog, useDesktop } from '../../platform/desktop'
+import { desktopError } from '../../platform/model'
 
 import { ConfigEditor } from './ConfigEditor'
 import { UpdateCheck } from './UpdateCheck'
@@ -18,6 +23,9 @@ import './style.css'
 const languageOptions: ButtonSelectOptions[] = [{ label: '中文', value: 'zh_CN' }, { label: 'English', value: 'en_US' }]
 
 export default function Settings () {
+    const desktop = useDesktop()
+    const isDesktop = inDesktop()
+    const coreOffline = isDesktop && desktop.status?.phase !== 'running'
     const { premium, version } = useVersion()
     const { data: clashXData, update: fetchClashXData } = useClashXData()
     const { general, update: fetchGeneral } = useGeneral()
@@ -32,12 +40,17 @@ export default function Settings () {
     }, [location.search])
     const { translation, setLang, lang } = useI18n()
     const { t } = translation('Settings')
+    const { t: td } = translation('Desktop')
     const client = useClient()
     const { data: settings, set: setSettings } = useConfig()
     const savedProbeURL = normalizeProbeURL(settings.probeURL) ?? DEFAULT_PROBE_URL
     const [probeURL, setProbeURL] = useState(savedProbeURL)
     const [reloading, setReloading] = useState(false)
     const [editorOpen, setEditorOpen] = useState(false)
+    function openConfigEditor () {
+        if (isDesktop) setDesktopDialog('config')
+        else setEditorOpen(true)
+    }
     const reloadRequest = useRef<AbortController | null>(null)
     const [info, set] = useObject({
         socks5ProxyPort: 7891,
@@ -53,7 +66,7 @@ export default function Settings () {
 
     useEffect(() => { setProbeURL(savedProbeURL) }, [savedProbeURL])
 
-    useEffect(() => { setEditorOpen(false) }, [client])
+    useEffect(() => { if (!isDesktop) setEditorOpen(false) }, [client, isDesktop])
 
     useEffect(() => {
         setReloading(false)
@@ -105,17 +118,33 @@ export default function Settings () {
         }
     }
 
+    async function changeRuntimeConfig (patch: Partial<Config>) {
+        try {
+            await client.updateConfig(patch)
+            await fetchGeneral()
+        } catch (reason) {
+            error(isDesktop ? desktopError(reason).message : td('operationFailed'))
+        }
+    }
+
     async function handleProxyModeChange (mode: string) {
-        await client.updateConfig({ mode })
-        await fetchGeneral()
+        await changeRuntimeConfig({ mode })
     }
 
     async function handleStartAtLoginChange (state: boolean) {
+        if (isDesktop) {
+            try { await desktopAction('desktop_set_autostart', { enabled: state }) } catch (reason) { error(desktopError(reason).message) }
+            return
+        }
         await jsBridge?.setStartAtLogin(state)
         await fetchClashXData()
     }
 
     async function handleSetSystemProxy (state: boolean) {
+        if (isDesktop) {
+            try { await desktopAction('desktop_set_system_proxy', { enabled: state }) } catch (reason) { error(desktopError(reason).message) }
+            return
+        }
         await jsBridge?.setSystemProxy(state)
         await fetchClashXData()
     }
@@ -125,23 +154,19 @@ export default function Settings () {
     }
 
     async function handleHttpPortSave () {
-        await client.updateConfig({ port: info.httpProxyPort })
-        await fetchGeneral()
+        await changeRuntimeConfig({ port: info.httpProxyPort })
     }
 
     async function handleSocksPortSave () {
-        await client.updateConfig({ 'socks-port': info.socks5ProxyPort })
-        await fetchGeneral()
+        await changeRuntimeConfig({ 'socks-port': info.socks5ProxyPort })
     }
 
     async function handleMixedPortSave () {
-        await client.updateConfig({ 'mixed-port': info.mixedProxyPort })
-        await fetchGeneral()
+        await changeRuntimeConfig({ 'mixed-port': info.mixedProxyPort })
     }
 
     async function handleAllowLanChange (state: boolean) {
-        await client.updateConfig({ 'allow-lan': state })
-        await fetchGeneral()
+        await changeRuntimeConfig({ 'allow-lan': state })
     }
 
     const {
@@ -151,8 +176,8 @@ export default function Settings () {
 
     const { allowLan, mode } = general
 
-    const startAtLogin = clashXData?.startAtLogin ?? false
-    const systemProxy = clashXData?.systemProxy ?? false
+    const startAtLogin = isDesktop ? desktop.status?.autostart ?? false : clashXData?.startAtLogin ?? false
+    const systemProxy = isDesktop ? desktop.status?.systemProxy ?? false : clashXData?.systemProxy ?? false
     const isClashX = clashXData?.isClashX ?? false
 
     const proxyModeOptions = useMemo(() => {
@@ -161,7 +186,7 @@ export default function Settings () {
             { label: t('values.rules'), value: 'rule' },
             { label: t('values.direct'), value: 'direct' },
         ] as Array<{ label: string, value: string }>
-        if (premium) {
+        if (premium && !isDesktop) {
             options.push({ label: t('values.script'), value: 'script' })
         }
         return options
@@ -171,10 +196,10 @@ export default function Settings () {
         (h, idx) => ({ value: idx, label: <span className="settings-endpoint">{h.hostname}:{h.port}</span> }),
     )
 
-    const controllers = isClashX || controllerFromURL
+    const controllers = isDesktop || isClashX || controllerFromURL
         ? <div className="settings-controller-fixed">
-            <span className="controller-endpoint">{`${apiInfo.protocol}//${externalControllerHost}:${externalControllerPort}`}</span>
-            {!isClashX && controllerFromURL && <p className="settings-hint">{t('controllerFromURL')}</p>}
+            <span className="controller-endpoint">{isDesktop ? td('managedController') : `${apiInfo.protocol}//${externalControllerHost}:${externalControllerPort}`}</span>
+            {!isDesktop && !isClashX && controllerFromURL && <p className="settings-hint">{t('controllerFromURL')}</p>}
         </div>
         : (
             <>
@@ -199,6 +224,8 @@ export default function Settings () {
         <div className="page settings-page">
             <Header title={t('title')} />
 
+            {isDesktop && <DesktopControls onEditConfig={openConfigEditor} />}
+
             <section className="settings-section">
                 <h2 className="settings-section-title">{t('sections.proxy')}</h2>
                 <Card className="settings-card">
@@ -206,6 +233,7 @@ export default function Settings () {
                         <span className="label">{t('labels.proxyMode')}</span>
                         <ButtonSelect
                             label={t('labels.proxyMode')}
+                            disabled={coreOffline}
                             options={proxyModeOptions}
                             value={mode}
                             onSelect={handleProxyModeChange}
@@ -213,7 +241,7 @@ export default function Settings () {
                     </div>
                     <div className="settings-row">
                         <span className="label">{t('labels.allowConnectFromLan')}</span>
-                        <Switch label={t('labels.allowConnectFromLan')} checked={allowLan} onChange={handleAllowLanChange} />
+                        <Switch label={t('labels.allowConnectFromLan')} disabled={coreOffline} checked={allowLan} onChange={handleAllowLanChange} />
                     </div>
                     <div className="settings-row">
                         <label className="label" htmlFor="settings-http-port">{t('labels.httpProxyPort')}</label>
@@ -223,7 +251,7 @@ export default function Settings () {
                             align="right"
                             mono
                             inputMode="numeric"
-                            disabled={isClashX}
+                            disabled={isClashX || coreOffline}
                             value={info.httpProxyPort}
                             onChange={httpProxyPort => set('httpProxyPort', +httpProxyPort)}
                             onBlur={handleHttpPortSave}
@@ -237,7 +265,7 @@ export default function Settings () {
                             align="right"
                             mono
                             inputMode="numeric"
-                            disabled={isClashX}
+                            disabled={isClashX || coreOffline}
                             value={info.socks5ProxyPort}
                             onChange={socks5ProxyPort => set('socks5ProxyPort', +socks5ProxyPort)}
                             onBlur={handleSocksPortSave}
@@ -251,7 +279,7 @@ export default function Settings () {
                             align="right"
                             mono
                             inputMode="numeric"
-                            disabled={isClashX}
+                            disabled={isClashX || coreOffline}
                             value={info.mixedProxyPort}
                             onChange={mixedProxyPort => set('mixedProxyPort', +mixedProxyPort)}
                             onBlur={handleMixedPortSave}
@@ -270,7 +298,7 @@ export default function Settings () {
                         </div>
                     </div>
                     <div className="settings-row settings-row-action">
-                        <Button icon="edit" disabled={isClashX || reloading} onClick={() => setEditorOpen(true)}>{t('labels.editConfig')}</Button>
+                        <Button icon="edit" disabled={isClashX || reloading} onClick={openConfigEditor}>{t('labels.editConfig')}</Button>
                         <Button icon="update" loading={reloading} disabled={reloading} onClick={handleReloadConfig}>{t(reloading ? 'labels.reloading' : 'labels.reloadConfig')}</Button>
                     </div>
                 </Card>
@@ -313,13 +341,13 @@ export default function Settings () {
                     </div>
                     <div className="settings-row">
                         <span className="label">{t('labels.startAtLogin')}</span>
-                        <Switch label={t('labels.startAtLogin')} disabled={!clashXData?.isClashX} checked={startAtLogin} onChange={handleStartAtLoginChange} />
+                        <Switch label={t('labels.startAtLogin')} disabled={isDesktop ? !!desktop.busy || !desktop.status?.capabilities.autostart : !clashXData?.isClashX} checked={startAtLogin} onChange={handleStartAtLoginChange} />
                     </div>
                     <div className="settings-row">
                         <span className="label">{t('labels.setAsSystemProxy')}</span>
                         <Switch
                             label={t('labels.setAsSystemProxy')}
-                            disabled={!isClashX}
+                            disabled={isDesktop ? !!desktop.busy || !desktop.status?.capabilities.systemProxy : !isClashX}
                             checked={systemProxy}
                             onChange={handleSetSystemProxy}
                         />
@@ -329,9 +357,10 @@ export default function Settings () {
 
             <section className="settings-section">
                 <h2 className="settings-section-title">{t('sections.update')}</h2>
-                <UpdateCheck client={client} kernelVersion={version} />
+                {isDesktop && <DesktopAppUpdate />}
+                {(!isDesktop || desktop.status?.phase === 'running') && <UpdateCheck client={client} kernelVersion={version} resourcesOnly={isDesktop} />}
             </section>
-            <ConfigEditor show={editorOpen} onClose={() => setEditorOpen(false)} />
+            {!isDesktop && <ConfigEditor show={editorOpen} onClose={() => setEditorOpen(false)} />}
         </div>
     )
 }
