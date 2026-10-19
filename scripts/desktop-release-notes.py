@@ -32,5 +32,7 @@ print(f'''## Windows x64 桌面版 v{version}
 
 安装包使用 GitHub Actions 构建证明供应用内更新验签；未配置 Windows Authenticode 发布者证书。缺少 WebView2 时安装程序需要联网安装运行环境。不同物理网卡、睡眠恢复及企业网络环境需进一步实机使用验证。
 
+本项目已准备 SignPath Foundation 免费开源代码签名申请材料，当前仍处于申请准备阶段，尚未提交或获批，本发行未使用 SignPath 证书签名。[代码签名政策草稿与隐私说明](https://github.com/chummumm/mihomo-optimized/blob/codex/signpath-oss-prep/docs/desktop-signing/code-signing-policy.draft.md)记录拟议的签名范围、审批流程和第三方来源。GitHub 构建证明与 Windows 发布者签名用途不同，当前下载仍可能出现 SmartScreen 信誉提示。
+
 请阅读附件 `README.zh-CN.md`；`SHA256SUMS`、`build-info.json` 和 `.sigstore.json` 分别提供完整性校验、来源记录和构建证明。
 ''')

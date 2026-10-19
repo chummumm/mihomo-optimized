@@ -346,6 +346,17 @@ class RestrictedDesktop:
             # LUA_TOKEN is 0x4 in winnt.h; pywin32 311 does not export that flag.
             self.token = win32security.CreateRestrictedToken(source,
                 win32security.DISABLE_MAX_PRIVILEGE | 0x4, [(administrator, 0)], None, None)
+            stage = "set_restricted_default_dacl"
+            default_dacl = win32security.GetTokenInformation(self.token, win32security.TokenDefaultDacl)
+            require(default_dacl is not None and default_dacl.IsValid(), "restricted_default_dacl_invalid")
+            original_ace_count = default_dacl.GetAceCount()
+            # A filtered administrator must retain access to its own newly
+            # created objects. Preserve every existing ACE and add only TokenUser.
+            default_dacl.AddAccessAllowedAceEx(default_dacl.GetAclRevision(), 0, 0x10000000,
+                win32security.GetTokenInformation(self.token, win32security.TokenUser)[0])  # GENERIC_ALL
+            require(default_dacl.IsValid() and default_dacl.GetAceCount() == original_ace_count + 1,
+                    "restricted_default_dacl_merge_invalid")
+            win32security.SetTokenInformation(self.token, win32security.TokenDefaultDacl, default_dacl)
             stage = "set_medium_integrity"
             medium = win32security.ConvertStringSidToSid("S-1-16-8192")
             win32security.SetTokenInformation(self.token, win32security.TokenIntegrityLevel,
@@ -383,7 +394,8 @@ class RestrictedDesktop:
         require(not debug_enabled, "gui_debug_privilege_enabled")
         return {"mode": "same_sid_filtered_primary", "sameUserSid": True,
                 "administratorEnabled": False, "administratorDenyOnly": True,
-                "integrity": "medium", "seDebugPrivilegeEnabled": False}
+                "integrity": "medium", "seDebugPrivilegeEnabled": False,
+                "sessionId": win32security.GetTokenInformation(token, win32security.TokenSessionId)}
 
     def check_process(self, process) -> dict:
         import win32security
@@ -521,27 +533,53 @@ def owned_firewall_rule_count(core: Path) -> int:
 
 
 class WebViewDriver:
-    def __init__(self, driver: Path, app: Path, processes: Processes, desktop: RestrictedDesktop) -> None:
+    def __init__(self, driver: Path, app: Path, processes: Processes, desktop: RestrictedDesktop,
+                 artifacts: Path) -> None:
         self.port = free_port()
         self.session = None
+        self.log_path = (artifacts / "edgedriver.log").resolve()
+        self.startup_path = artifacts / "edgedriver-startup.json"
+        self.startup = {"ready": False, "requestedDesktop": r"winsta0\default",
+                        "requestedToken": desktop.check_token(desktop.token),
+                        "logFile": self.log_path.name, "logLevel": "SEVERE"}
+        self.write_startup_evidence()
         # EdgeDriver inherits Chromium's mutually exclusive log-level/silent flags.
-        self.process = desktop.spawn([str(driver), f"--port={self.port}", "--log-level=SEVERE"], driver.parent)
+        # Keep protocol command/response logging disabled at SEVERE level.
+        self.process = desktop.spawn([str(driver), f"--port={self.port}", "--log-level=SEVERE",
+                                      "--log-path=" + str(self.log_path)], driver.parent)
         try:
             self.identity = processes.identity(self.process.pid)
             require(self.identity and self.identity.path == os.path.normcase(str(driver.resolve())), "edgedriver_process_mismatch")
             wait_until(self.ready, "edgedriver_start_timeout", 20)
+            self.startup["ready"] = True
+            self.write_startup_evidence()
             result = self.request("POST", "/session", {"capabilities": {"alwaysMatch": {
                 "browserName": "webview2", "ms:edgeOptions": {"binary": str(app)},
             }}}, timeout=90)
             require(isinstance(result, dict) and isinstance(result.get("sessionId"), str), "webview_session_missing")
             self.session = result["sessionId"]
             self.request("POST", self.path("timeouts"), {"script": 90000, "pageLoad": 30000, "implicit": 0})
-        except BaseException:
-            self.close()
+        except BaseException as error:
+            try:
+                self.startup["failure"] = safe_code(str(error)) if isinstance(error, SmokeFailure) else "unexpected_" + type(error).__name__
+                # Capture the real exit code before cleanup can terminate the driver.
+                code = self.process.poll()
+                if code is not None:
+                    self.startup["exitCodeUnsigned"] = code & 0xFFFFFFFF
+                    self.startup["exitCodeHex"] = f"0x{code & 0xFFFFFFFF:08X}"
+                self.write_startup_evidence()
+            finally:
+                self.close()
             raise
 
+    def write_startup_evidence(self) -> None:
+        self.startup["logExists"] = self.log_path.is_file()
+        self.startup_path.write_text(json.dumps(self.startup, indent=2) + "\n", encoding="utf-8")
+
     def ready(self) -> bool:
-        require(self.process.poll() is None, "edgedriver_exited")
+        code = self.process.poll()
+        if code is not None:
+            raise SmokeFailure(f"edgedriver_exited_0x{code & 0xFFFFFFFF:08X}")
         try:
             return self.request("GET", "/status", timeout=1).get("ready") is True
         except (OSError, http.client.HTTPException):
@@ -1006,7 +1044,7 @@ class Acceptance:
 
         self.stage = "non_elevated_gui"
         self.desktop = RestrictedDesktop()
-        self.driver = WebViewDriver(self.driver_path, self.app, self.processes, self.desktop)
+        self.driver = WebViewDriver(self.driver_path, self.app, self.processes, self.desktop, self.artifacts)
         gui = wait_until(lambda: self.processes.at_paths([self.app]), "gui_process_not_found")
         require(len(gui) == 1, "multiple_gui_processes")
         self.gui = gui[0]
