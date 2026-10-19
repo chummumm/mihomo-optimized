@@ -373,8 +373,17 @@ class RestrictedDesktop:
                                      "attributesHex": f"0x{attributes:08X}",
                                      "enabled": bool(attributes & 0x4),
                                      "denyOnly": bool(attributes & 0x10)})
+        # This descriptor is only a local serialization container. No token or
+        # operating-system object receives a security-descriptor update.
+        descriptor = win32security.SECURITY_DESCRIPTOR()
+        descriptor.SetSecurityDescriptorDacl(True,
+            win32security.GetTokenInformation(token, win32security.TokenDefaultDacl), False)
         return {"sessionId": win32security.GetTokenInformation(token, win32security.TokenSessionId),
-                "logonGroups": logon_groups}
+                "logonGroups": logon_groups,
+                "ownerSid": win32security.ConvertSidToStringSid(
+                    win32security.GetTokenInformation(token, win32security.TokenOwner)),
+                "defaultDaclSddl": win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(
+                    descriptor, win32security.SDDL_REVISION_1, win32security.DACL_SECURITY_INFORMATION)}
 
     def probe_access(self, output: Path) -> dict:
         """Observe desktop access without changing any ACL or launch setting."""
@@ -482,6 +491,90 @@ class RestrictedDesktop:
             output.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
         return evidence
 
+    def probe_startup(self, driver: Path, artifacts: Path) -> dict:
+        """Six bounded observations; the normal GUI acceptance still runs next."""
+        import pywintypes
+        import win32api
+        import win32security
+
+        requested = r"winsta0\default"
+        python = str(Path(sys.executable).resolve())
+        command = str(Path(win32api.GetSystemDirectory()) / "cmd.exe")
+        cases = [("cmd_exit", [command, "/d", "/q", "/c", "exit", "0"], requested, True, None, None),
+                 ("python_exit", [python, "-I", "-S", "-c", "import os; os._exit(0)"], requested, True, None, None)]
+        for library in ("kernel32", "user32"):
+            script = ("import os\ntry:\n import ctypes\n ctypes.WinDLL('" + library + ".dll')\n"
+                      "except OSError as error:\n os._exit(error.winerror or 1)\nos._exit(0)\n")
+            cases.append(("python_" + library, [python, "-I", "-S", "-c", script], requested, True, None, None))
+        for name, desktop, no_window in (("driver_inherit_desktop", None, True),
+                                         ("driver_without_no_window", requested, False)):
+            port = free_port()
+            log = (artifacts / (name + ".log")).resolve()
+            arguments = [str(driver), f"--port={port}", "--log-level=SEVERE", "--log-path=" + str(log)]
+            cases.append((name, arguments, desktop, no_window, port, log))
+        evidence = {"diagnosticOnly": True, "token": self.check_token(self.token),
+                    "sourceToken": self.source_context, "restrictedToken": self.token_context(self.token),
+                    "cases": []}
+        output = artifacts / "startup-matrix.json"
+        security_parts = (win32security.OWNER_SECURITY_INFORMATION | win32security.GROUP_SECURITY_INFORMATION
+                          | win32security.DACL_SECURITY_INFORMATION)
+        for name, arguments, desktop, no_window, port, log in cases:
+            timeout = 20 if port is not None else 5
+            result = {"name": name, "requestedDesktop": desktop, "createNoWindow": no_window,
+                      "timeoutSeconds": timeout, "ready": False, "timedOut": False}
+            evidence["cases"].append(result)
+            process = None
+            try:
+                process = self.spawn(arguments, driver.parent, desktop=desktop, no_window=no_window)
+                result["tokenVerifiedBeforeResume"] = True
+                try:
+                    descriptor = win32security.GetSecurityInfo(process.handle, win32security.SE_KERNEL_OBJECT,
+                                                               security_parts)
+                    result["processSecuritySddl"] = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(
+                        descriptor, win32security.SDDL_REVISION_1, security_parts)
+                except pywintypes.error as error:
+                    result["processSecurityWinError"] = error.winerror
+                if port is None:
+                    process.wait(timeout)
+                else:
+                    deadline = time.monotonic() + timeout
+                    while process.poll() is None and time.monotonic() < deadline:
+                        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                        try:
+                            connection.request("GET", "/status", headers={"Connection": "close"})
+                            response = connection.getresponse()
+                            payload = response.read(64 * 1024 + 1)
+                            if response.status == 200 and len(payload) <= 64 * 1024:
+                                value = json.loads(payload)
+                                if isinstance(value, dict) and isinstance(value.get("value"), dict):
+                                    result["ready"] = value["value"].get("ready") is True
+                        except (OSError, http.client.HTTPException, ValueError):
+                            pass  # Readiness polling only; the final observation is mandatory.
+                        finally:
+                            connection.close()
+                        if result["ready"]:
+                            break
+                        time.sleep(0.1)
+                    result["timedOut"] = not result["ready"] and process.poll() is None
+            except subprocess.TimeoutExpired:
+                result["timedOut"] = True
+            except SmokeFailure as error:
+                result["failure"] = safe_code(str(error))
+            finally:
+                try:
+                    if process is not None:
+                        code = process.poll()  # Record the real result before cleanup termination.
+                        if code is not None:
+                            result["exitCodeUnsigned"] = code & 0xFFFFFFFF
+                            result["exitCodeHex"] = f"0x{code & 0xFFFFFFFF:08X}"
+                        process.close()  # Owns the exact CreateProcessAsUser handle, never a PID lookup.
+                        result["cleanupComplete"] = True
+                    if log is not None:
+                        result.update({"logFile": log.name, "logExists": log.is_file()})
+                finally:
+                    output.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+        return evidence
+
     def check_token(self, token) -> dict:
         import win32security
 
@@ -527,7 +620,8 @@ class RestrictedDesktop:
         finally:
             process.Close()
 
-    def spawn(self, arguments: list[str], cwd: Path) -> RestrictedProcess:
+    def spawn(self, arguments: list[str], cwd: Path, *, desktop: str | None = r"winsta0\default",
+              no_window: bool = True) -> RestrictedProcess:
         import pywintypes
         import win32con
         import win32process
@@ -536,12 +630,12 @@ class RestrictedDesktop:
         stage = "create_restricted_process"
         try:
             startup = win32process.STARTUPINFO()
-            startup.lpDesktop = r"winsta0\default"
+            startup.lpDesktop = desktop
             # No supervisor handles or ambient credentials reach the child.
             # Start suspended to inspect even a short-lived second instance.
             process, thread, pid, _tid = win32process.CreateProcessAsUser(
                 self.token, arguments[0], subprocess.list2cmdline(arguments), None, None, False,
-                win32con.CREATE_SUSPENDED | win32con.CREATE_NO_WINDOW,
+                win32con.CREATE_SUSPENDED | (win32con.CREATE_NO_WINDOW if no_window else 0),
                 child_environment(), str(cwd), startup)
             stage = "inspect_restricted_process"
             self.check_process(process)
@@ -1154,6 +1248,7 @@ class Acceptance:
         # Probe before starting fixture threads or child processes. Station
         # changes are synchronous, temporary, and always restored before launch.
         self.report["desktopAccess"] = self.desktop.probe_access(self.artifacts / "desktop-access.json")
+        self.report["startupMatrix"] = self.desktop.probe_startup(self.driver_path, self.artifacts)
         self.socks = SocksFixture()
         mixed = free_port()
         self.ports.add(mixed)
