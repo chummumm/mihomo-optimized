@@ -25,6 +25,13 @@ func TestDesktopManagedDaemon(t *testing.T) {
 		return
 	}
 	home := t.TempDir()
+	// Windows runners may use an 8.3 TMPDIR, and macOS commonly exposes /var
+	// through /private/var. Exercise an equivalent parent alias on runners
+	// that support symlinks so Linux also catches bootstrap path mismatches.
+	alias := filepath.Join(t.TempDir(), "temporary-root")
+	if err := os.Symlink(filepath.Dir(home), alias); err == nil {
+		home = filepath.Join(alias, filepath.Base(home))
+	}
 	path := filepath.Join(home, "config.yaml")
 	if err := os.WriteFile(path, []byte("mixed-port: 0\nmode: direct\ncore-auto-update: true\nexternal-ui-auto-update: true\nrules: ['MATCH,DIRECT']\n"), 0o600); err != nil {
 		t.Fatal(err)

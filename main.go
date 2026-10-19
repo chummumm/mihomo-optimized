@@ -181,6 +181,15 @@ func main() {
 		} else {
 			configFile = filepath.Join(C.Path.HomeDir(), C.Path.Config())
 		}
+		if desktop.Enabled() {
+			// Enable canonicalizes the home (for example a Windows 8.3 name
+			// or macOS /var). Map the launcher's matching -f spelling into
+			// that verified home before enforcing the normal I/O boundary.
+			// Do not resolve config symlinks: CheckPath must still reject them.
+			if relative, err := filepath.Rel(homeDir, configFile); err == nil && filepath.IsLocal(relative) {
+				configFile = filepath.Join(desktop.Home(), relative)
+			}
+		}
 		C.SetConfig(configFile)
 		if err := desktop.CheckPath(configFile); err != nil {
 			log.Fatalln("Invalid managed configuration path: %s", err)

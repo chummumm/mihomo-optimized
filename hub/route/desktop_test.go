@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/component/desktop"
+	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resource"
 	"github.com/metacubex/mihomo/component/updater"
 	C "github.com/metacubex/mihomo/constant"
@@ -50,6 +51,19 @@ func TestDesktopManagedContracts(t *testing.T) {
 	}
 	C.SetHomeDir(desktop.Home())
 	C.SetConfig(filepath.Join(desktop.Home(), "config.yaml"))
+	defer func() {
+		if err := executor.Shutdown(); err != nil {
+			t.Errorf("managed contract shutdown failed: %v", err)
+		}
+		// Unlike the daemon, this subprocess runs TempDir cleanup before it
+		// exits. Release the mapped cache file first, as Windows requires.
+		cache := cachefile.Cache()
+		if cache.DB != nil {
+			if err := cache.Close(); err != nil {
+				t.Errorf("managed contract cache cleanup failed: %v", err)
+			}
+		}
+	}()
 	const yaml = "mixed-port: 0\nmode: direct\ncore-auto-update: true\nexternal-ui-auto-update: true\nexternal-controller: 0.0.0.0:12345\nexternal-controller-tls: 0.0.0.0:12346\nexternal-controller-unix: /untrusted/socket\nexternal-controller-pipe: untrusted-pipe\nsecret: yaml-secret\nrules: [MATCH,DIRECT]\n"
 	// The sequence format is used below to retain a single MATCH rule.
 	document := strings.ReplaceAll(yaml, "rules: [MATCH,DIRECT]", "rules: ['MATCH,DIRECT']")
@@ -66,7 +80,6 @@ func TestDesktopManagedContracts(t *testing.T) {
 	if err := executor.ApplyConfig(cfg, true); err != nil {
 		t.Fatal(err)
 	}
-	defer executor.Shutdown()
 	handler := router(true, "wrong-secret", "/untrusted-doh", Cors{AllowOrigins: []string{"*"}})
 	request := func(method, path, body string, authenticated bool) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
