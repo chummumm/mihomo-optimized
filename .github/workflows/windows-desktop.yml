@@ -57,6 +57,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install Windows acceptance API bindings
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
       - name: Check UI and build both targets
@@ -94,14 +97,8 @@ jobs:
         run: pnpm exec tauri build --ci --target x86_64-pc-windows-msvc --bundles nsis
       - name: Assemble installer and portable distribution
         run: python scripts/package-desktop.py
-      - name: Test real Windows core authentication, proxying and exit
-        run: python desktop/tests/core_smoke.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe
-      - name: Install desktop and matching WebView2 driver
-        run: ./desktop/tests/setup-windows.ps1
-      - name: Test installed WebView2 UI, system proxy, TUN forwarding and cleanup
-        run: python desktop/tests/windows_smoke.py
-      - name: Keep completed compilation work for runtime-failure retries
-        if: always() && steps.rust-cache.outcome == 'success' && steps.rust-cache.outputs.cache-hit != 'true'
+      - name: Cache completed Windows compilation
+        if: success() && steps.rust-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -109,6 +106,21 @@ jobs:
             ~/.cargo/git
             src-tauri/target
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+      # Preserve the compiled candidate if system integration fails. Publishing
+      # remains gated on every test in this build job passing.
+      - name: Upload Windows installer and portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-desktop-windows-x64
+          path: artifacts/desktop/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Test real Windows core authentication, proxying and exit
+        run: python desktop/tests/core_smoke.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe
+      - name: Install desktop and matching WebView2 driver
+        run: ./desktop/tests/setup-windows.ps1
+      - name: Test installed WebView2 UI, system proxy, TUN forwarding and cleanup
+        run: python desktop/tests/windows_smoke.py
       - name: Upload Windows verification evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -117,13 +129,6 @@ jobs:
           path: artifacts/verification/
           if-no-files-found: ignore
           retention-days: 14
-      - name: Upload Windows installer and portable package
-        uses: actions/upload-artifact@v4
-        with:
-          name: mihomo-desktop-windows-x64
-          path: artifacts/desktop/
-          if-no-files-found: error
-          retention-days: 30
 
   release:
     name: Attest and publish desktop release

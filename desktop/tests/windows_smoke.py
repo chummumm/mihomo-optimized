@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Acceptance test for the installed Windows application on a disposable runner.
 
-Uses Python's standard library, actual WebView2/EdgeDriver, actual WinInet, and a
-local SOCKS fixture. No Tauri bridge or operating-system behavior is mocked.
+Uses actual WebView2/EdgeDriver, WinInet, pywin32 firewall COM, and a local SOCKS
+fixture. No Tauri bridge or operating-system behavior is mocked.
 See https://learn.microsoft.com/en-us/microsoft-edge/webview2/how-to/webdriver
 and https://learn.microsoft.com/en-us/microsoft-edge/webdriver/capabilities-edge-options
 
@@ -18,6 +18,7 @@ import contextlib
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
+import hashlib
 import http.client
 import json
 import os
@@ -40,6 +41,8 @@ RUN_VALUE = "MihomoOptimized"
 TUN_TARGET = "198.18.77.77"
 TUN_BODY = b"mihomo-windows-tun-socks-forwarded\n"
 BAD_CONFIG = "mixed-port: [unterminated\n"
+FIREWALL_RULE_PREFIX = "com.chummumm.mihomo-optimized.tun.tcp."
+FIREWALL_GROUP = "Mihomo Optimized TUN"
 
 
 class SmokeFailure(Exception):
@@ -230,15 +233,27 @@ class Processes:
                     result.append(identity)
         return result
 
-    def descendants(self, parents: set[int]) -> list[ProcessIdentity]:
+    def descendants(self, roots: list[ProcessIdentity], allowed_paths: set[str]) -> list[ProcessIdentity]:
+        # Toolhelp parent IDs outlive the parent. A later process may reuse that
+        # ID, so every edge needs a verified parent identity and creation order.
+        # Only known application/WebView2 binaries may enter the cleanup set.
         entries = self.entries()
-        selected = set(parents)
-        while True:
-            found = {pid for pid, parent, _name in entries if parent in selected} - selected
-            if not found:
-                break
-            selected.update(found)
-        return [identity for pid in selected - parents if (identity := self.identity(pid))]
+        selected = {root.pid: root for root in roots if self.identity(root.pid) == root}
+        root_ids = set(selected)
+        pending = list(selected.values())
+        while pending:
+            parent = pending.pop()
+            if self.identity(parent.pid) != parent:
+                continue
+            for pid, parent_pid, _name in entries:
+                if parent_pid != parent.pid or pid in selected:
+                    continue
+                child = self.identity(pid)
+                if (child and child.path in allowed_paths and child.created >= parent.created
+                        and self.identity(parent.pid) == parent):
+                    selected[pid] = child
+                    pending.append(child)
+        return [identity for pid, identity in selected.items() if pid not in root_ids]
 
     def kill(self, expected: ProcessIdentity) -> None:
         handle = self.api.OpenProcess(0x1000 | 0x100000 | 0x1, False, expected.pid)
@@ -280,24 +295,60 @@ def service_installed() -> bool:
     return result.returncode == 0
 
 
+def com_error_hresult(error) -> int:
+    code = error.hresult & 0xFFFFFFFF
+    # IDispatch can wrap the actual COM error in DISP_E_EXCEPTION/EXCEPINFO.
+    info = getattr(error, "excepinfo", None)
+    if code == 0x80020009 and isinstance(info, tuple) and len(info) > 5 and isinstance(info[5], int) and info[5]:
+        return info[5] & 0xFFFFFFFF
+    return code
+
+
+def owned_firewall_rule(core: Path) -> dict | None:
+    import pythoncom
+    import pywintypes
+    from win32com.client import dynamic
+
+    path = str(core.resolve()).removeprefix("\\\\?\\")
+    name = FIREWALL_RULE_PREFIX + hashlib.sha256(path.lower().encode("utf-8")).hexdigest()[:16]
+    policy = rules = rule = None
+    pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+    try:
+        # Use the same exact Item lookup as the native host. Do not enumerate
+        # Windows firewall rules or start PowerShell/CIM for this assertion.
+        policy = dynamic.Dispatch("HNetCfg.FwPolicy2")
+        rules = policy.Rules
+        try:
+            rule = rules.Item(name)
+        except pywintypes.com_error as error:
+            if com_error_hresult(error) == 0x80070002:
+                return None
+            raise
+        require(rule.Name == name and rule.Grouping == FIREWALL_GROUP
+                and str(rule.ApplicationName).lower() == path.lower(), "owned_firewall_rule_identity_mismatch")
+        return {"name": name, "group": FIREWALL_GROUP, "program": path,
+                "enabled": bool(rule.Enabled), "direction": int(rule.Direction),
+                "action": int(rule.Action), "profiles": int(rule.Profiles),
+                "protocol": int(rule.Protocol), "edgeTraversal": bool(rule.EdgeTraversal)}
+    except pywintypes.com_error as error:
+        raise SmokeFailure(f"owned_firewall_query_hresult_{com_error_hresult(error):08X}") from None
+    finally:
+        rule = rules = policy = None
+        pythoncom.CoUninitialize()
+
+
 def owned_firewall_rule_count(core: Path) -> int:
-    environment = child_environment()
-    environment["MIHOMO_DIAG_CORE"] = str(core)
-    result = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", r"""
-$ErrorActionPreference = 'Stop'
-$policy = New-Object -ComObject HNetCfg.FwPolicy2
-$rules = @($policy.Rules | Where-Object { $_.Name -like 'com.chummumm.mihomo-optimized.tun.tcp.*' -and $_.Grouping -eq 'Mihomo Optimized TUN' -and $_.ApplicationName -eq $env:MIHOMO_DIAG_CORE })
-$rules.Count | ConvertTo-Json -Compress
-"""], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                            timeout=15, env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
-    require(result.returncode == 0 and len(result.stdout) <= 128, "owned_firewall_query_failed")
-    count = json.loads(result.stdout)
-    require(isinstance(count, int) and 0 <= count <= 100, "owned_firewall_count_invalid")
-    return count
+    rule = owned_firewall_rule(core)
+    if rule is None:
+        return 0
+    require(rule["enabled"] and rule["direction"] == 1 and rule["action"] == 1
+            and rule["profiles"] == 0x7FFFFFFF and rule["protocol"] == 6 and not rule["edgeTraversal"],
+            "owned_firewall_rule_settings_mismatch")
+    return 1
 
 
 class WebViewDriver:
-    def __init__(self, driver: Path, app: Path) -> None:
+    def __init__(self, driver: Path, app: Path, processes: Processes) -> None:
         self.port = free_port()
         self.session = None
         self.output = tempfile.TemporaryFile()
@@ -306,6 +357,8 @@ class WebViewDriver:
                                         stdin=subprocess.DEVNULL, stdout=self.output, stderr=subprocess.STDOUT,
                                         env=child_environment(), creationflags=subprocess.CREATE_NO_WINDOW)
         try:
+            self.identity = processes.identity(self.process.pid)
+            require(self.identity and self.identity.path == os.path.normcase(str(driver.resolve())), "edgedriver_process_mismatch")
             wait_until(self.ready, "edgedriver_start_timeout", 20)
             result = self.request("POST", "/session", {"capabilities": {"alwaysMatch": {
                 "browserName": "webview2", "ms:edgeOptions": {"binary": str(app)},
@@ -557,6 +610,13 @@ class Acceptance:
         self.app, self.driver_path, self.artifacts = app, driver, artifacts
         self.helper = app.with_name("mihomo-desktop-service.exe")
         self.core = app.with_name("mihomo-core.exe")
+        self.child_paths = {os.path.normcase(str(path.resolve())) for path in (self.app, self.core, self.helper)}
+        for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+            if os.environ.get(variable):
+                runtime = Path(os.environ[variable]) / "Microsoft" / "EdgeWebView" / "Application"
+                for executable in runtime.glob("*/msedgewebview2.exe"):
+                    if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", executable.parent.name) and executable.is_file():
+                        self.child_paths.add(os.path.normcase(str(executable.resolve())))
         self.directory = Path(os.environ["LOCALAPPDATA"]) / "Mihomo Optimized"
         self.processes = Processes()
         self.wininet = WinInet()
@@ -614,18 +674,16 @@ class Acceptance:
         return result
 
     def capture_children(self) -> None:
-        parents = set()
-        if self.gui and self.processes.identity(self.gui.pid) == self.gui:
-            parents.add(self.gui.pid)
+        roots = [self.gui] if self.gui else []
         if self.driver and self.driver.process.poll() is None:
-            parents.add(self.driver.process.pid)
-        for identity in self.processes.descendants(parents):
+            roots.append(self.driver.identity)
+        for identity in self.processes.descendants(roots, self.child_paths):
             self.owned_children[identity.pid] = identity
 
     def capture_tun_failure(self, status: dict, core_pid: int) -> None:
         """Keep bounded observations before cleanup removes the failing route."""
         evidence = {"fixture": self.socks.diagnostics(),
-                    "host": {"phase": status.get("phase"), "service": status.get("service")}}
+                    "host": {"phase": status.get("phase"), "service": status.get("service"), "corePid": core_pid}}
         self.report["tunDiagnostics"] = evidence
         print("TUN fixture: " + json.dumps(evidence["fixture"], sort_keys=True), flush=True)
         # Capture the helper's failure before a successful cleanup overwrites it.
@@ -671,32 +729,10 @@ class Acceptance:
             evidence["configDiagnosticError"] = type(error).__name__
 
         try:
-            environment = child_environment()
-            environment["MIHOMO_DIAG_CORE"] = str(self.core)
-            environment["MIHOMO_DIAG_PID"] = str(core_pid)
-            result = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", r"""
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*Mihomo*' -or $_.InterfaceDescription -like '*Wintun*' } | Select-Object -First 8 Name, ifIndex, Status, InterfaceDescription)
-$policy = New-Object -ComObject HNetCfg.FwPolicy2
-$rules = @($policy.Rules | Where-Object { $_.Name -like 'com.chummumm.mihomo-optimized.tun.tcp.*' -and $_.Grouping -eq 'Mihomo Optimized TUN' -and $_.ApplicationName -eq $env:MIHOMO_DIAG_CORE } | Select-Object -First 8 Name, Grouping, ApplicationName, Enabled, Direction, Action, Profiles, Protocol, EdgeTraversal)
-$profiles = @(1, 2, 4 | ForEach-Object { [ordered]@{ type = $_; enabled = $policy.FirewallEnabled($_); defaultInboundAction = $policy.DefaultInboundAction($_) } })
-$listeners = @()
-if ([int]$env:MIHOMO_DIAG_PID -gt 0) { $listeners = @(Get-NetTCPConnection -OwningProcess ([int]$env:MIHOMO_DIAG_PID) -State Listen -ErrorAction SilentlyContinue | Select-Object -First 8 LocalAddress, LocalPort, OwningProcess) }
-[ordered]@{
-  route = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '198.18.77.77/32' -ErrorAction SilentlyContinue | Select-Object -First 8 DestinationPrefix, InterfaceAlias, ifIndex, NextHop, RouteMetric)
-  adapters = $adapters
-  coreListeners = $listeners
-  firewallProfiles = $profiles
-  coreFirewallRules = $rules
-} | ConvertTo-Json -Depth 5 -Compress
-"""], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                    timeout=20, env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
-            require(result.returncode == 0 and len(result.stdout) <= 32 * 1024, "diagnostic_windows_query_failed")
-            evidence["windows"] = json.loads(result.stdout.decode("utf-8-sig"))
+            evidence["firewallRule"] = owned_firewall_rule(self.core)
+            print("TUN firewall rule: " + json.dumps(evidence["firewallRule"], sort_keys=True), flush=True)
         except Exception as error:
-            evidence["windowsDiagnosticError"] = type(error).__name__
+            evidence["firewallDiagnosticError"] = safe_code(str(error)) if isinstance(error, SmokeFailure) else type(error).__name__
 
         try:
             directory = Path(os.environ["PROGRAMDATA"]) / "Mihomo Optimized" / "service" / "logs"
@@ -737,7 +773,7 @@ if ([int]$env:MIHOMO_DIAG_PID -gt 0) { $listeners = @(Get-NetTCPConnection -Owni
         valid = profile(mixed, self.socks.server_address[1])
 
         self.stage = "startup_recovery"
-        self.driver = WebViewDriver(self.driver_path, self.app)
+        self.driver = WebViewDriver(self.driver_path, self.app, self.processes)
         gui = wait_until(lambda: self.processes.at_paths([self.app]), "gui_process_not_found")
         require(len(gui) == 1, "multiple_gui_processes")
         self.gui = gui[0]
@@ -823,8 +859,8 @@ if ([int]$env:MIHOMO_DIAG_PID -gt 0) { $listeners = @(Get-NetTCPConnection -Owni
             tun = self.phase("running")
             require(tun.get("tun") is True and tun.get("service", {}).get("running") is True, "tun_service_not_running")
             tun_core_pid = self.managed_core(tun)["pid"]
-            require(owned_firewall_rule_count(self.core) == 1, "tun_firewall_rule_not_installed")
             wait_until(self.socks.roundtrip, "tun_forwarding_timeout")
+            require(owned_firewall_rule_count(self.core) == 1, "tun_firewall_rule_not_installed")
         except Exception:
             with contextlib.suppress(Exception):
                 tun = self.status()
@@ -870,6 +906,7 @@ if ([int]$env:MIHOMO_DIAG_PID -gt 0) { $listeners = @(Get-NetTCPConnection -Owni
                 operation()
             except Exception:
                 errors.append(code)
+                print("CLEANUP error: " + code, flush=True)
 
         if self.driver:
             attempt("capture_children", self.capture_children)
