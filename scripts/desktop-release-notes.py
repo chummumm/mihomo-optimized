@@ -15,6 +15,12 @@ print(f'''## Windows x64 桌面版 v{version}
 - 免安装程序包：`mihomo-desktop-{version}-windows-x64-portable.zip`，解压整个目录后运行 `mihomo-optimized.exe`。
 - 首次使用在设置中导入自己的 YAML 配置或订阅，然后启动内核并按需开启系统代理 / TUN。
 
+### 本次修复与升级
+
+- 修复普通权限启动界面后，开启 TUN 提示“无法验证服务进程，系统错误：5”的问题。服务仅向安装该服务的用户授予查询进程身份所需的有限权限，保留双向身份验证。
+- 从 0.1.0 升级时，先从托盘退出旧程序，再运行新版完整安装包；覆盖安装会停止并替换旧服务。若安装时选择先卸载，首次开启 TUN 需要重新批准一次服务安装。
+- 安装完成后普通双击启动即可；TUN 仍需安装版，便携包适合普通系统代理使用。
+
 ### 构建来源
 
 - 桌面：{info['desktopVersion']}；UI：{info['uiVersion']}；内核：{info['coreVersion']}。
@@ -22,7 +28,7 @@ print(f'''## Windows x64 桌面版 v{version}
 - [内核对应源码](https://github.com/{info['repository']}/tree/{info['coreCommit']})
 - 配置目录：`%LOCALAPPDATA%\\Mihomo Optimized`。关闭窗口收起到托盘，托盘退出会恢复代理并停止内核。
 
-此发行已通过 Windows runner 中的编译、内核通信、安装后 WebView2、系统代理恢复和隔离 TUN 流量测试。完整测试记录可在此提交的 Windows desktop Actions 运行中查看。
+此发行已通过 Windows runner 中的编译、内核通信、安装后 WebView2、系统代理恢复和隔离 TUN 流量测试。界面以中等完整性、管理员组未启用的令牌运行，并检查服务身份可查询而终止、读写内存、复制句柄及修改权限仍被拒绝。完整测试记录可在此提交的 Windows desktop Actions 运行中查看。
 
 安装包使用 GitHub Actions 构建证明供应用内更新验签；未配置 Windows Authenticode 发布者证书。缺少 WebView2 时安装程序需要联网安装运行环境。不同物理网卡、睡眠恢复及企业网络环境需进一步实机使用验证。
 
