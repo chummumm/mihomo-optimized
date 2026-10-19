@@ -29,6 +29,7 @@ type policy struct {
 	Options
 	shutdown chan struct{}
 	once     sync.Once
+	ready    atomic.Bool
 }
 
 var current atomic.Pointer[policy]
@@ -88,6 +89,23 @@ func validateOptions(options Options) (Options, error) {
 }
 
 func Enabled() bool { return current.Load() != nil }
+
+// Ready is published only after a full configuration application succeeds.
+// The tunnel's traffic phase can become Running before listener errors are
+// collected, so it cannot establish supervisor readiness on its own.
+func Ready() bool {
+	p := current.Load()
+	return p != nil && p.ready.Load()
+}
+
+// SetReady is called by the serialized configuration executor, after admission
+// checks and at the end of the apply transaction. It is a no-op in standalone
+// mode and never turns a failed reload into an implicit rollback.
+func SetReady(ready bool) {
+	if p := current.Load(); p != nil {
+		p.ready.Store(ready)
+	}
+}
 
 func AllowedOrigins() []string {
 	return []string{"tauri://localhost", "http://tauri.localhost", "https://tauri.localhost", "http://localhost:3000"}

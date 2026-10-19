@@ -80,6 +80,17 @@ func TestDesktopManagedContracts(t *testing.T) {
 		handler.ServeHTTP(w, r)
 		return w
 	}
+	assertState := func(expected string) {
+		t.Helper()
+		w := request(http.MethodGet, "/desktop", "", true)
+		var status struct {
+			State string `json:"state"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil || w.Code != http.StatusOK || status.State != expected {
+			t.Fatalf("expected desktop state %s, got %d %s", expected, w.Code, w.Body.String())
+		}
+	}
+	assertState("running")
 	for _, path := range []string{"/desktop", "/configs/file", "/upgrade/check"} {
 		if w := request(http.MethodGet, path, "", false); w.Code != http.StatusUnauthorized {
 			t.Fatalf("missing authentication accepted at %s: %d", path, w.Code)
@@ -127,6 +138,26 @@ func TestDesktopManagedContracts(t *testing.T) {
 	if w := request(http.MethodGet, "/desktop", "", false); w.Code != http.StatusUnauthorized {
 		t.Fatal("force reload lost authentication")
 	}
+	// Rejected parsing never begins configuration mutation and must preserve a
+	// previously ready core. A real late TUN constructor failure must clear it.
+	invalidPayload, _ := json.Marshal(map[string]string{"payload": "mixed-port: [unterminated\n"})
+	if w := request(http.MethodPut, "/configs?force=true", string(invalidPayload), true); w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid reload was accepted: %d %s", w.Code, w.Body.String())
+	}
+	assertState("running")
+	// DNS hijack address parsing occurs inside sing_tun.New, before it creates
+	// a device. This exercises a real ApplyConfig failure on all CI platforms
+	// without requiring TUN privileges or altering the machine's routes.
+	failedTun := document + "tun:\n  enable: true\n  dns-hijack: ['invalid-address']\n"
+	failedPayload, _ := json.Marshal(map[string]string{"payload": failedTun})
+	if w := request(http.MethodPut, "/configs?force=true", string(failedPayload), true); w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "dns-hijack") {
+		t.Fatalf("late TUN apply failure was not returned: %d %s", w.Code, w.Body.String())
+	}
+	assertState("loading")
+	if w := request(http.MethodPut, "/configs?force=true", string(payload), true); w.Code != http.StatusNoContent {
+		t.Fatalf("valid recovery reload failed: %d %s", w.Code, w.Body.String())
+	}
+	assertState("running")
 	if err := updater.DefaultCoreUpdater.UpdateContext(context.Background(), "must-not-run.exe", "release", true); !errors.Is(err, desktop.ErrManaged) {
 		t.Fatalf("core installer bypassed managed policy: %v", err)
 	}
@@ -180,4 +211,5 @@ func TestDesktopManagedContracts(t *testing.T) {
 	if err := executor.ApplyConfig(cfg, true); !errors.Is(err, executor.ErrShuttingDown) {
 		t.Fatalf("configuration reopened after shutdown: %v", err)
 	}
+	assertState("stopping")
 }

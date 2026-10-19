@@ -75,7 +75,15 @@ Allowed browser origins are `tauri://localhost`, `http://tauri.localhost`, and
 }
 ```
 
-`state` is `loading`, `running`, or `stopping`. TUN capability means the
+`state` is `loading`, `running`, or `stopping`. `running` is published only after
+the full configuration application returns successfully, including TUN errors.
+An apply failure leaves `loading` until the supervisor successfully reapplies
+a valid configuration; it does not promise an automatic rollback. A rejected
+parse or admission check preserves the previous readiness. Shutdown always
+takes precedence. The supervisor also checks the actual HTTP/SOCKS/mixed ports
+from `GET /configs`, since those legacy listener factories report bind errors
+through logs rather than returning them to the configuration executor.
+TUN capability means the
 implementation is present; it does not assert privileges, driver readiness or
 successful capture of traffic. The GUI can remain open even if the core cannot
 start a configuration and the endpoint is unavailable.

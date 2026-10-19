@@ -9,7 +9,6 @@ import (
 	"github.com/metacubex/mihomo/component/desktop"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
-	"github.com/metacubex/mihomo/tunnel"
 
 	"github.com/metacubex/chi"
 	"github.com/metacubex/chi/render"
@@ -25,7 +24,7 @@ func desktopRouter() http.Handler {
 
 func getDesktopStatus(w http.ResponseWriter, r *http.Request) {
 	state := "loading"
-	if tunnel.Status() == tunnel.Running {
+	if desktop.Ready() {
 		state = "running"
 	}
 	if executor.ShutdownRequested() {

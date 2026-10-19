@@ -125,6 +125,9 @@ func ApplyConfig(cfg *config.Config, force bool) error {
 	if err := beginTransparentProxyApply(cfg.General.TransparentProxy, transparentProxyRuntime(cfg)); err != nil {
 		return fmt.Errorf("apply transparent-proxy: %w", err)
 	}
+	// Admission/validation failures above preserve the previous ready state.
+	// Once mutation starts, only the final successful application may restore it.
+	desktop.SetReady(false)
 	startTransparentProxyRepairs()
 	invalidateUpdateConfiguration()
 	log.SetLevel(cfg.General.LogLevel)
@@ -180,6 +183,7 @@ func ApplyConfig(cfg *config.Config, force bool) error {
 	applyErr = errors.Join(applyErr, finishTransparentProxyApply(transparentProxyRuntime(cfg)))
 	publishUpdateConfiguration(cfg)
 	finishUpdates()
+	desktop.SetReady(applyErr == nil)
 	return applyErr
 }
 
