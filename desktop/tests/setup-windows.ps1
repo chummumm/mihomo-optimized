@@ -2,10 +2,10 @@ $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true') { throw 'This integration setup is restricted to disposable GitHub Windows runners.' }
 $out = Join-Path $PWD 'artifacts/verification'
 New-Item -ItemType Directory -Path $out -Force | Out-Null
-$installer = @(Get-ChildItem 'artifacts/desktop/*-setup.exe')
-if ($installer.Count -ne 1) { throw 'Expected one installer.' }
-$process = Start-Process -FilePath $installer[0].FullName -ArgumentList '/S' -Wait -PassThru
-if ($process.ExitCode -ne 0) { throw "Installer failed with $($process.ExitCode)" }
+python (Join-Path $PSScriptRoot 'upgrade_smoke.py')
+if ($LASTEXITCODE -ne 0) { throw 'Uninstall-first and running-service upgrade acceptance failed; see upgrade.json.' }
+$upgrade = Get-Content (Join-Path $out 'upgrade.json') -Raw | ConvertFrom-Json
+if ($upgrade.passed -ne $true) { throw 'Upgrade acceptance did not report success.' }
 $application = Join-Path $env:ProgramFiles 'Mihomo Optimized/mihomo-optimized.exe'
 if (-not (Test-Path $application)) { throw "Installed application missing: $application" }
 $runtimes = @(
@@ -24,4 +24,4 @@ $driver = Join-Path $driverDirectory 'msedgedriver.exe'
 if (-not (Test-Path $driver)) { throw 'Edge WebDriver download is incomplete.' }
 "MIHOMO_TEST_APP=$application" >> $env:GITHUB_ENV
 "MIHOMO_TEST_DRIVER=$driver" >> $env:GITHUB_ENV
-@{ webview2Version = $version; installerExitCode = $process.ExitCode; application = $application } | ConvertTo-Json | Set-Content (Join-Path $out 'installation.json')
+@{ webview2Version = $version; installerExitCode = 0; application = $application; upgradeEvidence = 'upgrade.json' } | ConvertTo-Json | Set-Content (Join-Path $out 'installation.json')

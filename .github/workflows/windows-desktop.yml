@@ -117,7 +117,7 @@ jobs:
           retention-days: 30
       - name: Test real Windows core authentication, proxying and exit
         run: python desktop/tests/core_smoke.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe
-      - name: Install desktop and matching WebView2 driver
+      - name: Test uninstall-first upgrade from 0.1.1 and prepare WebView2 driver
         run: ./desktop/tests/setup-windows.ps1
       - name: Test installed WebView2 UI, system proxy, TUN forwarding and cleanup
         run: python desktop/tests/windows_smoke.py

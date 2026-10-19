@@ -18,8 +18,8 @@ use std::{
 };
 use windows_service::{
     service::{
-        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-        ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+        Service, ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl,
+        ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
     },
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
@@ -185,36 +185,36 @@ fn install(owner_sid: &str) -> Result<()> {
 }
 
 fn set_installed_running(running: bool) -> Result<()> {
-    let directory = windows::protected_install_dir()?;
+    // An old uninstall may leave only this helper behind. Stopping the fixed SCM
+    // service must not require the application/core files that were just removed.
+    let directory = if running {
+        Some(windows::protected_install_dir()?)
+    } else {
+        None
+    };
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(service_error)?;
-    let service = match manager.open_service(
-        SERVICE_NAME,
-        ServiceAccess::STOP | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
-    ) {
-        Ok(service) => service,
-        Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1060) => {
-            return Ok(())
-        }
-        Err(error) => return Err(service_error(error)),
+    let access = ServiceAccess::QUERY_STATUS
+        | if running {
+            ServiceAccess::START
+        } else {
+            ServiceAccess::STOP
+        };
+    let service = match open_maintenance_service(&manager, access)? {
+        Some(service) => service,
+        None => return Ok(()),
     };
-    if running {
+    if let Some(directory) = directory {
         windows::configure_tun_firewall(&directory, true)?;
+    } else {
+        return stop_service(&service);
     }
     let current = service.query_status().map_err(service_error)?.current_state;
-    if running && current == ServiceState::Stopped {
+    if current == ServiceState::Stopped {
         service.start::<&str>(&[]).map_err(service_error)?;
     }
-    if !running && current != ServiceState::Stopped {
-        service.stop().map_err(service_error)?;
-    }
-    let expected = if running {
-        ServiceState::Running
-    } else {
-        ServiceState::Stopped
-    };
     let started = Instant::now();
-    while service.query_status().map_err(service_error)?.current_state != expected {
+    while service.query_status().map_err(service_error)?.current_state != ServiceState::Running {
         if started.elapsed() > Duration::from_secs(40) {
             return Err(AppError::new(
                 "service_transition_timeout",
@@ -226,40 +226,153 @@ fn set_installed_running(running: bool) -> Result<()> {
     Ok(())
 }
 
+fn has_service_error(error: &windows_service::Error, code: i32) -> bool {
+    matches!(error, windows_service::Error::Winapi(error) if error.raw_os_error() == Some(code))
+}
+
+fn open_maintenance_service(
+    manager: &ServiceManager,
+    access: ServiceAccess,
+) -> Result<Option<Service>> {
+    match manager.open_service(SERVICE_NAME, access) {
+        Ok(service) => Ok(Some(service)),
+        Err(error) if has_service_error(&error, 1060) => Ok(None),
+        Err(error) if has_service_error(&error, 1072) => {
+            // Marked for deletion does not prove that the service has stopped.
+            wait_for_service_deleted(manager)?;
+            Ok(None)
+        }
+        Err(error) => Err(service_error(error)),
+    }
+}
+
+fn maintenance_wait(started: Instant) -> bool {
+    if started.elapsed() >= Duration::from_secs(40) {
+        return false;
+    }
+    thread::sleep(Duration::from_millis(100));
+    true
+}
+
+fn stop_service(service: &Service) -> Result<()> {
+    let started = Instant::now();
+    stop_service_with(
+        || service.query_status().map(|status| status.current_state),
+        || service.stop().map(|_| ()),
+        || maintenance_wait(started),
+    )
+}
+
+fn stop_service_with(
+    mut query: impl FnMut() -> windows_service::Result<ServiceState>,
+    mut stop: impl FnMut() -> windows_service::Result<()>,
+    mut wait: impl FnMut() -> bool,
+) -> Result<()> {
+    let mut stop_requested = false;
+    let mut last_error = None;
+    loop {
+        let state = query().map_err(service_error)?;
+        if state == ServiceState::Stopped {
+            return Ok(());
+        }
+        // Pending states need time to finish. A successful STOP must not be
+        // repeated even if QueryServiceStatusEx still reports the previous state.
+        if !stop_requested && matches!(state, ServiceState::Running | ServiceState::Paused) {
+            match stop() {
+                Ok(()) => stop_requested = true,
+                Err(error)
+                    if has_service_error(&error, 1061) || has_service_error(&error, 1062) =>
+                {
+                    // A concurrent stop/start can race the status query. Requery
+                    // before deciding whether another STOP is appropriate.
+                    last_error = Some(service_error(error));
+                }
+                Err(error) => return Err(service_error(error)),
+            }
+        }
+        if !wait() {
+            return Err(maintenance_timeout(
+                "service_stop_timeout",
+                format!("等待服务停止超时（当前状态：{state:?}）"),
+                last_error,
+            ));
+        }
+    }
+}
+
+fn wait_for_service_deleted(manager: &ServiceManager) -> Result<()> {
+    let started = Instant::now();
+    wait_for_service_deleted_with(
+        // Do not keep a probe handle open: it would itself defer deletion.
+        || {
+            manager
+                .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+                .map(drop)
+        },
+        || maintenance_wait(started),
+    )
+}
+
+fn wait_for_service_deleted_with(
+    mut open: impl FnMut() -> windows_service::Result<()>,
+    mut wait: impl FnMut() -> bool,
+) -> Result<()> {
+    let mut last_error = None;
+    loop {
+        match open() {
+            Ok(()) => (),
+            Err(error) if has_service_error(&error, 1060) => return Ok(()),
+            Err(error) if has_service_error(&error, 1072) => {
+                last_error = Some(service_error(error));
+            }
+            Err(error) => return Err(service_error(error)),
+        }
+        if !wait() {
+            return Err(maintenance_timeout(
+                "service_delete_timeout",
+                "等待服务从 Windows 服务列表移除超时，请关闭服务管理窗口后重试".into(),
+                last_error,
+            ));
+        }
+    }
+}
+
+fn maintenance_timeout(code: &str, message: String, last_error: Option<AppError>) -> AppError {
+    AppError::new(
+        code,
+        match last_error {
+            Some(error) => format!("{message}；上次操作错误：{}", error.message),
+            None => message,
+        },
+    )
+}
+
 fn uninstall() -> Result<()> {
     let directory = windows::protected_install_dir()?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(service_error)?;
-    let service = match manager.open_service(
-        SERVICE_NAME,
+    let service = open_maintenance_service(
+        &manager,
         ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
-    ) {
-        Ok(service) => Some(service),
-        Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1060) => None,
-        Err(error) => return Err(service_error(error)),
-    };
+    )?;
     if let Some(service) = &service {
-        if service.query_status().map_err(service_error)?.current_state != ServiceState::Stopped {
-            service.stop().map_err(service_error)?;
-            let started = Instant::now();
-            while service.query_status().map_err(service_error)?.current_state
-                != ServiceState::Stopped
-            {
-                if started.elapsed() > Duration::from_secs(40) {
-                    return Err(AppError::new(
-                        "service_stop_timeout",
-                        "服务尚未停止，请稍后重试卸载",
-                    ));
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
+        stop_service(service)?;
     }
     // A previous partial uninstall may have already removed the SCM entry.
     // Always remove this installation's firewall rules before clearing ownership.
     windows::configure_tun_firewall(&directory, false)?;
     if let Some(service) = service {
-        service.delete().map_err(service_error)?;
+        match service.delete() {
+            Ok(()) => (),
+            Err(error) if has_service_error(&error, 1072) => (),
+            Err(error) => return Err(service_error(error)),
+        }
+        // Another administrator may have started the service between the first
+        // stop and DeleteService. A marked entry cannot be started again; confirm
+        // it has stopped before closing our handle and waiting for actual removal.
+        stop_service(&service)?;
+        drop(service);
+        wait_for_service_deleted(&manager)?;
     }
     let owner = windows::service_data_dir()?.join("owner.sid");
     if owner.exists() {
@@ -370,4 +483,107 @@ fn run_service() -> Result<()> {
     })();
     let final_status = report_status(&handle, ServiceState::Stopped);
     result.and(final_status)
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    fn winapi_error(code: i32) -> windows_service::Error {
+        windows_service::Error::Winapi(std::io::Error::from_raw_os_error(code))
+    }
+
+    #[test]
+    fn stop_handles_concurrent_transitions_without_repeated_controls() {
+        use ServiceState::{Running, StartPending, StopPending, Stopped};
+        for (states, controls) in [
+            (vec![StopPending, Stopped], vec![]),
+            (vec![StartPending, Running, Stopped], vec![None]),
+            (vec![Running, Running, StopPending, Stopped], vec![None]),
+            (vec![Running, StopPending, Stopped], vec![Some(1061)]),
+            (vec![Running, Stopped], vec![Some(1062)]),
+        ] {
+            let mut states = states.into_iter();
+            let mut controls = controls.into_iter();
+            stop_service_with(
+                || Ok(states.next().expect("unexpected extra status query")),
+                || match controls.next().expect("unexpected repeated STOP") {
+                    Some(code) => Err(winapi_error(code)),
+                    None => Ok(()),
+                },
+                || true,
+            )
+            .unwrap();
+            assert!(states.next().is_none());
+            assert!(controls.next().is_none());
+        }
+    }
+
+    #[test]
+    fn stop_preserves_query_and_control_access_errors() {
+        let query_error = stop_service_with(
+            || Err(winapi_error(5)),
+            || panic!("must not stop after a failed status query"),
+            || panic!("access denied is not a retryable transition"),
+        )
+        .unwrap_err();
+        let control_error = stop_service_with(
+            || Ok(ServiceState::Running),
+            || Err(winapi_error(5)),
+            || panic!("access denied is not a retryable transition"),
+        )
+        .unwrap_err();
+        for error in [query_error, control_error] {
+            assert_eq!(error.code, "io_error");
+            assert!(error.message.contains("系统错误：5"));
+        }
+    }
+
+    #[test]
+    fn stop_timeout_preserves_the_last_transition_error() {
+        let error = stop_service_with(
+            || Ok(ServiceState::Running),
+            || Err(winapi_error(1061)),
+            || false,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "service_stop_timeout");
+        assert!(error.message.contains("系统错误：1061"));
+        let pending = stop_service_with(
+            || Ok(ServiceState::StopPending),
+            || panic!("must not repeat STOP while StopPending"),
+            || false,
+        )
+        .unwrap_err();
+        assert_eq!(pending.code, "service_stop_timeout");
+    }
+
+    #[test]
+    fn deletion_waits_until_the_service_is_absent() {
+        let mut results = [Some(1072), None, Some(1060)].into_iter();
+        wait_for_service_deleted_with(
+            || match results.next().expect("unexpected extra service probe") {
+                Some(code) => Err(winapi_error(code)),
+                None => Ok(()),
+            },
+            || true,
+        )
+        .unwrap();
+        assert!(results.next().is_none());
+    }
+
+    #[test]
+    fn deletion_does_not_report_pending_or_access_denied_as_success() {
+        let pending =
+            wait_for_service_deleted_with(|| Err(winapi_error(1072)), || false).unwrap_err();
+        assert_eq!(pending.code, "service_delete_timeout");
+        assert!(pending.message.contains("系统错误：1072"));
+        let denied = wait_for_service_deleted_with(
+            || Err(winapi_error(5)),
+            || panic!("access denied is not a pending deletion"),
+        )
+        .unwrap_err();
+        assert_eq!(denied.code, "io_error");
+        assert!(denied.message.contains("系统错误：5"));
+    }
 }
