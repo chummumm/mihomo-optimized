@@ -161,6 +161,42 @@ Function MihomoPrepareInstallation
     System::Store "l"
 FunctionEnd
 
+; Keep the other installed binaries until the helper is actually deletable.
+; In particular, let a proxy recovery watchdog finish naturally after GUI exit.
+Function un.MihomoDeleteHelper
+  System::Store "s"
+  StrCpy $MihomoMaintenanceStage "delete_helper_file"
+  StrCpy $MihomoMaintenanceError 0
+  System::Call 'kernel32::GetTickCount() i .R0'
+  mihomo_delete_helper_poll:
+    System::Call 'kernel32::DeleteFileW(w "$INSTDIR\mihomo-desktop-service.exe") i .r0 ?e'
+    Pop $1
+    ${If} $0 <> 0
+    ${OrIf} $1 = 2 ; ERROR_FILE_NOT_FOUND
+    ${OrIf} $1 = 3 ; ERROR_PATH_NOT_FOUND
+      Goto mihomo_delete_helper_done
+    ${EndIf}
+    ${If} $1 <> 5 ; ERROR_ACCESS_DENIED, including a mapped image
+    ${AndIf} $1 <> 32 ; ERROR_SHARING_VIOLATION
+      Goto mihomo_delete_helper_failed
+    ${EndIf}
+    System::Call 'kernel32::GetTickCount() i .R1'
+    IntOp $R1 $R1 - $R0
+    ${If} $R1 U>= 40000
+      Goto mihomo_delete_helper_failed
+    ${EndIf}
+    IntOp $R2 40000 - $R1
+    ${If} $R2 > 100
+      StrCpy $R2 100
+    ${EndIf}
+    Sleep $R2
+    Goto mihomo_delete_helper_poll
+  mihomo_delete_helper_failed:
+    StrCpy $MihomoMaintenanceError $1
+  mihomo_delete_helper_done:
+    System::Store "l"
+FunctionEnd
+
 ; Service installation stays opt-in. Stop existing installations before copying
 ; new files, then restart an installed service with its existing owner SID.
 !macro NSIS_HOOK_PREINSTALL
@@ -192,7 +228,8 @@ FunctionEnd
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  IfFileExists "$INSTDIR\mihomo-desktop-service.exe" 0 mihomo_preuninstall_done
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\mihomo-optimized.exe" "${PRODUCTNAME}"
+  IfFileExists "$INSTDIR\mihomo-desktop-service.exe" 0 mihomo_preuninstall_delete_helper
   System::Store "s"
   nsExec::ExecToStack '"$INSTDIR\mihomo-desktop-service.exe" --uninstall'
   Pop $0
@@ -211,5 +248,16 @@ FunctionEnd
     SetErrorLevel 1
     Abort
   ${EndIf}
-  mihomo_preuninstall_done:
+  mihomo_preuninstall_delete_helper:
+  Call un.MihomoDeleteHelper
+  ${If} $MihomoMaintenanceError != 0
+    DetailPrint "Mihomo helper removal failed: stage=$MihomoMaintenanceStage, Win32=$MihomoMaintenanceError"
+    IfSilent mihomo_preuninstall_delete_abort 0
+    ${If} $PassiveMode != 1
+      MessageBox MB_ICONSTOP|MB_OK "Unable to remove the Mihomo desktop helper.$\r$\nStage: $MihomoMaintenanceStage$\r$\nWindows error: $MihomoMaintenanceError"
+    ${EndIf}
+    mihomo_preuninstall_delete_abort:
+    SetErrorLevel 1
+    Abort
+  ${EndIf}
 !macroend

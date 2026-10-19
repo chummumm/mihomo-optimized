@@ -232,6 +232,9 @@ class UpgradeAcceptance:
         for path in (self.candidate, archive, distribution / "build-info.json"):
             require(path.is_file() and checksums.get(path.name) == digest(path), "candidate_checksum_mismatch")
         self.expected_hashes = {}
+        self.expected_sizes = {}
+        portable_hashes = {}
+        marker_patch = {}
         with zipfile.ZipFile(archive) as bundle:
             info_member = PRODUCT + "/resources/build-info.json"
             require(bundle.namelist().count(info_member) == 1
@@ -243,7 +246,26 @@ class UpgradeAcceptance:
                         and 0 < bundle.getinfo(member).file_size < 256 * 1024 * 1024,
                         "portable_binary_invalid")
                 with bundle.open(member) as stream:
-                    self.expected_hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+                    if name == "mihomo-optimized.exe":
+                        data = stream.read()
+                        portable_hashes[name] = hashlib.sha256(data).hexdigest()
+                        unknown = b"__TAURI_BUNDLE_TYPE_VAR_UNK"
+                        nsis = b"__TAURI_BUNDLE_TYPE_VAR_NSS"
+                        require(data.count(unknown) == 1 and data.count(nsis) == 0,
+                                "portable_gui_bundle_marker_invalid")
+                        # Locked tauri-cli 2.12.3 patches the first UNK marker for
+                        # NSIS, then restores the original build for other bundles.
+                        # https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.3/crates/tauri-bundler/src/bundle.rs
+                        # Hash the complete expected installed file; no bytes are
+                        # excluded from the subsequent strict installed comparison.
+                        self.expected_hashes[name] = hashlib.sha256(data.replace(unknown, nsis, 1)).hexdigest()
+                        marker_patch = {"binary": name, "tauriCliVersion": "2.12.3",
+                                        "from": unknown.decode("ascii"), "to": nsis.decode("ascii"),
+                                        "offset": data.index(unknown), "replacements": 1}
+                    else:
+                        self.expected_hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+                        portable_hashes[name] = self.expected_hashes[name]
+                self.expected_sizes[name] = bundle.getinfo(member).file_size
             for name in EXECUTABLES[1:]:
                 companion = name.removesuffix(".exe") + "-" + TARGET + ".exe"
                 require(self.info.get("companions", {}).get(companion) == self.expected_hashes[name],
@@ -251,7 +273,9 @@ class UpgradeAcceptance:
         self.report["candidate"] = {"version": version, "source": self.info["uiCommit"],
                                     "coreSource": self.info["coreCommit"],
                                     "installer": self.candidate.name, "sha256": digest(self.candidate),
-                                    "installedBinarySha256": self.expected_hashes}
+                                    "portableBinarySha256": portable_hashes,
+                                    "installedBinarySha256": self.expected_hashes,
+                                    "markerPatch": marker_patch}
 
     def download_legacy(self) -> Path:
         # Keep this outside artifacts/desktop so the candidate remains unique.
@@ -328,11 +352,29 @@ class UpgradeAcceptance:
         return identity
 
     def assert_candidate_files(self) -> None:
-        installed = json.loads((self.install_dir / "resources/build-info.json").read_text(encoding="utf-8-sig"))
-        require(installed == self.info, "installed_build_source_mismatch")
+        evidence = {"stage": self.stage, "files": {}}
         for name, expected in self.expected_hashes.items():
             path = self.install_dir / name
-            require(path.is_file() and digest(path) == expected, "installed_binary_mismatch_" + name)
+            item = {"expectedSha256": expected, "expectedSize": self.expected_sizes[name],
+                    "actualSha256": None, "actualSize": None, "missing": not path.is_file()}
+            evidence["files"][name] = item
+            if not item["missing"]:
+                try:
+                    item["actualSize"] = path.stat().st_size
+                    item["actualSha256"] = digest(path)
+                except OSError as error:
+                    item["readError"] = failure_code(error)
+        # Preserve all four observations before the first strict assertion can
+        # fail, including a stale GUI alongside otherwise current companions.
+        self.report.setdefault("installedFileChecks", []).append(evidence)
+        self.write_report()
+        installed = json.loads((self.install_dir / "resources/build-info.json").read_text(encoding="utf-8-sig"))
+        evidence["buildInfoMatches"] = installed == self.info
+        self.write_report()
+        require(installed == self.info, "installed_build_source_mismatch")
+        for name, item in evidence["files"].items():
+            require(not item["missing"] and item["actualSha256"] == item["expectedSha256"]
+                    and item["actualSize"] == item["expectedSize"], "installed_binary_mismatch_" + name)
         self.assert_registration(self.info["desktopVersion"])
         self.assert_marker()
 
@@ -439,14 +481,39 @@ class UpgradeAcceptance:
             "processReplaced": True, "ownerSidPreserved": True, "configurationPreserved": True}
         self.mark("overwrite_restarts_existing_service")
 
-        self.stage = "candidate_service_uninstall"
-        require(self.command("candidate_service_uninstall", self.helper, ["--uninstall"])["exitCode"] == 0,
-                "candidate_service_uninstall_failed")
-        self.report["candidate"]["serviceAfterUninstall"] = self.assert_no_service()
+        self.stage = "candidate_application_uninstall"
+        running = self.running_service()
+        uninstaller = self.install_dir / "uninstall.exe"
+        raw = uninstall_command(uninstaller)
+        self.report["candidateUninstall"] = {"commandLine": raw, "servicePidBefore": running.pid}
+        result = self.command("candidate_uninstall", uninstaller, raw, 180)
+        remaining = {name: (self.install_dir / name).exists() for name in EXECUTABLES}
+        self.report["candidateUninstall"]["remainingFiles"] = remaining
+        self.write_report()
+        require(result["exitCode"] == 0, "candidate_uninstall_failed")
+        self.report["candidateUninstall"]["service"] = self.assert_no_service()
+        require(not any(remaining.values()), "candidate_uninstall_left_program_files")
         require(not self.owner_file.exists(), "uninstalled_service_owner_remains")
+        require(registration() is None, "candidate_uninstall_registration_remains")
         self.assert_marker()
         wait_until(lambda: not self.processes.at_paths([self.app, self.core, self.helper]), "upgrade_process_remains", 15)
-        self.mark("candidate_service_fully_removed")
+        self.report["candidateUninstall"].update({"ownerRemoved": True, "registrationRemoved": True,
+                                                   "configurationPreserved": True})
+        # Only the in-place uninstaller needs parent cleanup. The assertions
+        # above require NSIS itself to have removed all four installed programs.
+        uninstaller.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            self.install_dir.rmdir()
+        self.mark("candidate_application_fully_uninstalled")
+
+        self.stage = "candidate_reinstall_for_gui"
+        require(self.command("candidate_reinstall", self.candidate, ["/S"], 180)["exitCode"] == 0,
+                "candidate_reinstall_failed")
+        self.assert_candidate_files()
+        self.report["candidate"]["serviceAfterReinstall"] = self.assert_no_service()
+        require(not self.owner_file.exists(), "candidate_reinstall_created_service_owner")
+        wait_until(lambda: not self.processes.at_paths([self.app, self.core, self.helper]), "reinstall_started_process", 15)
+        self.mark("candidate_reinstalled_for_gui")
 
     def remove_owned_service(self) -> None:
         """Failure cleanup is restricted to the service this test installed."""
@@ -556,7 +623,8 @@ def main() -> int:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": failure_code(error)})
             required = {"published_baseline_verified", "legacy_service_running", "uninstall_retained_locked_helper",
                         "published_old_helper_failure_reproduced", "candidate_repairs_uninstall_residue",
-                        "overwrite_restarts_existing_service", "candidate_service_fully_removed", "final_cleanup"}
+                        "overwrite_restarts_existing_service", "candidate_application_fully_uninstalled",
+                        "candidate_reinstalled_for_gui", "final_cleanup"}
             acceptance.report["passed"] = (all(acceptance.report["tests"].get(name) is True for name in required)
                                            and not acceptance.report["diagnostics"])
             acceptance.write_report()
