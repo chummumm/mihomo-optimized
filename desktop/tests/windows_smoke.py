@@ -776,7 +776,7 @@ class ResourceFixture(http.server.ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self) -> None:
+    def __init__(self, proxy_check=None) -> None:
         super().__init__(("127.0.0.1", 0), ResourceHandler)
         self.delay = float(os.environ.get("MIHOMO_TEST_RESOURCE_DELAY_SECONDS", "22"))
         require(0 < self.delay <= 30, "resource_fixture_delay_invalid")
@@ -786,12 +786,32 @@ class ResourceFixture(http.server.ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.stopping = threading.Event()
         self.offline = False
+        self.proxy_check = proxy_check
+        self.pending_proxy_checks = 0
+        self.pending_proxy_failure = None
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
 
     def count(self, path: str) -> int:
         with self.lock:
             return self.requests.get(path, 0)
+
+    def check_pending_proxy(self) -> None:
+        if self.proxy_check is None:
+            return
+        try:
+            disabled = self.proxy_check()
+            failure = None if disabled else "system_proxy_enabled_before_resource_ready"
+        except Exception:
+            failure = "pending_system_proxy_query_failed"
+        with self.lock:
+            self.pending_proxy_checks += 1
+            self.pending_proxy_failure = self.pending_proxy_failure or failure
+
+    def require_direct_preparation(self, previous_checks: int) -> None:
+        with self.lock:
+            require(self.pending_proxy_checks > previous_checks, "resource_proxy_observation_missing")
+            require(self.pending_proxy_failure is None, self.pending_proxy_failure or "resource_proxy_observation_failed")
 
     def configuration(self, base: str, *, failing: bool = False) -> str:
         endpoint = "/timeout.yaml" if failing else "/rules.yaml"
@@ -828,7 +848,15 @@ class ResourceHandler(http.server.BaseHTTPRequestHandler):
         if fixture.offline or path not in ("/rules.yaml", "/timeout.yaml"):
             code, body = 503, b"fixture offline\n"
         else:
-            fixture.stopping.wait(5 if path == "/timeout.yaml" else fixture.delay)
+            deadline = time.monotonic() + (5 if path == "/timeout.yaml" else fixture.delay)
+            while time.monotonic() < deadline:
+                # The successful request is still withholding the required file,
+                # so the new core cannot be ready. Timeout requests may already
+                # have been cancelled by the core and are deliberately excluded.
+                if path == "/rules.yaml":
+                    fixture.check_pending_proxy()
+                if fixture.stopping.wait(min(0.1, max(0, deadline - time.monotonic()))):
+                    break
             code, body = 200, b"payload:\n  - '+.bootstrap-fixture.invalid'\n"
         with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
             self.send_response(code)
@@ -895,6 +923,7 @@ class Acceptance:
         self.processes = Processes()
         self.wininet = WinInet()
         self.proxy_before = self.wininet.read()
+        self.proxy_disabled: dict | None = None
         self.autostart_before = read_autostart()
         self.original_files: dict[Path, bytes | None] = {}
         self.desktop: RestrictedDesktop | None = None
@@ -902,6 +931,7 @@ class Acceptance:
         self.socks: SocksFixture | None = None
         self.resources: ResourceFixture | None = None
         self.gui: ProcessIdentity | None = None
+        self.service_identity: ProcessIdentity | None = None
         self.owned_children: dict[int, ProcessIdentity] = {}
         self.ports: set[int] = set()
         self.secrets: set[str] = set()
@@ -921,10 +951,13 @@ class Acceptance:
     def check_resource_bootstrap(self, base: str) -> str:
         self.stage = "resource_bootstrap"
         self.driver.invoke("desktop_stop")
-        self.resources = ResourceFixture()
+        require(self.wininet.read() == self.proxy_disabled, "cold_start_proxy_not_disabled")
+        self.resources = ResourceFixture(lambda: self.wininet.read() == self.proxy_disabled)
         self.secrets.add(self.resources.token)
         source = self.resources.configuration(base)
         self.save_configuration(source)
+        cache = self.directory / "runtime" / "rules" / (self.resources.cache_name + ".yaml")
+        require(not cache.exists(), "cold_user_resource_cache_already_exists")
         started = time.monotonic()
         self.driver.invoke("desktop_start")
         elapsed = time.monotonic() - started
@@ -932,7 +965,9 @@ class Acceptance:
         identity = self.managed_core(running)
         require(elapsed >= self.resources.delay * 0.9 and self.resources.count("/rules.yaml") >= 1,
                 "delayed_resource_not_awaited")
-        cache = self.directory / "runtime" / "rules" / (self.resources.cache_name + ".yaml")
+        self.resources.require_direct_preparation(0)
+        require(running.get("systemProxy") is False and self.wininet.read() == self.proxy_disabled,
+                "cold_start_changed_system_proxy")
         require(cache.is_file() and b"bootstrap-fixture.invalid" in cache.read_bytes(), "resource_cache_not_persisted")
         self.save_configuration(self.resources.configuration(base, failing=True))
         failed_at = time.monotonic()
@@ -956,12 +991,14 @@ class Acceptance:
         self.report["resourceBootstrap"] = {"delaySeconds": self.resources.delay,
                                              "startupSeconds": round(elapsed, 3),
                                              "failedReloadSeconds": round(failure_seconds, 3),
-                                             "cachePersisted": True, "oldCoreRestored": True}
+                                             "cachePersisted": True, "oldCoreRestored": True,
+                                             "coldUserStartWithoutSystemProxy": True,
+                                             "userPreparationProxyChecks": self.resources.pending_proxy_checks}
         self.mark("resource_bootstrap")
         return source
 
-    def status(self) -> dict:
-        value = self.driver.invoke("desktop_status")
+    def status(self, timeout: float = 95) -> dict:
+        value = self.driver.invoke("desktop_status", timeout=timeout)
         require(isinstance(value, dict), "desktop_status_invalid")
         controller = value.get("controller")
         if isinstance(controller, dict) and isinstance(controller.get("secret"), str):
@@ -1036,8 +1073,96 @@ class Acceptance:
                     raise SmokeFailure("service_excess_process_access_" + name)
         finally:
             win32security.RevertToSelf()
+        self.service_identity = identity
         return {"serviceAccount": "LocalSystem", "caller": "same_sid_filtered_primary",
                 "queryLimitedInformation": True, "deniedRights": list(denied)}
+
+    def check_service_proxy_recovery(self, running: dict, mixed: int) -> None:
+        """Briefly deny identity queries to this fixture's service, then restore.
+
+        The retained, identity-checked handle restores the exact original DACL in
+        finally. No process is replaced, no production identity check is bypassed,
+        and each observation is bounded well inside the normal 20s service lease.
+        """
+        import win32api
+        import win32security
+
+        self.stage = "system_proxy_service_recovery"
+        identity = self.service_identity
+        require(identity is not None and self.processes.identity(identity.pid) == identity,
+                "proxy_recovery_service_identity_changed")
+        current = self.driver.invoke("desktop_set_system_proxy", {"enabled": True})
+        require(current.get("systemProxy") is True, "service_recovery_proxy_not_enabled")
+        core_pid = self.managed_core(running)["pid"]
+        # READ_CONTROL | WRITE_DAC | PROCESS_QUERY_LIMITED_INFORMATION. Rights
+        # on this held handle survive the temporary deny ACE for new opens.
+        process = win32api.OpenProcess(0x00061000, False, identity.pid)
+        try:
+            require(self.processes.from_handle(int(process), identity.pid) == identity,
+                    "proxy_recovery_service_handle_mismatch")
+            token = win32security.OpenProcessToken(process, win32security.TOKEN_QUERY)
+            try:
+                user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+                require(win32security.ConvertSidToStringSid(user) == "S-1-5-18",
+                        "proxy_recovery_service_not_system")
+            finally:
+                token.Close()
+            flags = win32security.DACL_SECURITY_INFORMATION
+            descriptor = win32security.GetSecurityInfo(process, win32security.SE_KERNEL_OBJECT, flags)
+            original = descriptor.GetSecurityDescriptorDacl()
+            require(original is not None and original.IsValid(), "service_original_dacl_invalid")
+            original_sddl = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(descriptor, 1, flags)
+            changed = win32security.GetSecurityInfo(process, win32security.SE_KERNEL_OBJECT, flags).GetSecurityDescriptorDacl()
+            require(changed is not None and changed.IsValid(), "service_probe_dacl_invalid")
+            changed.SetEntriesInAcl([{
+                "AccessPermissions": 0x1000, "AccessMode": win32security.DENY_ACCESS,
+                "Inheritance": 0,
+                "Trustee": {"TrusteeForm": win32security.TRUSTEE_IS_SID,
+                            "TrusteeType": win32security.TRUSTEE_IS_USER,
+                            "Identifier": win32security.ConvertStringSidToSid(self.desktop.sid)},
+            }])
+            require(changed.IsValid(), "service_probe_dacl_merge_failed")
+            started = time.monotonic()
+            try:
+                win32security.SetSecurityInfo(process, win32security.SE_KERNEL_OBJECT, flags,
+                                              None, None, changed, None)
+
+                def identity_rejected():
+                    observed = self.status(timeout=2)
+                    return observed if observed.get("phase") == "error" else None
+
+                failed = wait_until(identity_rejected, "service_identity_outage_not_observed", 6)
+                require("无法验证服务进程" in (failed.get("lastError") or "")
+                        and "系统错误：5" in (failed.get("lastError") or "")
+                        and failed.get("controller") is None and failed.get("systemProxy") is False,
+                        "service_identity_outage_not_safely_reported")
+                require(self.wininet.read() == self.proxy_disabled,
+                        "service_identity_outage_did_not_restore_proxy")
+            finally:
+                win32security.SetSecurityInfo(process, win32security.SE_KERNEL_OBJECT, flags,
+                                              None, None, original, None)
+            denied_seconds = time.monotonic() - started
+            require(denied_seconds < 10, "service_identity_probe_exceeded_lease_margin")
+            restored = win32security.GetSecurityInfo(process, win32security.SE_KERNEL_OBJECT, flags)
+            require(win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(restored, 1, flags) == original_sddl,
+                    "service_identity_dacl_not_restored")
+        finally:
+            process.Close()
+
+        def proxy_restored():
+            observed = self.status(timeout=3)
+            return observed if observed.get("phase") == "running" and observed.get("systemProxy") is True else None
+
+        recovered = wait_until(proxy_restored, "confirmed_service_did_not_restore_proxy", 8)
+        require(self.managed_core(recovered)["pid"] == core_pid
+                and self.wininet.read()["server"] == f"127.0.0.1:{mixed}",
+                "service_proxy_recovery_changed_core_or_port")
+        self.report["systemProxyRecovery"] = {"identityQueryDeniedSeconds": round(denied_seconds, 3),
+                                              "originalDaclRestored": True, "sameCorePid": True,
+                                              "proxyRestoredAfterConfirmation": True}
+        self.driver.invoke("desktop_set_system_proxy", {"enabled": False})
+        require(self.wininet.read() == self.proxy_disabled, "service_proxy_recovery_cleanup_failed")
+        self.mark("system_proxy_service_recovery")
 
     def managed_core(self, status: dict) -> dict:
         require(status.get("phase") == "running", "core_not_running")
@@ -1155,6 +1280,12 @@ class Acceptance:
             self.original_files[path] = path.read_bytes() if path.exists() else None
         require(not (self.directory / "system-proxy-recovery.json").exists(), "preexisting_proxy_recovery")
         self.mutations_started = True
+        # Make the negative prerequisite explicit, including PAC/autodetection.
+        # The runner's original per-user settings are restored in cleanup.
+        self.wininet.restore({"flags": 1, "server": "", "bypass": "", "pac": ""})
+        self.proxy_disabled = self.wininet.read()
+        require(self.proxy_disabled["flags"] == 1 and not self.proxy_disabled["server"]
+                and not self.proxy_disabled["pac"], "wininet_direct_fixture_not_applied")
         (self.directory / "config.yaml").write_text(BAD_CONFIG, encoding="utf-8", newline="")
         (self.directory / "preferences.json").write_text(json.dumps({"desiredRunning": True, "systemProxy": False, "tun": False}), encoding="utf-8")
         self.socks = SocksFixture()
@@ -1196,7 +1327,8 @@ class Acceptance:
         require(after.get("revision") == saved["revision"] and after.get("content") == valid, "revision_conflict_overwrote_source")
         self.mark("config_revision")
 
-        valid = self.check_resource_bootstrap(valid)
+        base = valid
+        valid = self.check_resource_bootstrap(base)
 
         self.stage = "system_proxy_restore"
         proxy = self.driver.invoke("desktop_set_system_proxy", {"enabled": True})
@@ -1205,7 +1337,43 @@ class Acceptance:
         require(actual["flags"] & 2 and actual["server"] == f"127.0.0.1:{mixed}", "system_proxy_not_applied_to_windows")
         self.driver.invoke("desktop_stop")
         self.phase("stopped")
-        wait_until(lambda: self.wininet.read() == self.proxy_before, "system_proxy_not_restored_after_stop")
+        wait_until(lambda: self.wininet.read() == self.proxy_disabled, "system_proxy_not_restored_after_stop")
+        require(json.loads((self.directory / "preferences.json").read_text(encoding="utf-8"))["systemProxy"] is True,
+                "stop_did_not_preserve_system_proxy_preference")
+        # A remembered proxy preference must not point Windows at a core that is
+        # still preparing resources, including a failed cold start and retry.
+        self.resources.offline = False
+        self.save_configuration(self.resources.configuration(base, failing=True))
+        self.driver.invoke("desktop_start", expected_error=("resource_bootstrap_timeout", "reload_invalid", "core_start_failed"))
+        failed = self.phase("error")
+        require(failed.get("controller") is None and failed.get("systemProxy") is False
+                and self.wininet.read() == self.proxy_disabled,
+                "failed_start_enabled_system_proxy")
+        self.save_configuration(valid)
+        cache = self.directory / "runtime" / "rules" / (self.resources.cache_name + ".yaml")
+        require(cache.is_file(), "preferred_proxy_cache_fixture_missing")
+        cache.unlink()  # Only this run's random, previously verified cache.
+        previous_checks = self.resources.pending_proxy_checks
+        previous_delay = self.resources.delay
+        self.resources.delay = min(previous_delay, 1.0)
+        try:
+            self.driver.invoke("desktop_start")
+        finally:
+            self.resources.delay = previous_delay
+        ready = self.phase("running")
+        self.managed_core(ready)
+        self.resources.require_direct_preparation(previous_checks)
+        require(ready.get("systemProxy") is True and cache.is_file()
+                and self.wininet.read()["server"] == f"127.0.0.1:{mixed}",
+                "preferred_proxy_not_restored_after_cold_start")
+        self.report["systemProxyStartup"] = {"wininetDirectBeforeStart": True,
+                                               "failedStartKeptDirect": True,
+                                               "coldRetryKeptDirectWhilePreparing": True,
+                                               "preferredProxyAppliedAfterReady": True,
+                                               "preparationProxyChecks": self.resources.pending_proxy_checks - previous_checks}
+        self.driver.invoke("desktop_stop")
+        require(self.wininet.read() == self.proxy_disabled, "preferred_proxy_not_restored_after_stop")
+        self.resources.offline = True
         # Clear the remembered switch so later starts do not silently re-enable it.
         self.driver.invoke("desktop_set_system_proxy", {"enabled": False})
         self.mark("system_proxy_restore")
@@ -1261,17 +1429,26 @@ class Acceptance:
             self.driver.invoke("desktop_set_tun", {"enabled": True})
             self.resources.offline = False
             service_resource_requests = self.resources.count("/rules.yaml")
+            service_proxy_checks = self.resources.pending_proxy_checks
+            service_cache = Path(os.environ["PROGRAMDATA"]) / "Mihomo Optimized" / "service" / "runtime" / "rules" / (self.resources.cache_name + ".yaml")
+            require(not service_cache.exists() and self.wininet.read() == self.proxy_disabled,
+                    "service_cold_start_prerequisites_not_met")
             service_start = time.monotonic()
             self.driver.invoke("desktop_start")
             tun = self.phase("running")
             require(tun.get("tun") is True and tun.get("service", {}).get("running") is True, "tun_service_not_running")
             tun_core_pid = self.managed_core(tun)["pid"]
-            service_cache = Path(os.environ["PROGRAMDATA"]) / "Mihomo Optimized" / "service" / "runtime" / "rules" / (self.resources.cache_name + ".yaml")
             require(service_cache.is_file() and self.resources.count("/rules.yaml") > service_resource_requests,
                     "service_resource_home_not_prepared")
+            self.resources.require_direct_preparation(service_proxy_checks)
+            require(tun.get("systemProxy") is False and self.wininet.read() == self.proxy_disabled,
+                    "service_cold_start_changed_system_proxy")
             self.report["resourceBootstrap"]["serviceStartupSeconds"] = round(time.monotonic() - service_start, 3)
+            self.report["resourceBootstrap"]["coldServiceStartWithoutSystemProxy"] = True
+            self.report["resourceBootstrap"]["servicePreparationProxyChecks"] = self.resources.pending_proxy_checks - service_proxy_checks
             self.mark("resource_bootstrap_service")
             self.mark("tun_service_identity")
+            self.check_service_proxy_recovery(tun, mixed)
 
             # A recovery must run inside an already authenticated heartbeat.
             # Otherwise its >20s preparation would block the next pipe connect
@@ -1331,7 +1508,7 @@ class Acceptance:
         wait_until(lambda: not service_installed(), "tun_service_not_removed")
         require(owned_firewall_rule_count(self.core) == 0, "tun_firewall_rule_not_removed")
         wait_until(lambda: not self.processes.at_paths([self.core]) and all(not listening(port) for port in self.ports), "core_survived_stop")
-        require(self.wininet.read() == self.proxy_before, "proxy_changed_during_tun_test")
+        require(self.wininet.read() == self.proxy_disabled, "proxy_changed_during_tun_test")
         self.mark("stop_cleanup")
 
         self.stage = "crash_cleanup"
@@ -1343,7 +1520,7 @@ class Acceptance:
         self.processes.kill(self.gui)
         # Do not stop the driver/helper or manually restore proxy/core until the
         # actual watchdog and native Job Object have passed these assertions.
-        wait_until(lambda: self.wininet.read() == self.proxy_before, "watchdog_did_not_restore_system_proxy")
+        wait_until(lambda: self.wininet.read() == self.proxy_disabled, "watchdog_did_not_restore_system_proxy")
         wait_until(lambda: not self.processes.at_paths([self.core]) and all(not listening(port) for port in self.ports), "job_did_not_stop_core_after_gui_crash")
         wait_until(lambda: not self.processes.at_paths([self.helper]), "watchdog_process_survived_gui_crash")
         require(not service_installed(), "service_reappeared_after_crash")
@@ -1447,7 +1624,7 @@ def main() -> int:
             required = {"startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
                         "single_instance_and_webview2_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
-                        "resource_bootstrap_recovery"}
+                        "resource_bootstrap_recovery", "system_proxy_service_recovery"}
             acceptance.report["passed"] = all(acceptance.report["tests"].get(name) is True for name in required) and not acceptance.report["diagnostics"]
             (artifacts / "verification.json").write_text(json.dumps(acceptance.report, indent=2) + "\n", encoding="utf-8")
     return 0 if acceptance and acceptance.report["passed"] else 1
