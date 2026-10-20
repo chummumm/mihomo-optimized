@@ -52,9 +52,9 @@ func TestResourceBootstrapRejectsUnavailableAndCyclicDependenciesBeforeDownload(
 	for _, tc := range []struct{ body, code string }{
 		{"resource-bootstrap: {proxy: missing}", "proxy_unavailable"},
 		{"resource-bootstrap: {proxy-provider: provider}", "missing_proxy"},
-		{"resource-bootstrap: {proxy: group}\nproxy-groups: [{name: group, type: select, proxies: [DIRECT]}]", "dynamic_proxy"},
+		{"resource-bootstrap: {proxy: group}\nproxy-groups: [{name: group, type: relay, proxies: [DIRECT]}]", "invalid_group"},
 		{"resource-bootstrap: {proxy: a}\nproxies: [{name: a, type: socks5, server: 127.0.0.1, port: 1, dialer-proxy: b}, {name: b, type: socks5, server: 127.0.0.1, port: 1, dialer-proxy: a}]", "proxy_cycle"},
-		{"resource-bootstrap: {proxy: a}\nproxies: [{name: a, type: socks5, server: 127.0.0.1, port: 1, dialer-proxy: group}]\nproxy-groups: [{name: group, type: select, proxies: [DIRECT]}]", "dynamic_proxy"},
+		{"resource-bootstrap: {proxy: a}\nproxies: [{name: a, type: socks5, server: 127.0.0.1, port: 1, dialer-proxy: group}]\nproxy-groups: [{name: group, type: select, proxies: [a]}]", "proxy_cycle"},
 		{"resource-bootstrap: {proxy: a, proxy-provider: remote}\nproxy-providers: {remote: {type: http, url: 'http://127.0.0.1:1/subscription'}}", "provider_cache_unavailable"},
 	} {
 		raw, err := UnmarshalRawConfig([]byte(tc.body))
@@ -191,11 +191,15 @@ func TestResourceBootstrapProviderUsesExistingFilteredCache(t *testing.T) {
 	}
 	defer scope.Close()
 	temporary := resource.BootstrapDialer(scope.Context()).(*bootstrapOutbound)
-	mapping, err := temporary.mapping("chosen-keep", true)
-	if err != nil || mapping["type"] != "socks5" {
-		t.Fatalf("provider selection ignored override or picked same-name static node: %#v %v", mapping, err)
+	chosen, err := temporary.root("chosen-keep", true)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := temporary.mapping("exclude", true); err == nil {
+	mapping := chosen.Adapter().(*bootstrapNode).mapping
+	if mapping["type"] != "socks5" {
+		t.Fatalf("provider selection ignored override or picked same-name static node: %#v", mapping)
+	}
+	if _, err := temporary.root("exclude", true); err == nil {
 		t.Fatal("provider filter was bypassed")
 	}
 	after, _ := os.ReadFile(path)
@@ -221,7 +225,11 @@ func TestResourceBootstrapGenericAdaptersAndUDP(t *testing.T) {
 			defer scope.Close()
 			done := make(chan error, 1)
 			go func() {
-				_, err := resource.BootstrapDialer(scope.Context()).(*bootstrapOutbound).outbound()
+				owner := resource.BootstrapDialer(scope.Context()).(*bootstrapOutbound)
+				proxy, err := owner.root("node", false)
+				if err == nil {
+					_, err = proxy.Adapter().(*bootstrapNode).adapter()
+				}
 				done <- err
 			}()
 			select {

@@ -103,7 +103,15 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 }
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
-	proxies := f.GetProxies(touch)
+	return f.SelectFrom(f.GetProxies(touch), nil, touch)
+}
+
+// SelectFrom applies the group's normal policy to a caller-owned candidate
+// snapshot. The caller serializes access to group selection state.
+func (f *Fallback) SelectFrom(proxies []C.Proxy, _ *C.Metadata, _ bool) C.Proxy {
+	if len(proxies) == 0 {
+		return nil
+	}
 	for _, proxy := range proxies {
 		if len(f.selected) == 0 {
 			if proxy.AliveForTestUrl(f.testUrl) {

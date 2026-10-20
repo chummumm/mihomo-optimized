@@ -187,33 +187,79 @@ func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []b
 			setIfNoneMatch = true
 		}
 	}
-	options := []mihomoHttp.Option{mihomoHttp.WithSpecialProxy(h.proxy)}
-	if BootstrapEnabled(ctx) {
-		options = append(options, mihomoHttp.WithDialTimeout(BootstrapConnectTimeout))
-		// An explicit provider proxy always takes precedence over the startup
-		// default. WithDialer bypasses specialProxy inside the HTTP transport.
-		if h.proxy == "" {
-			if downloadDialer := BootstrapDialer(ctx); downloadDialer != nil {
-				options = append(options, mihomoHttp.WithDialer(downloadDialer))
+	route, err := BootstrapRequestFor(ctx, h.proxy, h.url)
+	if err != nil {
+		return nil, utils.HashType{}, err
+	}
+	for {
+		options := []mihomoHttp.Option{mihomoHttp.WithSpecialProxy(h.proxy)}
+		if BootstrapEnabled(ctx) {
+			options = append(options, mihomoHttp.WithDialTimeout(BootstrapConnectTimeout))
+		}
+		if route != nil {
+			d, nextErr := route.Next(ctx)
+			if nextErr != nil {
+				if ctx.Err() != nil {
+					err = ctx.Err()
+				} else if err == nil {
+					err = nextErr
+				}
+				return nil, utils.HashType{}, err
+			}
+			options = append(options, mihomoHttp.WithDialer(d))
+		} else if h.proxy == "" {
+			if d := BootstrapDialer(ctx); d != nil {
+				options = append(options, mihomoHttp.WithDialer(d))
 			}
 		}
-	}
-	resp, err := mihomoHttp.HttpRequest(ctx, h.url, http.MethodGet, header, nil, options...)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	if h.inRead != nil {
-		h.inRead(resp)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		if setIfNoneMatch && resp.StatusCode == http.StatusNotModified {
+		var resp *http.Response
+		var retry bool
+		buf, resp, retry, err = h.readOnce(ctx, header, setIfNoneMatch, route != nil, options)
+		if err != nil {
+			if route == nil || !retry || ctx.Err() != nil {
+				return nil, utils.HashType{}, err
+			}
+			route.Failed()
+			continue
+		}
+		if route != nil {
+			route.Succeeded()
+		}
+		if route != nil && h.inRead != nil {
+			h.inRead(resp)
+		}
+		if resp.StatusCode == http.StatusNotModified {
 			return nil, oldHash, nil
 		}
-		err = errors.New(resp.Status)
+		hash = utils.MakeHash(buf)
+		if useETag {
+			cachefile.Cache().SetETagWithHash(h.url, cachefile.EtagWithHash{
+				Hash: hash, ETag: resp.Header.Get("ETag"), Time: time.Now(),
+			})
+		}
 		return
+	}
+}
+
+// Only transport/HTTP/body failures are replayable. Resource parsing happens
+// after Read, so a malformed provider or Geo database never switches routes.
+func (h *HTTPVehicle) readOnce(ctx context.Context, header http.Header, conditional, isolated bool, options []mihomoHttp.Option) ([]byte, *http.Response, bool, error) {
+	resp, err := mihomoHttp.HttpRequest(ctx, h.url, http.MethodGet, header, nil, options...)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, nil, true, err
+	}
+	defer resp.Body.Close()
+	if !isolated && h.inRead != nil {
+		h.inRead(resp)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		if conditional && resp.StatusCode == http.StatusNotModified {
+			return nil, resp, false, nil
+		}
+		return nil, resp, true, errors.New(resp.Status)
 	}
 	var reader io.Reader = resp.Body
 	if h.sizeLimit > 0 {
@@ -223,25 +269,17 @@ func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []b
 		}
 		reader = io.LimitReader(reader, limit)
 	}
-	buf, err = io.ReadAll(reader)
+	buf, err := io.ReadAll(reader)
 	if err != nil {
-		return
+		return nil, resp, true, err
 	}
 	if h.sizeLimit > 0 && int64(len(buf)) > h.sizeLimit {
-		return nil, utils.HashType{}, errors.New("resource exceeds configured size limit")
+		return nil, resp, false, errors.New("resource exceeds configured size limit")
 	}
-	if err = ctx.Err(); err != nil {
-		return nil, utils.HashType{}, err
+	if err := ctx.Err(); err != nil {
+		return nil, resp, false, err
 	}
-	hash = utils.MakeHash(buf)
-	if useETag {
-		cachefile.Cache().SetETagWithHash(h.url, cachefile.EtagWithHash{
-			Hash: hash,
-			ETag: resp.Header.Get("ETag"),
-			Time: time.Now(),
-		})
-	}
-	return
+	return buf, resp, false, nil
 }
 
 func NewHTTPVehicle(url string, path string, proxy string, header http.Header, timeout time.Duration, sizeLimit int64) *HTTPVehicle {

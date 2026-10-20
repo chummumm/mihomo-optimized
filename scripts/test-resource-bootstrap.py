@@ -97,17 +97,22 @@ class ResourceProxy(socketserver.ThreadingTCPServer):
     daemon_threads = True
     block_on_close = False
 
-    def __init__(self, target_port: int, *, delayed: bool = False) -> None:
+    def __init__(self, target_port: int, *, delayed: bool = False,
+                 health_delay: float = 0, fail_resources: bool = False) -> None:
         super().__init__(("127.0.0.1", 0), ResourceHandler)
         self.target_port = target_port
         self.started = threading.Event()
         self.finished = threading.Event()
         self.release = threading.Event()
+        self.closing = threading.Event()
+        self.health_delay = health_delay
+        self.fail_resources = fail_resources
         if not delayed:
             self.release.set()
         self.condition = threading.Condition()
         self.connections: set[socket.socket] = set()
         self.requests = 0
+        self.health_requests = 0
         self.errors: list[str] = []
         self.thread = threading.Thread(target=self.serve_forever,
                                        kwargs={"poll_interval": 0.05}, daemon=True)
@@ -121,6 +126,7 @@ class ResourceProxy(socketserver.ThreadingTCPServer):
         return self
 
     def __exit__(self, *_exc: object) -> None:
+        self.closing.set()
         self.release.set()
         self.shutdown()
         with self.condition:
@@ -169,17 +175,29 @@ class ResourceHandler(socketserver.BaseRequestHandler):
             while b"\r\n\r\n" not in headers and len(headers) <= 16384:
                 headers.extend(receive_exact(connection, 1))
             first_line = bytes(headers).split(b"\r\n", 1)[0]
+            require(len(headers) <= 16384, "resource HTTP headers exceeded fixture limit")
+            if first_line in (b"GET /health HTTP/1.1", b"HEAD /health HTTP/1.1"):
+                with proxy.condition:
+                    proxy.health_requests += 1
+                proxy.closing.wait(proxy.health_delay)
+                with contextlib.suppress(OSError):
+                    connection.sendall(b"HTTP/1.1 204 No Content\r\n"
+                                       b"Connection: close\r\nContent-Length: 0\r\n\r\n")
+                return
             require(first_line == b"GET /rules.yaml HTTP/1.1",
                     "unexpected resource HTTP request")
-            require(len(headers) <= 16384, "resource HTTP headers exceeded fixture limit")
             with proxy.condition:
                 proxy.requests += 1
             requested = True
             proxy.started.set()
             require(proxy.release.wait(10), "test did not release its delayed response")
-            response = (b"HTTP/1.1 200 OK\r\nContent-Type: application/yaml\r\n"
-                        b"Connection: close\r\nContent-Length: "
-                        + str(len(RULES)).encode() + b"\r\n\r\n" + RULES)
+            if proxy.fail_resources:
+                response = (b"HTTP/1.1 503 Service Unavailable\r\n"
+                            b"Connection: close\r\nContent-Length: 0\r\n\r\n")
+            else:
+                response = (b"HTTP/1.1 200 OK\r\nContent-Type: application/yaml\r\n"
+                            b"Connection: close\r\nContent-Length: "
+                            + str(len(RULES)).encode() + b"\r\n\r\n" + RULES)
             # A cancelled download may close its socket before the deliberately
             # late response. That is expected; protocol failures above are not.
             with contextlib.suppress(OSError):
@@ -221,13 +239,15 @@ def configuration(proxy_port: int, target_port: int) -> dict:
 
 class Core:
     def __init__(self, executable: Path, home: Path, config: dict,
-                 *, budget: str | None = None, timeout: float = 15) -> None:
+                 *, budget: str | None = None, timeout: float = 15,
+                 environment: dict[str, str] | None = None) -> None:
         self.home, self.timeout = home, timeout
         home.mkdir(parents=True, exist_ok=True)
         # JSON is valid YAML and keeps this test independent of PyYAML.
         (home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
-        proxy_port = config["proxies"][0]["port"]
-        self.port = free_port({proxy_port})
+        proxy_ports = {node["port"] for node in config.get("proxies", [])
+                       if isinstance(node.get("port"), int)}
+        self.port = free_port(proxy_ports)
         self.secret = secrets.token_urlsafe(32)
         self.log = tempfile.TemporaryFile()
         arguments = [str(executable), "-desktop-managed", "-d", str(home),
@@ -235,9 +255,12 @@ class Core:
                      "-ext-ctl", f"127.0.0.1:{self.port}"]
         if budget is not None:
             arguments.append("-resource-bootstrap-timeout=" + budget)
+        child_env = child_environment(self.secret)
+        if environment:
+            child_env.update(environment)
         try:
             self.process = subprocess.Popen(
-                arguments, cwd=home, env=child_environment(self.secret),
+                arguments, cwd=home, env=child_env,
                 stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT,
             )
         except BaseException:
@@ -318,6 +341,213 @@ class Core:
             self.log.close()
 
 
+def group_configuration(kind: str, nodes: list[dict], target_port: int) -> dict:
+    config = configuration(1, target_port)
+    config["proxies"] = nodes
+    config["resource-bootstrap"]["proxy"] = "Bootstrap"
+    config["proxy-groups"] = [{
+        "name": "Bootstrap", "type": kind,
+        "proxies": [node["name"] for node in nodes],
+        "url": f"http://127.0.0.1:{target_port}/health",
+        "expected-status": "204", "timeout": 500,
+        "interval": 300, "lazy": True,
+    }]
+    return config
+
+
+def socks_node(name: str, port: int) -> dict:
+    return {"name": name, "type": "socks5", "server": "127.0.0.1",
+            "port": port, "udp": False}
+
+
+def run_groups(executable: Path, root: Path, target_port: int,
+               timeout: float, report: dict, passed) -> None:
+    with socket.socket() as unavailable:
+        unavailable.bind(("127.0.0.1", 0))
+        unavailable_port = unavailable.getsockname()[1]
+        require_unreachable(unavailable_port)
+
+        for kind in ("select", "fallback", "url-test", "load-balance"):
+            report["stage"] = "group_" + kind.replace("-", "_") + "_cold_start"
+            home = root / kind
+            with ResourceProxy(target_port, health_delay=0.03) as fast, \
+                    ResourceProxy(target_port, health_delay=0.18) as slow:
+                nodes = [socks_node("slow", slow.port), socks_node("fast", fast.port)]
+                if kind in ("select", "fallback"):
+                    nodes[0] = socks_node("unavailable", unavailable_port)
+                config = group_configuration(kind, nodes, target_port)
+                group = config["proxy-groups"][0]
+                if kind == "select":
+                    group["default-selected"] = "fast"
+                if kind == "load-balance":
+                    group["strategy"] = "round-robin"
+                    config["rule-providers"]["second-rules"] = {
+                        **config["rule-providers"]["bootstrap-rules"],
+                        "path": "./rules/second.yaml",
+                    }
+                    config["rules"].insert(0, "RULE-SET,second-rules,REJECT")
+                with Core(executable, home, config, timeout=timeout) as core:
+                    core.wait_ready()
+                    core.assert_rule_loaded()
+                    fast.assert_requested()
+                    if kind == "load-balance":
+                        slow.assert_requested()
+                        require((home / "rules/second.yaml").read_bytes() == RULES,
+                                "load-balance did not load both resource files")
+                        require(fast.requests == slow.requests == 1,
+                                "round-robin did not preserve group selection")
+                    else:
+                        require(fast.requests == 1 and slow.requests == 0,
+                                "group did not choose its expected working member")
+                    if kind == "url-test":
+                        require(fast.health_requests > 0 and slow.health_requests > 0,
+                                "url-test selected without measuring both candidates")
+                    passed(report["stage"], fast_requests=fast.requests,
+                           slow_requests=slow.requests, cache_loaded=True)
+
+            if kind == "fallback":
+                report["stage"] = "group_offline_cache_start"
+                require_unreachable(fast.port)
+                with Core(executable, home, config, timeout=timeout) as core:
+                    core.wait_ready()
+                    core.assert_rule_loaded()
+                    passed(report["stage"], group_members_offline=True, cache_loaded=True)
+
+        report["stage"] = "group_http_failure_fallback"
+        with ResourceProxy(target_port, fail_resources=True) as failed, \
+                ResourceProxy(target_port) as working:
+            config = group_configuration("fallback", [
+                socks_node("http-failure", failed.port),
+                socks_node("working", working.port),
+            ], target_port)
+            with Core(executable, root / "http-fallback", config, timeout=timeout) as core:
+                core.wait_ready()
+                core.assert_rule_loaded()
+                failed.assert_requested()
+                working.assert_requested()
+                require(failed.requests == working.requests == 1,
+                        "resource HTTP failure did not advance once to the next candidate")
+                passed(report["stage"], failed_status=503,
+                       failed_requests=failed.requests, working_requests=working.requests)
+
+        report["stage"] = "nested_group_cold_start"
+        with ResourceProxy(target_port) as proxy:
+            config = group_configuration("fallback", [
+                socks_node("unavailable", unavailable_port),
+                socks_node("working", proxy.port),
+            ], target_port)
+            config["proxy-groups"][0]["name"] = "Automatic"
+            config["proxy-groups"].append({
+                "name": "Bootstrap", "type": "select", "proxies": ["Automatic"],
+            })
+            with Core(executable, root / "nested", config, timeout=timeout) as core:
+                core.wait_ready()
+                core.assert_rule_loaded()
+                proxy.assert_requested()
+                passed(report["stage"], cache_loaded=True)
+
+        report["stage"] = "provider_file_group_cold_start"
+        with ResourceProxy(target_port) as proxy:
+            home = root / "provider-group"
+            (home / "proxies").mkdir(parents=True)
+            (home / "proxies/nodes.yaml").write_text(json.dumps({"proxies": [
+                socks_node("excluded", unavailable_port),
+                socks_node("download-working", proxy.port),
+            ]}), encoding="utf-8")
+            config = group_configuration("select", [], target_port)
+            config["proxy-providers"] = {
+                "local-nodes": {"type": "file", "path": "./proxies/nodes.yaml"},
+            }
+            group = config["proxy-groups"][0]
+            group.pop("proxies")
+            group.update({"use": ["local-nodes"], "filter": "^download-"})
+            with Core(executable, home, config, timeout=timeout) as core:
+                core.wait_ready()
+                core.assert_rule_loaded()
+                proxy.assert_requested()
+                passed(report["stage"], provider_cache_only=True, filter_applied=True)
+
+        for default_proxy in ("unavailable", None):
+            suffix = "override" if default_proxy else "without_default"
+            report["stage"] = "provider_group_" + suffix
+            with ResourceProxy(target_port) as proxy:
+                config = group_configuration("select", [socks_node("working", proxy.port)], target_port)
+                config["proxies"].append(socks_node("unavailable", unavailable_port))
+                if default_proxy:
+                    config["resource-bootstrap"]["proxy"] = default_proxy
+                else:
+                    config["resource-bootstrap"].pop("proxy")
+                config["rule-providers"]["bootstrap-rules"]["proxy"] = "Bootstrap"
+                with Core(executable, root / ("provider-" + suffix), config,
+                          timeout=timeout) as core:
+                    core.wait_ready()
+                    core.assert_rule_loaded()
+                    proxy.assert_requested()
+                    passed(report["stage"], explicit_provider_group_used=True,
+                           default_bootstrap_configured=bool(default_proxy))
+
+        report["stage"] = "select_saved_choice_cold_start"
+        with ResourceProxy(target_port) as first, ResourceProxy(target_port) as second:
+            home = root / "saved-choice"
+            config = group_configuration("select", [
+                socks_node("first", first.port), socks_node("second", second.port),
+            ], target_port)
+            config["profile"]["store-selected"] = True
+            with Core(executable, home, config, timeout=timeout) as core:
+                core.wait_ready()
+                core.assert_rule_loaded()
+                first.assert_requested()
+                status, _ = core.request("PUT", "/proxies/Bootstrap", {"name": "second"})
+                require(status == 204, "could not save normal runtime group selection")
+            (home / CACHE).unlink()
+            with Core(executable, home, config, timeout=timeout) as core:
+                core.wait_ready()
+                core.assert_rule_loaded()
+                second.assert_requested()
+                require(first.requests == second.requests == 1,
+                        "bootstrap ignored the existing stored selection")
+                passed(report["stage"], saved_choice_reused=True)
+
+        report["stage"] = "group_poisoned_proxy_environment"
+        with ResourceProxy(target_port) as proxy:
+            config = group_configuration("fallback", [
+                socks_node("unavailable", unavailable_port),
+                socks_node("working", proxy.port),
+            ], target_port)
+            poisoned = {name: f"http://127.0.0.1:{unavailable_port}" for name in (
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy",
+            )}
+            poisoned.update({"NO_PROXY": "", "no_proxy": ""})
+            with Core(executable, root / "environment", config,
+                      timeout=timeout, environment=poisoned) as core:
+                core.wait_ready()
+                core.assert_rule_loaded()
+                proxy.assert_requested()
+                # This is resilience with a poisoned child environment. Because
+                # the destination is loopback, it does not independently prove
+                # whether an HTTP library consulted proxy environment variables.
+                passed(report["stage"], cache_loaded=True, poisoned_environment=True)
+
+        report["stage"] = "group_probe_preserves_download_budget"
+        with ResourceProxy(target_port, health_delay=2) as slow:
+            home = root / "group-budget"
+            config = group_configuration("url-test", [socks_node("slow", slow.port)], target_port)
+            config["proxy-groups"][0]["timeout"] = 5000
+            started = time.monotonic()
+            with Core(executable, home, config, budget=CLI_BUDGET, timeout=timeout) as core:
+                core.wait_ready()
+                core.assert_rule_loaded()
+                elapsed = time.monotonic() - started
+                require(elapsed < FAILURE_TIMEOUT_SECONDS,
+                        "group probing consumed the startup budget")
+                require(slow.health_requests > 0 and slow.requests == 1,
+                        "a stalled health URL blocked the real resource download")
+                passed(report["stage"], budget=CLI_BUDGET,
+                       elapsed_seconds=round(elapsed, 3), cache_loaded=True,
+                       stalled_probe_did_not_block_download=True)
+
+
 def run(executable: Path, root: Path, timeout: float, report: dict) -> None:
     def passed(name: str, **evidence: object) -> None:
         report["checks"].append({"name": name, "passed": True, **evidence})
@@ -347,6 +577,8 @@ def run(executable: Path, root: Path, timeout: float, report: dict) -> None:
             core.wait_ready()
             core.assert_rule_loaded()
             passed(report["stage"], proxy_listener_closed=True, cache_unchanged=True)
+
+        run_groups(executable, root / "groups", target_port, timeout, report, passed)
 
         report["stage"] = "cli_remaining_budget"
         with ResourceProxy(target_port, delayed=True) as proxy:

@@ -102,50 +102,58 @@ func (u *URLTest) healthCheck() {
 
 func (u *URLTest) fast(touch bool) C.Proxy {
 	elm, _, shared := u.fastSingle.Do(func() (C.Proxy, error) {
-		proxies := u.GetProxies(touch)
-		if u.selected != "" {
-			for _, proxy := range proxies {
-				if !proxy.AliveForTestUrl(u.testUrl) {
-					continue
-				}
-				if proxy.Name() == u.selected {
-					u.fastNode = proxy
-					return proxy, nil
-				}
-			}
-		}
-
-		fast := proxies[0]
-		minDelay := fast.LastDelayForTestUrl(u.testUrl)
-		fastNotExist := true
-
-		for _, proxy := range proxies[1:] {
-			if u.fastNode != nil && proxy.Name() == u.fastNode.Name() {
-				fastNotExist = false
-			}
-
-			if !proxy.AliveForTestUrl(u.testUrl) {
-				continue
-			}
-
-			delay := proxy.LastDelayForTestUrl(u.testUrl)
-			if delay < minDelay {
-				fast = proxy
-				minDelay = delay
-			}
-
-		}
-		// tolerance
-		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.fastNode.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance {
-			u.fastNode = fast
-		}
-		return u.fastNode, nil
+		return u.SelectFrom(u.GetProxies(touch), nil, touch), nil
 	})
 	if shared && touch { // a shared fastSingle.Do() may cause providers untouched, so we touch them again
 		u.Touch()
 	}
 
 	return elm
+}
+
+// SelectFrom keeps URL-test delay/tolerance semantics without a cached choice
+// from a different candidate snapshot. Callers serialize selection state.
+func (u *URLTest) SelectFrom(proxies []C.Proxy, _ *C.Metadata, _ bool) C.Proxy {
+	if len(proxies) == 0 {
+		return nil
+	}
+	if u.selected != "" {
+		for _, proxy := range proxies {
+			if !proxy.AliveForTestUrl(u.testUrl) {
+				continue
+			}
+			if proxy.Name() == u.selected {
+				u.fastNode = proxy
+				return proxy
+			}
+		}
+	}
+
+	fast := proxies[0]
+	minDelay := fast.LastDelayForTestUrl(u.testUrl)
+	fastNotExist := u.fastNode != fast
+
+	for _, proxy := range proxies[1:] {
+		if u.fastNode != nil && proxy == u.fastNode {
+			fastNotExist = false
+		}
+
+		if !proxy.AliveForTestUrl(u.testUrl) {
+			continue
+		}
+
+		delay := proxy.LastDelayForTestUrl(u.testUrl)
+		if delay < minDelay {
+			fast = proxy
+			minDelay = delay
+		}
+
+	}
+	// tolerance
+	if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.fastNode.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance {
+		u.fastNode = fast
+	}
+	return u.fastNode
 }
 
 // SupportUDP implements C.ProxyAdapter

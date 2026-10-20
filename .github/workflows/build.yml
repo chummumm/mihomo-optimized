@@ -295,7 +295,7 @@ jobs:
       - name: Verify desktop supervisor authentication, confinement and lifecycle contracts
         run: go test -tags with_gvisor -count=1 -timeout=3m ./component/desktop ./hub/route . -run Desktop
       - name: Verify native startup resource routing, cache isolation and cancellation
-        run: go test -tags with_gvisor -count=1 -timeout=5m ./adapter/provider ./component/dialer ./component/http ./component/resolver ./config ./hub/executor ./hub/route . -run ResourceBootstrap
+        run: go test -tags with_gvisor -count=1 -timeout=5m ./adapter/provider ./adapter/outboundgroup ./component/profile/cachefile ./component/dialer ./component/http ./component/resolver ./config ./hub/executor ./hub/route . -run 'ResourceBootstrap|ReadSelectedSnapshot'
 
   release:
     name: Publish GitHub release
@@ -369,7 +369,15 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.19
+              printf '%s\n\n' '## 本次更新：1.0.20
+
+          - resource-bootstrap 支持已有 select、fallback、url-test、load-balance 和 GLOBAL 组，包含嵌套、过滤和本地订阅成员；沿用各组选择策略与现有选择缓存，不增加另一套配置或存储。
+          - 资源需要下载时才创建私有代理图和有界探测。手动组保持选择，自动组可在本次 GET 中回退失败路径；连接、TLS、HTTP 与读体重试共享原预算，空组或全部失败不静默直连。
+          - 初始化 provider 的显式 proxy 也统一走独立引导图，不依赖旧内核或尚未初始化的常规组；后续资源刷新与业务流量保留原行为。
+          - 配套桌面 0.1.5 / UI 0.4.16 修复服务状态短暂失败后遗漏恢复系统代理偏好。系统代理只在内核认证就绪后应用，真实 Windows 回归覆盖关闭系统代理的冷缓存启动及故障恢复。
+
+          [配置与故障排查](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.20/docs/resource-bootstrap.md) · [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.20/docs/releases.md)'
+              printf '%s\n\n' '## 1.0.19：跨平台启动资源下载
 
           - 新增跨平台 resource-bootstrap，初始化规则、代理订阅和 Geo 数据时可使用现有具体节点。支持静态 proxies，以及明确指定 provider 的已有缓存、文件或内联内容；不限定 AnyTLS，不通过先下载订阅来取得引导节点。
           - 保留原有 URL、缓存路径、ETag、订阅解析和内容校验。provider 显式 proxy（包括 DIRECT）优先；引导代理失败不会静默切回直连。临时节点只服务于本轮初始化，后续定时刷新与普通业务流量继续沿用原配置。
