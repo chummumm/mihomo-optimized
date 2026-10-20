@@ -1,10 +1,10 @@
 use crate::{
     config::{ConfigDocument, MAX_CONFIG_SIZE},
-    desktop::{DesktopManager, DesktopStatus, HostState},
+    desktop::{DesktopManager, DesktopStatus, HostState, PublishedDesktopStatus},
     error::{AppError, Result},
     windows,
 };
-use std::io::Read;
+use std::{io::Read, sync::TryLockError};
 use tauri::State;
 
 async fn with_manager<T, F>(state: State<'_, HostState>, operation: F) -> Result<T>
@@ -25,8 +25,27 @@ where
 }
 
 #[tauri::command]
-pub async fn desktop_status(state: State<'_, HostState>) -> Result<DesktopStatus> {
-    with_manager(state, |manager| Ok(manager.status())).await
+pub async fn desktop_status(
+    state: State<'_, HostState>,
+    published: State<'_, PublishedDesktopStatus>,
+) -> Result<DesktopStatus> {
+    let state = state.inner().clone();
+    let published = published.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Refresh OS-backed switches while idle, but never queue a status read
+        // behind resource preparation or another long-running core operation.
+        let result = match state.0.try_lock() {
+            Ok(manager) => Ok(manager.status()),
+            Err(TryLockError::WouldBlock) => Ok(published.read()),
+            Err(TryLockError::Poisoned(_)) => Err(AppError::new(
+                "state_unavailable",
+                "桌面状态不可用，请重新启动程序",
+            )),
+        };
+        result
+    })
+    .await
+    .map_err(|_| AppError::new("task_failed", "桌面操作未能完成"))?
 }
 #[tauri::command]
 pub async fn desktop_start(state: State<'_, HostState>) -> Result<DesktopStatus> {

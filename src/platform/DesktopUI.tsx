@@ -23,12 +23,12 @@ export function DesktopStatusBar () {
     const phase = desktop.status?.phase
     const busy = !!desktop.busy || phase === 'starting' || phase === 'stopping'
     return <div className="desktop-statusbar" aria-label={t('title')}>
-        <span className={`desktop-phase is-${phase ?? 'starting'}`} role="status">
-            <i aria-hidden="true" />{t('local')} · {phase ? t(`phases.${phase}`) : t('loading')}
+        <span className={`desktop-phase is-${phase ?? (desktop.ready ? 'error' : 'starting')}`} role="status">
+            <i aria-hidden="true" />{t('local')} · {phase ? t(`phases.${phase}`) : t(desktop.ready ? 'connectionFailed' : 'loading')}
         </span>
         <span className="desktop-status-details">
-            <span>{t('systemProxy')} <b>{t(desktop.status?.systemProxy ? 'on' : 'off')}</b></span>
-            <span>{t('tun')} <b>{t(phase === 'running' && desktop.status?.tun ? 'on' : 'off')}</b></span>
+            <span>{t('systemProxy')} <b>{desktop.status ? t(desktop.status.systemProxy ? 'on' : 'off') : '—'}</b></span>
+            <span>{t('tun')} <b>{desktop.status ? t(phase === 'running' && desktop.status.tun ? 'on' : 'off') : '—'}</b></span>
         </span>
         <div className="desktop-status-actions">
             <Button size="sm" icon={phase === 'running' ? 'pause' : 'play'} disabled={busy || !desktop.status} onClick={() => runAction(phase === 'running' ? 'desktop_stop' : 'desktop_start')}>{t(phase === 'running' ? 'stop' : 'start')}</Button>
@@ -62,14 +62,29 @@ export function DesktopUnavailable () {
     const { t } = translation('Desktop')
     const navigate = useNavigate()
     const phase = desktop.status?.phase
-    return <div className="page desktop-recovery-page">
+    let title = t('notRunning')
+    let hint = t('notRunningHint')
+    if (!desktop.status) {
+        title = t(desktop.ready ? 'connectionFailed' : 'loading')
+        hint = t(desktop.ready ? 'connectionError' : 'loadingHint')
+    } else if (phase === 'starting') {
+        title = t('starting')
+        hint = t('startingHint')
+    } else if (phase === 'stopping') {
+        title = t('stopping')
+        hint = t('stoppingHint')
+    } else if (phase === 'error') {
+        title = t('runtimeError')
+        hint = t('runtimeErrorHint')
+    }
+    return <div className="page desktop-recovery-page" data-phase={phase ?? (desktop.ready ? 'error' : 'connecting')}>
         <Card className="desktop-recovery">
-            <div className="desktop-recovery-symbol"><Icon type={desktop.error || phase === 'error' ? 'warning' : 'nav-proxies'} size={36} /></div>
-            <h1>{!desktop.ready ? t('loading') : t('notRunning')}</h1>
-            <p>{t('notRunningHint')}</p>
+            <div className="desktop-recovery-symbol"><Icon type={desktop.status?.lastError || desktop.error || phase === 'error' ? 'warning' : 'nav-proxies'} size={36} /></div>
+            <h1>{title}</h1>
+            <p>{hint}</p>
             {(desktop.status?.lastError || desktop.error) && <p className="desktop-error" role="alert">{desktop.status?.lastError || (desktop.error?.code === 'desktop_unavailable' ? t('connectionError') : desktop.error?.message)}</p>}
             <div className="desktop-recovery-actions">
-                {!desktop.status && <Button icon="update" onClick={() => { void refreshDesktop() }}>{t('retry')}</Button>}
+                {!desktop.status && desktop.ready && <Button icon="update" onClick={() => { void refreshDesktop() }}>{t('retry')}</Button>}
                 <Button icon="nav-settings" onClick={() => navigate('/settings')}>{t('settings')}</Button>
             </div>
         </Card>
@@ -129,10 +144,10 @@ export function DesktopControls ({ onEditConfig }: { onEditConfig: () => void })
         <Card className="settings-card">
             <div className="settings-row">
                 <span className="label">{t('local')}</span>
-                <span className={`desktop-phase is-${status?.phase ?? 'error'}`}><i aria-hidden="true" />{status ? t(`phases.${status.phase}`) : t('connectionError')}</span>
+                <span className={`desktop-phase is-${status?.phase ?? (desktop.ready ? 'error' : 'starting')}`}><i aria-hidden="true" />{status ? t(`phases.${status.phase}`) : t(desktop.ready ? 'connectionFailed' : 'loading')}</span>
             </div>
             <div className="settings-row settings-row-action">
-                <Button icon="update" disabled={busy} onClick={() => { void refreshDesktop() }}>{t('retry')}</Button>
+                <Button icon="update" disabled={busy || !desktop.ready} onClick={() => { void refreshDesktop() }}>{t('retry')}</Button>
                 <Button icon="update" disabled={busy || !status} loading={desktop.busy === 'desktop_restart'} onClick={() => runAction('desktop_restart')}>{t('restart')}</Button>
             </div>
             {(status?.lastError || desktop.error) && <div className="desktop-error desktop-inset" role="alert">{status?.lastError || (desktop.error?.code === 'desktop_unavailable' ? t('connectionError') : desktop.error?.message)}</div>}
@@ -142,7 +157,7 @@ export function DesktopControls ({ onEditConfig }: { onEditConfig: () => void })
             </div>
             <div className="settings-row">
                 <span className="label">{t('service')}</span>
-                <span className="desktop-service-status">{status?.service?.running ? t('serviceRunning') : t(status?.service?.installed ? 'serviceInstalled' : 'serviceMissing')}</span>
+                <span className="desktop-service-status">{status?.service ? t(status.service.running ? 'serviceRunning' : status.service.installed ? 'serviceInstalled' : 'serviceMissing') : '—'}</span>
                 <Button size="sm" icon={status?.service?.installed ? 'trash' : 'arrow-down'} disabled={busy || !status?.capabilities.serviceManagement || status.tun} onClick={() => runAction(status?.service?.installed ? 'desktop_uninstall_service' : 'desktop_install_service')}>{t(status?.service?.installed ? 'uninstallService' : 'installService')}</Button>
             </div>
             <div className="settings-row desktop-config-path">

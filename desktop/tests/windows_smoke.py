@@ -776,7 +776,7 @@ class ResourceFixture(http.server.ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, proxy_check=None) -> None:
+    def __init__(self, proxy_check=None, *, hold_success: bool = False) -> None:
         super().__init__(("127.0.0.1", 0), ResourceHandler)
         self.delay = float(os.environ.get("MIHOMO_TEST_RESOURCE_DELAY_SECONDS", "22"))
         require(0 < self.delay <= 30, "resource_fixture_delay_invalid")
@@ -789,6 +789,12 @@ class ResourceFixture(http.server.ThreadingHTTPServer):
         self.proxy_check = proxy_check
         self.pending_proxy_checks = 0
         self.pending_proxy_failure = None
+        # First-launch UI inspection must happen while the resource is missing,
+        # even if creating the initial WebView2 profile is unusually slow.
+        self.hold_success = hold_success
+        self.release_success = threading.Event()
+        if not hold_success:
+            self.release_success.set()
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
 
@@ -817,7 +823,7 @@ class ResourceFixture(http.server.ThreadingHTTPServer):
         endpoint = "/timeout.yaml" if failing else "/rules.yaml"
         cache = self.cache_name + ("-timeout" if failing else "")
         # A smaller configured timeout tests expiry without waiting 180 seconds.
-        timeout = 1 if failing else int(self.delay) + 15
+        timeout = 1 if failing else max(int(self.delay) + 15, 55 if self.hold_success else 0)
         document = base.replace("rules:\n", "rules:\n  - RULE-SET,desktop-bootstrap,DIRECT\n", 1)
         return document + f"""resource-bootstrap:
   timeout: {timeout}
@@ -834,6 +840,7 @@ rule-providers:
 
     def close(self) -> None:
         self.stopping.set()
+        self.release_success.set()
         self.shutdown()
         self.server_close()
         self.thread.join(timeout=3)
@@ -848,16 +855,22 @@ class ResourceHandler(http.server.BaseHTTPRequestHandler):
         if fixture.offline or path not in ("/rules.yaml", "/timeout.yaml"):
             code, body = 503, b"fixture offline\n"
         else:
-            deadline = time.monotonic() + (5 if path == "/timeout.yaml" else fixture.delay)
-            while time.monotonic() < deadline:
+            started = time.monotonic()
+            deadline = started + (5 if path == "/timeout.yaml" else fixture.delay)
+            hold_expired = False
+            while time.monotonic() < deadline or (path == "/rules.yaml" and not fixture.release_success.is_set()):
                 # The successful request is still withholding the required file,
                 # so the new core cannot be ready. Timeout requests may already
                 # have been cancelled by the core and are deliberately excluded.
                 if path == "/rules.yaml":
                     fixture.check_pending_proxy()
-                if fixture.stopping.wait(min(0.1, max(0, deadline - time.monotonic()))):
+                    if not fixture.release_success.is_set() and time.monotonic() - started >= 45:
+                        hold_expired = True
+                        break
+                if fixture.stopping.wait(0.1):
                     break
-            code, body = 200, b"payload:\n  - '+.bootstrap-fixture.invalid'\n"
+            code, body = ((503, b"fixture inspection deadline exceeded\n") if hold_expired else
+                          (200, b"payload:\n  - '+.bootstrap-fixture.invalid'\n"))
         with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
             self.send_response(code)
             self.send_header("Content-Length", str(len(body)))
@@ -947,6 +960,117 @@ class Acceptance:
     def save_configuration(self, content: str) -> None:
         current = self.driver.invoke("desktop_read_config")
         self.driver.invoke("desktop_save_config", {"content": content, "expectedRevision": current["revision"]})
+
+    def launch_gui(self, artifacts: Path) -> dict:
+        require(self.driver is None and self.gui is None, "previous_gui_session_not_closed")
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.driver = WebViewDriver(self.driver_path, self.app, self.processes, self.desktop, artifacts)
+        gui = wait_until(lambda: self.processes.at_paths([self.app]), "gui_process_not_found")
+        require(len(gui) == 1, "multiple_gui_processes")
+        self.gui = gui[0]
+        return self.desktop.check_gui(self.gui, self.processes)
+
+    def check_automatic_startup(self, base: str) -> None:
+        """The first GUI launch must become ready without a start/restart command."""
+        self.stage = "automatic_startup_ready"
+        self.resources = ResourceFixture(lambda: self.wininet.read() == self.proxy_disabled, hold_success=True)
+        self.secrets.add(self.resources.token)
+        cache = self.directory / "runtime" / "rules" / (self.resources.cache_name + ".yaml")
+        require(not cache.exists(), "automatic_startup_cache_already_exists")
+        (self.directory / "config.yaml").write_text(self.resources.configuration(base), encoding="utf-8", newline="")
+        (self.directory / "preferences.json").write_text(
+            json.dumps({"desiredRunning": True, "systemProxy": False, "tun": False}), encoding="utf-8")
+        evidence = {"desiredRunning": True, "coldResourceCache": True,
+                    "resourceDelaySeconds": self.resources.delay, "statusResponseMilliseconds": []}
+        self.report["automaticStartup"] = evidence
+        started = time.monotonic()
+        self.report["guiToken"] = self.launch_gui(self.artifacts / "automatic-startup")
+        self.mark("non_elevated_gui")
+        wait_until(lambda: self.driver.execute("return typeof window.__TAURI_INTERNALS__?.invoke === 'function' && !!document.querySelector('.desktop-statusbar');"),
+                   "automatic_startup_ui_not_loaded", 15)
+        wait_until(lambda: self.resources.count("/rules.yaml") > 0, "automatic_startup_resource_not_requested", 15)
+        require(not cache.exists(), "automatic_startup_resource_released_before_inspection")
+
+        for _ in range(3):
+            read_at = time.monotonic()
+            try:
+                preparing = self.status(timeout=3)
+            except (OSError, http.client.HTTPException):
+                raise SmokeFailure("automatic_startup_status_unresponsive") from None
+            elapsed = time.monotonic() - read_at
+            evidence["statusResponseMilliseconds"].append(round(elapsed * 1000, 1))
+            require(elapsed < 2, "automatic_startup_status_blocked_by_preparation")
+            require(preparing.get("phase") == "starting" and preparing.get("lastError") is None
+                    and preparing.get("controller") is None and preparing.get("systemProxy") is False,
+                    "automatic_startup_preparation_status_invalid")
+            require(self.wininet.read() == self.proxy_disabled, "automatic_startup_enabled_system_proxy_early")
+
+        self.driver.execute("location.hash = '#/proxies';")
+        wait_until(lambda: self.driver.execute("return !!document.querySelector('.desktop-recovery-page[data-phase=\"starting\"]') && !!document.querySelector('.desktop-statusbar .desktop-phase.is-starting');"),
+                   "automatic_startup_preparing_ui_missing", 8)
+        require(self.driver.execute("""
+            const page = document.querySelector('.desktop-recovery-page[data-phase="starting"]');
+            const start = [...document.querySelectorAll('.desktop-status-actions button')]
+                .find(button => /^(启动内核|Start core)$/i.test(button.textContent.trim()));
+            return !!page && /正在启动本机内核|Starting the local core/i.test(page.querySelector('h1')?.textContent || '')
+                && !/本机内核尚未运行|导入完整配置|The local core is not running|Import a complete configuration/i.test(page.innerText)
+                && !page.querySelector('.desktop-error') && !!start && start.disabled;
+        """), "automatic_startup_ui_reported_failure_or_enabled_start")
+        self.driver.execute("location.hash = '#/settings';")
+        wait_until(lambda: self.driver.execute("return !!document.querySelector('.desktop-controls .desktop-phase.is-starting');"),
+                   "automatic_startup_settings_not_responsive", 8)
+        require(self.driver.execute("""
+            const controls = document.querySelector('.desktop-controls');
+            const restart = [...controls.querySelectorAll('button')]
+                .find(button => /^(重启内核|Restart core)$/i.test(button.textContent.trim()));
+            const start = [...document.querySelectorAll('.desktop-status-actions button')]
+                .find(button => /^(启动内核|Start core)$/i.test(button.textContent.trim()));
+            return !controls.querySelector('.desktop-error') && !!restart && restart.disabled && !!start && start.disabled;
+        """), "automatic_startup_actions_enabled_during_preparation")
+        preparing = self.status(timeout=3)
+        require(preparing.get("phase") == "starting" and preparing.get("lastError") is None
+                and preparing.get("controller") is None and not cache.exists(),
+                "automatic_startup_inspection_missed_preparation")
+        evidence.update({"preparationPhase": "starting", "preparationErrorAbsent": True,
+                         "preparationControllerAbsent": True, "startAndRestartDisabled": True,
+                         "preparationUiWithoutFailureHint": True})
+        self.resources.release_success.set()
+
+        def automatically_ready():
+            observed = self.status(timeout=3)
+            require(observed.get("phase") != "error" and observed.get("lastError") is None,
+                    "automatic_startup_failed_without_manual_action")
+            return observed if observed.get("phase") == "running" else None
+
+        running = wait_until(automatically_ready, "automatic_startup_did_not_become_ready", self.resources.delay + 20)
+        self.managed_core(running)
+        require(cache.is_file() and b"bootstrap-fixture.invalid" in cache.read_bytes(), "automatic_startup_cache_not_persisted")
+        require(running.get("systemProxy") is False and self.wininet.read() == self.proxy_disabled,
+                "automatic_startup_changed_system_proxy")
+        self.resources.require_direct_preparation(0)
+        wait_until(lambda: self.driver.execute("return !!document.querySelector('.desktop-statusbar .desktop-phase.is-running');"),
+                   "automatic_startup_running_ui_missing", 8)
+        evidence.update({"readyWithoutStartOrRestart": True, "cachePersisted": True,
+                         "startupSeconds": round(time.monotonic() - started, 3),
+                         "preparationProxyChecks": self.resources.pending_proxy_checks})
+
+        # Close this owned GUI normally before launching the original bad-YAML
+        # recovery case. A second-instance forward must not mask that negative test.
+        self.driver.invoke("desktop_stop")
+        self.capture_children()
+        first_children = list(self.owned_children.values())
+        self.driver.execute("setTimeout(() => { void window.__TAURI_INTERNALS__.invoke('desktop_exit', {force: true}).catch(() => {}); }, 0); return true;")
+        wait_until(lambda: not self.processes.at_paths([self.app, self.core, self.helper]),
+                   "automatic_startup_gui_did_not_exit", 20)
+        self.driver.close()
+        self.driver, self.gui = None, None
+        wait_until(lambda: all(self.processes.identity(identity.pid) != identity for identity in first_children),
+                   "automatic_startup_webview_children_survived", 15)
+        require(all(not listening(port) for port in self.ports), "automatic_startup_ports_survived_exit")
+        cache.unlink()
+        self.resources.close()
+        self.resources = None
+        self.mark("automatic_startup_ready")
 
     def check_resource_bootstrap(self, base: str) -> str:
         self.stage = "resource_bootstrap"
@@ -1286,8 +1410,6 @@ class Acceptance:
         self.proxy_disabled = self.wininet.read()
         require(self.proxy_disabled["flags"] == 1 and not self.proxy_disabled["server"]
                 and not self.proxy_disabled["pac"], "wininet_direct_fixture_not_applied")
-        (self.directory / "config.yaml").write_text(BAD_CONFIG, encoding="utf-8", newline="")
-        (self.directory / "preferences.json").write_text(json.dumps({"desiredRunning": True, "systemProxy": False, "tun": False}), encoding="utf-8")
         self.socks = SocksFixture()
         mixed = free_port()
         self.ports.add(mixed)
@@ -1295,13 +1417,11 @@ class Acceptance:
 
         self.stage = "non_elevated_gui"
         self.desktop = RestrictedDesktop()
-        self.driver = WebViewDriver(self.driver_path, self.app, self.processes, self.desktop, self.artifacts)
-        gui = wait_until(lambda: self.processes.at_paths([self.app]), "gui_process_not_found")
-        require(len(gui) == 1, "multiple_gui_processes")
-        self.gui = gui[0]
-        self.report["guiToken"] = self.desktop.check_gui(self.gui, self.processes)
-        self.mark("non_elevated_gui")
+        self.check_automatic_startup(valid)
+        (self.directory / "config.yaml").write_text(BAD_CONFIG, encoding="utf-8", newline="")
+        (self.directory / "preferences.json").write_text(json.dumps({"desiredRunning": True, "systemProxy": False, "tun": False}), encoding="utf-8")
         self.stage = "startup_recovery"
+        self.report["recoveryGuiToken"] = self.launch_gui(self.artifacts)
         wait_until(lambda: self.driver.execute("return typeof window.__TAURI_INTERNALS__?.invoke === 'function' && !!document.querySelector('.desktop-statusbar');"), "desktop_ui_not_loaded")
         failed = self.phase("error")
         require(bool(failed.get("lastError")) and failed.get("controller") is None, "startup_failure_not_reported")
@@ -1621,7 +1741,7 @@ def main() -> int:
                 acceptance.cleanup()
             except Exception as error:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": "unexpected_" + type(error).__name__})
-            required = {"startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
+            required = {"automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
                         "single_instance_and_webview2_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
                         "resource_bootstrap_recovery", "system_proxy_service_recovery"}
