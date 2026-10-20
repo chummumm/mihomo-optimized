@@ -252,7 +252,13 @@ func strategyStickySessions(url string, keyOf keyFn) strategyFn {
 
 // Unwrap implements C.ProxyAdapter
 func (lb *LoadBalance) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
-	proxies := lb.GetProxies(touch)
+	return lb.SelectFrom(lb.GetProxies(touch), metadata, touch)
+}
+
+func (lb *LoadBalance) SelectFrom(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
+	if len(proxies) == 0 {
+		return nil
+	}
 	return lb.strategyFn(proxies, metadata, touch)
 }
 

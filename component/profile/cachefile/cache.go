@@ -1,8 +1,12 @@
 package cachefile
 
 import (
+	"context"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/component/desktop"
@@ -16,7 +20,7 @@ import (
 var (
 	initOnce     sync.Once
 	fileMode     os.FileMode = 0o666
-	defaultCache *CacheFile
+	defaultCache atomic.Pointer[CacheFile]
 
 	bucketSelected         = []byte("selected")
 	bucketFakeip           = []byte("fakeip")
@@ -74,6 +78,89 @@ func (c *CacheFile) SelectedMap() map[string]string {
 	return mapping
 }
 
+// ReadSelectedSnapshot reads existing selections without initializing or repairing
+// the cache. The caller applies its own configuration's store-selected policy.
+// An unavailable/locked database returns an error; absence is an empty snapshot.
+func ReadSelectedSnapshot(ctx context.Context) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	path := C.Path.Cache()
+	if err := desktop.CheckPath(path); err != nil {
+		return nil, err
+	}
+	// Reopening our own writer would contend with its lifetime file lock. The
+	// atomic publication also permits snapshots while Cache is first initializing.
+	if cached := defaultCache.Load(); cached != nil && cached.DB != nil &&
+		filepath.Clean(cached.DB.Path()) == filepath.Clean(path) {
+		return readSelectedSnapshot(ctx, cached.DB)
+	}
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("selection cache is not a regular database")
+	}
+	if info.Size() == 0 {
+		return nil, bbolt.ErrInvalid
+	}
+	// Never wait for another core's writer: startup can use the group's default.
+	// bbolt uses 50ms lock-retry intervals, so this permits at most the first try.
+	lockTimeout := 50 * time.Millisecond
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, context.DeadlineExceeded
+		}
+		if remaining < lockTimeout {
+			lockTimeout = remaining
+		}
+	}
+	db, err := bbolt.Open(path, fileMode, &bbolt.Options{
+		ReadOnly: true, Timeout: lockTimeout, NoStatistics: true,
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer db.Close()
+	return readSelectedSnapshot(ctx, db)
+}
+
+func readSelectedSnapshot(ctx context.Context, db *bbolt.DB) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	mapping := make(map[string]string)
+	err := db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(bucketSelected)
+		if bucket == nil {
+			return ctx.Err()
+		}
+		cursor := bucket.Cursor()
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			mapping[string(key)] = string(value)
+		}
+		return ctx.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return mapping, nil
+}
+
 func (c *CacheFile) Close() error {
 	return c.DB.Close()
 }
@@ -81,7 +168,7 @@ func (c *CacheFile) Close() error {
 func initCache() {
 	if err := desktop.CheckPath(C.Path.Cache()); err != nil {
 		log.Warnln("[CacheFile] refusing unsafe managed cache: %s", err)
-		defaultCache = &CacheFile{}
+		defaultCache.Store(&CacheFile{})
 		return
 	}
 	options := bbolt.Options{Timeout: time.Second, NoStatistics: true}
@@ -102,14 +189,14 @@ func initCache() {
 		log.Warnln("[CacheFile] can't open cache file: %s", err.Error())
 	}
 
-	defaultCache = &CacheFile{
+	defaultCache.Store(&CacheFile{
 		DB: db,
-	}
+	})
 }
 
 // Cache return singleton of CacheFile
 func Cache() *CacheFile {
 	initOnce.Do(initCache)
 
-	return defaultCache
+	return defaultCache.Load()
 }

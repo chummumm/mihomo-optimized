@@ -36,6 +36,20 @@ type Bootstrap struct {
 	closer   io.Closer
 	once     sync.Once
 	closeErr error
+	routes   BootstrapRoutes
+}
+
+// BootstrapRoutes resolves explicit provider overrides and the startup default
+// in the same private graph. Each GET owns its retries; background refreshes do
+// not carry this scope or its temporary adapters.
+type BootstrapRoutes interface {
+	NewRequest(ctx context.Context, proxy, address string) (BootstrapRequest, error)
+}
+
+type BootstrapRequest interface {
+	Next(context.Context) (C.Dialer, error)
+	Failed()
+	Succeeded()
 }
 
 var activeBootstraps = struct {
@@ -67,12 +81,15 @@ func ParseBootstrapTimeout(value string) (time.Duration, error) {
 	return limit, nil
 }
 
-func NewBootstrap(ctx context.Context, timeout time.Duration, dialer C.Dialer, closer io.Closer) *Bootstrap {
+func NewBootstrap(ctx context.Context, timeout time.Duration, dialer C.Dialer, closer io.Closer, routes ...BootstrapRoutes) *Bootstrap {
 	if limit, ok := ctx.Value(bootstrapLimitKey{}).(time.Duration); ok && limit < timeout {
 		timeout = limit
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	b := &Bootstrap{cancel: cancel, dialer: dialer, closer: closer}
+	if len(routes) > 0 {
+		b.routes = routes[0]
+	}
 	b.ctx = context.WithValue(ctx, bootstrapKey{}, b)
 	activeBootstraps.Lock()
 	activeBootstraps.scopes[b] = struct{}{}
@@ -105,6 +122,13 @@ func BootstrapDialer(ctx context.Context) C.Dialer {
 		return b.dialer
 	}
 	return nil
+}
+
+func BootstrapRequestFor(ctx context.Context, proxy, address string) (BootstrapRequest, error) {
+	if b, ok := ctx.Value(bootstrapKey{}).(*Bootstrap); ok && b.routes != nil {
+		return b.routes.NewRequest(ctx, proxy, address)
+	}
+	return nil, nil
 }
 
 func WithInitialResource(ctx context.Context, kind, name string) context.Context {

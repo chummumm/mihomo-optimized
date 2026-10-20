@@ -101,7 +101,13 @@ func (s *Selector) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 }
 
 func (s *Selector) selectedProxy(touch bool) C.Proxy {
-	proxies := s.GetProxies(touch)
+	return s.SelectFrom(s.GetProxies(touch), nil, touch)
+}
+
+func (s *Selector) SelectFrom(proxies []C.Proxy, _ *C.Metadata, _ bool) C.Proxy {
+	if len(proxies) == 0 {
+		return nil
+	}
 	for _, proxy := range proxies {
 		if proxy.Name() == s.selected {
 			return proxy
