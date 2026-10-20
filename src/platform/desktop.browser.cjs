@@ -57,6 +57,90 @@ async function verifyStartupUpdates(origin, initializeFixture) {
         assert.equal(await count(page, 'desktop_open_external'), 0, 'checking never opens a download page')
     }
 
+    // The native host may start before the WebView subscribes. A pending first
+    // snapshot must not turn an unknown runtime into a stopped or failed one.
+    {
+        const { context, page } = await open('startup-status-held')
+        try {
+            await until(() => page.evaluate(() => typeof window.__desktopFixture.finishStatus === 'function'), 'the initial native status is pending')
+            const pending = {
+                title: await page.locator('.desktop-recovery h1').innerText(),
+                hint: await page.locator('.desktop-recovery > p').first().innerText(),
+                proxyValues: await page.locator('.desktop-status-details b').allTextContents(),
+            }
+            await route(page, '/settings')
+            Object.assign(pending, {
+                errorPhase: await page.locator('.desktop-controls .desktop-phase.is-error').count(),
+                service: await page.locator('.desktop-service-status').innerText(),
+                startEnabled: await page.getByRole('button', { name: '启动内核', exact: true }).isEnabled(),
+                restartEnabled: await page.getByRole('button', { name: '重启内核', exact: true }).isEnabled(),
+                refreshEnabled: await page.getByRole('button', { name: '刷新状态', exact: true }).isEnabled(),
+            })
+            assert.deepEqual(pending, {
+                title: '正在连接桌面服务…', hint: '正在读取本机内核状态，请稍候。', proxyValues: ['—', '—'],
+                errorPhase: 0, service: '—', startEnabled: false, restartEnabled: false, refreshEnabled: false,
+            }, 'a late first snapshot is unknown, with no false failure or queued runtime controls')
+            await page.clock.runFor(180000)
+            for (const command of ['desktop_start', 'desktop_restart', 'desktop_check_update']) {
+                assert.equal(await count(page, command), 0, `waiting for the initial status does not submit ${command}`)
+            }
+            assert.equal(await count(page, 'desktop_status'), 1, 'pending initialization does not queue redundant status reads')
+            await page.evaluate(() => { window.__desktopFixture.holdStatus = false; window.__desktopFixture.finishStatus() })
+            await route(page, '/connections')
+            await page.getByRole('heading', { name: '正在启动本机内核', exact: true }).waitFor()
+            assert.equal(await page.locator('.desktop-recovery-page').getAttribute('data-phase'), 'starting')
+            await page.getByText('正在校验配置、准备所需资源并等待内核就绪。首次启动可能需要更长时间，请稍候。', { exact: true }).waitFor()
+            assert.equal(await page.getByRole('button', { name: '启动内核', exact: true }).isEnabled(), false)
+            await route(page, '/settings')
+            assert.equal(await page.getByRole('button', { name: '重启内核', exact: true }).isEnabled(), false)
+            await page.getByRole('button', { name: 'English', exact: true }).click()
+            await route(page, '/connections')
+            await page.getByRole('heading', { name: 'Starting the local core', exact: true }).waitFor()
+            await page.getByText('Validating configuration, preparing required resources, and waiting for the core to become ready. The first start may take longer. Please wait.', { exact: true }).waitFor()
+            await page.evaluate(() => window.__desktopFixture.phase('running'))
+            await until(() => page.locator('.desktop-recovery-page').count().then(value => value === 0), 'native readiness opens the dashboard without a manual restart')
+            assert.equal(await count(page, 'desktop_start'), 0)
+            assert.equal(await count(page, 'desktop_restart'), 0)
+            await page.evaluate(() => window.__desktopFixture.phase('stopping'))
+            await page.getByRole('heading', { name: 'Stopping the local core', exact: true }).waitFor()
+            assert.equal(await page.getByRole('button', { name: 'Start core', exact: true }).isEnabled(), false)
+            await page.evaluate(() => window.__desktopFixture.phase('stopped'))
+            await page.getByRole('heading', { name: 'The local core is not running', exact: true }).waitFor()
+            assert.equal(await page.getByRole('button', { name: 'Start core', exact: true }).isEnabled(), true)
+            await page.evaluate(() => {
+                window.__desktopFixture.status.lastError = 'Fixture resource preparation failure'
+                window.__desktopFixture.phase('error')
+            })
+            await page.getByRole('heading', { name: 'The local core encountered a problem', exact: true }).waitFor()
+            assert.equal(await page.locator('.desktop-recovery [role="alert"]').innerText(), 'Fixture resource preparation failure')
+            await route(page, '/settings')
+            assert.equal(await page.getByRole('button', { name: 'Log folder', exact: true }).isEnabled(), true, 'real errors preserve access to native logs')
+            assert.equal(await page.getByRole('button', { name: 'Edit configuration file', exact: true }).isEnabled(), true, 'real errors preserve offline configuration editing')
+            await page.evaluate(() => window.__desktopFixture.phase('running'))
+            assert.equal(await page.locator('.desktop-controls [role="alert"]').innerText(), 'Fixture resource preparation failure', 'running status does not hide a separate native error')
+            await page.getByRole('button', { name: '中文', exact: true }).click()
+            await page.evaluate(() => window.__desktopFixture.phase('error'))
+            await route(page, '/connections')
+            await page.getByRole('heading', { name: '本机内核运行遇到问题', exact: true }).waitFor()
+            await page.evaluate(() => window.__desktopFixture.phase('stopped'))
+            assert.equal(await page.locator('.desktop-recovery [role="alert"]').innerText(), 'Fixture resource preparation failure', 'stopped status does not hide a retained native error')
+        } finally { await context.close() }
+    }
+
+    {
+        const { context, page } = await open('startup-status-failed')
+        try {
+            await page.getByRole('heading', { name: '无法读取本机状态', exact: true }).waitFor()
+            assert.equal(await page.locator('.desktop-statusbar .desktop-phase.is-error').count(), 1, 'a failed first status read is distinct from a pending read')
+            assert.equal(await page.getByRole('button', { name: '启动内核', exact: true }).isEnabled(), false)
+            await page.evaluate(() => { window.__desktopFixture.statusReadError = false })
+            await page.getByRole('button', { name: '刷新状态', exact: true }).click()
+            await page.getByRole('heading', { name: '正在启动本机内核', exact: true }).waitFor()
+            assert.equal(await count(page, 'desktop_status'), 2, 'retry explicitly reads a fresh native status')
+            assert.equal(await count(page, 'desktop_start'), 0, 'status recovery never starts the core again')
+        } finally { await context.close() }
+    }
+
     // Hold the real UI's IPC response to expose duplicate requests and accidental
     // coupling between a background check, core startup, and route lifetimes.
     {
@@ -352,10 +436,12 @@ async function main() {
             holdUpdateCheck: fixtureCase === 'update-held', holdUpdateInstall: false,
             finishUpdateCheck: null, finishUpdateInstall: null,
             holdStart: fixtureCase === 'update-start-held', finishStart: null,
+            holdStatus: fixtureCase === 'startup-status-held', finishStatus: null,
+            statusReadError: fixtureCase === 'startup-status-failed',
             holdConfigSave: fixtureCase === 'update-write-held', finishConfigSave: null,
             file: { path: 'C:\\Users\\Fixture\\AppData\\Local\\mihomo\\config.yaml', content: 'mode: rule\nproxies: []\n', revision: 'revision-1', max_size: 4194304, writable: true },
             status: {
-                appVersion: '0.1.0', phase: fixtureCase === 'update-starting' ? 'starting' : 'stopped', systemProxy: false, tun: false, autostart: false,
+                appVersion: '0.1.0', phase: ['update-starting', 'startup-status-held', 'startup-status-failed'].includes(fixtureCase) ? 'starting' : 'stopped', systemProxy: false, tun: false, autostart: false,
                 controller: null, lastError: null, coreVersion: null,
                 configPath: 'C:\\Users\\Fixture\\AppData\\Local\\mihomo\\config.yaml', logPath: 'C:\\Users\\Fixture\\AppData\\Local\\mihomo\\logs',
                 service: { installed: false, running: false },
@@ -382,7 +468,11 @@ async function main() {
                 }
                 if (command === 'plugin:event|unlisten') { listeners.get(args.event)?.delete(args.eventId); return }
                 mock.commands.push({ command, args: structuredClone(args) })
-                if (command === 'desktop_status') return structuredClone(mock.status)
+                if (command === 'desktop_status') {
+                    if (mock.holdStatus) await new Promise(resolve => { mock.finishStatus = resolve })
+                    if (mock.statusReadError) throw { code: 'desktop_unavailable', message: 'Fixture native status failure' }
+                    return structuredClone(mock.status)
+                }
                 if (command === 'desktop_read_config') return structuredClone(mock.file)
                 if (command === 'desktop_set_dirty') { mock.dirty = args.dirty; return }
                 if (['desktop_start', 'desktop_restart'].includes(command)) {

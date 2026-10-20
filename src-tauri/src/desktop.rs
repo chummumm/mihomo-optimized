@@ -56,6 +56,33 @@ pub struct DesktopStatus {
     pub app_version: String,
 }
 
+/// Startup can hold the operation mutex while downloading resources. Keep the
+/// last published view independently readable, including for a WebView that
+/// subscribes after the initial Starting event. This lock only copies a view;
+/// it is never held across core, service, registry or event operations.
+#[derive(Clone)]
+pub struct PublishedDesktopStatus(Arc<Mutex<DesktopStatus>>);
+
+impl PublishedDesktopStatus {
+    fn new(status: DesktopStatus) -> Self {
+        Self(Arc::new(Mutex::new(status)))
+    }
+
+    pub fn read(&self) -> DesktopStatus {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn replace(&self, status: DesktopStatus) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
+    }
+}
+
 enum RunningCore {
     Direct(CoreSupervisor),
     Service(ServiceClient),
@@ -141,7 +168,11 @@ impl DesktopManager {
     }
 
     pub fn publish(&self) {
-        let _ = self.app.emit("desktop-status", self.status());
+        let status = self.status();
+        self.app
+            .state::<PublishedDesktopStatus>()
+            .replace(status.clone());
+        let _ = self.app.emit("desktop-status", status);
     }
 
     fn active_log_directory(&self) -> PathBuf {
@@ -626,8 +657,13 @@ pub fn run() {
             crate::update::desktop_install_update
         ])
         .setup(|app| {
-            let manager = DesktopManager::new(app.handle().clone())?;
+            let mut manager = DesktopManager::new(app.handle().clone())?;
             let should_start = manager.preferences.desired_running;
+            if should_start {
+                manager.phase = Phase::Starting;
+                manager.last_error = None;
+            }
+            app.manage(PublishedDesktopStatus::new(manager.status()));
             let state = HostState(Arc::new(Mutex::new(manager)));
             app.manage(state.clone());
             let show =

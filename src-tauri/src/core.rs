@@ -262,6 +262,83 @@ pub fn http_client() -> Result<Client> {
         .map_err(|_| AppError::new("http_init_failed", "无法初始化本地控制连接"))
 }
 
+enum ReadinessFailure {
+    Temporary(AppError),
+    Fatal(AppError),
+}
+
+/// Only transport failures and temporary HTTP failures can be retried. Responses
+/// that disprove the controller's identity/protocol must never become readiness.
+fn read_readiness_json(
+    client: &Client,
+    controller: &Controller,
+    endpoint: &str,
+    deadline: Instant,
+) -> std::result::Result<serde_json::Value, ReadinessFailure> {
+    let temporary = |reason: String| {
+        ReadinessFailure::Temporary(AppError::new(
+            "core_readiness_unavailable",
+            format!("就绪检查 {endpoint}：{reason}"),
+        ))
+    };
+    let timeout = remaining(deadline)
+        .map_err(|_| temporary("已到本次操作截止时间".into()))?
+        .min(CONTROL_TIMEOUT);
+    let response = client
+        .get(format!("{}{endpoint}", controller.url))
+        .timeout(timeout)
+        .bearer_auth(&controller.secret)
+        .send()
+        .map_err(|error| {
+            // reqwest's formatted errors may include URLs. Keep only a fixed
+            // category; never copy response bodies or controller secrets.
+            temporary(
+                if error.is_timeout() {
+                    "本地请求超时"
+                } else if error.is_connect() {
+                    "本地连接尚未建立或已被拒绝"
+                } else {
+                    "本地连接中断"
+                }
+                .into(),
+            )
+        })?;
+    let status = response.status();
+    if matches!(status.as_u16(), 401 | 403) {
+        return Err(ReadinessFailure::Fatal(AppError::new(
+            "core_controller_unauthorized",
+            format!("就绪检查 {endpoint}：本地控制接口鉴权失败（HTTP {status}）"),
+        )));
+    }
+    if matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
+        return Err(temporary(format!("本地控制接口暂不可用（HTTP {status}）")));
+    }
+    if !status.is_success() {
+        return Err(ReadinessFailure::Fatal(AppError::new(
+            "core_controller_incompatible",
+            format!("就绪检查 {endpoint}：配套内核控制协议不兼容（HTTP {status}）"),
+        )));
+    }
+    // Read failures (including a timeout halfway through a body) are temporary;
+    // a complete response containing invalid JSON is a protocol failure.
+    let body = response.bytes().map_err(|error| {
+        temporary(
+            if error.is_timeout() {
+                "本地响应读取超时"
+            } else {
+                "本地响应读取中断"
+            }
+            .into(),
+        )
+    })?;
+    serde_json::from_slice(&body).map_err(|_| {
+        ReadinessFailure::Fatal(AppError::new(
+            "core_controller_incompatible",
+            format!("就绪检查 {endpoint}：内核返回无效 JSON"),
+        ))
+    })
+}
+
 pub fn fixed_core_path() -> Result<PathBuf> {
     let current = std::env::current_exe().map_err(|e| AppError::io("无法定位程序", e))?;
     let parent = current
@@ -499,7 +576,9 @@ impl CoreSupervisor {
         deadline: Instant,
     ) -> Result<()> {
         let client = http_client()?;
-        while let Ok(timeout) = remaining(deadline) {
+        let expected = config::parse(source)?;
+        let mut last_failure = None;
+        while remaining(deadline).is_ok() {
             if let Some(exit) = self
                 .child
                 .as_mut()
@@ -522,27 +601,44 @@ impl CoreSupervisor {
                     ),
                 ));
             }
-            if let Ok(response) = client
-                .get(format!("{}/desktop", controller.url))
-                .timeout(timeout.min(CONTROL_TIMEOUT))
-                .bearer_auth(&controller.secret)
-                .send()
-            {
-                if response.status().is_success() {
-                    if let Ok(info) = response.json::<serde_json::Value>() {
-                        let expected_pid = self.child.as_ref().map(|child| child.id() as u64);
-                        if info.get("managed").and_then(serde_json::Value::as_bool) == Some(true)
-                            && info.get("api_version").and_then(serde_json::Value::as_u64)
-                                == Some(1)
-                            && info.get("state").and_then(serde_json::Value::as_str)
-                                == Some("running")
-                            && info.get("pid").and_then(serde_json::Value::as_u64) == expected_pid
-                        {
-                            self.verify_listeners(controller, source, deadline)?;
-                            return Ok(());
-                        }
+            let probe = (|| {
+                let info = read_readiness_json(&client, controller, "/desktop", deadline)?;
+                if info.get("managed").and_then(serde_json::Value::as_bool) != Some(true)
+                    || info.get("api_version").and_then(serde_json::Value::as_u64) != Some(1)
+                {
+                    return Err(ReadinessFailure::Fatal(AppError::new(
+                        "core_controller_incompatible",
+                        "就绪检查 /desktop：配套内核的桌面控制协议不兼容",
+                    )));
+                }
+                let expected_pid = self.child.as_ref().map(|child| child.id() as u64);
+                if info.get("pid").and_then(serde_json::Value::as_u64) != expected_pid {
+                    return Err(ReadinessFailure::Fatal(AppError::new(
+                        "core_controller_identity",
+                        "就绪检查 /desktop：控制接口进程与自有内核不一致",
+                    )));
+                }
+                match info.get("state").and_then(serde_json::Value::as_str) {
+                    Some("running") => {}
+                    Some("loading" | "stopping") => {
+                        return Err(ReadinessFailure::Temporary(AppError::new(
+                            "core_not_ready",
+                            "就绪检查 /desktop：内核仍在准备资源、应用配置或停止中",
+                        )));
+                    }
+                    _ => {
+                        return Err(ReadinessFailure::Fatal(AppError::new(
+                            "core_controller_incompatible",
+                            "就绪检查 /desktop：内核返回未知运行状态",
+                        )));
                     }
                 }
+                self.verify_listeners(&client, controller, &expected, deadline)
+            })();
+            match probe {
+                Ok(()) => return Ok(()),
+                Err(ReadinessFailure::Fatal(error)) => return Err(error),
+                Err(ReadinessFailure::Temporary(error)) => last_failure = Some(error),
             }
             if let Ok(timeout) = remaining(deadline) {
                 thread::sleep(timeout.min(Duration::from_millis(150)));
@@ -550,7 +646,10 @@ impl CoreSupervisor {
         }
         Err(AppError::new(
             "core_start_timeout",
-            "资源准备与内核就绪已超过本次操作总时限，请检查资源来源、端口或配置日志",
+            format!(
+                "资源准备与内核就绪已超过本次操作总时限，请检查资源来源、端口或配置日志{}",
+                last_failure.map_or_else(String::new, |error| format!("；{}", error.message)),
+            ),
         ))
     }
 
@@ -641,31 +740,12 @@ impl CoreSupervisor {
 
     fn verify_listeners(
         &self,
+        client: &Client,
         controller: &Controller,
-        source: &str,
+        expected: &serde_yaml::Mapping,
         deadline: Instant,
-    ) -> Result<()> {
-        let expected = config::parse(source)?;
-        let response = http_client()?
-            .get(format!("{}/configs", controller.url))
-            .timeout(remaining(deadline)?.min(CONTROL_TIMEOUT))
-            .bearer_auth(&controller.secret)
-            .send()
-            .map_err(|_| {
-                AppError::new(
-                    "core_listener_unverified",
-                    "无法确认内核监听状态，系统代理未切换",
-                )
-            })?;
-        if !response.status().is_success() {
-            return Err(AppError::new(
-                "core_listener_unverified",
-                "无法鉴权读取内核监听状态",
-            ));
-        }
-        let actual: serde_json::Value = response
-            .json()
-            .map_err(|_| AppError::new("core_listener_unverified", "内核返回无效监听状态"))?;
+    ) -> std::result::Result<(), ReadinessFailure> {
+        let actual = read_readiness_json(client, controller, "/configs", deadline)?;
         // Mihomo reports these values from its actual TCP listeners, so a port bind
         // failure cannot be mistaken for a successful config application.
         for field in ["port", "socks-port", "mixed-port"] {
@@ -673,11 +753,21 @@ impl CoreSupervisor {
                 .get(field)
                 .and_then(serde_yaml::Value::as_u64)
                 .unwrap_or(0);
-            if actual.get(field).and_then(serde_json::Value::as_u64) != Some(requested) {
-                return Err(AppError::new(
+            let actual_port = actual
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .filter(|port| *port <= u16::MAX as u64)
+                .ok_or_else(|| {
+                    ReadinessFailure::Fatal(AppError::new(
+                        "core_controller_incompatible",
+                        format!("就绪检查 /configs：内核返回无效监听字段 {field}"),
+                    ))
+                })?;
+            if actual_port != requested {
+                return Err(ReadinessFailure::Fatal(AppError::new(
                     "core_listener_failed",
-                    format!("内核未能监听配置的 {field}，请检查端口是否被占用"),
-                ));
+                    format!("就绪检查 /configs：内核未能监听配置的 {field}，请检查端口是否被占用"),
+                )));
             }
         }
         Ok(())
@@ -954,6 +1044,227 @@ impl Drop for CoreSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[derive(Clone, Copy)]
+    enum ReadinessScenario {
+        DisconnectOnce,
+        TimeoutOnce,
+        DisconnectAlways,
+        PortConflict,
+        Unauthorized,
+        InvalidJson,
+        WrongPid,
+        IncompatibleApi,
+    }
+
+    struct ReadinessFixture {
+        core: CoreSupervisor,
+        controller: Controller,
+        source: String,
+        config_reads: Arc<AtomicUsize>,
+        finished: Arc<AtomicBool>,
+        server: Option<thread::JoinHandle<()>>,
+        _occupied_port: Option<TcpListener>,
+    }
+
+    impl ReadinessFixture {
+        fn new(scenario: ReadinessScenario) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let controller = Controller {
+                url: format!("http://{}", listener.local_addr().unwrap()),
+                secret: "readiness-fixture-secret".into(),
+            };
+            // A real owned child keeps PID/liveness checks active. Its only input
+            // is a pipe owned by this fixture; it cannot launch another process.
+            let child = quiet_command(&std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "core::tests::readiness_owned_process",
+                ])
+                .env("MIHOMO_READINESS_TEST_CHILD", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let mut core = CoreSupervisor::new(PathBuf::new(), PathBuf::new(), PathBuf::new());
+            core.child = Some(child);
+            let occupied_port = matches!(scenario, ReadinessScenario::PortConflict)
+                .then(|| TcpListener::bind(("127.0.0.1", 0)).unwrap());
+            let requested_port = occupied_port
+                .as_ref()
+                .map_or(7890, |socket| socket.local_addr().unwrap().port());
+            let actual_port = if let Some(socket) = &occupied_port {
+                // Match the core's actual-listener response after a real bind
+                // failure: the requested port is nonzero but the listener is 0.
+                assert!(TcpListener::bind(socket.local_addr().unwrap()).is_err());
+                0
+            } else {
+                requested_port
+            };
+            let finished = Arc::new(AtomicBool::new(false));
+            let config_reads = Arc::new(AtomicUsize::new(0));
+            let stop = finished.clone();
+            let reads = config_reads.clone();
+            let server = thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut byte = [0_u8];
+                    while request.len() < 4096 && !request.ends_with(b"\r\n\r\n") {
+                        if stream.read(&mut byte).ok() != Some(1) {
+                            break;
+                        }
+                        request.push(byte[0]);
+                    }
+                    let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    assert!(request.contains("authorization: bearer readiness-fixture-secret\r\n"));
+                    let (status, body) = if request.starts_with("get /desktop ") {
+                        let reported_pid = if matches!(scenario, ReadinessScenario::WrongPid) {
+                            pid as u64 + 1
+                        } else {
+                            pid as u64
+                        };
+                        let api = if matches!(scenario, ReadinessScenario::IncompatibleApi) {
+                            2
+                        } else {
+                            1
+                        };
+                        (200, serde_json::json!({"managed":true,"api_version":api,"state":"running","pid":reported_pid}).to_string())
+                    } else {
+                        assert!(request.starts_with("get /configs "));
+                        let attempt = reads.fetch_add(1, Ordering::SeqCst);
+                        match scenario {
+                            ReadinessScenario::DisconnectAlways => continue,
+                            ReadinessScenario::DisconnectOnce if attempt == 0 => continue,
+                            ReadinessScenario::TimeoutOnce if attempt == 0 => {
+                                let delayed_until = Instant::now() + CONTROL_TIMEOUT + Duration::from_millis(200);
+                                while !stop.load(Ordering::SeqCst) && Instant::now() < delayed_until {
+                                    thread::sleep(Duration::from_millis(10));
+                                }
+                                continue;
+                            }
+                            ReadinessScenario::Unauthorized => (401, "fixture-secret-must-not-be-displayed".into()),
+                            ReadinessScenario::InvalidJson => (200, "fixture-secret-must-not-be-displayed".into()),
+                            _ => (200, serde_json::json!({"port":0,"socks-port":0,"mixed-port":actual_port}).to_string()),
+                        }
+                    };
+                    let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            Self {
+                core,
+                controller,
+                source: format!("mixed-port: {requested_port}\n"),
+                config_reads,
+                finished,
+                server: Some(server),
+                _occupied_port: occupied_port,
+            }
+        }
+
+        fn wait(&mut self, timeout: Duration) -> Result<()> {
+            self.core
+                .wait_ready(&self.controller, &self.source, Instant::now() + timeout)
+        }
+    }
+
+    impl Drop for ReadinessFixture {
+        fn drop(&mut self) {
+            self.finished.store(true, Ordering::SeqCst);
+            let _ = self.core.terminate_child();
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "owned child fixture, invoked only by the readiness tests"]
+    fn readiness_owned_process() {
+        if std::env::var_os("MIHOMO_READINESS_TEST_CHILD").is_some() {
+            let _ = std::io::stdin().read_to_end(&mut Vec::new());
+        }
+    }
+
+    #[test]
+    fn readiness_retries_one_listener_disconnect_without_restarting() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::DisconnectOnce);
+        let original_pid = fixture.core.child.as_ref().unwrap().id();
+        fixture.wait(Duration::from_secs(2)).unwrap();
+        assert_eq!(fixture.config_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.core.child.as_ref().unwrap().id(), original_pid);
+    }
+
+    #[test]
+    fn readiness_retries_one_listener_timeout_within_the_original_deadline() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::TimeoutOnce);
+        let started = Instant::now();
+        fixture.wait(Duration::from_secs(6)).unwrap();
+        assert!(started.elapsed() >= CONTROL_TIMEOUT);
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert_eq!(fixture.config_reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn readiness_persistent_unreadable_listener_uses_one_deadline() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::DisconnectAlways);
+        let started = Instant::now();
+        let error = fixture.wait(Duration::from_millis(450)).unwrap_err();
+        assert_eq!(error.code, "core_start_timeout");
+        assert!(error.message.contains("/configs"));
+        assert!(fixture.config_reads.load(Ordering::SeqCst) >= 2);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn readiness_real_port_conflict_is_not_retried_as_transport_failure() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::PortConflict);
+        let started = Instant::now();
+        let error = fixture.wait(Duration::from_secs(5)).unwrap_err();
+        assert_eq!(error.code, "core_listener_failed");
+        assert_eq!(fixture.config_reads.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn readiness_rejects_authentication_protocol_and_owned_pid_mismatches() {
+        for scenario in [
+            ReadinessScenario::Unauthorized,
+            ReadinessScenario::InvalidJson,
+            ReadinessScenario::WrongPid,
+            ReadinessScenario::IncompatibleApi,
+        ] {
+            let mut fixture = ReadinessFixture::new(scenario);
+            let started = Instant::now();
+            let error = fixture.wait(Duration::from_secs(5)).unwrap_err();
+            assert_ne!(error.code, "core_start_timeout");
+            assert!(!error.message.contains("fixture-secret"));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(fixture.config_reads.load(Ordering::SeqCst) <= 1);
+        }
+    }
 
     #[test]
     fn validation_main_and_recovery_use_one_operation_budget() {
