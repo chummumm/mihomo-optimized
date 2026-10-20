@@ -107,6 +107,7 @@ function UpdateRow ({ item, label, version, idle, clock, stale, uncertain = fals
 export function UpdateCheck ({ client, kernelVersion, resourcesOnly = false }: { client: Client, kernelVersion: string, resourcesOnly?: boolean }) {
     const { translation } = useI18n()
     const { t } = translation('Settings')
+    const { t: desktopText } = translation('Desktop')
     const task = useUpdateTask(client)
     const [, refreshClock] = useState(0)
     useEffect(() => {
@@ -147,19 +148,24 @@ export function UpdateCheck ({ client, kernelVersion, resourcesOnly = false }: {
     const retry = task.problem !== undefined && !task.disconnected
     const busy = task.loading || task.starting || task.disconnected || (running && !retry)
     const finished = snapshot?.finished_at ?? previous?.finished_at
-    const footer = task.disconnected
-        ? t('update.reconnecting')
-        : task.problem
-            ? t(`update.errors.${task.problem}`)
-            : task.startRejected === true || task.unconfirmedStart === true
-                ? t(task.startRejected ? 'update.requestBusy' : 'update.requestUnconfirmed')
-                : task.starting || running
-                    ? t(snapshot?.state === 'restarting' ? 'update.restartingHint' : 'update.checkingHint')
-                    : task.restart
-                        ? t(task.restart === 'verified' ? 'update.restartVerified' : 'update.restartUnconfirmed')
-                        : snapshot?.state === 'partial'
-                            ? t('update.summaryPartial')
-                            : snapshot?.state === 'completed' ? t('update.summaryDone') : t('update.hint')
+    function summary () {
+        if (task.disconnected) return t('update.reconnecting')
+        if (task.problem) return resourcesOnly ? desktopText(`resourceUpdate.errors.${task.problem}`) : t(`update.errors.${task.problem}`)
+        if (task.startRejected || task.unconfirmedStart) {
+            return resourcesOnly
+                ? desktopText(task.startRejected ? 'resourceUpdate.requestBusy' : 'resourceUpdate.requestUnconfirmed')
+                : t(task.startRejected ? 'update.requestBusy' : 'update.requestUnconfirmed')
+        }
+        if (task.starting || running) {
+            return resourcesOnly ? desktopText('resourceUpdate.checkingHint') : t(snapshot?.state === 'restarting' ? 'update.restartingHint' : 'update.checkingHint')
+        }
+        if (task.restart) {
+            return resourcesOnly ? desktopText('resourceUpdate.interrupted') : t(task.restart === 'verified' ? 'update.restartVerified' : 'update.restartUnconfirmed')
+        }
+        if (snapshot?.state === 'partial') return resourcesOnly ? desktopText('resourceUpdate.summaryPartial') : t('update.summaryPartial')
+        if (snapshot?.state === 'completed') return resourcesOnly ? desktopText('resourceUpdate.summaryDone') : t('update.summaryDone')
+        return resourcesOnly ? desktopText('resourceUpdate.hint') : t('update.hint')
+    }
 
     function group (rows: UpdateItem[], label: string) {
         const enabled = rows.filter(item => item.auto_update)
@@ -187,7 +193,8 @@ export function UpdateCheck ({ client, kernelVersion, resourcesOnly = false }: {
         </details>
     }
 
-    return <Card className="settings-card settings-update" aria-busy={busy}>
+    return <Card className="settings-card settings-update" aria-busy={busy} aria-label={resourcesOnly ? desktopText('resourceUpdate.title') : undefined}>
+        {resourcesOnly && <div className="settings-row"><span className="label">{desktopText('resourceUpdate.title')}</span></div>}
         {!resourcesOnly && <UpdateRow item={completedCore} label={t('update.kernel')} version={currentCore?.current_version ? currentCore.current_version : task.loading ? '' : kernelVersion} idle={idle} clock={clock} stale={staleSchedule} uncertain={task.restart === 'unconfirmed' || task.unconfirmedStart} />}
         {!resourcesOnly && <UpdateRow item={ui} label={t('update.dashboard')} version={__UI_VERSION__} idle={idle} clock={clock} stale={staleSchedule} uncertain={task.restart !== undefined || task.unconfirmedStart} />}
         {!resourcesOnly && uiInstalled && uiInstalled !== __UI_VERSION__ && <div className="settings-update-installed">
@@ -204,9 +211,11 @@ export function UpdateCheck ({ client, kernelVersion, resourcesOnly = false }: {
         </div>
         <div className="settings-row settings-row-action settings-update-footer">
             <span className="settings-update-summary" role={task.problem && !task.disconnected ? 'alert' : 'status'}>
-                {footer}{finished && !running ? ` · ${formatClock(finished)}` : ''}
+                {summary()}{finished && !running ? ` · ${formatClock(finished)}` : ''}
             </span>
-            <Button icon="arrow-circle-up" loading={busy} disabled={busy || task.problem === 'unsupported'} onClick={() => { void task.start() }}>{t(busy ? 'update.checking' : retry ? 'update.retry' : 'update.check')}</Button>
+            <Button icon="arrow-circle-up" loading={busy} disabled={busy || task.problem === 'unsupported'} onClick={() => { void task.start() }}>{resourcesOnly
+                ? desktopText(busy ? 'resourceUpdate.checking' : retry ? 'resourceUpdate.retry' : 'resourceUpdate.check')
+                : t(busy ? 'update.checking' : retry ? 'update.retry' : 'update.check')}</Button>
         </div>
     </Card>
 }

@@ -177,27 +177,106 @@ async function verifyStartupUpdates(origin, initializeFixture) {
         } finally { await context.close() }
     }
 
+    for (const phase of ['running', 'error']) {
+        const { context, page } = await open('update-starting')
+        try {
+            await page.clock.runFor(180000)
+            assert.equal(await count(page, 'desktop_check_update'), 0, 'resource preparation does not race a release request')
+            await page.evaluate(phase => window.__desktopFixture.phase(phase), phase)
+            await until(() => count(page, 'desktop_check_update').then(value => value === 1), `long preparation ending in ${phase} resumes the startup check`)
+            await page.evaluate(() => {
+                window.__desktopFixture.emit('desktop-visibility', { visible: false })
+                window.__desktopFixture.emit('desktop-visibility', { visible: true })
+                window.__desktopFixture.emit('desktop-status', window.__desktopFixture.status)
+            })
+            await page.clock.runFor(60000)
+            assert.equal(await count(page, 'desktop_check_update'), 1, 'later status events and elapsed time do not repeat the automatic check')
+            await noInstall(page)
+        } finally { await context.close() }
+    }
+
+    {
+        const { context, page } = await open('update-start-held')
+        try {
+            await page.getByRole('button', { name: '启动内核', exact: true }).click()
+            await until(() => page.evaluate(() => typeof window.__desktopFixture.finishStart === 'function'), 'the native start is pending')
+            await page.evaluate(() => window.__desktopFixture.phase('running'))
+            await page.clock.runFor(60000)
+            assert.equal(await count(page, 'desktop_check_update'), 0, 'a status event cannot bypass an unfinished core operation')
+            await page.evaluate(() => window.__desktopFixture.finishStart())
+            await until(() => count(page, 'desktop_check_update').then(value => value === 1), 'finishing the core operation releases the pending check')
+            await noInstall(page)
+        } finally { await context.close() }
+    }
+
+    {
+        const { context, page } = await open('update-write-held', '/settings')
+        try {
+            await page.getByRole('button', { name: '编辑配置文件', exact: true }).click()
+            const editor = page.locator('textarea.config-editor-text')
+            await until(() => editor.isEditable(), 'the native editor opens before the startup check')
+            await editor.fill('mode: direct\n# pending save\n')
+            await page.locator('.config-editor-footer').getByRole('button', { name: '保存并重新加载', exact: true }).click()
+            await until(() => page.evaluate(() => typeof window.__desktopFixture.finishConfigSave === 'function'), 'the native configuration write is pending')
+            await page.clock.runFor(60000)
+            assert.equal(await count(page, 'desktop_check_update'), 0, 'automatic updates wait for an active configuration write')
+            await page.evaluate(() => window.__desktopFixture.finishConfigSave())
+            await until(() => count(page, 'desktop_check_update').then(value => value === 1), 'saving and applying the configuration releases the pending check')
+            await noInstall(page)
+        } finally { await context.close() }
+    }
+
+    {
+        const { context, page } = await open('update-starting', '/settings')
+        try {
+            await page.clock.runFor(60000)
+            await page.getByRole('button', { name: '检查应用更新', exact: true }).click()
+            await page.locator('.desktop-app-update').getByText('发现新版本 · 0.2.0', { exact: true }).waitFor()
+            await page.evaluate(() => window.__desktopFixture.phase('running'))
+            await page.clock.runFor(60000)
+            assert.equal(await count(page, 'desktop_check_update'), 1, 'a manual check consumes the pending automatic check during long preparation')
+            await noInstall(page)
+        } finally { await context.close() }
+    }
+
     {
         const { context, page } = await open('update-starting')
         try {
             await page.clock.runFor(60000)
-            assert.equal(await count(page, 'desktop_check_update'), 0, 'a persistently starting core does not cause an endless background check loop')
-            await page.evaluate(() => window.__desktopFixture.phase('running'))
+            await page.evaluate(() => {
+                window.dispatchEvent(new PageTransitionEvent('pagehide'))
+                window.__desktopFixture.phase('running')
+            })
             await page.clock.runFor(60000)
-            assert.equal(await count(page, 'desktop_check_update'), 0, 'an expired startup attempt stays consumed')
-            await route(page, '/settings')
-            await page.getByRole('button', { name: '检查应用更新', exact: true }).click()
-            await page.locator('.desktop-app-update').getByText('发现新版本 · 0.2.0', { exact: true }).waitFor()
-            assert.equal(await count(page, 'desktop_check_update'), 1, 'manual checking remains available after startup readiness expires')
-            await noInstall(page)
+            assert.equal(await count(page, 'desktop_check_update'), 0, 'leaving the WebView cancels a waiting startup check')
         } finally { await context.close() }
     }
-    process.stdout.write('Desktop startup update regression passed: one check per launch, background core access, shared route state, notice/dismissal, failure/retry, installation exclusion, manual-first and readiness deadlines.\n')
+
+    {
+        const { context, page } = await open('update-exit', '/settings')
+        try {
+            await page.getByRole('button', { name: '编辑配置文件', exact: true }).click()
+            const editor = page.locator('textarea.config-editor-text')
+            await until(() => editor.isEditable(), 'the exit test opens a native draft')
+            await editor.fill('mode: direct\n# unsaved exit draft\n')
+            await page.evaluate(() => window.__desktopFixture.emit('desktop-exit-requested', {}))
+            await page.getByRole('button', { name: '丢弃修改并退出', exact: true }).click()
+            await until(() => page.evaluate(() => window.__desktopFixture.exited), 'explicit exit reaches the native host')
+            await page.clock.runFor(60000)
+            assert.equal(await count(page, 'desktop_check_update'), 0, 'confirmed exit cancels the initial delay before the WebView closes')
+        } finally { await context.close() }
+    }
+    process.stdout.write('Desktop startup update regression passed: one check per launch, background core access, shared route state, notice/dismissal, failure/retry, installation exclusion, manual-first, long preparation/write recovery and exit cancellation.\n')
 }
 
 async function main() {
     assert.ok(fs.existsSync(path.join(dist, 'index.html')), 'build the desktop UI first')
     const ws = new WebSocketServer({ noServer: true })
+    const resourceTask = { instance_id: 'fixture-instance', state: 'idle', items: [
+        { id: 'kernel', kind: 'kernel', name: 'kernel', status: 'skipped', reason: 'desktop_managed' },
+        { id: 'ui', kind: 'ui', name: 'ui', status: 'skipped', reason: 'desktop_managed' },
+        { id: 'geodata', kind: 'geodata', name: 'GeoIP', status: 'up_to_date' },
+    ] }
     server = http.createServer((req, res) => {
         const url = new URL(req.url, 'http://127.0.0.1')
         res.setHeader('Access-Control-Allow-Origin', '*')
@@ -214,15 +293,15 @@ async function main() {
                 'fixture-node': { name: 'fixture-node', type: 'Socks', history: [], udp: true },
             } },
             '/connections': { connections: [], uploadTotal: 0, downloadTotal: 0 },
-            '/upgrade/check': { instance_id: 'fixture-instance', state: 'idle', items: [
-                { id: 'kernel', kind: 'kernel', name: 'kernel', status: 'skipped', reason: 'desktop_managed' },
-                { id: 'ui', kind: 'ui', name: 'ui', status: 'skipped', reason: 'desktop_managed' },
-                { id: 'geodata', kind: 'geodata', name: 'GeoIP', status: 'up_to_date' },
-            ] },
+            '/upgrade/check': resourceTask,
         }
         if (api[url.pathname]) {
-            requests.push({ path: url.pathname, auth: req.headers.authorization })
+            requests.push({ path: url.pathname, method: req.method, auth: req.headers.authorization })
             assert.equal(req.headers.authorization, `Bearer ${secret}`, 'HTTP uses only the native secret')
+            if (url.pathname === '/upgrade/check' && req.method === 'POST') {
+                Object.assign(resourceTask, { state: 'running', task_id: 'fixture-resource-update', request_id: req.headers['idempotency-key'] })
+                resourceTask.items.find(item => item.kind === 'geodata').status = 'checking'
+            }
             json(res, api[url.pathname]); return
         }
         if (url.pathname === '/configs/file') {
@@ -272,6 +351,8 @@ async function main() {
             updateAvailable: fixtureCase !== 'update-none', updateError: fixtureCase === 'update-failure',
             holdUpdateCheck: fixtureCase === 'update-held', holdUpdateInstall: false,
             finishUpdateCheck: null, finishUpdateInstall: null,
+            holdStart: fixtureCase === 'update-start-held', finishStart: null,
+            holdConfigSave: fixtureCase === 'update-write-held', finishConfigSave: null,
             file: { path: 'C:\\Users\\Fixture\\AppData\\Local\\mihomo\\config.yaml', content: 'mode: rule\nproxies: []\n', revision: 'revision-1', max_size: 4194304, writable: true },
             status: {
                 appVersion: '0.1.0', phase: fixtureCase === 'update-starting' ? 'starting' : 'stopped', systemProxy: false, tun: false, autostart: false,
@@ -304,7 +385,14 @@ async function main() {
                 if (command === 'desktop_status') return structuredClone(mock.status)
                 if (command === 'desktop_read_config') return structuredClone(mock.file)
                 if (command === 'desktop_set_dirty') { mock.dirty = args.dirty; return }
-                if (['desktop_start', 'desktop_restart'].includes(command)) { mock.phase('running'); return structuredClone(mock.status) }
+                if (['desktop_start', 'desktop_restart'].includes(command)) {
+                    if (mock.holdStart) {
+                        mock.phase('starting')
+                        await new Promise(resolve => { mock.finishStart = resolve })
+                    }
+                    mock.phase('running')
+                    return structuredClone(mock.status)
+                }
                 if (command === 'desktop_stop') { mock.status.systemProxy = false; mock.phase('stopped'); return structuredClone(mock.status) }
                 if (command === 'desktop_set_system_proxy') {
                     if (mock.failProxy) throw { code: 'system_proxy_failed', message: 'Fixture proxy rejection' }
@@ -316,6 +404,7 @@ async function main() {
                 } else if (command === 'desktop_install_service') mock.status.service.installed = true
                 else if (command === 'desktop_uninstall_service') mock.status.service = { installed: false, running: false }
                 else if (['desktop_save_config', 'desktop_import_config', 'desktop_import_config_url'].includes(command)) {
+                    if (mock.holdConfigSave) await new Promise(resolve => { mock.finishConfigSave = resolve })
                     if (mock.conflict || args.expectedRevision !== mock.file.revision) throw { code: 'config_conflict', message: 'Configuration changed' }
                     mock.file.content = command === 'desktop_import_config_url' ? 'mode: direct\n# imported by native URL download\n' : args.content
                     mock.file.revision = 'revision-' + (parseInt(mock.file.revision.split('-')[1]) + 1)
@@ -364,13 +453,36 @@ async function main() {
     })
     await page.goto(origin + '/#/settings?host=untrusted.invalid&port=4567&secret=untrusted-url')
     await page.getByRole('heading', { name: '本机运行', exact: true }).waitFor()
-    await until(() => page.getByRole('button', { name: '启动内核', exact: true }).first().isEnabled(), 'native startup status enables start')
+    await until(() => page.getByRole('button', { name: '启动内核', exact: true }).isEnabled(), 'native startup status enables start')
+    assert.equal(await page.getByRole('button', { name: '启动内核', exact: true }).count(), 1, 'the status bar owns the single start control')
+    assert.equal(await page.locator('.desktop-controls').getByRole('button', { name: /^(启动内核|停止内核)$/ }).count(), 0, 'Settings does not duplicate start and stop')
+    assert.equal(await page.getByRole('button', { name: '编辑配置文件', exact: true }).count(), 1, 'Settings has one source-file editor entry')
+    assert.equal(await page.getByRole('heading', { name: '控制器', exact: true }).count(), 0, 'desktop hides the browser controller card')
+    assert.equal(await page.locator('.desktop-statusbar').getByRole('button', { name: '打开设置', exact: true }).count(), 0, 'the Settings page does not link to itself in the status bar')
+    assert.equal(await page.getByRole('button', { name: '检查并更新资源', exact: true }).isEnabled(), false, 'resource updates remain visible but disabled while stopped')
+    await page.getByText('启动内核后可检查并更新规则与 Geo 数据。', { exact: true }).waitFor()
+    assert.equal(await page.getByRole('button', { name: '检查应用更新', exact: true }).isEnabled(), true, 'application updates do not require a running core')
     assert.equal(requests.length, 0, 'stopped core does not contact browser or URL controllers')
     assert.equal(await page.getByLabel('控制器密钥').count(), 0)
     assert.equal(await page.locator('link[rel="manifest"]').count(), 0, 'desktop has no PWA manifest')
     assert.equal(await page.evaluate(async () => (await navigator.serviceWorker.getRegistrations()).length), 0, 'desktop has no service worker')
 
-    await page.getByRole('button', { name: '编辑配置文件', exact: true }).first().click()
+    const beforeRefresh = await page.evaluate(() => window.__desktopFixture.commands.length)
+    await page.getByRole('button', { name: '刷新状态', exact: true }).click()
+    await until(() => page.evaluate(start => window.__desktopFixture.commands.slice(start).some(item => item.command === 'desktop_status'), beforeRefresh), 'refresh reads native status')
+    assert.deepEqual(await page.evaluate(start => window.__desktopFixture.commands.slice(start).filter(item => ['desktop_start', 'desktop_stop', 'desktop_restart', 'desktop_reload_config'].includes(item.command)), beforeRefresh), [], 'refresh does not mutate the runtime')
+    await page.getByRole('button', { name: '重新加载已保存配置', exact: true }).click()
+    await page.getByText('配置校验完成，将在下次启动内核时生效。', { exact: true }).waitFor()
+    assert.equal(await page.evaluate(() => window.__desktopFixture.status.phase), 'stopped', 'reloading a stopped core does not start it')
+    assert.equal(await page.evaluate(() => window.__desktopFixture.commands.filter(item => item.command === 'desktop_reload_config').length), 1, 'the moved reload entry submits one native reload')
+
+    await page.getByRole('button', { name: 'English', exact: true }).click()
+    await page.getByText('Start the core to check and update rules and Geo data.', { exact: true }).waitFor()
+    assert.equal(await page.getByRole('button', { name: 'Reload saved configuration', exact: true }).count(), 1, 'the English desktop controls use the same single configuration entry')
+    assert.equal(await page.getByRole('button', { name: 'Check and update resources', exact: true }).isEnabled(), false)
+    await page.getByRole('button', { name: '中文', exact: true }).click()
+
+    await page.getByRole('button', { name: '编辑配置文件', exact: true }).click()
     const editor = page.locator('textarea.config-editor-text')
     await until(() => editor.isEditable(), 'native config editing is available while core is stopped')
     await editor.fill('mode: direct\nproxies: []\n# retained draft\n')
@@ -395,7 +507,7 @@ async function main() {
     await page.locator('.config-editor-footer').getByRole('button', { name: '关闭', exact: true }).click()
     await page.getByRole('button', { name: '丢弃并关闭', exact: true }).click()
     await page.evaluate(() => { window.__desktopFixture.conflict = false; window.__desktopFixture.reloadFails = true })
-    await page.getByRole('button', { name: '编辑配置文件', exact: true }).first().click()
+    await page.getByRole('button', { name: '编辑配置文件', exact: true }).click()
     await until(() => editor.isEditable(), 'a new editor session reads the native revision')
     await editor.fill('mode: direct\nproxies: []\n# retry reload\n')
     await page.locator('.config-editor-footer').getByRole('button', { name: '保存并重新加载' }).click()
@@ -408,8 +520,23 @@ async function main() {
     await page.locator('.config-editor-footer').getByRole('button', { name: '关闭', exact: true }).click()
     assert.equal(requests.filter(item => item.path === '/configs/file').length, 0, 'configuration I/O always uses native source-file commands')
 
-    await page.getByRole('button', { name: '启动内核', exact: true }).first().click()
+    await page.getByRole('button', { name: '启动内核', exact: true }).click()
     await until(() => page.evaluate(() => window.__desktopFixture.status.phase === 'running'), 'start invokes native host')
+    assert.equal(await page.getByRole('button', { name: '停止内核', exact: true }).count(), 1, 'a running core has only the status-bar stop control')
+    const beforeRestart = await page.evaluate(() => window.__desktopFixture.commands.length)
+    await page.getByRole('button', { name: '重启内核', exact: true }).click()
+    await until(() => page.evaluate(start => window.__desktopFixture.commands.slice(start).some(item => item.command === 'desktop_restart'), beforeRestart), 'restart remains a distinct native operation')
+    assert.equal(await page.evaluate(start => window.__desktopFixture.commands.slice(start).filter(item => item.command === 'desktop_reload_config').length, beforeRestart), 0, 'restart is not replaced with configuration reload')
+    const resources = page.locator('.settings-update[aria-label="规则与 Geo 数据"]')
+    await resources.getByText('检查当前配置中的规则集与 Geo 数据来源，并应用可用的资源更新。', { exact: true }).waitFor()
+    assert.equal(await resources.innerText().then(text => /内核最后升级|升级后会重启|内核升级/.test(text)), false, 'resource-only idle text never promises a core upgrade')
+    await resources.getByRole('button', { name: '检查并更新资源', exact: true }).click()
+    await resources.getByText('正在检查并应用规则与 Geo 数据更新。', { exact: true }).waitFor()
+    assert.equal(requests.filter(item => item.path === '/upgrade/check' && item.method === 'POST').length, 1, 'resource updating keeps the existing core-owned task API')
+    resourceTask.state = 'partial'
+    Object.assign(resourceTask.items.find(item => item.kind === 'geodata'), { status: 'error', error: 'update_failed' })
+    await resources.getByText('部分资源更新失败，请查看各项结果。', { exact: true }).waitFor()
+    assert.equal(await resources.innerText().then(text => /内核最后升级|升级后会重启|内核升级/.test(text)), false, 'resource-only results stay scoped to resources')
     const proxySwitch = page.getByRole('switch', { name: '设置为系统代理', exact: true })
     await proxySwitch.click()
     await until(() => proxySwitch.getAttribute('aria-checked').then(value => value === 'true'), 'system proxy uses native confirmed state')
@@ -424,10 +551,10 @@ async function main() {
     await until(() => page.evaluate(() => window.__desktopFixture.status.autostart), 'Windows autostart is connected without ClashX emulation')
     await page.getByRole('switch', { name: 'TUN 模式', exact: true }).click()
     await until(() => page.evaluate(() => window.__desktopFixture.status.tun), 'TUN reaches native service path')
-    await page.getByRole('button', { name: '停止内核', exact: true }).first().click()
+    await page.getByRole('button', { name: '停止内核', exact: true }).click()
     await until(() => page.locator('.desktop-status-details').innerText().then(text => text.includes('TUN 模式 关闭')), 'stopping the core clears effective TUN status')
     assert.equal(await page.getByRole('switch', { name: 'TUN 模式', exact: true }).getAttribute('aria-checked'), 'true', 'the selected TUN mode survives stopping')
-    await page.getByRole('button', { name: '启动内核', exact: true }).first().click()
+    await page.getByRole('button', { name: '启动内核', exact: true }).click()
     await until(() => page.evaluate(() => window.__desktopFixture.status.phase === 'running'), 'restart applies the selected mode')
 
     await page.getByRole('button', { name: '导入配置', exact: true }).click()
@@ -458,6 +585,7 @@ async function main() {
     assert.equal(await page.locator('[data-update-id="ui"]').count(), 0, 'bundled UI is not overwritten by web dashboard updates')
 
     await page.locator('.sidebar-menu').getByRole('link', { name: '连接', exact: true }).click()
+    assert.equal(await page.locator('.desktop-statusbar').getByRole('button', { name: '打开设置', exact: true }).count(), 1, 'other routes retain the Settings shortcut')
     await until(() => [...sockets].some(socket => socket.kind === '/connections' && socket.readyState === 1), 'connection statistics stream starts')
     await page.evaluate(() => window.__desktopFixture.emit('desktop-visibility', { visible: false }))
     assert.equal(await page.evaluate(() => document.visibilityState), 'visible')

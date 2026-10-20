@@ -420,6 +420,7 @@ impl DesktopManager {
             }
         };
         self.core_status = status;
+        self.last_error = None;
         self.applied_proxy_port = config::mixed_port(&content).ok();
         if self.preferences.system_proxy {
             self.proxy.enable(config::mixed_port(&content)?)?;

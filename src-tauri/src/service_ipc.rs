@@ -1,10 +1,12 @@
 use crate::{
+    config,
     core::CoreStatus,
     error::{AppError, Result},
     windows,
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::Cell,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     thread,
@@ -31,6 +33,34 @@ use windows_sys::Win32::{
 };
 
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
+const RESPONSE_RESERVE: Duration = Duration::from_secs(60);
+
+fn operation_timeout(request: &Request, current: Duration) -> Result<Duration> {
+    match request {
+        Request::Start { config } | Request::Reload { config } => {
+            config::resource_bootstrap_timeout(config)?
+                .checked_add(RESPONSE_RESERVE)
+                .ok_or_else(|| AppError::new("config_invalid", "服务操作时限超出系统支持范围"))
+        }
+        // Status can observe a bounded automatic core recovery, so it must use
+        // the active configuration's budget rather than the old fixed 90s wait.
+        Request::Status => Ok(current),
+        Request::Stop => Ok(Duration::from_secs(30)),
+    }
+}
+
+fn deadline_after(timeout: Duration) -> Result<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| AppError::new("config_invalid", "服务操作时限超出系统支持范围"))
+}
+
+fn time_left(deadline: Instant) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| AppError::new("service_timeout", "等待 TUN 服务超过本次操作总时限"))
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -69,6 +99,7 @@ fn pipe_name(sid: &str) -> String {
 pub struct Client {
     sid: String,
     expected_service: PathBuf,
+    response_timeout: Cell<Duration>,
 }
 
 impl Client {
@@ -76,10 +107,13 @@ impl Client {
         Ok(Self {
             sid: windows::current_sid()?,
             expected_service: windows::protected_install_dir()?.join("mihomo-desktop-service.exe"),
+            response_timeout: Cell::new(config::DEFAULT_RESOURCE_TIMEOUT + RESPONSE_RESERVE),
         })
     }
 
     pub fn call(&self, request: &Request) -> Result<CoreStatus> {
+        let timeout = operation_timeout(request, self.response_timeout.get())?;
+        let deadline = deadline_after(timeout)?;
         let pipe = windows::wide(pipe_name(&self.sid));
         let start = Instant::now();
         let handle = loop {
@@ -137,18 +171,33 @@ impl Client {
         }
         let bytes = serde_json::to_vec(request)
             .map_err(|_| AppError::new("service_protocol", "无法编码服务请求"))?;
-        write_message(handle.as_raw_handle(), &bytes, Duration::from_secs(10))?;
-        // Includes bounded YAML validation, application, and (when needed) rollback.
-        let response = read_message(handle.as_raw_handle(), Duration::from_secs(90))?;
+        write_message(
+            handle.as_raw_handle(),
+            &bytes,
+            time_left(deadline)?.min(Duration::from_secs(10)),
+        )?;
+        // Validation, application, rollback and pipe framing share this one
+        // outer deadline. A header does not restart the response timer.
+        let response = read_message(handle.as_raw_handle(), time_left(deadline)?)?;
         let reply: Reply = serde_json::from_slice(&response)
             .map_err(|_| AppError::new("service_protocol", "服务返回了不兼容的响应"))?;
-        let _ = write_bytes(handle.as_raw_handle(), &[1], Duration::from_secs(1));
+        if let Ok(remaining) = time_left(deadline) {
+            let _ = write_bytes(
+                handle.as_raw_handle(),
+                &[1],
+                remaining.min(Duration::from_secs(1)),
+            );
+        }
         if let Some(error) = reply.error {
             return Err(error);
         }
-        reply
+        let status = reply
             .status
-            .ok_or_else(|| AppError::new("service_protocol", "服务响应缺少状态"))
+            .ok_or_else(|| AppError::new("service_protocol", "服务响应缺少状态"))?;
+        if matches!(request, Request::Start { .. } | Request::Reload { .. }) {
+            self.response_timeout.set(timeout);
+        }
+        Ok(status)
     }
 }
 
@@ -282,13 +331,19 @@ fn write_message(handle: HANDLE, content: &[u8], timeout: Duration) -> Result<()
             "服务请求超过大小限制",
         ));
     }
-    write_bytes(handle, &(content.len() as u32).to_le_bytes(), timeout)?;
-    write_bytes(handle, content, timeout)
+    let deadline = deadline_after(timeout)?;
+    write_bytes(
+        handle,
+        &(content.len() as u32).to_le_bytes(),
+        time_left(deadline)?,
+    )?;
+    write_bytes(handle, content, time_left(deadline)?)
 }
 
 fn read_message(handle: HANDLE, timeout: Duration) -> Result<Vec<u8>> {
+    let deadline = deadline_after(timeout)?;
     let mut header = [0_u8; 4];
-    read_bytes(handle, &mut header, timeout)?;
+    read_bytes(handle, &mut header, time_left(deadline)?)?;
     let length = u32::from_le_bytes(header) as usize;
     if length > MAX_MESSAGE {
         return Err(AppError::new(
@@ -297,7 +352,7 @@ fn read_message(handle: HANDLE, timeout: Duration) -> Result<Vec<u8>> {
         ));
     }
     let mut bytes = vec![0; length];
-    read_bytes(handle, &mut bytes, timeout)?;
+    read_bytes(handle, &mut bytes, time_left(deadline)?)?;
     Ok(bytes)
 }
 
@@ -378,4 +433,110 @@ fn write_bytes(handle: HANDLE, buffer: &[u8], timeout: Duration) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn service_wait_tracks_the_configuration_including_automatic_recovery() {
+        let current = Duration::from_secs(240);
+        assert_eq!(
+            operation_timeout(
+                &Request::Start {
+                    config: "mode: rule".into()
+                },
+                current
+            )
+            .unwrap(),
+            current
+        );
+        let enlarged = operation_timeout(
+            &Request::Reload {
+                config: "resource-bootstrap:\n  timeout: 300\n".into(),
+            },
+            current,
+        )
+        .unwrap();
+        assert_eq!(enlarged, Duration::from_secs(360));
+        assert_eq!(
+            operation_timeout(
+                &Request::Start {
+                    config: "resource-bootstrap:\n  timeout: 1\n".into()
+                },
+                current
+            )
+            .unwrap(),
+            Duration::from_secs(61)
+        );
+        assert_eq!(
+            operation_timeout(&Request::Status, enlarged).unwrap(),
+            enlarged
+        );
+        assert_eq!(
+            operation_timeout(&Request::Stop, enlarged).unwrap(),
+            Duration::from_secs(30)
+        );
+        assert!(operation_timeout(
+            &Request::Start {
+                config: "resource-bootstrap:\n  timeout: 0\n".into()
+            },
+            current
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pipe_header_cannot_restart_the_response_deadline() {
+        let mut nonce = [0_u8; 12];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let name = windows::wide(format!(r"\\.\pipe\MihomoBudgetTest.{}", hex::encode(nonce)));
+        let raw_server = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(raw_server, INVALID_HANDLE_VALUE);
+        let server = unsafe { OwnedHandle::from_raw_handle(raw_server) };
+        let raw_client = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(raw_client, INVALID_HANDLE_VALUE);
+        let client = unsafe { OwnedHandle::from_raw_handle(raw_client) };
+        let connected = unsafe { ConnectNamedPipe(server.as_raw_handle(), std::ptr::null_mut()) };
+        assert!(connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED);
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            write_bytes(
+                server.as_raw_handle(),
+                &1_u32.to_le_bytes(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(100));
+            write_bytes(server.as_raw_handle(), &[42], Duration::from_secs(1)).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+        // Neither header nor body individually exceeds 140ms. Their combined
+        // duration does, so resetting after the header would incorrectly succeed.
+        let error = read_message(client.as_raw_handle(), Duration::from_millis(140)).unwrap_err();
+        assert_eq!(error.code, "service_timeout");
+        writer.join().unwrap();
+    }
 }

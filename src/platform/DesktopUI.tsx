@@ -19,6 +19,7 @@ export function DesktopStatusBar () {
     const { translation } = useI18n()
     const { t } = translation('Desktop')
     const navigate = useNavigate()
+    const location = useLocation()
     const phase = desktop.status?.phase
     const busy = !!desktop.busy || phase === 'starting' || phase === 'stopping'
     return <div className="desktop-statusbar" aria-label={t('title')}>
@@ -31,7 +32,7 @@ export function DesktopStatusBar () {
         </span>
         <div className="desktop-status-actions">
             <Button size="sm" icon={phase === 'running' ? 'pause' : 'play'} disabled={busy || !desktop.status} onClick={() => runAction(phase === 'running' ? 'desktop_stop' : 'desktop_start')}>{t(phase === 'running' ? 'stop' : 'start')}</Button>
-            <Button size="sm" icon="nav-settings" ariaLabel={t('settings')} onClick={() => navigate('/settings')} />
+            {location.pathname !== '/settings' && <Button size="sm" icon="nav-settings" ariaLabel={t('settings')} onClick={() => navigate('/settings')} />}
         </div>
     </div>
 }
@@ -61,7 +62,6 @@ export function DesktopUnavailable () {
     const { t } = translation('Desktop')
     const navigate = useNavigate()
     const phase = desktop.status?.phase
-    const busy = !!desktop.busy || phase === 'starting' || phase === 'stopping'
     return <div className="page desktop-recovery-page">
         <Card className="desktop-recovery">
             <div className="desktop-recovery-symbol"><Icon type={desktop.error || phase === 'error' ? 'warning' : 'nav-proxies'} size={36} /></div>
@@ -69,7 +69,6 @@ export function DesktopUnavailable () {
             <p>{t('notRunningHint')}</p>
             {(desktop.status?.lastError || desktop.error) && <p className="desktop-error" role="alert">{desktop.status?.lastError || (desktop.error?.code === 'desktop_unavailable' ? t('connectionError') : desktop.error?.message)}</p>}
             <div className="desktop-recovery-actions">
-                {desktop.status && <Button type="primary" icon="play" loading={busy} disabled={busy} onClick={() => runAction('desktop_start')}>{t('start')}</Button>}
                 {!desktop.status && <Button icon="update" onClick={() => { void refreshDesktop() }}>{t('retry')}</Button>}
                 <Button icon="nav-settings" onClick={() => navigate('/settings')}>{t('settings')}</Button>
             </div>
@@ -119,6 +118,12 @@ export function DesktopControls ({ onEditConfig }: { onEditConfig: () => void })
     const { t: settings } = translation('Settings')
     const status = desktop.status
     const busy = !!desktop.busy || status?.phase === 'starting' || status?.phase === 'stopping'
+    async function reloadConfig () {
+        try {
+            await desktopAction('desktop_reload_config', { force: false })
+            success(desktopSnapshot().status?.phase === 'running' ? settings('messages.reloadOk') : t('reloadStopped'))
+        } catch (reason) { toastError(desktopError(reason).message) }
+    }
     return <section className="settings-section desktop-controls">
         <h2 className="settings-section-title">{t('title')}</h2>
         <Card className="settings-card">
@@ -128,8 +133,6 @@ export function DesktopControls ({ onEditConfig }: { onEditConfig: () => void })
             </div>
             <div className="settings-row settings-row-action">
                 <Button icon="update" disabled={busy} onClick={() => { void refreshDesktop() }}>{t('retry')}</Button>
-                <Button icon="play" type="primary" disabled={busy || !status || status.phase === 'running'} loading={desktop.busy === 'desktop_start'} onClick={() => runAction('desktop_start')}>{t('start')}</Button>
-                <Button icon="pause" disabled={busy || status?.phase !== 'running'} loading={desktop.busy === 'desktop_stop'} onClick={() => runAction('desktop_stop')}>{t('stop')}</Button>
                 <Button icon="update" disabled={busy || !status} loading={desktop.busy === 'desktop_restart'} onClick={() => runAction('desktop_restart')}>{t('restart')}</Button>
             </div>
             {(status?.lastError || desktop.error) && <div className="desktop-error desktop-inset" role="alert">{status?.lastError || (desktop.error?.code === 'desktop_unavailable' ? t('connectionError') : desktop.error?.message)}</div>}
@@ -143,13 +146,14 @@ export function DesktopControls ({ onEditConfig }: { onEditConfig: () => void })
                 <Button size="sm" icon={status?.service?.installed ? 'trash' : 'arrow-down'} disabled={busy || !status?.capabilities.serviceManagement || status.tun} onClick={() => runAction(status?.service?.installed ? 'desktop_uninstall_service' : 'desktop_install_service')}>{t(status?.service?.installed ? 'uninstallService' : 'installService')}</Button>
             </div>
             <div className="settings-row desktop-config-path">
-                <span className="label">{t('config')}</span>
+                <div><span className="label">{t('config')}</span><p className="settings-hint">{t('managedController')}</p></div>
                 <span className="reading" title={status?.configPath}>{status?.configPath || '—'}</span>
             </div>
             <div className="settings-row settings-row-action">
                 <Button icon="file" disabled={!status} onClick={() => runAction('desktop_open_directory', { kind: 'config' })}>{t('configFolder')}</Button>
                 <Button icon="nav-logs" disabled={!status} onClick={() => runAction('desktop_open_directory', { kind: 'logs' })}>{t('logFolder')}</Button>
                 <Button icon="edit" disabled={!status} onClick={onEditConfig}>{settings('labels.editConfig')}</Button>
+                <Button icon="update" disabled={busy || !status || desktop.dirty} loading={desktop.busy === 'desktop_reload_config'} onClick={() => { void reloadConfig() }}>{t('reloadConfig')}</Button>
                 <Button icon="arrow-down" disabled={busy || !status?.capabilities.configImport} onClick={() => setDesktopDialog('import')}>{t('importConfig')}</Button>
             </div>
         </Card>
