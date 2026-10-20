@@ -498,7 +498,11 @@ impl DesktopManager {
         };
         match result {
             Ok(status) => {
-                let recovered = !self.core_status.running && status.running;
+                // A failed service query preserves the last process status, but
+                // withdraws the controller and restores our system proxy. The
+                // next confirmed Running observation must also restore the user's
+                // preference when that last process status was already running.
+                let recovered = self.phase != Phase::Running && status.running;
                 self.phase = if status.running {
                     Phase::Running
                 } else {
