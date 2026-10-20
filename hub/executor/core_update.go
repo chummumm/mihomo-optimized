@@ -1,10 +1,17 @@
 package executor
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/metacubex/mihomo/component/desktop"
+)
 
 // Restart keeps successful shutdown preparation and process replacement in one
 // configuration transaction. The callback runs only after protection is ready.
 func Restart(restart func()) error {
+	if desktop.Enabled() {
+		return desktop.ErrManaged
+	}
 	mux.Lock()
 	defer mux.Unlock()
 	if ShutdownRequested() {
@@ -28,6 +35,9 @@ func Restart(restart func()) error {
 // updater locks before returning so shutdown can cancel their background work.
 // A failed or obsolete commit never shuts down the current process.
 func ApplyUpdateAndRestart(commit func() error, restart func()) error {
+	if desktop.Enabled() {
+		return desktop.ErrManaged
+	}
 	mux.Lock()
 	defer mux.Unlock()
 	if ShutdownRequested() {

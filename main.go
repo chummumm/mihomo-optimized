@@ -19,8 +19,10 @@ import (
 
 	"github.com/metacubex/mihomo/common/cmd"
 	"github.com/metacubex/mihomo/component/age"
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/component/generator"
 	"github.com/metacubex/mihomo/component/geodata"
+	"github.com/metacubex/mihomo/component/resource"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/constant/features"
@@ -35,6 +37,8 @@ import (
 var (
 	version                       bool
 	testConfig                    bool
+	resourceBootstrapTimeout      string
+	desktopManaged                bool
 	geodataMode                   bool
 	homeDir                       string
 	configFile                    string
@@ -75,6 +79,9 @@ func init() {
 	flag.BoolVar(&geodataMode, "m", false, "set geodata mode")
 	flag.BoolVar(&version, "v", false, "show current version of mihomo")
 	flag.BoolVar(&testConfig, "t", false, "test configuration and exit")
+	flag.StringVar(&resourceBootstrapTimeout, "resource-bootstrap-timeout", "", "limit the initial resource budget to the supervisor's remaining Go duration")
+	managedEnv, _ := strconv.ParseBool(os.Getenv("CLASH_DESKTOP_MANAGED"))
+	flag.BoolVar(&desktopManaged, "desktop-managed", managedEnv, "delegate process and program updates to a desktop supervisor")
 }
 
 func main() {
@@ -131,6 +138,17 @@ func main() {
 		}
 		C.SetHomeDir(homeDir)
 	}
+	if desktopManaged {
+		if configString != "" || configFile == "-" || postUp != "" || postDown != "" {
+			log.Fatalln("desktop-managed requires a configuration file and does not allow post-up/post-down scripts")
+			return
+		}
+		if err := desktop.Enable(desktop.Options{Home: homeDir, Controller: externalController, Secret: secret}); err != nil {
+			log.Fatalln("%s", err)
+			return
+		}
+		C.SetHomeDir(desktop.Home())
+	}
 
 	if geodataMode {
 		geodata.SetGeodataMode(true)
@@ -166,7 +184,20 @@ func main() {
 		} else {
 			configFile = filepath.Join(C.Path.HomeDir(), C.Path.Config())
 		}
+		if desktop.Enabled() {
+			// Enable canonicalizes the home (for example a Windows 8.3 name
+			// or macOS /var). Map the launcher's matching -f spelling into
+			// that verified home before enforcing the normal I/O boundary.
+			// Do not resolve config symlinks: CheckPath must still reject them.
+			if relative, err := filepath.Rel(homeDir, configFile); err == nil && filepath.IsLocal(relative) {
+				configFile = filepath.Join(desktop.Home(), relative)
+			}
+		}
 		C.SetConfig(configFile)
+		if err := desktop.CheckPath(configFile); err != nil {
+			log.Fatalln("Invalid managed configuration path: %s", err)
+			return
+		}
 
 		if err := config.Init(C.Path.HomeDir()); err != nil {
 			log.Fatalln("Initial configuration directory error: %s", err.Error())
@@ -174,19 +205,28 @@ func main() {
 	}
 
 	if testConfig {
+		ctx, err := initialResourceContext(context.Background())
+		if err != nil {
+			log.Errorln("%s", err)
+			os.Exit(1)
+		}
+		var cfg *config.Config
 		if len(configBytes) != 0 {
-			if _, err := executor.ParseWithBytes(configBytes); err != nil {
+			cfg, err = executor.ParseWithBytesContext(ctx, configBytes)
+			if err != nil {
 				log.Errorln(err.Error())
 				fmt.Println("configuration test failed")
 				os.Exit(1)
 			}
 		} else {
-			if _, err := executor.Parse(); err != nil {
+			cfg, err = executor.ParseContext(ctx)
+			if err != nil {
 				log.Errorln(err.Error())
 				fmt.Printf("configuration file %s test failed\n", C.Path.Config())
 				os.Exit(1)
 			}
 		}
+		cfg.CloseResourceBootstrap()
 		fmt.Printf("configuration file %s test is successful\n", C.Path.Config())
 		return
 	}
@@ -221,6 +261,12 @@ func main() {
 }
 
 func runDaemon(options []hub.Option) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startupCtx, err := initialResourceContext(ctx)
+	if err != nil {
+		return err
+	}
 	termSign := make(chan os.Signal, 1)
 	hupSign := make(chan os.Signal, 1)
 	// Queue stop requests before configuration can create managed resources.
@@ -229,7 +275,7 @@ func runDaemon(options []hub.Option) error {
 	signal.Notify(hupSign, syscall.SIGHUP)
 	defer signal.Stop(termSign)
 	defer signal.Stop(hupSign)
-	stopRequests, stopWatching := relayStopSignals(termSign, executor.RequestShutdown)
+	stopRequests, stopWatching := relayStopSignals(termSign, func() { cancel(); executor.RequestShutdown() })
 	defer stopWatching()
 	configured := false
 	defer func() {
@@ -240,7 +286,7 @@ func runDaemon(options []hub.Option) error {
 			}
 		}
 	}()
-	if err := hub.Parse(configBytes, options...); err != nil {
+	if err := hub.ParseContext(startupCtx, configBytes, options...); err != nil {
 		if errors.Is(err, executor.ErrShuttingDown) {
 			return nil
 		}
@@ -249,6 +295,9 @@ func runDaemon(options []hub.Option) error {
 	configured = true
 	select {
 	case <-stopRequests:
+		return nil
+	case <-desktop.ShutdownRequests():
+		executor.RequestShutdown()
 		return nil
 	default:
 	}
@@ -261,8 +310,11 @@ func runDaemon(options []hub.Option) error {
 		select {
 		case <-stopRequests:
 			return nil
+		case <-desktop.ShutdownRequests():
+			executor.RequestShutdown()
+			return nil
 		case <-hupSign:
-			if err := hub.Parse(configBytes, options...); err != nil {
+			if err := hub.ParseContext(ctx, configBytes, options...); err != nil {
 				if errors.Is(err, executor.ErrShuttingDown) {
 					return nil
 				}
@@ -270,6 +322,17 @@ func runDaemon(options []hub.Option) error {
 			}
 		}
 	}
+}
+
+func initialResourceContext(ctx context.Context) (context.Context, error) {
+	if resourceBootstrapTimeout == "" {
+		return ctx, nil
+	}
+	limit, err := resource.ParseBootstrapTimeout(resourceBootstrapTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return resource.WithBootstrapTimeout(ctx, limit), nil
 }
 
 // Publish stop intent independently of configuration parsing and the executor

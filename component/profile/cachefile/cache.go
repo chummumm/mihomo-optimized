@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/component/profile"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -78,10 +79,18 @@ func (c *CacheFile) Close() error {
 }
 
 func initCache() {
+	if err := desktop.CheckPath(C.Path.Cache()); err != nil {
+		log.Warnln("[CacheFile] refusing unsafe managed cache: %s", err)
+		defaultCache = &CacheFile{}
+		return
+	}
 	options := bbolt.Options{Timeout: time.Second, NoStatistics: true}
 	db, err := bbolt.Open(C.Path.Cache(), fileMode, &options)
 	switch err {
 	case bbolt.ErrInvalid, bbolt.ErrChecksum, bbolt.ErrVersionMismatch:
+		if err = desktop.CheckPath(C.Path.Cache()); err != nil {
+			break
+		}
 		if err = os.Remove(C.Path.Cache()); err != nil {
 			log.Warnln("[CacheFile] remove invalid cache file error: %s", err.Error())
 			break

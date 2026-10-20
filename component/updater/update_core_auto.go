@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/log"
 )
 
@@ -85,6 +86,9 @@ func (u *CoreUpdater) ConfigureAutoUpdate(enabled bool, intervalHours int) {
 // work waits for this configuration's resolver reset. Same-policy jobs follow
 // the newest readiness barrier without restarting their timer or first check.
 func (u *CoreUpdater) ConfigureAutoUpdateWhenReady(enabled bool, intervalHours int, ready <-chan struct{}) {
+	if desktop.Enabled() {
+		enabled = false
+	}
 	if intervalHours <= 0 || intervalHours > int((1<<63-1)/time.Hour) {
 		intervalHours = defaultCoreUpdateInterval
 	}
@@ -117,7 +121,7 @@ func (u *CoreUpdater) SetAutomaticRestartHandler(handler CoreAutomaticRestartHan
 }
 
 func (u *CoreUpdater) startAutomaticUpdatesLocked(immediate bool) {
-	if !u.autoUpdate || u.restartHandler == nil {
+	if desktop.Enabled() || !u.autoUpdate || u.restartHandler == nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())

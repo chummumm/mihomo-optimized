@@ -10,6 +10,7 @@ import (
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/component/resource"
 	"github.com/metacubex/mihomo/component/transparentproxy"
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
@@ -463,11 +464,26 @@ func updateConfigs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	force := r.URL.Query().Get("force") == "true"
+	ctx := r.Context()
+	if values, exists := r.URL.Query()["resource-bootstrap-timeout"]; exists {
+		if len(values) != 1 {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError(resource.NewBootstrapError("invalid_timeout", "config", "timeout", nil).Error()))
+			return
+		}
+		limit, err := resource.ParseBootstrapTimeout(values[0])
+		if err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError(err.Error()))
+			return
+		}
+		ctx = resource.WithBootstrapTimeout(ctx, limit)
+	}
 	var cfg *config.Config
 	var err error
 
 	if req.Payload != "" {
-		cfg, err = executor.ParseWithBytes([]byte(req.Payload))
+		cfg, err = executor.ParseWithBytesContext(ctx, []byte(req.Payload))
 		if err != nil {
 			render.Status(r, http.StatusBadRequest)
 			render.JSON(w, r, newError(err.Error()))
@@ -490,7 +506,7 @@ func updateConfigs(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		cfg, err = executor.ParseWithPath(req.Path)
+		cfg, err = executor.ParseWithPathContext(ctx, req.Path)
 		if err != nil {
 			render.Status(r, http.StatusBadRequest)
 			render.JSON(w, r, newError(err.Error()))

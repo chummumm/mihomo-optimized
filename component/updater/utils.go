@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/metacubex/mihomo/component/desktop"
 	mihomoHttp "github.com/metacubex/mihomo/component/http"
 
 	"github.com/metacubex/http"
@@ -26,5 +27,8 @@ func downloadForBytes(url string) ([]byte, error) {
 }
 
 func saveFile(bytes []byte, path string) error {
+	if err := desktop.CheckPath(path); err != nil {
+		return err
+	}
 	return os.WriteFile(path, bytes, 0o644)
 }

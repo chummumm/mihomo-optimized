@@ -16,6 +16,7 @@ import (
 
 	"github.com/metacubex/chi/render"
 	"github.com/metacubex/http"
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"go.yaml.in/yaml/v3"
@@ -308,6 +309,9 @@ func configFileRevision(path, identity, content string, info os.FileInfo) string
 }
 
 func readCurrentConfigFile() (*configFileSnapshot, *configFileFailure) {
+	if desktop.Enabled() && desktop.CheckPath(C.Path.Config()) != nil {
+		return nil, configFileUnsupported
+	}
 	path, err := filepath.Abs(C.Path.Config())
 	if err != nil {
 		return nil, configFileReadError

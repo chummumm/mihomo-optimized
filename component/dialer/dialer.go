@@ -114,7 +114,7 @@ func Listen(ctx context.Context, network, address string, options ...Option) (ne
 func listenConfig(network, address string, rAddrPort netip.AddrPort, opt option) (*net.ListenConfig, string, error) {
 	lc := &net.ListenConfig{}
 	if opt.routingMark == 0 {
-		opt.routingMark = int(DefaultRoutingMark.Load())
+		opt.routingMark = opt.routingMarkDefault()
 	}
 	if opt.addrReuse {
 		addrReuseToListenConfig(lc)
@@ -123,7 +123,7 @@ func listenConfig(network, address string, rAddrPort netip.AddrPort, opt option)
 		socketHookToListenConfig(lc)
 	} else {
 		if opt.interfaceName == "" {
-			opt.interfaceName = DefaultInterface.Load()
+			opt.interfaceName = opt.interfaceDefault()
 		}
 		if opt.interfaceName == "" {
 			if finder := DefaultInterfaceFinder.Load(); finder != nil {
@@ -174,14 +174,14 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
 	keepalive.SetNetDialer(dialer)
 	mptcp.SetNetDialer(dialer, opt.mpTcp)
 	if opt.routingMark == 0 {
-		opt.routingMark = int(DefaultRoutingMark.Load())
+		opt.routingMark = opt.routingMarkDefault()
 	}
 
 	if DefaultSocketHook != nil { // ignore interfaceName, routingMark and tfo when DefaultSocketHook not null (in CMFA)
 		socketHookToToDialer(dialer)
 	} else {
 		if opt.interfaceName == "" {
-			opt.interfaceName = DefaultInterface.Load()
+			opt.interfaceName = opt.interfaceDefault()
 		}
 		if opt.interfaceName == "" {
 			if finder := DefaultInterfaceFinder.Load(); finder != nil {
@@ -229,7 +229,7 @@ func SocketControlWithOptions(destination netip.Addr, options ...Option) func(ne
 		}
 		routingMark := opt.routingMark
 		if routingMark == 0 {
-			routingMark = int(DefaultRoutingMark.Load())
+			routingMark = opt.routingMarkDefault()
 		}
 		if DefaultSocketHook != nil {
 			if err := DefaultSocketHook(network, address, conn); err != nil {
@@ -240,7 +240,7 @@ func SocketControlWithOptions(destination netip.Addr, options ...Option) func(ne
 		dialer := &net.Dialer{}
 		interfaceName := opt.interfaceName
 		if interfaceName == "" {
-			interfaceName = DefaultInterface.Load()
+			interfaceName = opt.interfaceDefault()
 		}
 		if interfaceName == "" {
 			if finder := DefaultInterfaceFinder.Load(); finder != nil {

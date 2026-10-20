@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"time"
 
 	"github.com/metacubex/mihomo/common/utils"
@@ -55,6 +56,31 @@ type Resolver interface {
 	ResetConnection()
 }
 
+type bootstrapResolverKey struct{}
+
+// WithBootstrapResolver confines temporary startup adapters to system DNS.
+// Unlike normal proxy-server DNS, this cannot re-enter the business rules or a
+// provider which the same resource request is still trying to download.
+func WithBootstrapResolver(ctx context.Context) context.Context {
+	return context.WithValue(ctx, bootstrapResolverKey{}, true)
+}
+
+func usesBootstrapResolver(ctx context.Context, r Resolver) bool {
+	value, _ := ctx.Value(bootstrapResolverKey{}).(bool)
+	if !value {
+		return false
+	}
+	if r == nil {
+		return true
+	}
+	// Protocol-owned resolvers (e.g. WireGuard remote DNS) are already isolated
+	// and must retain their semantics. Only replace global business resolvers.
+	if !reflect.TypeOf(r).Comparable() {
+		return false
+	}
+	return r == DefaultResolver || r == ProxyServerHostResolver || r == DirectHostResolver || r == SystemResolver
+}
+
 // PreferIPOrder reports whether a resolver currently supplies a preferred
 // address order. It is optional so system and third-party resolvers retain
 // their existing connection selection behavior.
@@ -65,6 +91,9 @@ func PreferIPOrder(r Resolver) bool {
 
 // LookupIPv4WithResolver same as LookupIPv4, but with a resolver
 func LookupIPv4WithResolver(ctx context.Context, host string, r Resolver) ([]netip.Addr, error) {
+	if usesBootstrapResolver(ctx, r) {
+		return SystemResolver.LookupIPv4(ctx, host)
+	}
 	if node, ok := DefaultHosts.Search(host, false); ok {
 		if addrs := utils.Filter(node.IPs, func(ip netip.Addr) bool {
 			return ip.Is4()
@@ -112,6 +141,12 @@ func ResolveIPv4(ctx context.Context, host string) (netip.Addr, error) {
 
 // LookupIPv6WithResolver same as LookupIPv6, but with a resolver
 func LookupIPv6WithResolver(ctx context.Context, host string, r Resolver) ([]netip.Addr, error) {
+	if usesBootstrapResolver(ctx, r) {
+		if DisableIPv6 {
+			return nil, ErrIPv6Disabled
+		}
+		return SystemResolver.LookupIPv6(ctx, host)
+	}
 	if DisableIPv6 {
 		return nil, ErrIPv6Disabled
 	}
@@ -161,6 +196,12 @@ func ResolveIPv6(ctx context.Context, host string) (netip.Addr, error) {
 
 // LookupIPWithResolver same as LookupIP, but with a resolver
 func LookupIPWithResolver(ctx context.Context, host string, r Resolver) ([]netip.Addr, error) {
+	if usesBootstrapResolver(ctx, r) {
+		if DisableIPv6 {
+			return SystemResolver.LookupIPv4(ctx, host)
+		}
+		return SystemResolver.LookupIP(ctx, host)
+	}
 	if node, ok := DefaultHosts.Search(host, false); ok {
 		return node.IPs, nil
 	}
@@ -228,6 +269,9 @@ func ResolveIPPrefer6(ctx context.Context, host string) (netip.Addr, error) {
 }
 
 func ResolveECHWithResolver(ctx context.Context, host string, r Resolver) ([]byte, error) {
+	if usesBootstrapResolver(ctx, r) {
+		return SystemResolver.ResolveECH(ctx, host)
+	}
 	if r != nil && r.Invalid() {
 		return r.ResolveECH(ctx, host)
 	}

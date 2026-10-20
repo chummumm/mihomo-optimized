@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -69,10 +70,11 @@ func SetASNUrl(url string) {
 }
 
 func downloadToPath(url string, path string) (err error) {
-	defer func() { recordInitializationError(err) }()
 	scope := currentInitializationContext()
-	ctx, cancel := context.WithTimeout(scope.ctx, time.Second*90)
+	ctx := resource.WithInitialResource(scope.ctx, "geo", filepath.Base(path))
+	ctx, cancel := context.WithTimeout(ctx, resource.InitialDownloadTimeout(ctx, time.Second*90))
 	defer cancel()
+	defer func() { err = resource.BootstrapFailure(ctx, err); recordInitializationError(err) }()
 	vehicle := resource.NewHTTPVehicle(url, path, "", nil, 90*time.Second, 512<<20)
 	data, _, err := vehicle.Read(ctx, utils.HashType{})
 	if err != nil {
@@ -147,7 +149,7 @@ func InitGeoSite() (err error) {
 	if _, err := os.Stat(C.Path.GeoSite()); os.IsNotExist(err) {
 		log.Infoln("Can't find GeoSite.dat, start download")
 		if err := downloadToPath(GeoSiteUrl(), C.Path.GeoSite()); err != nil {
-			return fmt.Errorf("can't download GeoSite.dat: %s", err.Error())
+			return fmt.Errorf("can't download GeoSite.dat: %w", err)
 		}
 		log.Infoln("Download GeoSite.dat finish")
 		initGeoSite = false
@@ -156,7 +158,7 @@ func InitGeoSite() (err error) {
 		if err := Verify(C.GeositeName); err != nil {
 			log.Warnln("GeoSite.dat invalid, download replacement: %s", err)
 			if err := downloadToPath(GeoSiteUrl(), C.Path.GeoSite()); err != nil {
-				return fmt.Errorf("can't download GeoSite.dat: %s", err.Error())
+				return fmt.Errorf("can't download GeoSite.dat: %w", err)
 			}
 		}
 		initGeoSite = true
@@ -173,7 +175,7 @@ func InitGeoIP() (err error) {
 		if _, err := os.Stat(C.Path.GeoIP()); os.IsNotExist(err) {
 			log.Infoln("Can't find GeoIP.dat, start download")
 			if err := downloadToPath(GeoIpUrl(), C.Path.GeoIP()); err != nil {
-				return fmt.Errorf("can't download GeoIP.dat: %s", err.Error())
+				return fmt.Errorf("can't download GeoIP.dat: %w", err)
 			}
 			log.Infoln("Download GeoIP.dat finish")
 			initGeoIP = 0
@@ -183,7 +185,7 @@ func InitGeoIP() (err error) {
 			if err := Verify(C.GeoipName); err != nil {
 				log.Warnln("GeoIP.dat invalid, download replacement: %s", err)
 				if err := downloadToPath(GeoIpUrl(), C.Path.GeoIP()); err != nil {
-					return fmt.Errorf("can't download GeoIP.dat: %s", err.Error())
+					return fmt.Errorf("can't download GeoIP.dat: %w", err)
 				}
 			}
 			initGeoIP = 1
@@ -194,7 +196,7 @@ func InitGeoIP() (err error) {
 	if _, err := os.Stat(C.Path.MMDB()); os.IsNotExist(err) {
 		log.Infoln("Can't find MMDB, start download")
 		if err := downloadToPath(MmdbUrl(), C.Path.MMDB()); err != nil {
-			return fmt.Errorf("can't download MMDB: %s", err.Error())
+			return fmt.Errorf("can't download MMDB: %w", err)
 		}
 	}
 
@@ -202,7 +204,7 @@ func InitGeoIP() (err error) {
 		if !mmdb.Verify(C.Path.MMDB()) {
 			log.Warnln("MMDB invalid, download replacement")
 			if err := downloadToPath(MmdbUrl(), C.Path.MMDB()); err != nil {
-				return fmt.Errorf("can't download MMDB: %s", err.Error())
+				return fmt.Errorf("can't download MMDB: %w", err)
 			}
 		}
 		initGeoIP = 2
@@ -218,7 +220,7 @@ func InitASN() (err error) {
 	if _, err := os.Stat(C.Path.ASN()); os.IsNotExist(err) {
 		log.Infoln("Can't find ASN.mmdb, start download")
 		if err := downloadToPath(ASNUrl(), C.Path.ASN()); err != nil {
-			return fmt.Errorf("can't download ASN.mmdb: %s", err.Error())
+			return fmt.Errorf("can't download ASN.mmdb: %w", err)
 		}
 		log.Infoln("Download ASN.mmdb finish")
 		initASN = false
@@ -227,7 +229,7 @@ func InitASN() (err error) {
 		if !mmdb.Verify(C.Path.ASN()) {
 			log.Warnln("ASN invalid, download replacement")
 			if err := downloadToPath(ASNUrl(), C.Path.ASN()); err != nil {
-				return fmt.Errorf("can't download ASN: %s", err.Error())
+				return fmt.Errorf("can't download ASN: %w", err)
 			}
 		}
 		initASN = true

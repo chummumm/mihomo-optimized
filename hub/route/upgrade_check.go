@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/component/updater"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -393,6 +394,12 @@ func upgradeCheckItems(cfg *executor.UpdateConfiguration) []upgradeCheckItem {
 		{ID: "kernel", Kind: "kernel", Name: "mihomo-optimized", Status: "pending", CurrentVersion: C.Version},
 		{ID: "ui", Kind: "ui", Name: "mihomo", Status: "pending", CurrentVersion: uiStatus.CurrentVersion},
 	}
+	if desktop.Enabled() {
+		for i := range items {
+			items[i].Status, items[i].Reason = "skipped", "desktop_managed"
+			items[i].AutoUpdate = boolPolicy(false)
+		}
+	}
 	if cfg == nil {
 		return items
 	}
@@ -452,9 +459,13 @@ func buildUpgradeCheckPlan() (*upgradeCheckPlan, error) {
 	if cfg == nil || cfg.Context.Err() != nil {
 		return nil, errUpgradeConfigurationUnavailable
 	}
-	reservation, err := updater.DefaultCoreUpdater.ReserveCheckAndUpdate()
-	if err != nil {
-		return nil, err
+	var reservation *updater.CoreUpdateReservation
+	if !desktop.Enabled() {
+		var err error
+		reservation, err = updater.DefaultCoreUpdater.ReserveCheckAndUpdate()
+		if err != nil {
+			return nil, err
+		}
 	}
 	plan := &upgradeCheckPlan{ctx: cfg.Context, items: upgradeCheckItems(cfg), cleanup: reservation.Close}
 	var coreItem, uiItem upgradeCheckItem
@@ -527,16 +538,18 @@ func buildUpgradeCheckPlan() (*upgradeCheckPlan, error) {
 			}
 		}})
 	}
-	plan.steps = append(plan.steps, upgradeCheckStep{ids: []string{uiItem.ID}, run: func(ctx context.Context, report func(upgradeCheckItem)) {
-		result, err := cfg.UI.CheckAndUpdateContext(ctx)
-		uiItem.CurrentVersion, uiItem.LatestVersion = result.CurrentVersion, result.LatestVersion
-		uiItem.Status, uiItem.Error = upgradeItemOutcome(result.Updated, err)
-		if result.Updated {
-			uiItem.CurrentVersion = result.LatestVersion
-		}
-		report(uiItem)
-	}})
-	if !embedMode {
+	if !desktop.Enabled() {
+		plan.steps = append(plan.steps, upgradeCheckStep{ids: []string{uiItem.ID}, run: func(ctx context.Context, report func(upgradeCheckItem)) {
+			result, err := cfg.UI.CheckAndUpdateContext(ctx)
+			uiItem.CurrentVersion, uiItem.LatestVersion = result.CurrentVersion, result.LatestVersion
+			uiItem.Status, uiItem.Error = upgradeItemOutcome(result.Updated, err)
+			if result.Updated {
+				uiItem.CurrentVersion = result.LatestVersion
+			}
+			report(uiItem)
+		}})
+	}
+	if !embedMode && !desktop.Enabled() {
 		plan.steps = append(plan.steps, upgradeCheckStep{ids: []string{coreItem.ID}, run: func(ctx context.Context, report func(upgradeCheckItem)) {
 			executable, err := os.Executable()
 			if err != nil {
@@ -574,7 +587,7 @@ func buildUpgradeCheckPlan() (*upgradeCheckPlan, error) {
 			coreItem = coreUpgradeOutcome(coreItem, result, err)
 			report(coreItem)
 		}})
-	} else {
+	} else if embedMode {
 		for i := range plan.items {
 			if plan.items[i].Kind == "kernel" || plan.items[i].Kind == "geodata" && plan.items[i].Status == "pending" {
 				plan.items[i].Status, plan.items[i].Reason = "skipped", "embedded"

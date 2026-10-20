@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/constant/features"
 )
 
@@ -86,6 +87,9 @@ func (p *path) Resolve(path string) string {
 
 // IsSafePath return true if path is a subpath of homedir (or in the SAFE_PATHS environment variable)
 func (p *path) IsSafePath(path string) bool {
+	if desktop.Enabled() {
+		return desktop.CheckPath(p.Resolve(path)) == nil
+	}
 	if p.allowUnsafePath || features.CMFA {
 		return true
 	}
@@ -101,6 +105,9 @@ func (p *path) IsSafePath(path string) bool {
 }
 
 func (p *path) SafePaths() []string {
+	if desktop.Enabled() {
+		return []string{desktop.Home()}
+	}
 	return append([]string{p.homeDir}, p.safePaths...) // add homedir to safePaths
 }
 

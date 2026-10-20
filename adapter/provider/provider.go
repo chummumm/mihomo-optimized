@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -150,10 +151,14 @@ func (pp *proxySetProvider) Update() error {
 }
 
 func (pp *proxySetProvider) Initial() error {
+	return pp.InitialContext(context.Background())
+}
+
+func (pp *proxySetProvider) InitialContext(ctx context.Context) error {
 	if err := pp.baseProvider.Initial(); err != nil {
 		return err
 	}
-	_, err := pp.Fetcher.Initial()
+	_, err := pp.Fetcher.InitialContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -341,6 +346,33 @@ func (cp *CompatibleProvider) Close() error {
 }
 
 func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilter string, excludeType string, dialerProxy string, override overrideSchema, ageSecretKey string) (resource.Parser[[]C.Proxy], error) {
+	parseMappings, err := newProxyMappingsParser(filter, excludeFilter, excludeType, dialerProxy, override, ageSecretKey)
+	if err != nil {
+		return nil, err
+	}
+	return func(buf []byte) ([]C.Proxy, error) {
+		mappings, err := parseMappings(buf)
+		if err != nil {
+			return nil, err
+		}
+		proxies := make([]C.Proxy, 0, len(mappings))
+		for idx, mapping := range mappings {
+			proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName))
+			if err != nil {
+				for _, previous := range proxies {
+					_ = previous.Close()
+				}
+				return nil, fmt.Errorf("proxy %d error: %w", idx, err)
+			}
+			proxies = append(proxies, proxy)
+		}
+		return proxies, nil
+	}, nil
+}
+
+// Both live providers and bootstrap cache selection share decryption, format
+// conversion, filtering and overrides. This stage does not construct adapters.
+func newProxyMappingsParser(filter string, excludeFilter string, excludeType string, dialerProxy string, override overrideSchema, ageSecretKey string) (resource.Parser[[]map[string]any], error) {
 	var excludeTypeArray []string
 	if excludeType != "" {
 		excludeTypeArray = strings.Split(excludeType, "|")
@@ -372,7 +404,7 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 		}
 	}
 
-	return func(buf []byte) ([]C.Proxy, error) {
+	return func(buf []byte) ([]map[string]any, error) {
 		schema := &ProxySchema{}
 
 		// decrypt config
@@ -393,7 +425,7 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 			return nil, errors.New("file must have a `proxies` field")
 		}
 
-		proxies := []C.Proxy{}
+		proxies := []map[string]any{}
 		proxiesSet := map[string]struct{}{}
 		for _, filterReg := range filterRegs {
 		LOOP1:
@@ -446,13 +478,11 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 					return nil, fmt.Errorf("proxy %d override error: %w", idx, err)
 				}
 
-				proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName))
-				if err != nil {
-					return nil, fmt.Errorf("proxy %d error: %w", idx, err)
-				}
-
 				proxiesSet[name] = struct{}{}
-				proxies = append(proxies, proxy)
+				// A later filter may match the renamed source again. Live parsing
+				// historically captured each selection immediately; retain that
+				// snapshot instead of aliasing later override mutations.
+				proxies = append(proxies, cloneOverrideValue(mapping).(map[string]any))
 			}
 		}
 

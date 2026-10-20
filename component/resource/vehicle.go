@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/desktop"
 	mihomoHttp "github.com/metacubex/mihomo/component/http"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -37,6 +38,9 @@ func SetETag(b bool) {
 }
 
 func safeWrite(path string, buf []byte) error {
+	if err := desktop.CheckPath(path); err != nil {
+		return err
+	}
 	// Keep existing symlink destinations working, but publish regular resource
 	// files by rename so an interrupted write cannot leave a truncated database
 	// or provider cache behind.
@@ -83,6 +87,9 @@ func safeWrite(path string, buf []byte) error {
 	if err = f.Close(); err != nil {
 		return err
 	}
+	if err := desktop.CheckPath(path); err != nil {
+		return err
+	}
 	return os.Rename(temp, path)
 }
 
@@ -103,6 +110,9 @@ func (f *FileVehicle) Url() string {
 }
 
 func (f *FileVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []byte, hash utils.HashType, err error) {
+	if err = desktop.CheckPath(f.path); err != nil {
+		return
+	}
 	buf, err = os.ReadFile(f.path)
 	if err != nil {
 		return
@@ -159,8 +169,9 @@ func (h *HTTPVehicle) SetInRead(fn func(response *http.Response)) {
 }
 
 func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []byte, hash utils.HashType, err error) {
-	ctx, cancel := context.WithTimeout(ctx, h.timeout)
+	ctx, cancel := context.WithTimeout(ctx, InitialDownloadTimeout(ctx, h.timeout))
 	defer cancel()
+	defer func() { err = BootstrapFailure(ctx, err) }()
 	header := h.header
 	useETag := ETag()
 	setIfNoneMatch := false
@@ -176,7 +187,18 @@ func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []b
 			setIfNoneMatch = true
 		}
 	}
-	resp, err := mihomoHttp.HttpRequest(ctx, h.url, http.MethodGet, header, nil, mihomoHttp.WithSpecialProxy(h.proxy))
+	options := []mihomoHttp.Option{mihomoHttp.WithSpecialProxy(h.proxy)}
+	if BootstrapEnabled(ctx) {
+		options = append(options, mihomoHttp.WithDialTimeout(BootstrapConnectTimeout))
+		// An explicit provider proxy always takes precedence over the startup
+		// default. WithDialer bypasses specialProxy inside the HTTP transport.
+		if h.proxy == "" {
+			if downloadDialer := BootstrapDialer(ctx); downloadDialer != nil {
+				options = append(options, mihomoHttp.WithDialer(downloadDialer))
+			}
+		}
+	}
+	resp, err := mihomoHttp.HttpRequest(ctx, h.url, http.MethodGet, header, nil, options...)
 	if err != nil {
 		return
 	}
@@ -207,6 +229,9 @@ func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []b
 	}
 	if h.sizeLimit > 0 && int64(len(buf)) > h.sizeLimit {
 		return nil, utils.HashType{}, errors.New("resource exceeds configured size limit")
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, utils.HashType{}, err
 	}
 	hash = utils.MakeHash(buf)
 	if useETag {

@@ -27,6 +27,9 @@ func upgradeRouter() http.Handler {
 }
 
 func upgradeCore(w http.ResponseWriter, r *http.Request) {
+	if rejectDesktopOperation(w, r) {
+		return
+	}
 	// modify from https://github.com/AdguardTeam/AdGuardHome/blob/595484e0b3fb4c457f9bb727a6b94faa78a66c5f/internal/home/controlupdate.go#L108
 	log.Infoln("start update")
 	execPath, err := os.Executable()
@@ -65,6 +68,9 @@ func getUIUpdateStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func updateUI(w http.ResponseWriter, r *http.Request) {
+	if rejectDesktopOperation(w, r) {
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	err := updater.CurrentUIUpdater().DownloadUIContext(r.Context())
 	if err != nil {

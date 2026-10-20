@@ -42,9 +42,33 @@ type option struct {
 	resolver            resolver.Resolver
 	netDialer           NetDialer
 	preferResolverOrder bool
+	defaultInterface    *string
+	defaultRoutingMark  *int
 }
 
 type Option func(opt *option)
+
+// WithDefaults selects the candidate configuration's socket defaults without
+// changing the live runtime. Explicit per-node options still take precedence.
+func WithDefaults(interfaceName string, routingMark int) Option {
+	return func(opt *option) {
+		opt.defaultInterface, opt.defaultRoutingMark = &interfaceName, &routingMark
+	}
+}
+
+func (o option) interfaceDefault() string {
+	if o.defaultInterface != nil {
+		return *o.defaultInterface
+	}
+	return DefaultInterface.Load()
+}
+
+func (o option) routingMarkDefault() int {
+	if o.defaultRoutingMark != nil {
+		return *o.defaultRoutingMark
+	}
+	return int(DefaultRoutingMark.Load())
+}
 
 func WithInterface(name string) Option {
 	return func(opt *option) {

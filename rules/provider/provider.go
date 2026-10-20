@@ -99,7 +99,11 @@ type RuleSetProvider struct {
 }
 
 func (rp *ruleSetProvider) Initial() error {
-	_, err := rp.Fetcher.Initial()
+	return rp.InitialContext(context.Background())
+}
+
+func (rp *ruleSetProvider) InitialContext(ctx context.Context) error {
+	_, err := rp.Fetcher.InitialContext(ctx)
 	return err
 }
 

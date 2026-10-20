@@ -26,6 +26,7 @@ import (
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/component/resource"
 	"github.com/metacubex/mihomo/component/sniffer"
 	"github.com/metacubex/mihomo/component/transparentproxy"
 	"github.com/metacubex/mihomo/component/trie"
@@ -209,25 +210,26 @@ type TLS struct {
 
 // Config is mihomo config manager
 type Config struct {
-	GeoDataUsage  geodata.Usage
-	General       *General
-	Controller    *Controller
-	Experimental  *Experimental
-	IPTables      *IPTables
-	NTP           *NTP
-	DNS           *DNS
-	Hosts         *trie.DomainTrie[resolver.HostValue]
-	Profile       *Profile
-	Rules         []C.Rule
-	SubRules      map[string][]C.Rule
-	Users         []auth.AuthUser
-	Proxies       map[string]C.Proxy
-	Listeners     map[string]C.InboundListener
-	Providers     map[string]P.ProxyProvider
-	RuleProviders map[string]P.RuleProvider
-	Tunnels       []LC.Tunnel
-	Sniffer       *sniffer.Config
-	TLS           *TLS
+	ResourceBootstrap *resource.Bootstrap
+	GeoDataUsage      geodata.Usage
+	General           *General
+	Controller        *Controller
+	Experimental      *Experimental
+	IPTables          *IPTables
+	NTP               *NTP
+	DNS               *DNS
+	Hosts             *trie.DomainTrie[resolver.HostValue]
+	Profile           *Profile
+	Rules             []C.Rule
+	SubRules          map[string][]C.Rule
+	Users             []auth.AuthUser
+	Proxies           map[string]C.Proxy
+	Listeners         map[string]C.InboundListener
+	Providers         map[string]P.ProxyProvider
+	RuleProviders     map[string]P.RuleProvider
+	Tunnels           []LC.Tunnel
+	Sniffer           *sniffer.Config
+	TLS               *TLS
 }
 
 type RawCors struct {
@@ -440,32 +442,33 @@ type RawTLS struct {
 }
 
 type RawConfig struct {
-	Port                          int            `yaml:"port" json:"port"`
-	SocksPort                     int            `yaml:"socks-port" json:"socks-port"`
-	RedirPort                     int            `yaml:"redir-port" json:"redir-port"`
-	TProxyPort                    int            `yaml:"tproxy-port" json:"tproxy-port"`
-	MixedPort                     int            `yaml:"mixed-port" json:"mixed-port"`
-	DNSRuleRouting                bool           `yaml:"dns-rule-routing" json:"dns-rule-routing"`
-	ShadowSocksConfig             string         `yaml:"ss-config" json:"ss-config"`
-	VmessConfig                   string         `yaml:"vmess-config" json:"vmess-config"`
-	InboundTfo                    bool           `yaml:"inbound-tfo" json:"inbound-tfo"`
-	InboundMPTCP                  bool           `yaml:"inbound-mptcp" json:"inbound-mptcp"`
-	Authentication                []string       `yaml:"authentication" json:"authentication"`
-	SkipAuthPrefixes              []netip.Prefix `yaml:"skip-auth-prefixes" json:"skip-auth-prefixes"`
-	LanAllowedIPs                 []netip.Prefix `yaml:"lan-allowed-ips" json:"lan-allowed-ips"`
-	LanDisAllowedIPs              []netip.Prefix `yaml:"lan-disallowed-ips" json:"lan-disallowed-ips"`
-	AllowLan                      bool           `yaml:"allow-lan" json:"allow-lan"`
-	BindAddress                   string         `yaml:"bind-address" json:"bind-address"`
-	Mode                          T.TunnelMode   `yaml:"mode" json:"mode"`
-	UnifiedDelay                  bool           `yaml:"unified-delay" json:"unified-delay"`
-	LogLevel                      log.LogLevel   `yaml:"log-level" json:"log-level"`
-	IPv6                          bool           `yaml:"ipv6" json:"ipv6"`
-	ExternalController            string         `yaml:"external-controller" json:"external-controller"`
-	ExternalControllerRoutingMark int            `yaml:"external-controller-routing-mark" json:"external-controller-routing-mark"`
-	ExternalControllerPipe        string         `yaml:"external-controller-pipe" json:"external-controller-pipe"`
-	ExternalControllerUnix        string         `yaml:"external-controller-unix" json:"external-controller-unix"`
-	ExternalControllerTLS         string         `yaml:"external-controller-tls" json:"external-controller-tls"`
-	ExternalControllerCors        RawCors        `yaml:"external-controller-cors" json:"external-controller-cors"`
+	ResourceBootstrap             *ResourceBootstrap `yaml:"resource-bootstrap" json:"resource-bootstrap"`
+	Port                          int                `yaml:"port" json:"port"`
+	SocksPort                     int                `yaml:"socks-port" json:"socks-port"`
+	RedirPort                     int                `yaml:"redir-port" json:"redir-port"`
+	TProxyPort                    int                `yaml:"tproxy-port" json:"tproxy-port"`
+	MixedPort                     int                `yaml:"mixed-port" json:"mixed-port"`
+	DNSRuleRouting                bool               `yaml:"dns-rule-routing" json:"dns-rule-routing"`
+	ShadowSocksConfig             string             `yaml:"ss-config" json:"ss-config"`
+	VmessConfig                   string             `yaml:"vmess-config" json:"vmess-config"`
+	InboundTfo                    bool               `yaml:"inbound-tfo" json:"inbound-tfo"`
+	InboundMPTCP                  bool               `yaml:"inbound-mptcp" json:"inbound-mptcp"`
+	Authentication                []string           `yaml:"authentication" json:"authentication"`
+	SkipAuthPrefixes              []netip.Prefix     `yaml:"skip-auth-prefixes" json:"skip-auth-prefixes"`
+	LanAllowedIPs                 []netip.Prefix     `yaml:"lan-allowed-ips" json:"lan-allowed-ips"`
+	LanDisAllowedIPs              []netip.Prefix     `yaml:"lan-disallowed-ips" json:"lan-disallowed-ips"`
+	AllowLan                      bool               `yaml:"allow-lan" json:"allow-lan"`
+	BindAddress                   string             `yaml:"bind-address" json:"bind-address"`
+	Mode                          T.TunnelMode       `yaml:"mode" json:"mode"`
+	UnifiedDelay                  bool               `yaml:"unified-delay" json:"unified-delay"`
+	LogLevel                      log.LogLevel       `yaml:"log-level" json:"log-level"`
+	IPv6                          bool               `yaml:"ipv6" json:"ipv6"`
+	ExternalController            string             `yaml:"external-controller" json:"external-controller"`
+	ExternalControllerRoutingMark int                `yaml:"external-controller-routing-mark" json:"external-controller-routing-mark"`
+	ExternalControllerPipe        string             `yaml:"external-controller-pipe" json:"external-controller-pipe"`
+	ExternalControllerUnix        string             `yaml:"external-controller-unix" json:"external-controller-unix"`
+	ExternalControllerTLS         string             `yaml:"external-controller-tls" json:"external-controller-tls"`
+	ExternalControllerCors        RawCors            `yaml:"external-controller-cors" json:"external-controller-cors"`
 	// Legacy fields remain decodable but cannot select the managed dashboard.
 	ExternalUI               string                  `yaml:"external-ui" json:"-"`
 	ExternalUIURL            string                  `yaml:"external-ui-url" json:"-"`
@@ -518,12 +521,16 @@ type RawConfig struct {
 
 // Parse config
 func Parse(buf []byte) (*Config, error) {
+	return ParseContext(context.Background(), buf)
+}
+
+func ParseContext(ctx context.Context, buf []byte) (*Config, error) {
 	rawCfg, err := UnmarshalRawConfig(buf)
 	if err != nil {
 		return nil, err
 	}
 
-	return ParseRawConfig(rawCfg)
+	return ParseRawConfigContext(ctx, rawCfg)
 }
 
 func DefaultRawConfig() *RawConfig {
@@ -673,12 +680,47 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 }
 
 func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+	return ParseRawConfigContext(context.Background(), rawCfg)
+}
+
+func ParseRawConfigContext(ctx context.Context, rawCfg *RawConfig) (*Config, error) {
+	applyDesktopRawPolicy(rawCfg)
+	scope, err := newResourceBootstrap(ctx, rawCfg)
+	if err != nil {
+		return nil, err
+	}
 	var parsed *Config
-	err := geodata.WithInitializationContext(context.Background(), nil, func() (err error) {
+	err = geodata.WithInitializationContext(scope.Context(), nil, func() (err error) {
 		parsed, err = parseRawConfig(rawCfg)
 		return err
 	})
-	return parsed, err
+	if err == nil {
+		err = resource.BootstrapFailure(scope.Context(), scope.Context().Err())
+	}
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			err = resource.BootstrapFailure(scope.Context(), err)
+		}
+		_ = scope.Close()
+		return nil, err
+	}
+	parsed.ResourceBootstrap = scope
+	return parsed, nil
+}
+
+// CloseResourceBootstrap releases only startup transports, never live proxies.
+// Parse callers which do not ApplyConfig (notably -t) must call this themselves.
+func (c *Config) CloseResourceBootstrap() {
+	if c.ResourceBootstrap != nil {
+		_ = c.ResourceBootstrap.Close()
+	}
+}
+
+func (c *Config) ResourceContext() context.Context {
+	if c.ResourceBootstrap != nil {
+		return c.ResourceBootstrap.Context()
+	}
+	return context.Background()
 }
 
 func parseRawConfig(rawCfg *RawConfig) (*Config, error) {

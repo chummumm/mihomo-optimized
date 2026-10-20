@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/component/easytier"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
@@ -282,6 +283,9 @@ func (e *EasyTier) loop() {
 }
 
 func (e *EasyTier) init() error {
+	if err := desktop.CheckPath(e.stateDir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(e.stateDir, 0o755); err != nil {
 		return fmt.Errorf("easytier: create state-dir: %w", err)
 	}
@@ -609,5 +613,8 @@ func writeInstanceID(stateDir, id string) error {
 		return nil
 	}
 	path := filepath.Join(stateDir, easyTierInstanceIDFile)
+	if err := desktop.CheckPath(path); err != nil {
+		return err
+	}
 	return os.WriteFile(path, []byte(id+"\n"), 0o600)
 }
