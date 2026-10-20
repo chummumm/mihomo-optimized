@@ -4,6 +4,7 @@ use crate::{
     core::quiet_command,
     desktop::HostState,
     error::{AppError, Result},
+    update_cache::UpdateWorkspace,
 };
 use reqwest::{blocking::Client, Url};
 use semver::Version;
@@ -781,57 +782,61 @@ fn monitor() -> Result<()> {
         .parent()
         .ok_or_else(|| AppError::new("update_monitor_invalid", "更新目录无效"))?;
     let application_directory = installed_update_dir(Some(&plan.application))?;
-    let input_locks = lock_update_inputs(directory, &plan.candidate)?;
-    verify_at(
-        &application_directory.join("mihomo-update-verify.exe"),
-        &application_directory.join("resources/trusted-root.jsonl"),
-        directory,
-        &plan.candidate,
-    )?;
-    let installer = launch_installer(&directory.join(expected_installer))?;
-    let _ = writeln!(
-        std::io::stdout(),
-        "{}",
-        serde_json::to_string(&Ok::<(), AppError>(())).unwrap_or_default()
-    );
-    let _ = std::io::stdout().flush();
-    // UAC has succeeded. The parent now exits and NSIS can replace its files.
-    if unsafe { WaitForSingleObject(parent.as_raw_handle(), u32::MAX) } != 0 {
-        return Err(AppError::new(
-            "update_monitor_wait_failed",
-            "无法等待桌面程序退出，请检查安装进度",
-        ));
-    }
-    if unsafe { WaitForSingleObject(installer.as_raw_handle(), u32::MAX) } != 0 {
-        return Err(AppError::new(
-            "update_monitor_wait_failed",
-            "无法确认安装程序退出，请检查安装进度",
-        ));
-    }
-    drop(input_locks);
-    let mut exit_code = u32::MAX;
-    unsafe {
-        GetExitCodeProcess(installer.as_raw_handle(), &mut exit_code);
-    }
-    let outcome = serde_json::json!({"version":plan.candidate.version, "exitCode":exit_code, "success":exit_code == 0});
-    let _ = crate::config::atomic_write(
-        &crate::windows::user_data_dir()?.join("update-result.json"),
-        outcome.to_string().as_bytes(),
-    );
-    // NSIS installation is not a transaction and may have replaced some files
-    // before failing. Reopen the installed path if available to report the outcome;
-    // this does not promise a complete rollback of the previous application files.
-    quiet_command(&plan.application)
-        .current_dir(&application_directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| AppError::io("安装结束后无法重新启动桌面，请从开始菜单打开", e))?;
-    // The current monitor is the only file still mapped from this directory.
-    let _ = fs::remove_file(directory.join(&plan.candidate.installer.name));
-    let _ = fs::remove_file(directory.join(&plan.candidate.bundle.name));
-    Ok(())
+    let workspace = UpdateWorkspace::attach(directory)?;
+    let result = (|| {
+        let input_locks = lock_update_inputs(directory, &plan.candidate)?;
+        verify_at(
+            &application_directory.join("mihomo-update-verify.exe"),
+            &application_directory.join("resources/trusted-root.jsonl"),
+            directory,
+            &plan.candidate,
+        )?;
+        let installer = launch_installer(&directory.join(expected_installer))?;
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::to_string(&Ok::<(), AppError>(())).unwrap_or_default()
+        );
+        let _ = std::io::stdout().flush();
+        // UAC has succeeded. The parent now exits and NSIS can replace its files.
+        if unsafe { WaitForSingleObject(parent.as_raw_handle(), u32::MAX) } != 0 {
+            return Err(AppError::new(
+                "update_monitor_wait_failed",
+                "无法等待桌面程序退出，请检查安装进度",
+            ));
+        }
+        if unsafe { WaitForSingleObject(installer.as_raw_handle(), u32::MAX) } != 0 {
+            return Err(AppError::new(
+                "update_monitor_wait_failed",
+                "无法确认安装程序退出，请检查安装进度",
+            ));
+        }
+        drop(input_locks);
+        let mut exit_code = u32::MAX;
+        unsafe {
+            GetExitCodeProcess(installer.as_raw_handle(), &mut exit_code);
+        }
+        let outcome = serde_json::json!({"version":plan.candidate.version, "exitCode":exit_code, "success":exit_code == 0});
+        let _ = crate::config::atomic_write(
+            &crate::windows::user_data_dir()?.join("update-result.json"),
+            outcome.to_string().as_bytes(),
+        );
+        // NSIS installation is not a transaction and may have replaced some files
+        // before failing. Reopen the installed path if available to report the outcome;
+        // this does not promise a complete rollback of the previous application files.
+        quiet_command(&plan.application)
+            .current_dir(&application_directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| AppError::io("安装结束后无法重新启动桌面，请从开始菜单打开", e))?;
+        Ok(())
+    })();
+    // Also release the workspace on verification, authorization or restart failure.
+    // The GUI's collector removes this monitor's image after the process exits.
+    workspace.finish();
+    result
 }
 
 pub(crate) fn take_install_result() -> Option<String> {
@@ -894,19 +899,17 @@ pub async fn desktop_install_update(app: AppHandle, state: State<'_, HostState>)
         let candidate = CANDIDATE.get_or_init(|| Mutex::new(None)).lock().map_err(|_| AppError::new("update_state_failed", "更新状态不可用"))?
             .clone().ok_or_else(|| AppError::new("update_check_required", "请先检查桌面更新"))?;
         let proxy = manager.lock().map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?.update_proxy_url();
-        let mut nonce = [0_u8; 16];
-        getrandom::getrandom(&mut nonce).map_err(|_| AppError::new("random_failed", "系统随机数不可用"))?;
-        let directory = crate::windows::user_data_dir()?.join("updates").join(hex::encode(nonce));
-        crate::windows::secure_directory(&directory, Some(&crate::windows::current_sid()?))?;
+        let workspace = UpdateWorkspace::create()?;
+        let directory = workspace.path();
         let result = (|| {
             let client = client(proxy)?;
             emit(&app, "downloading", Some(0), Some(candidate.installer.size), "正在下载桌面更新");
             download(&app, &client, &candidate.installer, &directory.join(&candidate.installer.name), true)?;
             download(&app, &client, &candidate.bundle, &directory.join(&candidate.bundle.name), false)?;
             emit(&app, "installing", None, None, "正在验证构建签名");
-            verify(&app, &directory, &candidate)?;
+            verify(&app, directory, &candidate)?;
             let was_running = manager.lock().map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?.prepare_update()?;
-            if let Err(error) = handoff_to_monitor(&directory, &candidate) {
+            if let Err(error) = handoff_to_monitor(directory, &candidate) {
                 if let Err(recovery) = manager.lock().map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?.resume_after_update(was_running) {
                     return Err(AppError::new("update_recovery_failed", format!("{}；{}", error.message, recovery.message)));
                 }
@@ -918,9 +921,11 @@ pub async fn desktop_install_update(app: AppHandle, state: State<'_, HostState>)
             Ok(())
         })();
         if let Err(error) = &result {
-            let _ = fs::remove_dir_all(&directory);
             emit(&app, "error", None, None, &error.message);
         }
+        // The monitor acquires its own workspace lease before acknowledging the
+        // handoff. Releasing this one cannot expose an active installer to cleanup.
+        workspace.finish();
         result
     }).await.map_err(|_| AppError::new("update_task_failed", "更新安装被中断"))?
 }

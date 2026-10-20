@@ -418,7 +418,7 @@ class RestrictedDesktop:
         finally:
             process.Close()
 
-    def spawn(self, arguments: list[str], cwd: Path) -> RestrictedProcess:
+    def spawn(self, arguments: list[str], cwd: Path, *, suspended: bool = False) -> RestrictedProcess:
         import pywintypes
         import win32con
         import win32process
@@ -436,8 +436,9 @@ class RestrictedDesktop:
                 child_environment(), str(cwd), startup)
             stage = "inspect_restricted_process"
             self.check_process(process)
-            stage = "resume_restricted_process"
-            require(win32process.ResumeThread(thread) == 1, "restricted_process_resume_failed")
+            if not suspended:
+                stage = "resume_restricted_process"
+                require(win32process.ResumeThread(thread) == 1, "restricted_process_resume_failed")
             result = RestrictedProcess(process, pid, arguments)
             process = None  # Ownership moves to the wrapper.
             return result
@@ -453,6 +454,156 @@ class RestrictedDesktop:
         if self.token is not None:
             self.token.Close()
             self.token = None
+
+
+class UpdateCacheFixture:
+    """Own legacy-shaped files and locks; never invoke an installer or monitor."""
+
+    def __init__(self, directory: Path, app: Path, desktop: RestrictedDesktop) -> None:
+        self.directory, self.app, self.desktop = directory, app, desktop
+        self.root = directory / "updates"
+        self.directories: dict[str, Path] = {}
+        self.files: list[Path] = []
+        self.expected: dict[Path, str] = {}
+        self.preserved: dict[Path, str] = {}
+        self.file_lock = None
+        self.image_process: RestrictedProcess | None = None
+        self.evidence = {"legacyVersion": "0.1.6", "runningImageFixture": "owned_suspended_process"}
+
+    def write(self, path: Path, content: bytes) -> None:
+        with path.open("xb") as output:
+            self.files.append(path)
+            output.write(content)
+        self.expected[path] = hashlib.sha256(content).hexdigest()
+
+    def prepare(self) -> None:
+        import win32con
+        import win32file
+        import win32security
+
+        self.root.mkdir(exist_ok=True)
+        installer = "mihomo-desktop-0.1.6-windows-x64-setup.exe"
+        payloads = {installer: b"legacy installer fixture; never executed\n",
+                    installer + ".sigstore.json": b'{"fixture":true}\n',
+                    "desktop-update-monitor.exe": b"legacy monitor fixture; never executed\n",
+                    "verification.json": b'{"fixture":true}\n'}
+        descriptor = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+            f"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{self.desktop.sid})", 1)
+        for kind in ("idle", "file_busy", "image_busy", "unknown", "ordinary"):
+            name = secrets.token_hex(16)
+            if kind == "ordinary":
+                name = "user-files-" + name
+            path = self.root / name
+            path.mkdir()  # Never adopt an existing directory.
+            self.directories[kind] = path
+            # Match the old updater's per-user directory ACL, including inherited
+            # child access for the actual medium-integrity GUI.
+            win32security.SetFileSecurity(str(path), win32security.DACL_SECURITY_INFORMATION
+                | win32security.PROTECTED_DACL_SECURITY_INFORMATION, descriptor)
+            for name, content in payloads.items():
+                if kind == "image_busy" and name == "desktop-update-monitor.exe":
+                    content = self.app.read_bytes()
+                self.write(path / name, content)
+            if kind == "unknown":
+                self.write(path / "keep-user-file.txt", b"unrelated user content\n")
+            if kind in ("unknown", "ordinary"):
+                self.preserved.update({p: value for p, value in self.expected.items() if p.parent == path})
+
+        user_file = self.directory / ("update-cleanup-user-" + secrets.token_hex(16) + ".txt")
+        self.write(user_file, b"user file outside the update cache\n")
+        self.preserved[user_file] = self.expected[user_file]
+        backup = self.directory / "config.yaml.bak"
+        if not backup.exists():
+            self.write(backup, b"# user configuration backup\nmode: rule\n")
+        for path in (self.directory / "config.yaml", backup):
+            self.preserved[path] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+        self.file_lock = win32file.CreateFile(str(self.directories["file_busy"] / installer),
+            win32con.GENERIC_READ, win32con.FILE_SHARE_READ, None, win32con.OPEN_EXISTING,
+            win32con.FILE_ATTRIBUTE_NORMAL, None)
+        image = self.directories["image_busy"] / "desktop-update-monitor.exe"
+        # Windows maps the real installed image before its primary thread runs.
+        # Keep that owned process suspended: this checks an active image lock,
+        # without entering update handoff, installing anything or opening a GUI.
+        self.image_process = self.desktop.spawn([str(image), "--desktop-update-monitor"],
+                                                 image.parent, suspended=True)
+        require(self.image_process.poll() is None, "update_cache_image_fixture_exited")
+
+    def assert_unchanged(self, snapshot: dict[Path, str], code: str) -> None:
+        require(all(path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest
+                    for path, digest in snapshot.items()), code)
+
+    def verify(self) -> None:
+        wait_until(lambda: not self.directories["idle"].exists(), "update_cache_legacy_not_removed", 15)
+        self.evidence["legacyDirectoryRemoved"] = True
+        self.assert_unchanged(self.preserved, "update_cache_user_files_changed")
+        busy = {p: digest for p, digest in self.expected.items()
+                if p.parent in (self.directories["file_busy"], self.directories["image_busy"])}
+        self.assert_unchanged(busy, "update_cache_busy_directory_changed")
+        # Observe more than one two-second retry interval while both kinds of
+        # occupation remain live. A single pre-sweep observation is insufficient.
+        held_until = time.monotonic() + 3
+
+        def held_long_enough():
+            require(self.image_process.poll() is None, "update_cache_image_fixture_exited")
+            require(all(path.is_file() for path in busy), "update_cache_deleted_occupied_file")
+            return time.monotonic() >= held_until
+
+        wait_until(held_long_enough, "update_cache_busy_observation_timeout", 5)
+        self.assert_unchanged(busy, "update_cache_busy_directory_changed")
+        self.evidence.update({"lockedFilePreserved": True, "running_image_preserved": True})
+
+        released_at = time.monotonic()
+        self.file_lock.Close()
+        self.file_lock = None
+        wait_until(lambda: not self.directories["file_busy"].exists(), "update_cache_file_retry_failed", 15)
+        self.evidence.update({"releasedFileRemoved": True,
+                              "fileRetrySeconds": round(time.monotonic() - released_at, 3)})
+        self.assert_unchanged({p: digest for p, digest in busy.items()
+                               if p.parent == self.directories["image_busy"]},
+                              "update_cache_live_image_directory_changed")
+        require(self.image_process.poll() is None, "update_cache_live_image_terminated")
+
+        released_at = time.monotonic()
+        self.image_process.close()  # Only the exact handle returned by our spawn.
+        self.image_process = None
+        wait_until(lambda: not self.directories["image_busy"].exists(), "update_cache_image_retry_failed", 15)
+        self.evidence.update({"releasedImageRemoved": True,
+                              "imageRetrySeconds": round(time.monotonic() - released_at, 3)})
+        self.assert_unchanged(self.preserved, "update_cache_user_files_changed")
+        self.evidence.update({"configurationAndBackupPreserved": True,
+                              "unknownDirectoryPreserved": True, "ordinaryDirectoryPreserved": True,
+                              "outsideUserFilePreserved": True})
+
+    def close(self) -> None:
+        errors = []
+        if self.file_lock is not None:
+            try:
+                self.file_lock.Close()
+            except Exception:
+                errors.append("file_handle")
+            self.file_lock = None
+        if self.image_process is not None:
+            try:
+                self.image_process.close()
+            except Exception:
+                errors.append("image_process")
+            self.image_process = None
+        # Delete only files created by this fixture. Never traverse the update
+        # root or recursively remove an unknown item, junction or symlink.
+        for path in reversed(self.files):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                errors.append("file")
+        for path in reversed(list(self.directories.values())):
+            try:
+                path.rmdir()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                errors.append("directory")
+        require(not errors, "update_cache_fixture_cleanup_failed")
 
 
 def read_autostart():
@@ -943,6 +1094,7 @@ class Acceptance:
         self.driver: WebViewDriver | None = None
         self.socks: SocksFixture | None = None
         self.resources: ResourceFixture | None = None
+        self.update_cache: UpdateCacheFixture | None = None
         self.gui: ProcessIdentity | None = None
         self.service_identity: ProcessIdentity | None = None
         self.owned_children: dict[int, ProcessIdentity] = {}
@@ -980,6 +1132,9 @@ class Acceptance:
         (self.directory / "config.yaml").write_text(self.resources.configuration(base), encoding="utf-8", newline="")
         (self.directory / "preferences.json").write_text(
             json.dumps({"desiredRunning": True, "systemProxy": False, "tun": False}), encoding="utf-8")
+        self.update_cache = UpdateCacheFixture(self.directory, self.app, self.desktop)
+        self.report["updateCacheCleanup"] = self.update_cache.evidence
+        self.update_cache.prepare()
         evidence = {"desiredRunning": True, "coldResourceCache": True,
                     "resourceDelaySeconds": self.resources.delay, "statusResponseMilliseconds": []}
         self.report["automaticStartup"] = evidence
@@ -1043,7 +1198,7 @@ class Acceptance:
             return observed if observed.get("phase") == "running" else None
 
         running = wait_until(automatically_ready, "automatic_startup_did_not_become_ready", self.resources.delay + 20)
-        self.managed_core(running)
+        initial_core = self.managed_core(running)
         require(cache.is_file() and b"bootstrap-fixture.invalid" in cache.read_bytes(), "automatic_startup_cache_not_persisted")
         require(running.get("systemProxy") is False and self.wininet.read() == self.proxy_disabled,
                 "automatic_startup_changed_system_proxy")
@@ -1053,6 +1208,23 @@ class Acceptance:
         evidence.update({"readyWithoutStartOrRestart": True, "cachePersisted": True,
                          "startupSeconds": round(time.monotonic() - started, 3),
                          "preparationProxyChecks": self.resources.pending_proxy_checks})
+
+        # Cleanup is independent of core startup. Inspect it only after Ready so
+        # occupied-file retry waits cannot consume the held cold-resource window.
+        self.stage = "update_cache_cleanup"
+        self.update_cache.verify()
+        require(self.processes.identity(self.gui.pid) == self.gui, "update_cache_gui_was_restarted")
+        after_cleanup = self.status(timeout=3)
+        require(after_cleanup.get("phase") == "running" and after_cleanup.get("lastError") is None
+                and self.managed_core(after_cleanup)["pid"] == initial_core["pid"],
+                "update_cache_cleanup_changed_running_core")
+        preferences = json.loads((self.directory / "preferences.json").read_text(encoding="utf-8"))
+        require(preferences.get("desiredRunning") is True and preferences.get("systemProxy") is False
+                and preferences.get("tun") is False, "update_cache_cleanup_changed_preferences")
+        self.update_cache.evidence.update({"retryWithoutRestart": True, "coreStillRunning": True,
+                                          "preferencesPreserved": True})
+        self.mark("update_cache_cleanup")
+        self.stage = "automatic_startup_ready"
 
         # Close this owned GUI normally before launching the original bad-YAML
         # recovery case. A second-instance forward must not mask that negative test.
@@ -1067,6 +1239,8 @@ class Acceptance:
         wait_until(lambda: all(self.processes.identity(identity.pid) != identity for identity in first_children),
                    "automatic_startup_webview_children_survived", 15)
         require(all(not listening(port) for port in self.ports), "automatic_startup_ports_survived_exit")
+        self.update_cache.close()
+        self.update_cache = None
         cache.unlink()
         self.resources.close()
         self.resources = None
@@ -1685,6 +1859,8 @@ class Acceptance:
                 for suffix in (".yaml", "-timeout.yaml"):
                     path = runtime / "rules" / (self.resources.cache_name + suffix)
                     attempt("resource_fixture_cache_cleanup", lambda path=path: path.unlink(missing_ok=True))
+        if self.update_cache:
+            attempt("update_cache_fixture_cleanup", self.update_cache.close)
         attempt("proxy_restore", lambda: self.wininet.restore(self.proxy_before))
         attempt("autostart_restore", lambda: restore_autostart(self.autostart_before))
         for path, original in self.original_files.items():
@@ -1741,7 +1917,7 @@ def main() -> int:
                 acceptance.cleanup()
             except Exception as error:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": "unexpected_" + type(error).__name__})
-            required = {"automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
+            required = {"update_cache_cleanup", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
                         "single_instance_and_webview2_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
                         "resource_bootstrap_recovery", "system_proxy_service_recovery"}
