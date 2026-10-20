@@ -617,6 +617,14 @@ func TestDNSClientSharedAdmissionBoundsWaitingQueries(t *testing.T) {
 		results = append(results, sharedDNSAsync(dc, ctx, routingTestQuery(fmt.Sprintf("active-%d.example", i), 93)))
 		server.next(t)
 	}
+	// Reading the query does not guarantee enqueue's deferred admission release
+	// has run. Wait for both active requests to leave admission before filling
+	// its waiting slots, so an active enqueuer cannot reject a queued request.
+	waitSharedDNSCondition(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.waiters == 0 && p.current != nil && len(p.current.pending) == 2
+	})
 	for i := 0; i < 2; i++ {
 		results = append(results, sharedDNSAsync(dc, ctx, routingTestQuery(fmt.Sprintf("queued-%d.example", i), 94)))
 	}
