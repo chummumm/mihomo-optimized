@@ -58,6 +58,12 @@
     visibility: hidden;
 }
 
+/* Reduced-motion defaults must not animate presence visibility on live data. */
+.device-count,
+.device-rate {
+    transition-property: none;
+}
+
 /* The selection glides between sources: a lit gradient outline. */
 .device-highlight {
     position: absolute;

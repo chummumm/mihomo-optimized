@@ -1137,6 +1137,12 @@ mod tests {
                         }
                         request.push(byte[0]);
                     }
+                    // The shared deadline may cancel a connection before its
+                    // headers arrive. Only complete HTTP requests authenticate;
+                    // an EOF/timeout on a partial request is simply discarded.
+                    if !request.ends_with(b"\r\n\r\n") {
+                        continue;
+                    }
                     let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
                     assert!(request.contains("authorization: bearer readiness-fixture-secret\r\n"));
                     let (status, body) = if request.starts_with("get /desktop ") {
@@ -1154,16 +1160,24 @@ mod tests {
                     } else {
                         assert!(request.starts_with("get /configs "));
                         let attempt = reads.fetch_add(1, Ordering::SeqCst);
+                        // After two failed reads, hold /configs across the
+                        // parent's remaining deadline. This tests both retries
+                        // and timeout clipping without racing the next /desktop.
+                        let hold_response = matches!(scenario, ReadinessScenario::TimeoutOnce)
+                            && attempt == 0
+                            || matches!(scenario, ReadinessScenario::DisconnectAlways)
+                                && attempt >= 2;
+                        if hold_response {
+                            let delayed_until =
+                                Instant::now() + CONTROL_TIMEOUT + Duration::from_millis(200);
+                            while !stop.load(Ordering::SeqCst) && Instant::now() < delayed_until {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            continue;
+                        }
                         match scenario {
                             ReadinessScenario::DisconnectAlways => continue,
                             ReadinessScenario::DisconnectOnce if attempt == 0 => continue,
-                            ReadinessScenario::TimeoutOnce if attempt == 0 => {
-                                let delayed_until = Instant::now() + CONTROL_TIMEOUT + Duration::from_millis(200);
-                                while !stop.load(Ordering::SeqCst) && Instant::now() < delayed_until {
-                                    thread::sleep(Duration::from_millis(10));
-                                }
-                                continue;
-                            }
                             ReadinessScenario::Unauthorized => (401, "fixture-secret-must-not-be-displayed".into()),
                             ReadinessScenario::InvalidJson => (200, "fixture-secret-must-not-be-displayed".into()),
                             _ => (200, serde_json::json!({"port":0,"socks-port":0,"mixed-port":actual_port}).to_string()),
@@ -1218,6 +1232,23 @@ mod tests {
     }
 
     #[test]
+    fn readiness_fixture_discards_cancelled_incomplete_requests() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::DisconnectOnce);
+        let address = fixture.controller.url.trim_start_matches("http://");
+        drop(std::net::TcpStream::connect(address).unwrap());
+        {
+            let mut cancelled = std::net::TcpStream::connect(address).unwrap();
+            cancelled
+                .write_all(b"GET /desktop HTTP/1.1\r\nAuthorization: Bearer ")
+                .unwrap();
+        }
+        // Neither cancellation is an authenticated request. The next complete
+        // requests must still be served and must still pass the Bearer check.
+        fixture.wait(Duration::from_secs(2)).unwrap();
+        assert_eq!(fixture.config_reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn readiness_retries_one_listener_timeout_within_the_original_deadline() {
         let mut fixture = ReadinessFixture::new(ReadinessScenario::TimeoutOnce);
         let started = Instant::now();
@@ -1230,12 +1261,17 @@ mod tests {
     #[test]
     fn readiness_persistent_unreadable_listener_uses_one_deadline() {
         let mut fixture = ReadinessFixture::new(ReadinessScenario::DisconnectAlways);
+        let budget = Duration::from_secs(2);
         let started = Instant::now();
-        let error = fixture.wait(Duration::from_millis(450)).unwrap_err();
+        let error = fixture.wait(budget).unwrap_err();
+        let elapsed = started.elapsed();
         assert_eq!(error.code, "core_start_timeout");
         assert!(error.message.contains("/configs"));
-        assert!(fixture.config_reads.load(Ordering::SeqCst) >= 2);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(fixture.config_reads.load(Ordering::SeqCst) >= 3);
+        assert!(elapsed >= budget);
+        // A fresh CONTROL_TIMEOUT for the held third request would exceed this
+        // bound; it must use only the original operation's remaining time.
+        assert!(elapsed < Duration::from_secs(3));
     }
 
     #[test]
