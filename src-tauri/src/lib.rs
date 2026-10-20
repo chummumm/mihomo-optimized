@@ -15,6 +15,8 @@ pub mod service;
 pub mod service_ipc;
 #[cfg(all(windows, feature = "desktop"))]
 mod update;
+#[cfg(all(windows, feature = "desktop"))]
+mod update_cache;
 #[cfg(windows)]
 pub mod windows;
 

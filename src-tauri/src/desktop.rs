@@ -718,6 +718,7 @@ pub fn run() {
             if !std::env::args().any(|argument| argument == "--tray") {
                 show_main(app.handle());
             }
+            crate::update_cache::start_cleanup_worker();
             thread::spawn(move || {
                 if should_start {
                     if let Ok(mut manager) = state.0.lock() {
