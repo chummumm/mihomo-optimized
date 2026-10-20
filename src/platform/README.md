@@ -88,17 +88,27 @@ host; the WebView remains on the bundled interface.
 
 The app, sidecar core, and bundled dashboard update as one application. The
 existing resource update panel remains available for rules and geographic data,
-with kernel/UI self-update rows hidden. Configuration must be saved or discarded
-before installing an application update.
+with resource-specific controls and results, and kernel/UI self-update rows
+hidden. When the core is stopped, its resource panel explains why updating is
+disabled; application updates remain available. Configuration must be saved or
+discarded before installing an application update.
+
+The desktop status bar owns the single start/stop control. Settings retains
+restart and read-only status refresh, and groups its one source-file editor with
+reload of the saved configuration. The browser controller card remains a web
+feature; desktop connections are host-managed. Bootstrap download options use
+the same YAML editor and source file, without a second configuration store.
 
 ## Startup update checks
 
-Desktop 0.1.3 schedules at most one background `desktop_check_update` per
-application startup. It waits briefly after initialization and defers while the
+The desktop app schedules at most one background `desktop_check_update` per
+application startup. It waits five seconds after initialization and defers while the
 core is starting or stopping, or a desktop operation or configuration write is
-in progress. Continued activity can skip that startup check; a prior manual
-check also consumes the startup opportunity. Route changes, core status changes,
-and showing the tray window again do not schedule another startup check. A newer
+in progress. The check stays pending without a polling timer or an expiry; a
+stable status after successful or failed preparation resumes it. A prior manual
+check consumes the startup opportunity, and confirmed exit or WebView unload
+cancels a pending check. Route changes and showing the tray window again do not
+schedule another check after it has been consumed. A newer
 version produces a dismissible notice; settings retain the update result and
 provide manual checks and retry.
 
@@ -137,7 +147,10 @@ covers offline editing, draft survival through core failure/restart, revision
 conflicts, saved-file reload recovery, dirty exit, native settings/import/update,
 file size rejection, URL/storage isolation, no PWA, and tray pause/resume. Update
 coverage includes the single startup check, dismissing the notice, explicit
-installation, and manual retry after a failed background check.
+installation, manual retry after a failed background check, three-minute
+preparation, active native operations/configuration writes, and exit
+cancellation. It also checks single settings entries and resource-only update
+messages while the original controller operations remain available on the web.
 The original ten browser regression suites continue to exercise the web build.
 
 These browser fixtures verify UI behavior and the IPC contract. Windows EXE,

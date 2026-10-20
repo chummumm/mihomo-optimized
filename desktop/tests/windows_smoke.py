@@ -23,10 +23,12 @@ from ctypes import wintypes
 from dataclasses import dataclass
 import hashlib
 import http.client
+import http.server
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import socketserver
 import struct
@@ -611,7 +613,7 @@ class WebViewDriver:
     def execute(self, script: str, *args):
         return self.request("POST", self.path("execute/sync"), {"script": script, "args": args})
 
-    def invoke(self, command: str, arguments=None, expected_error: str | None = None, timeout: float = 95):
+    def invoke(self, command: str, arguments=None, expected_error: str | tuple[str, ...] | None = None, timeout: float = 95):
         result = self.request("POST", self.path("execute/async"), {"script": """
             const command = arguments[0], args = arguments[1], done = arguments[arguments.length - 1];
             if (typeof window.__TAURI_INTERNALS__?.invoke !== 'function') {
@@ -624,7 +626,8 @@ class WebViewDriver:
         """, "args": [command, arguments or {}]}, timeout=timeout)
         require(isinstance(result, dict), "native_command_invalid_result")
         if expected_error:
-            require(result.get("ok") is False and result.get("code") == expected_error, "expected_native_error_" + expected_error)
+            allowed = (expected_error,) if isinstance(expected_error, str) else expected_error
+            require(result.get("ok") is False and result.get("code") in allowed, "expected_native_error_" + allowed[0])
             return None
         require(result.get("ok") is True, "native_" + safe_code(result.get("code")))
         return result.get("value")
@@ -768,6 +771,76 @@ def socket_diagnostic(stage: str, error: Exception) -> dict:
             "errno": getattr(error, "errno", None), "winerror": getattr(error, "winerror", None)}
 
 
+class ResourceFixture(http.server.ThreadingHTTPServer):
+    """Finite loopback delays exercise the real host/core budget and cache paths."""
+
+    daemon_threads = True
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), ResourceHandler)
+        self.delay = float(os.environ.get("MIHOMO_TEST_RESOURCE_DELAY_SECONDS", "22"))
+        require(0 < self.delay <= 30, "resource_fixture_delay_invalid")
+        self.token = secrets.token_hex(24)
+        self.cache_name = "desktop-bootstrap-" + secrets.token_hex(8)
+        self.requests: dict[str, int] = {}
+        self.lock = threading.Lock()
+        self.stopping = threading.Event()
+        self.offline = False
+        self.thread = threading.Thread(target=self.serve_forever, daemon=True)
+        self.thread.start()
+
+    def count(self, path: str) -> int:
+        with self.lock:
+            return self.requests.get(path, 0)
+
+    def configuration(self, base: str, *, failing: bool = False) -> str:
+        endpoint = "/timeout.yaml" if failing else "/rules.yaml"
+        cache = self.cache_name + ("-timeout" if failing else "")
+        # A smaller configured timeout tests expiry without waiting 180 seconds.
+        timeout = 1 if failing else int(self.delay) + 15
+        document = base.replace("rules:\n", "rules:\n  - RULE-SET,desktop-bootstrap,DIRECT\n", 1)
+        return document + f"""resource-bootstrap:
+  timeout: {timeout}
+rule-providers:
+  desktop-bootstrap:
+    type: http
+    behavior: domain
+    format: yaml
+    url: http://127.0.0.1:{self.server_port}{endpoint}?token={self.token}
+    path: ./rules/{cache}.yaml
+    proxy: DIRECT
+    interval: 0
+"""
+
+    def close(self) -> None:
+        self.stopping.set()
+        self.shutdown()
+        self.server_close()
+        self.thread.join(timeout=3)
+
+
+class ResourceHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        fixture = self.server
+        path = urlsplit(self.path).path
+        with fixture.lock:
+            fixture.requests[path] = fixture.requests.get(path, 0) + 1
+        if fixture.offline or path not in ("/rules.yaml", "/timeout.yaml"):
+            code, body = 503, b"fixture offline\n"
+        else:
+            fixture.stopping.wait(5 if path == "/timeout.yaml" else fixture.delay)
+            code, body = 200, b"payload:\n  - '+.bootstrap-fixture.invalid'\n"
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+    def log_message(self, _format: str, *args: object) -> None:
+        pass
+
+
 def profile(mixed: int, socks: int) -> str:
     return f"""mixed-port: {mixed}
 port: 0
@@ -827,6 +900,7 @@ class Acceptance:
         self.desktop: RestrictedDesktop | None = None
         self.driver: WebViewDriver | None = None
         self.socks: SocksFixture | None = None
+        self.resources: ResourceFixture | None = None
         self.gui: ProcessIdentity | None = None
         self.owned_children: dict[int, ProcessIdentity] = {}
         self.ports: set[int] = set()
@@ -839,6 +913,52 @@ class Acceptance:
     def mark(self, name: str) -> None:
         self.report["tests"][name] = True
         print("PASS: " + name, flush=True)
+
+    def save_configuration(self, content: str) -> None:
+        current = self.driver.invoke("desktop_read_config")
+        self.driver.invoke("desktop_save_config", {"content": content, "expectedRevision": current["revision"]})
+
+    def check_resource_bootstrap(self, base: str) -> str:
+        self.stage = "resource_bootstrap"
+        self.driver.invoke("desktop_stop")
+        self.resources = ResourceFixture()
+        self.secrets.add(self.resources.token)
+        source = self.resources.configuration(base)
+        self.save_configuration(source)
+        started = time.monotonic()
+        self.driver.invoke("desktop_start")
+        elapsed = time.monotonic() - started
+        running = self.phase("running")
+        identity = self.managed_core(running)
+        require(elapsed >= self.resources.delay * 0.9 and self.resources.count("/rules.yaml") >= 1,
+                "delayed_resource_not_awaited")
+        cache = self.directory / "runtime" / "rules" / (self.resources.cache_name + ".yaml")
+        require(cache.is_file() and b"bootstrap-fixture.invalid" in cache.read_bytes(), "resource_cache_not_persisted")
+        self.save_configuration(self.resources.configuration(base, failing=True))
+        failed_at = time.monotonic()
+        self.driver.invoke("desktop_reload_config", {"force": True},
+                           expected_error=("resource_bootstrap_timeout", "reload_invalid", "reload_failed"))
+        failure_seconds = time.monotonic() - failed_at
+        # Background native status polling must not erase this actionable error.
+        time.sleep(2.2)
+        after = self.status()
+        require(after.get("phase") == "running" and after.get("controller") == running.get("controller")
+                and self.managed_core(after)["pid"] == identity["pid"], "resource_failure_did_not_restore_active_core")
+        require(failure_seconds < 10 and self.resources.count("/timeout.yaml") >= 1,
+                "short_resource_budget_not_enforced")
+        message = after.get("lastError", "")
+        require(isinstance(message, str) and message and self.resources.token not in message
+                and "http://" not in message and len(message) < 1024, "resource_error_diagnostic_unsafe")
+        self.save_configuration(source)
+        self.driver.invoke("desktop_reload_config", {"force": True})
+        require(self.status().get("lastError") is None, "successful_reload_kept_resource_error")
+        self.resources.offline = True
+        self.report["resourceBootstrap"] = {"delaySeconds": self.resources.delay,
+                                             "startupSeconds": round(elapsed, 3),
+                                             "failedReloadSeconds": round(failure_seconds, 3),
+                                             "cachePersisted": True, "oldCoreRestored": True}
+        self.mark("resource_bootstrap")
+        return source
 
     def status(self) -> dict:
         value = self.driver.invoke("desktop_status")
@@ -1076,6 +1196,8 @@ class Acceptance:
         require(after.get("revision") == saved["revision"] and after.get("content") == valid, "revision_conflict_overwrote_source")
         self.mark("config_revision")
 
+        valid = self.check_resource_bootstrap(valid)
+
         self.stage = "system_proxy_restore"
         proxy = self.driver.invoke("desktop_set_system_proxy", {"enabled": True})
         require(proxy.get("systemProxy") is True, "system_proxy_not_confirmed")
@@ -1102,6 +1224,9 @@ class Acceptance:
         self.driver.invoke("desktop_start")
         running = self.phase("running")
         identity = self.managed_core(running)
+        cache = self.directory / "runtime" / "rules" / (self.resources.cache_name + ".yaml")
+        require(cache.is_file() and b"bootstrap-fixture.invalid" in cache.read_bytes(), "offline_start_damaged_resource_cache")
+        self.report["resourceBootstrap"]["offlineCacheStart"] = True
         duplicate = self.desktop.spawn([str(self.app)], self.app.parent)
         try:
             require(duplicate.wait(timeout=12) == 0, "second_instance_exit_failed")
@@ -1134,11 +1259,58 @@ class Acceptance:
             self.report["serviceProcessAccess"] = self.service_process_access()
             self.report["tunGuiToken"] = self.desktop.check_gui(self.gui, self.processes)
             self.driver.invoke("desktop_set_tun", {"enabled": True})
+            self.resources.offline = False
+            service_resource_requests = self.resources.count("/rules.yaml")
+            service_start = time.monotonic()
             self.driver.invoke("desktop_start")
             tun = self.phase("running")
             require(tun.get("tun") is True and tun.get("service", {}).get("running") is True, "tun_service_not_running")
             tun_core_pid = self.managed_core(tun)["pid"]
+            service_cache = Path(os.environ["PROGRAMDATA"]) / "Mihomo Optimized" / "service" / "runtime" / "rules" / (self.resources.cache_name + ".yaml")
+            require(service_cache.is_file() and self.resources.count("/rules.yaml") > service_resource_requests,
+                    "service_resource_home_not_prepared")
+            self.report["resourceBootstrap"]["serviceStartupSeconds"] = round(time.monotonic() - service_start, 3)
+            self.mark("resource_bootstrap_service")
             self.mark("tun_service_identity")
+
+            # A recovery must run inside an already authenticated heartbeat.
+            # Otherwise its >20s preparation would block the next pipe connect
+            # (4s) and incorrectly expire the service's normal 20s UI lease.
+            self.stage = "resource_bootstrap_recovery"
+            old_controller = tun["controller"]
+            old_identity = self.owned_children[tun_core_pid]
+            require(old_identity.path == os.path.normcase(str(self.core.resolve()))
+                    and self.processes.identity(tun_core_pid) == old_identity,
+                    "recovery_target_identity_changed")
+            service_cache.unlink()  # Only this fixture's random, verified cache.
+            recovery_requests = self.resources.count("/rules.yaml")
+            recovery_started = time.monotonic()
+            self.processes.kill(old_identity)
+
+            def recovered_status():
+                observed = self.status()
+                require("无法连接本用户的 TUN 服务" not in (observed.get("lastError") or ""),
+                        "resource_recovery_blocked_service_connection")
+                return observed if observed.get("phase") == "running" and observed.get("controller") != old_controller else None
+
+            tun = wait_until(recovered_status, "service_resource_recovery_timeout", self.resources.delay + 25)
+            tun_core_pid = self.managed_core(tun)["pid"]
+            recovery_seconds = time.monotonic() - recovery_started
+            require(tun_core_pid != old_identity.pid and recovery_seconds >= self.resources.delay * 0.9
+                    and service_cache.is_file() and self.resources.count("/rules.yaml") > recovery_requests,
+                    "service_recovery_did_not_prepare_resources")
+            time.sleep(2.2)
+            tun = self.status()
+            require(tun.get("tun") is True and tun.get("service", {}).get("running") is True
+                    and self.managed_core(tun)["pid"] == tun_core_pid,
+                    "service_lease_stopped_recovered_core")
+            wait_until(self.socks.roundtrip, "recovered_tun_forwarding_timeout")
+            self.report["resourceBootstrap"].update({
+                "serviceRecoverySeconds": round(recovery_seconds, 3),
+                "serviceRecoveryNewPid": True, "serviceLeaseMaintained": True,
+                "serviceRecoveryTunForwarded": True,
+            })
+            self.mark("resource_bootstrap_recovery")
             self.stage = "tun_forwarding"
             wait_until(self.socks.roundtrip, "tun_forwarding_timeout")
             require(owned_firewall_rule_count(self.core) == 1, "tun_firewall_rule_not_installed")
@@ -1210,6 +1382,12 @@ class Acceptance:
                 attempt("owned_child_termination", lambda identity=identity: self.processes.kill(identity))
         if self.socks:
             attempt("socks_fixture_close", self.socks.close)
+        if self.resources:
+            attempt("resource_fixture_close", self.resources.close)
+            for runtime in (self.directory / "runtime", Path(os.environ["PROGRAMDATA"]) / "Mihomo Optimized" / "service" / "runtime"):
+                for suffix in (".yaml", "-timeout.yaml"):
+                    path = runtime / "rules" / (self.resources.cache_name + suffix)
+                    attempt("resource_fixture_cache_cleanup", lambda path=path: path.unlink(missing_ok=True))
         attempt("proxy_restore", lambda: self.wininet.restore(self.proxy_before))
         attempt("autostart_restore", lambda: restore_autostart(self.autostart_before))
         for path, original in self.original_files.items():
@@ -1268,7 +1446,8 @@ def main() -> int:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": "unexpected_" + type(error).__name__})
             required = {"startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
                         "single_instance_and_webview2_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
-                        "non_elevated_gui", "tun_service_identity"}
+                        "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
+                        "resource_bootstrap_recovery"}
             acceptance.report["passed"] = all(acceptance.report["tests"].get(name) is True for name in required) and not acceptance.report["diagnostics"]
             (artifacts / "verification.json").write_text(json.dumps(acceptance.report, indent=2) + "\n", encoding="utf-8")
     return 0 if acceptance and acceptance.report["passed"] else 1

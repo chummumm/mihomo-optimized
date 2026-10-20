@@ -465,6 +465,9 @@ fn run_service() -> Result<()> {
                     Request::Start { config } => core.start(config, true),
                     Request::Stop => core.stop().map(|_| core.status()),
                     Request::Reload { config } => core.reload(config),
+                    // Automatic recovery can prepare resources for the full
+                    // configured budget. Run it only inside an authenticated
+                    // heartbeat, whose client already uses that response budget.
                     Request::Status => core.poll(),
                 };
                 last_seen = Instant::now();
@@ -474,7 +477,8 @@ fn run_service() -> Result<()> {
             if last_seen.elapsed() > Duration::from_secs(20) {
                 core.stop()?;
             }
-            let _ = core.poll();
+            // Do not start recovery outside a request: that would block the next
+            // pipe connection and let the UI lease expire while work is ongoing.
             thread::sleep(Duration::from_millis(25));
         }
         report_status(&handle, ServiceState::StopPending)?;

@@ -36,15 +36,14 @@ let dirtyWrite = Promise.resolve()
 let statusEvent = 0
 let statusRead = 0
 const STARTUP_UPDATE_DELAY_MS = 5000
-const STARTUP_UPDATE_RETRY_MS = 1000
-const STARTUP_UPDATE_MAX_WAIT_MS = 30000
-let startupUpdateConsumed = false
+let startupUpdateState: 'idle' | 'delaying' | 'waiting' | 'consumed' = 'idle'
 let startupUpdateTimer: ReturnType<typeof setTimeout> | undefined
 let updateCheckInFlight: Promise<void> | undefined
 
 function publish (patch: Partial<DesktopView>) {
     current = { ...current, ...patch }
     for (const listener of subscribers) listener()
+    checkStartupUpdateWhenStable()
 }
 
 function subscribe (listener: () => void) {
@@ -106,25 +105,26 @@ function runtimeIsBusy () {
 }
 
 function consumeStartupUpdate () {
-    startupUpdateConsumed = true
+    startupUpdateState = 'consumed'
     if (startupUpdateTimer !== undefined) clearTimeout(startupUpdateTimer)
     startupUpdateTimer = undefined
 }
 
 function scheduleStartupUpdate () {
-    if (startupUpdateConsumed || startupUpdateTimer !== undefined) return
-    const deadlineMs = Date.now() + STARTUP_UPDATE_DELAY_MS + STARTUP_UPDATE_MAX_WAIT_MS
-    function checkWhenStable () {
+    if (startupUpdateState !== 'idle') return
+    startupUpdateState = 'delaying'
+    startupUpdateTimer = setTimeout(() => {
         startupUpdateTimer = undefined
-        if (startupUpdateConsumed) return
-        if (runtimeIsBusy()) {
-            if (Date.now() >= deadlineMs) consumeStartupUpdate()
-            else startupUpdateTimer = setTimeout(checkWhenStable, STARTUP_UPDATE_RETRY_MS)
-            return
-        }
-        void checkDesktopUpdate()
-    }
-    startupUpdateTimer = setTimeout(checkWhenStable, STARTUP_UPDATE_DELAY_MS)
+        startupUpdateState = 'waiting'
+        checkStartupUpdateWhenStable()
+    }, STARTUP_UPDATE_DELAY_MS)
+}
+
+function checkStartupUpdateWhenStable () {
+    // Resource preparation can outlast the initial delay. State changes resume
+    // this one pending check; elapsed time never consumes it or starts a retry loop.
+    if (startupUpdateState !== 'waiting' || runtimeIsBusy() || current.exitRequested) return
+    void checkDesktopUpdate()
 }
 
 // Checking has its own state: networking must not hold the core action lock.
@@ -198,6 +198,7 @@ export async function initializeDesktop () {
             await listen<DesktopUpdateProgress>('desktop-update-progress', event => {
                 publish({ updateProgress: event.payload })
             })
+            window.addEventListener('pagehide', consumeStartupUpdate, { once: true })
             document.addEventListener('click', event => {
                 // Router links already handle their navigation at the React root.
                 if (event.defaultPrevented) return
@@ -210,7 +211,7 @@ export async function initializeDesktop () {
                 })
             })
             await refreshDesktop()
-            if (current.status && !current.error) scheduleStartupUpdate()
+            scheduleStartupUpdate()
         } catch (reason) {
             publish({ ready: true, error: desktopError(reason) })
         }
@@ -246,6 +247,7 @@ export function cancelDesktopExit () { publish({ exitRequested: false }) }
 export function setDesktopDialog (dialog: DesktopView['dialog']) { publish({ dialog }) }
 
 export async function confirmDesktopExit () {
+    consumeStartupUpdate()
     await dirtyWrite
     await desktopInvoke('desktop_exit', { force: true })
 }

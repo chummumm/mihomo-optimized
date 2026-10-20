@@ -80,9 +80,9 @@ jobs:
           if (-not (Test-Path $env:PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH)) { throw 'Microsoft Edge is required for desktop UI tests' }
           pnpm test:desktop
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Exercise managed core on Windows
+      - name: Exercise managed core and resource bootstrap on Windows
         working-directory: core-src
-        run: go test -tags with_gvisor -count=1 -timeout=5m ./component/desktop ./hub/route . -run Desktop
+        run: go test -tags with_gvisor -count=1 -timeout=5m ./component/desktop ./component/resource ./component/http ./component/dialer ./component/resolver ./adapter/provider ./config ./hub/executor ./hub/route . -run 'Desktop|ResourceBootstrap'
       - name: Install pinned Rust compiler
         run: rustup toolchain install 1.99.1 --profile minimal
       - name: Cache Rust dependencies
@@ -124,6 +124,8 @@ jobs:
           retention-days: 30
       - name: Test real Windows core authentication, proxying and exit
         run: python desktop/tests/core_smoke.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe
+      - name: Test real Windows bootstrap routing, offline cache and cancellation
+        run: python core-src/scripts/test-resource-bootstrap.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe --report artifacts/verification/resource-bootstrap-core.json
       - name: Test uninstall-first upgrade from 0.1.1 and prepare WebView2 driver
         run: ./desktop/tests/setup-windows.ps1
       - name: Test installed WebView2 UI, system proxy, TUN forwarding and cleanup

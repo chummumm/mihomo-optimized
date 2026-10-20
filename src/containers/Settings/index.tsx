@@ -196,10 +196,10 @@ export default function Settings () {
         (h, idx) => ({ value: idx, label: <span className="settings-endpoint">{h.hostname}:{h.port}</span> }),
     )
 
-    const controllers = isDesktop || isClashX || controllerFromURL
+    const controllers = isClashX || controllerFromURL
         ? <div className="settings-controller-fixed">
-            <span className="controller-endpoint">{isDesktop ? td('managedController') : `${apiInfo.protocol}//${externalControllerHost}:${externalControllerPort}`}</span>
-            {!isDesktop && !isClashX && controllerFromURL && <p className="settings-hint">{t('controllerFromURL')}</p>}
+            <span className="controller-endpoint">{`${apiInfo.protocol}//${externalControllerHost}:${externalControllerPort}`}</span>
+            {!isClashX && controllerFromURL && <p className="settings-hint">{t('controllerFromURL')}</p>}
         </div>
         : (
             <>
@@ -288,7 +288,7 @@ export default function Settings () {
                 </Card>
             </section>
 
-            <section className="settings-section">
+            {!isDesktop && <section className="settings-section">
                 <h2 className="settings-section-title">{t('sections.controller')}</h2>
                 <Card className="settings-card">
                     <div className="settings-row settings-row-wrap">
@@ -302,7 +302,7 @@ export default function Settings () {
                         <Button icon="update" loading={reloading} disabled={reloading} onClick={handleReloadConfig}>{t(reloading ? 'labels.reloading' : 'labels.reloadConfig')}</Button>
                     </div>
                 </Card>
-            </section>
+            </section>}
 
             <section className="settings-section">
                 <h2 className="settings-section-title">{t('sections.probe')}</h2>
@@ -358,7 +358,15 @@ export default function Settings () {
             <section className="settings-section">
                 <h2 className="settings-section-title">{t('sections.update')}</h2>
                 {isDesktop && <DesktopAppUpdate />}
-                {(!isDesktop || desktop.status?.phase === 'running') && <UpdateCheck client={client} kernelVersion={version} resourcesOnly={isDesktop} />}
+                {coreOffline
+                    ? <Card className="settings-card settings-update" aria-label={td('resourceUpdate.title')}>
+                        <div className="settings-row"><span className="label">{td('resourceUpdate.title')}</span></div>
+                        <div className="settings-row settings-row-action settings-update-footer">
+                            <span className="settings-update-summary" role="status">{td('resourceUpdate.offline')}</span>
+                            <Button icon="arrow-circle-up" disabled>{td('resourceUpdate.check')}</Button>
+                        </div>
+                    </Card>
+                    : <UpdateCheck client={client} kernelVersion={version} resourcesOnly={isDesktop} />}
             </section>
             {!isDesktop && <ConfigEditor show={editorOpen} onClose={() => setEditorOpen(false)} />}
         </div>

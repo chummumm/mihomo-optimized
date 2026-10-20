@@ -6,9 +6,13 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 pub const MAX_CONFIG_SIZE: usize = 4 * 1024 * 1024;
+pub const DEFAULT_RESOURCE_TIMEOUT: Duration = Duration::from_secs(180);
+// Go's time.Duration is a signed count of nanoseconds, including on 32-bit builds.
+const MAX_RESOURCE_TIMEOUT_SECONDS: u64 = 9_223_372_036;
 pub const INITIAL_CONFIG: &str = "# 导入你的 Clash / Mihomo YAML 配置后启动。\n# 本地端口、系统代理和 TUN 可以在桌面设置中管理。\nmixed-port: 7890\nallow-lan: false\nmode: rule\nlog-level: info\nipv6: false\ndns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n    - 8.8.8.8\nproxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n";
 
 #[derive(Clone, Debug, Serialize)]
@@ -54,6 +58,31 @@ pub fn parse(content: &str) -> Result<Mapping> {
             "配置根节点必须是 YAML 对象",
         )),
     }
+}
+
+pub fn resource_bootstrap_timeout(content: &str) -> Result<Duration> {
+    let document = parse(content)?;
+    let Some(bootstrap) = document.get("resource-bootstrap") else {
+        return Ok(DEFAULT_RESOURCE_TIMEOUT);
+    };
+    if bootstrap.is_null() {
+        return Ok(DEFAULT_RESOURCE_TIMEOUT);
+    }
+    let invalid = || {
+        AppError::new(
+            "config_invalid",
+            "resource-bootstrap.timeout 必须是正整数秒，且不超过 9223372036",
+        )
+    };
+    let bootstrap = bootstrap.as_mapping().ok_or_else(invalid)?;
+    let Some(timeout) = bootstrap.get("timeout") else {
+        return Ok(DEFAULT_RESOURCE_TIMEOUT);
+    };
+    let seconds = timeout
+        .as_u64()
+        .filter(|seconds| *seconds > 0 && *seconds <= MAX_RESOURCE_TIMEOUT_SECONDS)
+        .ok_or_else(invalid)?;
+    Ok(Duration::from_secs(seconds))
 }
 
 pub fn read(path: &Path) -> Result<ConfigDocument> {
@@ -311,6 +340,36 @@ pub fn data_paths(directory: &Path) -> (PathBuf, PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resource_budget_uses_positive_integer_seconds_without_overflow() {
+        for content in [
+            "mode: rule",
+            "resource-bootstrap: {}",
+            "resource-bootstrap: null",
+        ] {
+            assert_eq!(
+                resource_bootstrap_timeout(content).unwrap(),
+                DEFAULT_RESOURCE_TIMEOUT
+            );
+        }
+        assert_eq!(
+            resource_bootstrap_timeout("resource-bootstrap:\n  timeout: 1").unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            resource_bootstrap_timeout("resource-bootstrap:\n  timeout: 9223372036").unwrap(),
+            Duration::from_secs(9_223_372_036)
+        );
+        for value in ["0", "-1", "1.5", "true", "null", "'180'", "9223372037"] {
+            let content = format!("resource-bootstrap:\n  timeout: {value}");
+            assert_eq!(
+                resource_bootstrap_timeout(&content).unwrap_err().code,
+                "config_invalid",
+                "{value}"
+            );
+        }
+        assert!(resource_bootstrap_timeout("resource-bootstrap: []").is_err());
+    }
     #[test]
     fn invalid_yaml_does_not_echo_credentials() {
         let error = parse("password: [very-secret-value").unwrap_err();

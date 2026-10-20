@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     fs,
+    io::{Read, Seek, SeekFrom, Write},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -14,10 +15,208 @@ use std::{
     time::{Duration, Instant},
 };
 
-const START_TIMEOUT: Duration = Duration::from_secs(20);
 const STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RESTARTS: usize = 3;
+const RECOVERY_RESERVE: Duration = Duration::from_secs(30);
+const CLEANUP_RESERVE: Duration = STOP_TIMEOUT;
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+
+/// Validation and the main process share one resource deadline. The additional
+/// reserve is for confirming readiness or restoring the previous runtime, never
+/// another full download allowance.
+struct OperationBudget {
+    resources: Instant,
+    total: Instant,
+}
+
+impl OperationBudget {
+    fn new(source: &str) -> Result<Self> {
+        Self::from_timeout(config::resource_bootstrap_timeout(source)?, Instant::now())
+    }
+
+    fn from_timeout(timeout: Duration, started: Instant) -> Result<Self> {
+        let resources = started.checked_add(timeout).ok_or_else(budget_overflow)?;
+        let total = resources
+            .checked_add(RECOVERY_RESERVE)
+            .ok_or_else(budget_overflow)?;
+        Ok(Self { resources, total })
+    }
+
+    fn resource_remaining(&self) -> Result<Duration> {
+        remaining(self.resources).map_err(|_| {
+            AppError::new(
+                "resource_bootstrap_timeout",
+                "资源准备已超过 resource-bootstrap.timeout，请检查规则、代理提供者或 GeoData 来源后重试",
+            )
+        })
+    }
+
+    fn work_deadline(&self) -> Instant {
+        self.total - CLEANUP_RESERVE
+    }
+
+    fn cleanup_deadline(&self) -> Instant {
+        Instant::now()
+            .checked_add(CLEANUP_RESERVE)
+            .unwrap_or(self.total)
+            .min(self.total)
+    }
+}
+
+fn budget_overflow() -> AppError {
+    AppError::new(
+        "config_invalid",
+        "resource-bootstrap.timeout 超出系统支持的计时范围",
+    )
+}
+
+fn remaining(deadline: Instant) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|value| !value.is_zero())
+        .ok_or_else(|| AppError::new("core_operation_timeout", "本次内核操作已超过总时限"))
+}
+
+fn duration_argument(duration: Duration) -> String {
+    format!("{}.{:09}s", duration.as_secs(), duration.subsec_nanos())
+}
+
+fn confirm_process_exit(
+    child: &mut Child,
+    deadline: Instant,
+    kill_error: Option<std::io::Error>,
+) -> Result<()> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) => return Err(AppError::io("无法确认自有内核进程退出", error)),
+        }
+        let Ok(timeout) = remaining(deadline) else {
+            let detail = kill_error
+                .as_ref()
+                .and_then(std::io::Error::raw_os_error)
+                .map(|code| format!("，系统错误：{code}"))
+                .unwrap_or_default();
+            return Err(AppError::new("core_termination_unconfirmed", format!("未能在清理时限内确认自有内核进程退出（PID：{}{detail}），请完全退出应用后检查进程", child.id())));
+        };
+        thread::sleep(timeout.min(Duration::from_millis(20)));
+    }
+}
+
+fn finish_diagnostics(reader: thread::JoinHandle<String>, deadline: Instant) -> Result<String> {
+    while !reader.is_finished() {
+        let timeout = remaining(deadline).map_err(|_| {
+            AppError::new(
+                "core_diagnostic_timeout",
+                "配置校验进程输出未在清理时限内关闭",
+            )
+        })?;
+        thread::sleep(timeout.min(Duration::from_millis(10)));
+    }
+    Ok(reader.join().unwrap_or_default())
+}
+
+// Core failures can include complete subscription URLs or YAML source lines.
+// Only the bootstrap diagnostic protocol is copied into host errors/logs.
+fn safe_resource_diagnostic(line: &str) -> Option<String> {
+    let (_, record) = line.split_once("[resource-bootstrap]")?;
+    let field = |name: &str| -> Option<&str> {
+        record
+            .split_whitespace()
+            .find_map(|value| value.strip_prefix(name))
+    };
+    let code = field("code=")?;
+    let kind = field("kind=")?;
+    if code.is_empty()
+        || code.len() > 64
+        || !code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || ![
+            "provider",
+            "geo",
+            "proxy",
+            "config",
+            "configuration",
+            "bootstrap",
+        ]
+        .contains(&kind)
+    {
+        return None;
+    }
+    let mut safe = format!("[resource-bootstrap] code={code} kind={kind}");
+    if let Some((_, name)) = record.split_once("resource=") {
+        let mut values = serde_json::Deserializer::from_str(name).into_iter::<String>();
+        if let Some(Ok(name)) = values.next() {
+            // Names are useful to locate the failed provider, but a URL or an
+            // opaque credential accidentally used as a name must not be echoed.
+            let allowed = !name.is_empty()
+                && name.chars().count() <= 80
+                && name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || " ._-".contains(c))
+                && !(name.len() >= 32
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'));
+            if allowed {
+                safe.push_str(" resource=");
+                safe.push_str(&serde_json::to_string(&name).ok()?);
+            }
+        }
+    }
+    Some(safe)
+}
+
+fn collect_diagnostics(mut reader: impl Read) -> String {
+    let mut output = VecDeque::new();
+    let mut size = 0;
+    let mut line = Vec::new();
+    let mut overflow = false;
+    let mut chunk = [0_u8; 2048];
+    loop {
+        let count = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        for byte in &chunk[..count] {
+            if *byte == b'\n' {
+                if !overflow {
+                    if let Some(safe) = safe_resource_diagnostic(&String::from_utf8_lossy(&line)) {
+                        size += safe.len() + 1;
+                        output.push_back(safe);
+                        while size > MAX_DIAGNOSTIC_BYTES {
+                            if let Some(old) = output.pop_front() {
+                                size -= old.len() + 1;
+                            }
+                        }
+                    }
+                }
+                line.clear();
+                overflow = false;
+            } else if line.len() < MAX_DIAGNOSTIC_BYTES {
+                line.push(*byte);
+            } else {
+                overflow = true;
+            }
+        }
+    }
+    if !overflow {
+        if let Some(safe) = safe_resource_diagnostic(&String::from_utf8_lossy(&line)) {
+            size += safe.len() + 1;
+            output.push_back(safe);
+            while size > MAX_DIAGNOSTIC_BYTES {
+                if let Some(old) = output.pop_front() {
+                    size -= old.len() + 1;
+                }
+            }
+        }
+    }
+    output.into_iter().collect::<Vec<_>>().join("\n")
+}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Controller {
@@ -48,7 +247,10 @@ pub struct CoreSupervisor {
     tun: bool,
     desired_running: bool,
     error: Option<String>,
+    log_start: u64,
     restarts: VecDeque<Instant>,
+    failed_recoveries: usize,
+    termination_unconfirmed: bool,
     restart_at: Option<Instant>,
 }
 
@@ -118,14 +320,17 @@ impl CoreSupervisor {
             tun: false,
             desired_running: false,
             error: None,
+            log_start: 0,
             restarts: VecDeque::new(),
+            failed_recoveries: 0,
+            termination_unconfirmed: false,
             restart_at: None,
         }
     }
 
     pub fn status(&self) -> CoreStatus {
         CoreStatus {
-            running: self.child.is_some(),
+            running: self.child.is_some() && !self.termination_unconfirmed,
             controller: self.controller.clone(),
             version: self.version.clone(),
             error: self.error.clone(),
@@ -134,15 +339,16 @@ impl CoreSupervisor {
     }
 
     pub fn start(&mut self, source: String, tun: bool) -> Result<CoreStatus> {
+        let budget = OperationBudget::new(&source)?;
         self.stop()?;
         self.source = Some(source);
         self.tun = tun;
         self.restarts.clear();
+        self.failed_recoveries = 0;
         self.restart_at = None;
         self.desired_running = true;
         self.error = None;
-        if let Err(error) = self.spawn() {
-            let _ = self.terminate_child();
+        if let Err(error) = self.spawn_with_budget(&budget) {
             self.controller = None;
             #[cfg(windows)]
             {
@@ -156,6 +362,27 @@ impl CoreSupervisor {
     }
 
     fn spawn(&mut self) -> Result<()> {
+        let source = self
+            .source
+            .as_deref()
+            .ok_or_else(|| AppError::new("config_missing", "没有可运行的配置"))?;
+        let budget = OperationBudget::new(source)?;
+        self.spawn_with_budget(&budget)
+    }
+
+    fn spawn_with_budget(&mut self, budget: &OperationBudget) -> Result<()> {
+        let result = self.launch(budget);
+        if result.is_err() {
+            let cleanup = self.terminate_child_until(budget.cleanup_deadline());
+            self.controller = None;
+            if let Err(error) = cleanup {
+                return Err(error);
+            }
+        }
+        result
+    }
+
+    fn launch(&mut self, budget: &OperationBudget) -> Result<()> {
         fs::create_dir_all(&self.home).map_err(|e| AppError::io("无法创建运行目录", e))?;
         fs::create_dir_all(&self.logs).map_err(|e| AppError::io("无法创建日志目录", e))?;
         let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -173,28 +400,18 @@ impl CoreSupervisor {
         };
         let source = self
             .source
-            .as_deref()
+            .clone()
             .ok_or_else(|| AppError::new("config_missing", "没有可运行的配置"))?;
-        let runtime = config::runtime_config(source, self.tun, port)?;
+        let runtime = config::runtime_config(&source, self.tun, port)?;
         config::atomic_write(&self.home.join("config.yaml"), runtime.as_bytes())?;
-        self.validate(&controller)?;
-        let log_path = self.logs.join("core.log");
-        if fs::metadata(&log_path).is_ok_and(|m| m.len() > 10 * 1024 * 1024) {
-            let old = self.logs.join("core.previous.log");
-            if old.exists() {
-                fs::remove_file(&old).map_err(|e| AppError::io("无法轮换日志", e))?;
-            }
-            fs::rename(&log_path, old).map_err(|e| AppError::io("无法轮换日志", e))?;
-        }
-        let stdout = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .map_err(|e| AppError::io("无法打开内核日志", e))?;
+        self.rotate_log()?;
+        self.log_start = fs::metadata(self.logs.join("core.log")).map_or(0, |file| file.len());
+        self.validate(&controller, budget)?;
+        let stdout = self.open_log()?;
         let stderr = stdout
             .try_clone()
             .map_err(|e| AppError::io("无法打开内核日志", e))?;
-        let mut command = self.command(&controller);
+        let mut command = self.command(&controller, budget.resource_remaining()?);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
@@ -203,23 +420,86 @@ impl CoreSupervisor {
         let child = command
             .spawn()
             .map_err(|e| AppError::io("无法启动配套内核", e))?;
+        self.child = Some(child);
+        self.termination_unconfirmed = false;
         #[cfg(windows)]
         {
-            match crate::windows::create_kill_job(&child) {
-                Ok(job) => self.job = Some(job),
-                Err(error) => {
-                    let mut child = child;
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error);
-                }
+            self.job = Some(crate::windows::create_kill_job(
+                self.child.as_ref().expect("child stored above"),
+            )?);
+        }
+        self.controller = Some(controller.clone());
+        self.wait_ready(&controller, &source, budget.work_deadline())?;
+        if let Ok(timeout) = remaining(budget.work_deadline()) {
+            self.version = http_client()?
+                .get(format!("{}/version", controller.url))
+                .timeout(timeout.min(CONTROL_TIMEOUT))
+                .bearer_auth(&controller.secret)
+                .send()
+                .ok()
+                .and_then(|r| r.json::<serde_json::Value>().ok())
+                .and_then(|v| {
+                    v.get("version")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                });
+        }
+        self.error = None;
+        Ok(())
+    }
+
+    fn rotate_log(&self) -> Result<()> {
+        let log_path = self.logs.join("core.log");
+        if fs::metadata(&log_path).is_ok_and(|m| m.len() > 10 * 1024 * 1024) {
+            let old = self.logs.join("core.previous.log");
+            if old.exists() {
+                fs::remove_file(&old).map_err(|e| AppError::io("无法轮换日志", e))?;
+            }
+            fs::rename(&log_path, old).map_err(|e| AppError::io("无法轮换日志", e))?;
+        }
+        Ok(())
+    }
+
+    fn open_log(&self) -> Result<fs::File> {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.logs.join("core.log"))
+            .map_err(|e| AppError::io("无法打开内核日志", e))
+    }
+
+    fn log_diagnostic(&self, summary: &str) {
+        if !summary.is_empty() {
+            if let Ok(mut log) = self.open_log() {
+                let _ = writeln!(log, "{summary}");
             }
         }
-        self.child = Some(child);
-        self.controller = Some(controller.clone());
-        let started = Instant::now();
+    }
+
+    fn recent_diagnostic(&self) -> String {
+        let Ok(mut file) = fs::File::open(self.logs.join("core.log")) else {
+            return String::new();
+        };
+        if let Ok(length) = file.metadata().map(|metadata| metadata.len()) {
+            let _ = file.seek(SeekFrom::Start(
+                length.saturating_sub(64 * 1024).max(self.log_start),
+            ));
+        }
+        collect_diagnostics(file.take(64 * 1024))
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn wait_ready(
+        &mut self,
+        controller: &Controller,
+        source: &str,
+        deadline: Instant,
+    ) -> Result<()> {
         let client = http_client()?;
-        while started.elapsed() < START_TIMEOUT {
+        while let Ok(timeout) = remaining(deadline) {
             if let Some(exit) = self
                 .child
                 .as_mut()
@@ -227,19 +507,24 @@ impl CoreSupervisor {
                 .try_wait()
                 .map_err(|e| AppError::io("无法读取内核状态", e))?
             {
-                self.child = None;
-                self.controller = None;
+                let diagnostic = self.recent_diagnostic();
                 return Err(AppError::new(
                     "core_start_failed",
                     format!(
-                        "内核启动后退出（{}），请检查配置或日志",
+                        "内核在就绪前退出（{}），请检查资源来源、配置或日志{}",
                         exit.code()
-                            .map_or_else(|| "已终止".into(), |n| n.to_string())
+                            .map_or_else(|| "已终止".into(), |n| n.to_string()),
+                        if diagnostic.is_empty() {
+                            String::new()
+                        } else {
+                            format!("：{diagnostic}")
+                        },
                     ),
                 ));
             }
             if let Ok(response) = client
                 .get(format!("{}/desktop", controller.url))
+                .timeout(timeout.min(CONTROL_TIMEOUT))
                 .bearer_auth(&controller.secret)
                 .send()
             {
@@ -253,38 +538,30 @@ impl CoreSupervisor {
                                 == Some("running")
                             && info.get("pid").and_then(serde_json::Value::as_u64) == expected_pid
                         {
-                            self.verify_listeners(&controller, source)?;
-                            self.version = client
-                                .get(format!("{}/version", controller.url))
-                                .bearer_auth(&controller.secret)
-                                .send()
-                                .ok()
-                                .and_then(|r| r.json::<serde_json::Value>().ok())
-                                .and_then(|v| {
-                                    v.get("version")
-                                        .and_then(|v| v.as_str())
-                                        .map(str::to_string)
-                                });
-                            self.error = None;
+                            self.verify_listeners(controller, source, deadline)?;
                             return Ok(());
                         }
                     }
                 }
             }
-            thread::sleep(Duration::from_millis(150));
+            if let Ok(timeout) = remaining(deadline) {
+                thread::sleep(timeout.min(Duration::from_millis(150)));
+            }
         }
-        let _ = self.terminate_child();
-        self.controller = None;
         Err(AppError::new(
             "core_start_timeout",
-            "内核在 20 秒内没有就绪，请检查端口或配置日志",
+            "资源准备与内核就绪已超过本次操作总时限，请检查资源来源、端口或配置日志",
         ))
     }
 
-    fn command(&self, controller: &Controller) -> Command {
+    fn command(&self, controller: &Controller, resource_remaining: Duration) -> Command {
         let mut command = quiet_command(&self.executable);
         command
             .arg("-desktop-managed")
+            .arg(format!(
+                "-resource-bootstrap-timeout={}",
+                duration_argument(resource_remaining)
+            ))
             .arg("-d")
             .arg(&self.home)
             .arg("-f")
@@ -296,54 +573,82 @@ impl CoreSupervisor {
         command
     }
 
-    fn validate(&self, controller: &Controller) -> Result<()> {
+    fn validate(&self, controller: &Controller, budget: &OperationBudget) -> Result<()> {
         let mut child = self
-            .command(controller)
+            .command(controller, budget.resource_remaining()?)
             .arg("-t")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| AppError::io("无法校验配置", e))?;
+        let stdout = child.stdout.take().expect("piped stdout configured above");
+        let stderr = child.stderr.take().expect("piped stderr configured above");
+        let stdout = thread::spawn(move || collect_diagnostics(stdout));
+        let stderr = thread::spawn(move || collect_diagnostics(stderr));
         #[cfg(windows)]
-        let _job = match crate::windows::create_kill_job(&child) {
+        let job = match crate::windows::create_kill_job(&child) {
             Ok(job) => job,
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let deadline = budget.cleanup_deadline();
+                let kill_error = child.kill().err();
+                let cleanup = confirm_process_exit(&mut child, deadline, kill_error);
+                let _ = finish_diagnostics(stdout, deadline);
+                let _ = finish_diagnostics(stderr, deadline);
+                cleanup?;
                 return Err(error);
             }
         };
-        let start = Instant::now();
-        loop {
-            match child
+        let result = (|| loop {
+            if let Some(status) = child
                 .try_wait()
                 .map_err(|e| AppError::io("无法读取配置校验结果", e))?
             {
-                Some(status) if status.success() => return Ok(()),
-                Some(_) => {
-                    return Err(AppError::new(
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(AppError::new(
                         "reload_invalid",
-                        "内核拒绝此配置，请检查字段、规则和提供者路径",
+                        "配置或必需资源准备失败，当前运行配置未替换",
                     ))
-                }
-                None if start.elapsed() >= Duration::from_secs(15) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(AppError::new(
-                        "config_validation_timeout",
-                        "配置校验超时，当前运行状态未改变",
-                    ));
-                }
-                None => thread::sleep(Duration::from_millis(50)),
+                };
             }
-        }
+            let timeout = budget.resource_remaining()?;
+            thread::sleep(timeout.min(Duration::from_millis(50)));
+        })();
+        let kill_error = result.as_ref().err().and_then(|_| child.kill().err());
+        // Closing the job terminates any owned descendants before we wait for
+        // process/pipe closure. Neither a failed kill nor an inherited pipe can
+        // extend the shared operation deadline indefinitely.
+        #[cfg(windows)]
+        drop(job);
+        let deadline = budget.cleanup_deadline();
+        let cleanup = confirm_process_exit(&mut child, deadline, kill_error);
+        let stdout = finish_diagnostics(stdout, deadline);
+        let stderr = finish_diagnostics(stderr, deadline);
+        cleanup?;
+        let output = [stdout?, stderr?].join("\n");
+        let summary = collect_diagnostics(output.as_bytes());
+        self.log_diagnostic(&summary);
+        result.map_err(|mut error| {
+            if let Some(last) = summary.lines().last() {
+                error.message.push_str("：");
+                error.message.push_str(last);
+            }
+            error
+        })
     }
 
-    fn verify_listeners(&self, controller: &Controller, source: &str) -> Result<()> {
+    fn verify_listeners(
+        &self,
+        controller: &Controller,
+        source: &str,
+        deadline: Instant,
+    ) -> Result<()> {
         let expected = config::parse(source)?;
         let response = http_client()?
             .get(format!("{}/configs", controller.url))
+            .timeout(remaining(deadline)?.min(CONTROL_TIMEOUT))
             .bearer_auth(&controller.secret)
             .send()
             .map_err(|_| {
@@ -378,22 +683,56 @@ impl CoreSupervisor {
         Ok(())
     }
 
-    fn apply_runtime(&self, controller: &Controller, source: &str) -> Result<()> {
+    fn apply_runtime(
+        &mut self,
+        controller: &Controller,
+        source: &str,
+        resource_deadline: Instant,
+        completion_deadline: Instant,
+    ) -> Result<()> {
+        let resource_remaining = remaining(resource_deadline)?;
         let response = http_client()?
             .put(format!("{}/configs?force=true", controller.url))
-            .timeout(Duration::from_secs(20))
+            .query(&[(
+                "resource-bootstrap-timeout",
+                duration_argument(resource_remaining),
+            )])
+            .timeout(remaining(completion_deadline)?)
             .bearer_auth(&controller.secret)
             .json(&serde_json::json!({"path": self.home.join("config.yaml").display().to_string()}))
             .send()
             .map_err(|_| AppError::new("reload_failed", "运行配置重载超时或连接失败"))?;
         if !response.status().is_success() {
-            return Err(AppError::new("reload_failed", "内核拒绝应用运行配置"));
+            // Error bodies are not trusted as display text: YAML and subscription
+            // failures elsewhere in the core may contain secrets or full URLs.
+            let mut bytes = Vec::new();
+            let _ = response
+                .take((MAX_DIAGNOSTIC_BYTES + 1) as u64)
+                .read_to_end(&mut bytes);
+            let diagnostic = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|body| {
+                    body.get("message")
+                        .and_then(|message| message.as_str())
+                        .and_then(safe_resource_diagnostic)
+                });
+            let message = match diagnostic {
+                Some(diagnostic) => {
+                    self.log_diagnostic(&diagnostic);
+                    format!("内核拒绝应用运行配置：{diagnostic}")
+                }
+                None => "内核拒绝应用运行配置，请检查资源来源、配置或日志".into(),
+            };
+            return Err(AppError::new("reload_failed", message));
         }
-        self.verify_listeners(controller, source)
+        // HTTP success alone cannot prove the actual listener/TUN application
+        // succeeded. Only this owned PID's managed readiness can confirm it.
+        self.wait_ready(controller, source, completion_deadline)
     }
 
     pub fn reload(&mut self, source: String) -> Result<CoreStatus> {
-        config::parse(&source)?;
+        let budget = OperationBudget::new(&source)?;
+        self.log_start = fs::metadata(self.logs.join("core.log")).map_or(0, |file| file.len());
         if self.child.is_none() {
             self.source = Some(source);
             return Ok(self.status());
@@ -411,37 +750,51 @@ impl CoreSupervisor {
         let previous = self.source.clone().unwrap_or_default();
         let runtime = config::runtime_config(&source, self.tun, port)?;
         config::atomic_write(&self.home.join("config.yaml"), runtime.as_bytes())?;
-        if let Err(error) = self.validate(&controller) {
+        if let Err(error) = self.validate(&controller, &budget) {
             let old = config::runtime_config(&previous, self.tun, port)?;
             config::atomic_write(&self.home.join("config.yaml"), old.as_bytes())?;
+            self.error = Some(error.message.clone());
             return Err(error);
         }
-        if let Err(error) = self.apply_runtime(&controller, &source) {
+        if let Err(error) = self.apply_runtime(
+            &controller,
+            &source,
+            budget.resources,
+            budget.work_deadline(),
+        ) {
+            let rollback_deadline = Instant::now()
+                .checked_add(RECOVERY_RESERVE - CLEANUP_RESERVE)
+                .unwrap_or(budget.work_deadline())
+                .min(budget.work_deadline());
             let rollback = (|| {
                 let old = config::runtime_config(&previous, self.tun, port)?;
                 config::atomic_write(&self.home.join("config.yaml"), old.as_bytes())?;
-                self.apply_runtime(&controller, &previous)
+                self.apply_runtime(&controller, &previous, rollback_deadline, rollback_deadline)
             })();
             if rollback.is_ok() {
-                return Err(AppError::new(
+                let restored = AppError::new(
                     "reload_failed",
                     format!(
                         "配置已保存，但未能应用：{}。已恢复上次运行配置，请修正后重载",
                         error.message
                     ),
-                ));
+                );
+                self.error = Some(restored.message.clone());
+                return Err(restored);
             }
-            // A timed-out ApplyConfig may still be running. Terminating the process
-            // also cancels any pending application before reporting a failed rollback.
-            let _ = self.stop();
-            let _ = self.terminate_child();
+            // A timed-out ApplyConfig may still be running. Only confirmed process
+            // exit proves that no pending application can keep changing live state.
+            self.desired_running = false;
+            self.restart_at = None;
+            let cleanup = self.terminate_child_until(budget.cleanup_deadline());
             self.controller = None;
-            #[cfg(windows)]
-            {
-                self.job = None;
-            }
-            self.error =
-                Some("配置已保存，重载和运行回滚均失败，内核已停止；请修正配置后重新启动".into());
+            self.version = None;
+            self.error = Some(match cleanup {
+                Ok(()) => {
+                    "配置已保存，重载和运行回滚均失败，内核已停止；请修正配置后重新启动".into()
+                }
+                Err(cleanup) => format!("配置已保存，重载和运行回滚均失败；{}", cleanup.message),
+            });
             return Err(AppError::new(
                 "reload_restore_failed",
                 self.error.clone().unwrap_or_default(),
@@ -461,12 +814,15 @@ impl CoreSupervisor {
             {
                 self.child = None;
                 self.controller = None;
+                self.termination_unconfirmed = false;
                 #[cfg(windows)]
                 {
                     self.job = None;
                 }
-                self.error = Some("内核意外退出，正在准备恢复".into());
-                self.restart_at = Some(Instant::now() + Duration::from_secs(1));
+                if self.desired_running {
+                    self.error = Some("内核意外退出，正在准备恢复".into());
+                    self.restart_at = Some(Instant::now() + Duration::from_secs(1));
+                }
             }
         }
         while self
@@ -480,20 +836,29 @@ impl CoreSupervisor {
             && self.child.is_none()
             && self.restart_at.is_some_and(|time| Instant::now() >= time)
         {
-            if self.restarts.len() >= MAX_RESTARTS {
+            if self.failed_recoveries >= MAX_RESTARTS || self.restarts.len() >= MAX_RESTARTS {
                 self.desired_running = false;
                 self.restart_at = None;
-                self.error = Some("内核在 60 秒内连续失败 3 次，已停止自动重启，请检查配置".into());
+                self.error = Some(
+                    "内核连续恢复失败或在 60 秒内重启 3 次，已停止自动重启，请检查配置与资源来源"
+                        .into(),
+                );
             } else {
                 self.restarts.push_back(Instant::now());
                 match self.spawn() {
-                    Ok(()) => self.restart_at = None,
+                    Ok(()) => {
+                        self.restart_at = None;
+                        self.failed_recoveries = 0;
+                    }
                     Err(error) => {
-                        let _ = self.terminate_child();
+                        self.failed_recoveries += 1;
                         self.controller = None;
                         self.error = Some(error.message);
-                        self.restart_at =
-                            Some(Instant::now() + Duration::from_secs(1 << self.restarts.len()));
+                        if !self.termination_unconfirmed {
+                            self.restart_at = Some(
+                                Instant::now() + Duration::from_secs(1 << self.restarts.len()),
+                            );
+                        }
                     }
                 }
             }
@@ -540,18 +905,140 @@ impl CoreSupervisor {
     }
 
     fn terminate_child(&mut self) -> Result<()> {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            child
-                .wait()
-                .map_err(|e| AppError::io("无法清理内核进程", e))?;
+        self.terminate_child_until(Instant::now() + CLEANUP_RESERVE)
+    }
+
+    fn terminate_child_until(&mut self, deadline: Instant) -> Result<()> {
+        let kill_error = self.child.as_mut().and_then(|child| child.kill().err());
+        #[cfg(windows)]
+        {
+            self.job = None;
         }
+        if let Some(child) = self.child.as_mut() {
+            if let Err(error) = confirm_process_exit(child, deadline, kill_error) {
+                // Keep the owned process handle so a later poll/stop can still
+                // confirm its exit. In particular, do not report it as stopped.
+                self.termination_unconfirmed = true;
+                self.desired_running = false;
+                self.restart_at = None;
+                self.controller = None;
+                self.version = None;
+                self.error = Some(error.message.clone());
+                return Err(error);
+            }
+        }
+        self.child = None;
+        self.termination_unconfirmed = false;
         Ok(())
     }
 }
 
 impl Drop for CoreSupervisor {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if self.termination_unconfirmed {
+            // The operation already used its cleanup allowance. Releasing the
+            // owner must not silently start another stop/cleanup deadline.
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+            }
+            #[cfg(windows)]
+            {
+                self.job = None;
+            }
+        } else {
+            let _ = self.stop();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validation_main_and_recovery_use_one_operation_budget() {
+        let started = Instant::now();
+        let budget = OperationBudget::from_timeout(Duration::from_secs(180), started).unwrap();
+        let after_validation = started + Duration::from_secs(37);
+        let after_main = after_validation + Duration::from_secs(140);
+        assert_eq!(
+            budget.resources.duration_since(after_validation),
+            Duration::from_secs(143)
+        );
+        assert_eq!(
+            budget.resources.duration_since(after_main),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            budget.total.duration_since(after_main),
+            Duration::from_secs(33)
+        );
+        assert_eq!(
+            budget.total.duration_since(budget.resources),
+            RECOVERY_RESERVE
+        );
+        assert_eq!(
+            budget.work_deadline().duration_since(budget.resources),
+            Duration::from_secs(22)
+        );
+        assert_eq!(
+            budget.total.duration_since(budget.work_deadline()),
+            CLEANUP_RESERVE
+        );
+        assert!(budget.cleanup_deadline() <= budget.total);
+        assert_eq!(
+            duration_argument(Duration::from_micros(137_250_001)),
+            "137.250001000s"
+        );
+        assert!(OperationBudget::from_timeout(Duration::MAX, started).is_err());
+    }
+
+    #[test]
+    fn diagnostic_capture_is_bounded_and_does_not_echo_raw_credentials() {
+        let diagnostic = "[resource-bootstrap] code=timeout kind=provider resource=\"rules-demo\"";
+        let output = format!("password: never-echo-this\nfailed GET https://user:password@example.invalid/?token=private\n{diagnostic}\n");
+        assert_eq!(collect_diagnostics(output.as_bytes()), diagnostic);
+        let unsafe_name = "[resource-bootstrap] code=timeout kind=provider resource=\"https://example.invalid/?token=private\"";
+        assert_eq!(
+            collect_diagnostics(unsafe_name.as_bytes()),
+            "[resource-bootstrap] code=timeout kind=provider"
+        );
+        assert!(
+            safe_resource_diagnostic("[resource-bootstrap] code=https://private kind=geo")
+                .is_none()
+        );
+        let repeated = format!(
+            "{}\n{}\n{diagnostic}",
+            "x".repeat(64 * 1024),
+            (diagnostic.to_string() + "\n").repeat(2000)
+        );
+        let safe = collect_diagnostics(repeated.as_bytes());
+        assert!(safe.len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(safe.ends_with(diagnostic));
+        assert!(!safe.contains("xxxx"));
+        assert_eq!(
+            safe_resource_diagnostic(
+                "[resource-bootstrap] code=deadline kind=config resource=\"configuration\""
+            ),
+            Some(
+                "[resource-bootstrap] code=deadline kind=config resource=\"configuration\"".into()
+            )
+        );
+    }
+
+    #[test]
+    fn long_failed_recoveries_do_not_evade_the_restart_limit() {
+        let mut core = CoreSupervisor::new(PathBuf::from("unused"), PathBuf::new(), PathBuf::new());
+        core.desired_running = true;
+        core.failed_recoveries = MAX_RESTARTS;
+        core.restart_at = Some(Instant::now());
+        // Each long failed preparation has aged out of the rapid-crash window.
+        core.restarts
+            .push_back(Instant::now() - RESTART_WINDOW - Duration::from_secs(1));
+        let status = core.poll().unwrap();
+        assert!(!status.running);
+        assert!(!core.desired_running);
+        assert!(core.restart_at.is_none());
+        assert!(status.error.unwrap().contains("已停止自动重启"));
     }
 }
