@@ -170,13 +170,14 @@ jobs:
           trap 'rm -f "$syn_test_binary"' EXIT
           CGO_ENABLED=0 go test -tags with_gvisor -c -o "$syn_test_binary" ./dns
           sudo -n bash scripts/test-dns-tcp-syn.sh "$syn_test_binary"
-      - name: Verify actual core SIGTERM and systemd stop cleanup
+      - name: Verify actual core startup resources, SIGTERM and systemd stop cleanup
         run: |
           set -euo pipefail
           stop_test_binary="$RUNNER_TEMP/mihomo-stop-test"
           trap 'rm -f "$stop_test_binary"' EXIT
           CGO_ENABLED=0 go build -tags with_gvisor -o "$stop_test_binary" .
           sudo -n python3 scripts/test-transparent-stop.py --core "$stop_test_binary" --require-systemd
+          python3 scripts/test-resource-bootstrap.py --core "$stop_test_binary" --report "$RUNNER_TEMP/resource-bootstrap-verification.json"
       - name: Test fork changes and sync safeguards
         run: bash scripts/ci-check.sh test
       - name: Test configuration permissions with an unprivileged service user
@@ -293,6 +294,8 @@ jobs:
         run: go test -tags with_gvisor -count=1 -timeout=5m ./hub/route -run 'ConfigFile|UIUpdater|UnifiedUpgrade|UpgradeSchedule'
       - name: Verify desktop supervisor authentication, confinement and lifecycle contracts
         run: go test -tags with_gvisor -count=1 -timeout=3m ./component/desktop ./hub/route . -run Desktop
+      - name: Verify native startup resource routing, cache isolation and cancellation
+        run: go test -tags with_gvisor -count=1 -timeout=5m ./adapter/provider ./component/dialer ./component/http ./component/resolver ./config ./hub/executor ./hub/route . -run ResourceBootstrap
 
   release:
     name: Publish GitHub release
@@ -366,7 +369,16 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.17
+              printf '%s\n\n' '## 本次更新：1.0.19
+
+          - 新增跨平台 resource-bootstrap，初始化规则、代理订阅和 Geo 数据时可使用现有具体节点。支持静态 proxies，以及明确指定 provider 的已有缓存、文件或内联内容；不限定 AnyTLS，不通过先下载订阅来取得引导节点。
+          - 保留原有 URL、缓存路径、ETag、订阅解析和内容校验。provider 显式 proxy（包括 DIRECT）优先；引导代理失败不会静默切回直连。临时节点只服务于本轮初始化，后续定时刷新与普通业务流量继续沿用原配置。
+          - 初始化资源共用默认 180 秒预算，provider 请求 60 秒、Geo 请求 120 秒、连接 10 秒均受剩余总时间限制。宿主可通过 CLI 与重载 API 的 resource-bootstrap-timeout 进一步收紧本轮预算，不会重复获得完整等待时间。
+          - 收录此前桌面版使用的受管内核生命周期、固定控制通道与就绪验证。配套桌面 0.1.4 / UI 0.4.15 统一配置检查、启动和重载预算，整理设置重复入口，并在繁忙结束后补做启动应用更新检查。
+          - 版本从公开内核 1.0.17 升为 1.0.19，避开旧桌面包已内置的 1.0.18；已发布标签和附件不覆盖。
+
+          [配置与故障排查](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.19/docs/resource-bootstrap.md) · [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.19/docs/releases.md)'
+              printf '%s\n\n' '## 1.0.17：连接采样时钟与面板恢复
 
           - /connections 的 HTTP 与 WebSocket 快照新增 sampledAt（进程单调时钟毫秒，可含小数）和 sequence（进程内递增采样序号），原有字段保持兼容。并发采样共享同一时钟与序号顺序；清零流量统计不重置采样时钟，系统墙钟校时不影响采样间隔。
           - 配套面板 0.4.11 优先按核心实际采样时间计算全局与连接速率，避免集中到达的网络或浏览器回调放大流量读数。旧核心继续使用接收时间回退；恢复统计连接后重新建立速率基线。

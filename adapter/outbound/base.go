@@ -204,11 +204,17 @@ type BasicOption struct {
 	// The following parameters are used internally, assign value by the structure decoder are disallowed
 	//
 	DialerForAPI C.Dialer `proxy:"-"` // the dialer used for API usage has higher priority than all the above configurations.
-	TunnelForAPI C.Tunnel `proxy:"-"`
-	ProviderName string   `proxy:"-"`
+	// Factory injection preserves each protocol's socket options while replacing
+	// only the transport resolver or an explicitly resolved local proxy chain.
+	DialerFactoryForAPI func([]dialer.Option) C.Dialer `proxy:"-"`
+	TunnelForAPI        C.Tunnel                       `proxy:"-"`
+	ProviderName        string                         `proxy:"-"`
 }
 
 func (b *BasicOption) NewDialer(opts []dialer.Option) C.Dialer {
+	if b.DialerFactoryForAPI != nil {
+		return b.DialerFactoryForAPI(opts)
+	}
 	cDialer := b.DialerForAPI
 	if cDialer == nil {
 		if b.DialerProxy != "" {

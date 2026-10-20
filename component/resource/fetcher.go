@@ -104,11 +104,22 @@ func (f *Fetcher[V]) BindUpdateContext(ctx context.Context, commit func(func() e
 }
 
 func (f *Fetcher[V]) Initial() (V, error) {
+	return f.InitialContext(f.ctx)
+}
+
+// InitialContext applies a caller's download budget only to synchronous
+// initialization. Refresh loops continue to use the provider's own context.
+func (f *Fetcher[V]) InitialContext(ctx context.Context) (_ V, resultErr error) {
+	ctx = WithInitialResource(ctx, "provider", f.name)
+	defer func() { resultErr = BootstrapFailure(ctx, resultErr) }()
+	if err := ctx.Err(); err != nil {
+		return lo.Empty[V](), err
+	}
 	if stat, fErr := os.Stat(f.vehicle.Path()); fErr == nil {
 		// local file exists, use it first
 		buf, err := os.ReadFile(f.vehicle.Path())
 		modTime := stat.ModTime()
-		contents, _, err := f.loadBuf(buf, utils.MakeHash(buf), false)
+		contents, _, err := f.loadBufWithCommit(ctx, buf, utils.MakeHash(buf), false, nil)
 		f.updatedAt.Store(modTime) // reset updatedAt to file's modTime
 
 		if err == nil {
@@ -130,7 +141,7 @@ func (f *Fetcher[V]) Initial() (V, error) {
 			if stat, sErr := file.Stat(); sErr == nil {
 				modTime = stat.ModTime()
 			}
-			contents, _, err := f.loadBuf(buf, utils.MakeHash(buf), true)
+			contents, _, err := f.loadBufWithCommit(ctx, buf, utils.MakeHash(buf), true, nil)
 			f.updatedAt.Store(modTime) // reset updatedAt to file's modTime
 
 			if err == nil {
@@ -148,7 +159,10 @@ func (f *Fetcher[V]) Initial() (V, error) {
 	}
 
 	// parse local file error, fallback to remote
-	contents, _, updateErr := f.Update()
+	contents, _, updateErr := f.UpdateContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return lo.Empty[V](), err
+	}
 
 	// start the pull loop even if f.Update() failed
 	err := f.startPullLoop(false)

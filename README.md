@@ -6,7 +6,7 @@
 
 [下载 Releases](https://github.com/chummumm/mihomo-optimized/releases) · [构建状态](https://github.com/chummumm/mihomo-optimized/actions/workflows/build.yml) · [完整配置说明](docs/dns-proxy.md) · [验证记录](docs/dns-rule-routing-validation.md)
 
-**配置入口：** [完整配置示例](#完整配置示例) · [面板与内核自动更新](#面板与内核自动更新) · [Linux 透明代理与自动路由恢复](#linux-透明代理与自动路由恢复) · [DNS 可选字段](#可选-dns-设置) · [共享连接例外](#共享-dns-连接与单个上游例外) · [旧配置迁移](#旧配置迁移与停用范围)
+**配置入口：** [完整配置示例](#完整配置示例) · [启动资源下载](docs/resource-bootstrap.md) · [面板与内核自动更新](#面板与内核自动更新) · [Linux 透明代理与自动路由恢复](#linux-透明代理与自动路由恢复) · [DNS 可选字段](#可选-dns-设置) · [共享连接例外](#共享-dns-连接与单个上游例外) · [旧配置迁移](#旧配置迁移与停用范围)
 
 ## 解决什么问题
 
@@ -39,7 +39,21 @@ UDP、TCP 和 DoT 上游在实际出口固定时共享连接，多个查询通�
 
 新增的 DNS 面板数据由本机控制器提供，查询记录、趋势和上游统计只保存在进程内存中，不写数据库或日志文件，也不发送遥测。无需维护第二份分流规则；观测不会改变 DNS 回答和出口选择。优化范围、缓存安全边界及测试方式见 [DNS 性能说明](docs/dns-performance.md)。
 
-正式版本采用 **`mihomo-optimized-vX.Y.Z`**，当前为 `mihomo-optimized-v1.0.13`。tag、发行标题、`version.txt` 和运行内核版本一致；`PROJECT_VERSION` 记录独立项目版本，上游 mihomo 的版本与提交另存于 `UPSTREAM_VERSION` / `UPSTREAM_COMMIT`。源码哈希保留在 BUILDINFO 中。**旧版 `v1.19.32-optimized-N` 及更早内核首次切换到新系列，需要手动安装一次**；新系列随后可通过 YAML 启用内核后台检查和更新，详见[更新说明](docs/releases.md#内核自动更新)。
+正式版本采用 **`mihomo-optimized-vX.Y.Z`**，当前为 `mihomo-optimized-v1.0.19`。tag、发行标题、`version.txt` 和运行内核版本一致；`PROJECT_VERSION` 记录独立项目版本，上游 mihomo 的版本与提交另存于 `UPSTREAM_VERSION` / `UPSTREAM_COMMIT`。源码哈希保留在 BUILDINFO 中。**旧版 `v1.19.32-optimized-N` 及更早内核首次切换到新系列，需要手动安装一次**；新系列随后可通过 YAML 启用内核后台检查和更新，详见[更新说明](docs/releases.md#内核自动更新)。
+
+## 启动资源下载
+
+从内核 `1.0.19` 起，可让初始化时缺少的规则、代理订阅和 Geo 数据通过现有节点下载，避免“需要规则才能启动代理、又需要代理才能下载规则”的依赖循环。Windows、Linux、macOS 等平台共用这一内核能力；桌面版从 `0.1.4` 起同时协调配置检查和正式启动的等待预算。
+
+在现有 YAML 顶层添加以下字段，`proxy` 填写已有的具体节点名：
+
+```yaml
+resource-bootstrap:
+  proxy: "下载节点"
+  timeout: 180 # 本轮初始化下载的总预算，正整数秒
+```
+
+节点可来自静态 `proxies`，也可用 `proxy-provider` 明确指定已有本地缓存的订阅。保留现有的 URL、路径、缓存、保存和更新周期；单个 provider 已设置的 `proxy` 优先。此出口只用于初始化下载，不接管正常业务流量或后续定时更新。具体示例、节点依赖限制和失败处理见[启动资源下载说明](docs/resource-bootstrap.md)。
 
 ## DNS 状态与原版面板
 

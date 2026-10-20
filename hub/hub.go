@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/hub/route"
@@ -88,13 +89,17 @@ func applyRoute(cfg *config.Config) {
 
 // Parse call at the beginning of mihomo
 func Parse(configBytes []byte, options ...Option) error {
+	return ParseContext(context.Background(), configBytes, options...)
+}
+
+func ParseContext(ctx context.Context, configBytes []byte, options ...Option) error {
 	var cfg *config.Config
 	var err error
 
 	if len(configBytes) != 0 {
-		cfg, err = executor.ParseWithBytes(configBytes)
+		cfg, err = executor.ParseWithBytesContext(ctx, configBytes)
 	} else {
-		cfg, err = executor.Parse()
+		cfg, err = executor.ParseContext(ctx)
 	}
 
 	if err != nil {

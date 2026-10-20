@@ -75,6 +75,11 @@ func HttpRequest(ctx context.Context, url, method string, header map[string][]st
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if opt.dialTimeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, opt.dialTimeout)
+				defer cancel()
+			}
 			if opt.dialer != nil {
 				return opt.dialer.DialContext(ctx, network, address)
 			}
@@ -95,7 +100,12 @@ type Option func(opt *option)
 type option struct {
 	specialProxy string
 	dialer       C.Dialer
+	dialTimeout  time.Duration
 	caOption     ca.Option
+}
+
+func WithDialTimeout(timeout time.Duration) Option {
+	return func(opt *option) { opt.dialTimeout = timeout }
 }
 
 func WithSpecialProxy(name string) Option {

@@ -60,7 +60,10 @@ var stopping atomic.Bool
 
 // RequestShutdown closes admission immediately, including during startup or
 // restart preparation. Shutdown performs the serialized resource cleanup.
-func RequestShutdown() { stopping.Store(true) }
+func RequestShutdown() {
+	stopping.Store(true)
+	resource.CancelBootstraps()
+}
 
 // ShutdownRequested permits a final check immediately before process exec.
 func ShutdownRequested() bool { return stopping.Load() }
@@ -95,30 +98,66 @@ func readConfig(path string) ([]byte, error) {
 
 // Parse config with default config path
 func Parse() (*config.Config, error) {
-	return ParseWithPath(C.Path.Config())
+	return ParseContext(context.Background())
+}
+
+func ParseContext(ctx context.Context) (*config.Config, error) {
+	return ParseWithPathContext(ctx, C.Path.Config())
 }
 
 // ParseWithPath parse config with custom config path
 func ParseWithPath(path string) (*config.Config, error) {
+	return ParseWithPathContext(context.Background(), path)
+}
+
+func ParseWithPathContext(ctx context.Context, path string) (*config.Config, error) {
 	buf, err := readConfig(path)
 	if err != nil {
 		return nil, err
 	}
 
-	return ParseWithBytes(buf)
+	return ParseWithBytesContext(ctx, buf)
 }
 
 // ParseWithBytes config with buffer
 func ParseWithBytes(buf []byte) (*config.Config, error) {
-	return config.Parse(buf)
+	return ParseWithBytesContext(context.Background(), buf)
+}
+
+func ParseWithBytesContext(ctx context.Context, buf []byte) (*config.Config, error) {
+	// Syntax errors remain configuration errors even when a stop was queued
+	// before startup. Decoding does not create resources or perform downloads.
+	raw, err := config.UnmarshalRawConfig(buf)
+	if err != nil {
+		return nil, err
+	}
+	if ShutdownRequested() {
+		return nil, ErrShuttingDown
+	}
+	cfg, err := config.ParseRawConfigContext(ctx, raw)
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return cfg, err
+	}
+	if ShutdownRequested() {
+		if cfg != nil {
+			cfg.CloseResourceBootstrap()
+		}
+		return nil, ErrShuttingDown
+	}
+	return cfg, err
 }
 
 // ApplyConfig dispatch configure to all parts without ExternalController
 func ApplyConfig(cfg *config.Config, force bool) error {
+	defer cfg.CloseResourceBootstrap()
 	mux.Lock()
 	defer mux.Unlock()
 	if ShutdownRequested() {
 		return ErrShuttingDown
+	}
+	resourceCtx := cfg.ResourceContext()
+	if err := resourceCtx.Err(); err != nil {
+		return resource.BootstrapFailure(resourceCtx, err)
 	}
 	config.ApplyDesktopPolicy(cfg)
 	wasManaged := transparentproxy.IsEnabled()
@@ -155,10 +194,12 @@ func ApplyConfig(cfg *config.Config, force bool) error {
 	updateRules(cfg.Rules, cfg.SubRules, cfg.RuleProviders)
 	updateSniffer(cfg.Sniffer)
 	updateHosts(cfg.Hosts)
-	_ = geodata.WithInitializationContext(context.Background(), nil, func() error {
+	if err := geodata.WithInitializationContext(resourceCtx, nil, func() error {
 		updateGeneral(cfg.General, true)
 		return nil
-	})
+	}); err != nil {
+		return resource.BootstrapFailure(resourceCtx, err)
+	}
 	// Do not change this in temporaryUpdateGeneral while merely parsing a
 	// candidate config: the DNS routing flag and resolver policy change together.
 	tunnel.SetDNSRuleRouting(cfg.General.DNSRuleRouting)
@@ -175,10 +216,21 @@ func ApplyConfig(cfg *config.Config, force bool) error {
 	tunnel.OnInnerLoading()
 
 	initInnerTcp()
-	loadProvider(cfg.Providers)
+	providerErr := loadProviderContext(resourceCtx, cfg.Providers)
 	updateProfile(cfg)
-	loadProvider(cfg.RuleProviders)
-	runtime.GC()
+	providerErr = errors.Join(providerErr, loadProviderContext(resourceCtx, cfg.RuleProviders))
+	if providerErr == nil {
+		runtime.GC()
+		providerErr = resource.BootstrapFailure(resourceCtx, resourceCtx.Err())
+	}
+	if providerErr != nil {
+		// Configuration application is not transactional. Keep admission closed
+		// and report failure so the supervisor can stop or restore its old config.
+		// No updater is activated for this incomplete application.
+		closeInitialProviders(cfg.Providers)
+		closeInitialProviders(cfg.RuleProviders)
+		return errors.Join(applyErr, providerErr)
+	}
 	tunnel.OnRunning()
 	applyErr = errors.Join(applyErr, finishTransparentProxyApply(transparentProxyRuntime(cfg)))
 	publishUpdateConfiguration(cfg)
@@ -447,6 +499,18 @@ func updateRules(rules []C.Rule, subRules map[string][]C.Rule, ruleProviders map
 }
 
 func loadProvider[T P.Provider](providers map[string]T) {
+	_ = loadProviderContext(context.Background(), providers)
+}
+
+func closeInitialProviders[T P.Provider](providers map[string]T) {
+	for _, provider := range providers {
+		if closer, ok := any(provider).(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}
+}
+
+func loadProviderContext[T P.Provider](ctx context.Context, providers map[string]T) error {
 	load := func(pv T) {
 		name := pv.Name()
 		if pv.VehicleType() == P.Compatible {
@@ -455,7 +519,13 @@ func loadProvider[T P.Provider](providers map[string]T) {
 			log.Infoln("Start initial provider %s", name)
 		}
 
-		if err := pv.Initial(); err != nil {
+		var err error
+		if initial, ok := any(pv).(interface{ InitialContext(context.Context) error }); ok {
+			err = initial.InitialContext(ctx)
+		} else if err = ctx.Err(); err == nil {
+			err = pv.Initial()
+		}
+		if err != nil {
 			switch pv.Type() {
 			case P.Proxy:
 				{
@@ -473,14 +543,23 @@ func loadProvider[T P.Provider](providers map[string]T) {
 	ch := make(chan struct{}, concurrentCount)
 	for _, pv := range providers {
 		pv := pv
+		select {
+		case ch <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return resource.BootstrapFailure(ctx, ctx.Err())
+		}
 		wg.Add(1)
-		ch <- struct{}{}
 		go func() {
 			defer func() { <-ch; wg.Done() }()
 			load(pv)
 		}()
 	}
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return resource.BootstrapFailure(ctx, err)
+	}
+	return nil
 }
 
 func updateSniffer(snifferConfig *sniffer.Config) {

@@ -5,6 +5,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/common/structure"
+	"github.com/metacubex/mihomo/component/dialer"
 	C "github.com/metacubex/mihomo/constant"
 )
 
@@ -18,9 +19,10 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 	opt := applyProxyOptions(options...)
 	dnsStatsIdentity := proxyDNSStatsIdentity(mapping, opt)
 	basicOption := outbound.BasicOption{
-		DialerForAPI: opt.DialerForAPI,
-		TunnelForAPI: opt.TunnelForAPI,
-		ProviderName: opt.ProviderName,
+		DialerForAPI:        opt.DialerForAPI,
+		DialerFactoryForAPI: opt.DialerFactoryForAPI,
+		TunnelForAPI:        opt.TunnelForAPI,
+		ProviderName:        opt.ProviderName,
 	}
 
 	var (
@@ -251,9 +253,16 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 }
 
 type proxyOption struct {
-	DialerForAPI C.Dialer
-	TunnelForAPI C.Tunnel
-	ProviderName string
+	DialerForAPI        C.Dialer
+	DialerFactoryForAPI func([]dialer.Option) C.Dialer
+	TunnelForAPI        C.Tunnel
+	ProviderName        string
+}
+
+// WithDialerFactoryForAPI retains protocol-supplied socket options when an
+// embedding caller needs an independent node connection transport.
+func WithDialerFactoryForAPI(factory func([]dialer.Option) C.Dialer) ProxyOption {
+	return func(opt *proxyOption) { opt.DialerFactoryForAPI = factory }
 }
 
 func applyProxyOptions(options ...ProxyOption) proxyOption {
