@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """Acceptance test for the installed Windows application on a disposable runner.
 
-Uses actual WebView2/EdgeDriver, WinInet, pywin32 firewall COM, and a local SOCKS
-fixture. No Tauri bridge or operating-system behavior is mocked.
-See https://learn.microsoft.com/en-us/microsoft-edge/webview2/how-to/webdriver
-and https://learn.microsoft.com/en-us/microsoft-edge/webdriver/capabilities-edge-options
+Uses the installed WPF UI, Windows UI Automation, WinInet, pywin32 firewall COM, and a local SOCKS
+fixture. No production host or operating-system behavior is mocked.
+The explicit test-only named pipe forwards the same real host protocol used by the UI.
 
-setup-windows.ps1 supplies MIHOMO_TEST_APP and MIHOMO_TEST_DRIVER. This test changes
+setup-windows.ps1 supplies MIHOMO_TEST_APP. This test changes
 the runner's own proxy/autostart settings and installs the app's TUN service; it
 refuses to run outside a disposable GitHub Actions Windows runner.
-An elevated supervisor handles installation/cleanup. EdgeDriver and the actual
-GUI use a same-SID filtered primary token at medium integrity; this is not an
+An elevated supervisor handles installation/cleanup. The actual native
+GUI uses a same-SID filtered primary token at medium integrity; this is not an
 interactive UAC-consent test or a separate standard-user-account test.
 """
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import ctypes
 from ctypes import wintypes
@@ -36,7 +34,7 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 
 SERVICE_NAME = "MihomoOptimizedService"
@@ -89,7 +87,7 @@ def listening(port: int) -> bool:
 
 def child_environment() -> dict[str, str]:
     # No GitHub credentials or unrelated proxy/core overrides reach the fixture
-    # application. Windows/WebView2 still receive their standard runtime paths.
+    # application. Windows/.NET still receive their standard runtime paths.
     allowed = {
         "SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP", "SYSTEMDRIVE",
         "COMSPEC", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "USERNAME",
@@ -240,7 +238,7 @@ class Processes:
     def descendants(self, roots: list[ProcessIdentity], allowed_paths: set[str]) -> list[ProcessIdentity]:
         # Toolhelp parent IDs outlive the parent. A later process may reuse that
         # ID, so every edge needs a verified parent identity and creation order.
-        # Only known application/WebView2 binaries may enter the cleanup set.
+        # Only known application/host binaries may enter the cleanup set.
         entries = self.entries()
         selected = {root.pid: root for root in roots if self.identity(root.pid) == root}
         root_ids = set(selected)
@@ -685,124 +683,136 @@ def owned_firewall_rule_count(core: Path) -> int:
     return 1
 
 
-class WebViewDriver:
-    def __init__(self, driver: Path, app: Path, processes: Processes, desktop: RestrictedDesktop,
+class NativeDriver:
+    """Exercise the installed WPF UI and its real host through an opt-in local pipe.
+
+    No TCP listener or browser is involved. The pipe belongs to the same user,
+    uses a fresh unpredictable name, and only exists on this explicit test launch.
+    UI assertions use Windows UI Automation independently of the host protocol.
+    """
+    def __init__(self, app: Path, processes: Processes, desktop: RestrictedDesktop,
                  artifacts: Path) -> None:
-        self.port = free_port()
-        self.session = None
-        self.log_path = (artifacts / "edgedriver.log").resolve()
-        self.startup_path = artifacts / "edgedriver-startup.json"
-        self.startup = {"ready": False, "requestedDesktop": r"winsta0\default",
-                        "requestedToken": desktop.check_token(desktop.token),
-                        "logFile": self.log_path.name, "logLevel": "SEVERE"}
-        self.write_startup_evidence()
-        # EdgeDriver inherits Chromium's mutually exclusive log-level/silent flags.
-        # Keep protocol command/response logging disabled at SEVERE level.
-        self.process = desktop.spawn([str(driver), f"--port={self.port}", "--log-level=SEVERE",
-                                      "--log-path=" + str(self.log_path)], driver.parent)
+        self.pipe = None
+        self.buffer = bytearray()
+        self.next_id = 0
+        self.pipe_name = "mihomo-acceptance-" + secrets.token_hex(20)
+        self.process = desktop.spawn([str(app), "--automation-pipe", self.pipe_name], app.parent)
+        self.identity = processes.identity(self.process.pid)
         try:
-            self.identity = processes.identity(self.process.pid)
-            require(self.identity and self.identity.path == os.path.normcase(str(driver.resolve())), "edgedriver_process_mismatch")
-            wait_until(self.ready, "edgedriver_start_timeout", 20)
-            self.startup["ready"] = True
-            self.write_startup_evidence()
-            result = self.request("POST", "/session", {"capabilities": {"alwaysMatch": {
-                "browserName": "webview2", "ms:edgeOptions": {"binary": str(app)},
-            }}}, timeout=90)
-            require(isinstance(result, dict) and isinstance(result.get("sessionId"), str), "webview_session_missing")
-            self.session = result["sessionId"]
-            self.request("POST", self.path("timeouts"), {"script": 90000, "pageLoad": 30000, "implicit": 0})
-        except BaseException as error:
-            try:
-                self.startup["failure"] = safe_code(str(error)) if isinstance(error, SmokeFailure) else "unexpected_" + type(error).__name__
-                # Capture the real exit code before cleanup can terminate the driver.
-                code = self.process.poll()
-                if code is not None:
-                    self.startup["exitCodeUnsigned"] = code & 0xFFFFFFFF
-                    self.startup["exitCodeHex"] = f"0x{code & 0xFFFFFFFF:08X}"
-                self.write_startup_evidence()
-            finally:
-                self.close()
+            require(self.identity and self.identity.path == os.path.normcase(str(app.resolve())),
+                    "native_ui_process_mismatch")
+            wait_until(self.connect, "native_ui_pipe_start_timeout", 30)
+            wait_until(lambda: self.snapshot().get("ready") is True, "native_ui_not_ready", 20)
+            evidence = {"ready": True, "framework": "WPF", "browserRuntime": False,
+                        "requestedDesktop": r"winsta0\default",
+                        "requestedToken": desktop.check_token(desktop.token)}
+            (artifacts / "native-startup.json").write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+        except BaseException:
+            self.close()
             raise
 
-    def write_startup_evidence(self) -> None:
-        self.startup["logExists"] = self.log_path.is_file()
-        self.startup_path.write_text(json.dumps(self.startup, indent=2) + "\n", encoding="utf-8")
-
-    def ready(self) -> bool:
-        code = self.process.poll()
-        if code is not None:
-            raise SmokeFailure(f"edgedriver_exited_0x{code & 0xFFFFFFFF:08X}")
+    def connect(self) -> bool:
+        import pywintypes
+        import win32con
+        import win32file
+        if self.process.poll() is not None:
+            raise SmokeFailure("native_ui_exited_before_pipe_ready")
+        if self.pipe is not None:
+            return True
         try:
-            return self.request("GET", "/status", timeout=1).get("ready") is True
-        except (OSError, http.client.HTTPException):
+            self.pipe = win32file.CreateFile("\\\\.\\pipe\\" + self.pipe_name,
+                win32con.GENERIC_READ | win32con.GENERIC_WRITE, 0, None,
+                # SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION: the medium
+                # GUI may identify the test account, never borrow its elevation.
+                win32con.OPEN_EXISTING, 0x00100000 | 0x00010000, None)
+            return True
+        except pywintypes.error as error:
+            if error.winerror not in (2, 231):
+                raise SmokeFailure("native_pipe_connect_winerror_" + str(error.winerror)) from None
             return False
 
-    def request(self, method: str, path: str, body=None, timeout: float = 95):
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+    def invoke(self, command: str, arguments=None, expected_error=None, timeout: float = 95):
+        import win32file
+        import win32pipe
+        require(self.pipe is not None, "native_pipe_closed")
+        self.next_id += 1
+        request_id = self.next_id
+        payload = json.dumps({"id": request_id, "method": command, "params": arguments or {}},
+                             ensure_ascii=False).encode("utf-8") + b"\n"
+        require(len(payload) <= 8 * 1024 * 1024, "native_request_too_large")
+        win32file.WriteFile(self.pipe, payload)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            while b"\n" in self.buffer:
+                line, _, remaining = self.buffer.partition(b"\n")
+                self.buffer = bytearray(remaining)
+                require(len(line) <= 12 * 1024 * 1024, "native_response_too_large")
+                result = json.loads(line)
+                if "event" in result:
+                    continue
+                require(result.get("id") == request_id, "native_response_id_mismatch")
+                if expected_error:
+                    allowed = (expected_error,) if isinstance(expected_error, str) else expected_error
+                    require(result.get("error", {}).get("code") in allowed,
+                            "expected_native_error_" + allowed[0])
+                    return None
+                require("error" not in result,
+                        "native_" + safe_code(result.get("error", {}).get("code")))
+                require("result" in result, "native_response_result_missing")
+                return result["result"]
+            available = win32pipe.PeekNamedPipe(self.pipe, 0)[1]
+            if available:
+                _, chunk = win32file.ReadFile(self.pipe, min(available, 65536))
+                self.buffer.extend(chunk)
+                require(len(self.buffer) <= 12 * 1024 * 1024, "native_response_too_large")
+            else:
+                time.sleep(0.02)
+        raise SmokeFailure("native_command_timeout_" + safe_code(command))
+
+    def snapshot(self) -> dict:
+        result = self.invoke("native_snapshot", timeout=5)
+        require(isinstance(result, dict), "native_ui_snapshot_invalid")
+        return result
+
+    def navigate(self, page: str) -> None:
+        self.invoke("native_navigate", {"page": page}, timeout=10)
+        wait_until(lambda: self.snapshot().get("page") == page, "native_navigation_failed", 10)
+
+    def ui(self, automation_id: str, action: str = "read", value: str = "") -> dict:
+        script = Path(__file__).with_name("uia-query.ps1").resolve()
+        result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", str(script), "-ApplicationProcessId", str(self.identity.pid),
+            "-AutomationId", automation_id, "-Action", action, "-Value", value],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW)
         try:
-            data = None if body is None else json.dumps(body).encode()
-            connection.request(method, path, data, {"Content-Type": "application/json", "Connection": "close"})
-            response = connection.getresponse()
-            content = response.read(12 * 1024 * 1024 + 1)
-            require(len(content) <= 12 * 1024 * 1024, "webdriver_response_too_large")
-            try:
-                value = json.loads(content).get("value")
-            except (ValueError, AttributeError):
-                raise SmokeFailure("webdriver_invalid_response") from None
-            if response.status >= 400 or isinstance(value, dict) and "error" in value:
-                code = value.get("error") if isinstance(value, dict) else None
-                raise SmokeFailure("webdriver_" + safe_code(code).replace(" ", "_"))
-            return value
-        finally:
-            connection.close()
+            response = json.loads(result.stdout.lstrip("\ufeff"))
+        except (ValueError, TypeError):
+            response = {}
+        if result.returncode:
+            # The helper emits only a bounded operation stage and exception type.
+            # Never include raw PowerShell stderr or user-controlled UI values.
+            detail = "_".join(safe_code(response.get(key, "unknown")) for key in ("stage", "exception"))
+            raise SmokeFailure("native_uia_query_failed_" + safe_code(automation_id) + "_" + detail)
+        require(isinstance(response, dict) and "found" in response, "native_uia_response_invalid")
+        return response
 
-    def path(self, suffix: str) -> str:
-        require(self.session is not None, "webdriver_session_closed")
-        return "/session/" + quote(self.session, safe="") + ("/" + suffix if suffix else "")
-
-    def execute(self, script: str, *args):
-        return self.request("POST", self.path("execute/sync"), {"script": script, "args": args})
-
-    def invoke(self, command: str, arguments=None, expected_error: str | tuple[str, ...] | None = None, timeout: float = 95):
-        result = self.request("POST", self.path("execute/async"), {"script": """
-            const command = arguments[0], args = arguments[1], done = arguments[arguments.length - 1];
-            if (typeof window.__TAURI_INTERNALS__?.invoke !== 'function') {
-                done({ok:false, code:'native_bridge_missing'}); return;
-            }
-            window.__TAURI_INTERNALS__.invoke(command, args).then(
-                value => done({ok:true, value}),
-                error => done({ok:false, code:typeof error?.code === 'string' ? error.code : 'native_command_failed'})
-            );
-        """, "args": [command, arguments or {}]}, timeout=timeout)
-        require(isinstance(result, dict), "native_command_invalid_result")
-        if expected_error:
-            allowed = (expected_error,) if isinstance(expected_error, str) else expected_error
-            require(result.get("ok") is False and result.get("code") in allowed, "expected_native_error_" + allowed[0])
-            return None
-        require(result.get("ok") is True, "native_" + safe_code(result.get("code")))
-        return result.get("value")
-
-    def screenshot(self, output: Path, secrets: set[str]) -> None:
-        self.execute("location.hash = '#/settings';")
-        wait_until(lambda: self.execute("return !!document.querySelector('.desktop-controls');"), "settings_ui_not_rendered")
-        self.execute("document.querySelector('.page-container').scrollTop = 0;")
-        self.request("POST", self.path("execute/async"), {"script": "const done=arguments[arguments.length-1]; document.fonts.ready.then(()=>requestAnimationFrame(()=>done(true)));", "args": []})
-        require(self.execute("return !document.querySelector('.modal-show') && arguments[0].every(value => !document.body.innerText.includes(value) && !JSON.stringify(localStorage).includes(value));", list(secrets)), "screenshot_would_expose_secret_or_editor")
-        raw = self.request("GET", self.path("screenshot"))
-        require(isinstance(raw, str), "screenshot_missing")
-        try:
-            image = base64.b64decode(raw, validate=True)
-        except ValueError:
-            raise SmokeFailure("screenshot_invalid_encoding") from None
-        require(image.startswith(b"\x89PNG\r\n\x1a\n"), "screenshot_invalid_png")
-        output.write_bytes(image)
+    def screenshot(self, output: Path, secrets: set[str], page: str | None = "settings", surface: str = "main") -> dict:
+        if page is not None:
+            self.navigate(page)
+        visible = self.ui("*")
+        require(visible.get("found") is True, "native_screenshot_ui_not_found")
+        text = json.dumps(visible, ensure_ascii=False)
+        require(all(value not in text for value in secrets), "screenshot_would_expose_secret_or_editor")
+        capture = self.invoke("native_screenshot", {"path": str(output.resolve()), "surface": surface}, timeout=10)
+        require(output.is_file() and output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"),
+                "native_screenshot_invalid")
+        return capture
 
     def close(self) -> None:
-        if self.session:
-            with contextlib.suppress(Exception):
-                self.request("DELETE", self.path(""), timeout=8)
-            self.session = None
+        if self.pipe is not None:
+            self.pipe.Close()
+            self.pipe = None
         self.process.close()
 
 
@@ -941,7 +951,7 @@ class ResourceFixture(http.server.ThreadingHTTPServer):
         self.pending_proxy_checks = 0
         self.pending_proxy_failure = None
         # First-launch UI inspection must happen while the resource is missing,
-        # even if creating the initial WebView2 profile is unusually slow.
+        # even if initializing the native WPF runtime is unusually slow.
         self.hold_success = hold_success
         self.release_success = threading.Event()
         if not hold_success:
@@ -1064,7 +1074,19 @@ proxies:
     server: 127.0.0.1
     port: {socks}
     udp: false
-proxy-groups: []
+proxy-groups:
+  - name: Smoke Primary
+    type: select
+    proxies: [DIRECT, smoke-socks]
+  - name: Smoke Media
+    type: select
+    proxies: [DIRECT, smoke-socks]
+  - name: Smoke Work
+    type: select
+    proxies: [DIRECT, smoke-socks]
+  - name: Smoke Backup
+    type: select
+    proxies: [DIRECT, smoke-socks]
 rules:
   - IP-CIDR,{TUN_TARGET}/32,smoke-socks,no-resolve
   - MATCH,DIRECT
@@ -1072,17 +1094,13 @@ rules:
 
 
 class Acceptance:
-    def __init__(self, app: Path, driver: Path, artifacts: Path) -> None:
-        self.app, self.driver_path, self.artifacts = app, driver, artifacts
+    def __init__(self, app: Path, artifacts: Path) -> None:
+        self.app, self.artifacts = app, artifacts
         self.helper = app.with_name("mihomo-desktop-service.exe")
         self.core = app.with_name("mihomo-core.exe")
-        self.child_paths = {os.path.normcase(str(path.resolve())) for path in (self.app, self.core, self.helper)}
-        for variable in ("ProgramFiles", "ProgramFiles(x86)"):
-            if os.environ.get(variable):
-                runtime = Path(os.environ[variable]) / "Microsoft" / "EdgeWebView" / "Application"
-                for executable in runtime.glob("*/msedgewebview2.exe"):
-                    if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", executable.parent.name) and executable.is_file():
-                        self.child_paths.add(os.path.normcase(str(executable.resolve())))
+        self.host = app.with_name("mihomo-desktop-host.exe")
+        self.child_paths = {os.path.normcase(str(path.resolve())) for path in
+                            (self.app, self.host, self.core, self.helper)}
         self.directory = Path(os.environ["LOCALAPPDATA"]) / "Mihomo Optimized"
         self.processes = Processes()
         self.wininet = WinInet()
@@ -1091,7 +1109,7 @@ class Acceptance:
         self.autostart_before = read_autostart()
         self.original_files: dict[Path, bytes | None] = {}
         self.desktop: RestrictedDesktop | None = None
-        self.driver: WebViewDriver | None = None
+        self.driver: NativeDriver | None = None
         self.socks: SocksFixture | None = None
         self.resources: ResourceFixture | None = None
         self.update_cache: UpdateCacheFixture | None = None
@@ -1113,10 +1131,224 @@ class Acceptance:
         current = self.driver.invoke("desktop_read_config")
         self.driver.invoke("desktop_save_config", {"content": content, "expectedRevision": current["revision"]})
 
+    def runtime_json(self, path: str) -> dict:
+        """Read actual loopback state without exposing the controller credential."""
+        controller = self.status().get("controller") or {}
+        url = urlsplit(controller.get("url", ""))
+        require(url.hostname == "127.0.0.1" and url.port, "native_ui_controller_unavailable")
+        connection = http.client.HTTPConnection("127.0.0.1", url.port, timeout=5)
+        try:
+            connection.request("GET", "/" + path.lstrip("/"), headers={"Authorization": "Bearer " + controller["secret"], "Connection": "close"})
+            response = connection.getresponse()
+            payload = response.read(4 * 1024 * 1024 + 1)
+            require(response.status == 200 and len(payload) <= 4 * 1024 * 1024, "native_ui_runtime_read_failed")
+            return json.loads(payload)
+        finally:
+            connection.close()
+
+    def check_native_redesign_ui(self, valid: str, base: str) -> None:
+        """Exercise final-design controls through independent Windows UIA peers.
+
+        The local automation pipe is used for navigation, resizing and captures;
+        feature actions (search, switches, selections and saving) use UIA. Runtime
+        readback and the actual configuration file prove the action took effect.
+        """
+        self.stage = "native_redesign_ui"
+        evidence = {"checks": [], "captures": [], "framework": "WPF", "browserRuntime": False}
+        self.report["nativeRedesign"] = evidence
+        driver = self.driver
+
+        def found(identifier: str, *, enabled: bool = False) -> dict:
+            def probe():
+                result = driver.ui(identifier)
+                return result if result.get("found") and (not enabled or result.get("enabled")) else None
+            return wait_until(probe, "native_ui_missing_" + identifier.replace(" ", "_"), 20)
+
+        def checked(name: str) -> None:
+            evidence["checks"].append(name)
+            print("UI: " + name, flush=True)
+
+        def capture(name: str, page: str | None = None, surface: str = "main") -> None:
+            result = driver.screenshot(self.artifacts / name, self.secrets, page, surface)
+            evidence["captures"].append({"file": name, "surface": result.get("surface"), "kind": result.get("captureKind"), "material": result.get("material")})
+
+        def search(query: str, result_id: str, page: str, *, screenshot: bool = False) -> None:
+            driver.ui("GlobalSearch", "invoke")
+            found("SearchInput", enabled=True)
+            driver.ui("SearchInput", "set", query)
+            found(result_id, enabled=True)
+            if screenshot:
+                capture("windows-search.png", surface="search")
+            driver.ui(result_id, "invoke")
+            wait_until(lambda: driver.snapshot().get("page") == page and not driver.ui("GlobalSearchWindow").get("found"), "native_search_destination_failed", 15)
+
+        driver.invoke("native_show")
+        driver.invoke("native_resize", {"width": 1180, "height": 780})
+        driver.navigate("home")
+        for identifier in ("TitleBarBack", "TitleBarMinimize", "TitleBarMaximize", "TitleBarClose", "NavigationToggle", "CoreCard", "TrafficChart"):
+            found(identifier)
+        for group in ("Smoke Primary", "Smoke Media", "Smoke Work", "Smoke Backup"):
+            found("HomeExitSummary_" + group)
+        require(driver.snapshot().get("customTitleBar") is True, "native_custom_titlebar_missing")
+        capture("windows-home.png")
+        driver.ui("HomeExitSummary_Smoke Primary", "invoke")
+        wait_until(lambda: driver.snapshot().get("page") == "proxies", "native_home_exit_navigation_failed", 15)
+        found("ProxyGroup_Smoke Primary")
+        checked("home_four_exits_and_group_navigation")
+
+        found("TopologyGroup_Smoke Primary")
+        found("MeasureAllProxies")
+        found("BreakConnectionsOnSwitch", enabled=True)
+        driver.ui("BreakConnectionsOnSwitch", "toggle")
+        wait_until(lambda: json.loads((self.directory / "native-appearance.json").read_text(encoding="utf-8")).get("closeConnectionsOnSwitch") is True, "native_proxy_preference_not_saved")
+        driver.ui("BreakConnectionsOnSwitch", "toggle")
+        driver.ui("ProxySearch", "set", "smoke-socks")
+        found("ProxyNode_smoke-socks")
+        driver.ui("ProxySearch", "set", "")
+        # Return to the top without manufacturing graph data or sampled rates.
+        driver.ui("ProxiesScrollViewer", "scroll", "0")
+        capture("windows-proxies.png")
+        checked("proxy_topology_filter_and_persisted_preferences")
+
+        driver.navigate("settings")
+        found("AppLanguage", enabled=True)
+        driver.ui("AppLanguage", "select", "English")
+        wait_until(lambda: driver.snapshot().get("language") == "en-US", "native_language_not_applied")
+        require("Settings" in found("NavSettings").get("name", ""), "native_navigation_not_translated")
+        driver.ui("AppTheme", "select", "Dark")
+        wait_until(lambda: driver.snapshot().get("theme") == "dark", "native_theme_not_applied")
+        capture("windows-settings-dark-en.png")
+        driver.ui("AppTheme", "select", "Light")
+        driver.ui("AppLanguage", "select", "中文")
+        wait_until(lambda: driver.snapshot().get("language") == "zh-CN", "native_chinese_not_restored")
+        checked("live_language_and_theme")
+
+        search("theme", "SearchResult_setting-set-theme", "settings", screenshot=True)
+        require(not found("AppTheme").get("offscreen"), "native_search_setting_not_revealed")
+        search(TUN_TARGET, "SearchResult_rule-1", "rules")
+        require(TUN_TARGET in found("RuleSearch").get("value", ""), "native_search_rule_filter_missing")
+        capture("windows-rules.png")
+        search("Smoke Primary", "SearchResult_group-Smoke Primary", "proxies")
+        require(not found("ProxyGroup_Smoke Primary").get("offscreen"), "native_search_group_not_revealed")
+        search("smoke-socks", "SearchResult_node-smoke-socks", "proxies")
+        checked("global_search_settings_rules_groups_nodes")
+
+        driver.navigate("settings")
+        found("SettingsAllowLan", enabled=True)
+        driver.ui("SettingsAllowLan", "toggle")
+        wait_until(lambda: self.runtime_json("configs").get("allow-lan") is True, "native_lan_toggle_not_applied")
+        found("SettingsAllowLan", enabled=True)
+        driver.ui("SettingsAllowLan", "toggle")
+        wait_until(lambda: self.runtime_json("configs").get("allow-lan") is False, "native_lan_toggle_not_restored")
+        old_port = self.runtime_json("configs")["mixed-port"]
+        port = free_port()
+        while port in self.ports:
+            port = free_port()
+        self.ports.add(port)
+        found("SettingsMixedPort", enabled=True)
+        driver.ui("SettingsMixedPort", "set", str(port))
+        driver.navigate("home")  # The real leave guard commits pending port edits.
+        wait_until(lambda: self.runtime_json("configs").get("mixed-port") == port, "native_port_edit_not_applied")
+        driver.navigate("settings")
+        found("SettingsMixedPort", enabled=True)
+        driver.ui("SettingsMixedPort", "set", str(old_port))
+        driver.navigate("home")
+        wait_until(lambda: self.runtime_json("configs").get("mixed-port") == old_port, "native_port_edit_not_restored")
+        driver.navigate("settings")
+        probe = "http://127.0.0.1:9/native-probe"
+        driver.ui("SettingsProbeUrl", "set", probe)
+        driver.ui("SaveProbeUrl", "invoke")
+        wait_until(lambda: json.loads((self.directory / "native-appearance.json").read_text(encoding="utf-8")).get("testUrl") == probe, "native_probe_url_not_saved")
+        driver.ui("ResetProbeUrl", "invoke")
+        wait_until(lambda: driver.ui("SettingsProbeUrl").get("value") == "https://www.gstatic.com/generate_204", "native_probe_url_not_reset")
+        checked("settings_switch_ports_and_probe_writeback")
+
+        # Use the real credential-free fixture in the editor screenshot. The
+        # resource bootstrap document carries a per-run private URL token.
+        self.save_configuration(base)
+        self.driver.invoke("desktop_reload_config", {"force": True})
+        self.phase("running")
+        driver.navigate("profiles")
+        found("EditConfig", enabled=True)
+        capture("windows-profiles.png")
+        driver.ui("EditConfig", "invoke")
+        editor = found("ConfigEditor", enabled=True)
+        require(editor.get("readOnly") is False, "native_config_editor_readonly")
+        found("ConfigLineNumbers")
+        original = editor.get("value", "")
+        require("Smoke Primary" in original, "native_editor_wrong_document")
+        marker = "# native UIA save acceptance"
+        driver.ui("ConfigEditor", "set", original.rstrip("\r\n") + "\n" + marker + "\n")
+        found("SaveOnlyConfig", enabled=True)
+        capture("windows-config-editor.png")
+        driver.ui("SaveOnlyConfig", "invoke")
+        wait_until(lambda: marker in (self.directory / "config.yaml").read_text(encoding="utf-8"), "native_editor_save_not_written")
+        found("CloseEditor", enabled=True)
+        driver.ui("CloseEditor", "invoke")
+        wait_until(lambda: not driver.ui("ConfigEditor").get("found") or driver.ui("ConfigEditor").get("offscreen"), "native_editor_did_not_close", 15)
+        self.save_configuration(valid)
+        self.driver.invoke("desktop_reload_config", {"force": True})
+        self.phase("running")
+        checked("native_editor_line_numbers_edit_and_save")
+
+        driver.navigate("dns")
+        found("DnsTabs")
+        capture("windows-dns.png")
+        driver.ui("DnsQueriesTab", "select")
+        found("DnsPageNumber", enabled=True)
+        driver.ui("DnsPageSize", "select", "100")
+        found("DnsPageNumber", enabled=True)
+        # The following external UIA calls cross several normal status polls;
+        # the first visit must remain usable without a manual refresh.
+        for identifier in ("DnsQueries", "FirstDnsPage", "LastDnsPage", "ResetDnsFilter", "DnsLive"):
+            found(identifier)
+        require(found("DnsPageNumber").get("enabled"), "native_dns_froze_after_status_poll")
+        capture("windows-dns-queries.png")
+        driver.ui("DnsPageSize", "select", "50")
+        driver.ui("DnsUpstreamsTab", "select")
+        found("DnsUpstreams")
+        checked("dns_tabs_pagination_and_status_poll")
+
+        driver.navigate("logs")
+        found("LogLevel")
+        driver.ui("PauseLogs", "toggle")
+        found("ResumeLogs", enabled=True)
+        driver.ui("ResumeLogs", "invoke")
+        require(driver.ui("PauseLogs").get("toggleState") == "Off", "native_logs_did_not_resume")
+        capture("windows-logs.png")
+        driver.navigate("connections")
+        found("ConnectionTable")
+        found("ConnectionSource_all")
+        driver.ui("PauseConnections", "toggle")
+        driver.ui("PauseConnections", "toggle")
+        capture("windows-connections.png")
+        checked("logs_pause_resume_and_connections")
+
+        driver.navigate("home")
+        narrow = driver.invoke("native_resize", {"width": 640, "height": 700})
+        require(narrow.get("navigationMode") in ("minimal", "compact"), "native_narrow_navigation_mode_missing")
+        driver.ui("NavigationToggle", "invoke")
+        wait_until(lambda: driver.snapshot().get("navigationOverlay") is True, "native_navigation_overlay_did_not_open")
+        capture("windows-home-narrow.png")
+        driver.ui("NavigationToggle", "invoke")
+        driver.invoke("native_resize", {"width": 1180, "height": 780})
+        driver.invoke("native_show_tray")
+        found("TrayFlyout")
+        for identifier in ("TraySystemProxy", "TrayTun", "TrayAllowLan", "TrayOpenMain", "TrayPower"):
+            found(identifier)
+        for group in ("Smoke Primary", "Smoke Media", "Smoke Work"):
+            found("TrayExitSummary_" + group)
+        require(not driver.ui("TrayExitSummary_Smoke Backup").get("found"), "native_tray_exit_limit_wrong")
+        capture("windows-tray.png", surface="tray")
+        driver.ui("TrayOpenMain", "invoke")
+        wait_until(lambda: driver.snapshot().get("trayVisible") is False, "native_tray_did_not_close")
+        checked("narrow_navigation_and_three_exit_tray")
+        self.mark("native_redesign_ui")
+
     def launch_gui(self, artifacts: Path) -> dict:
         require(self.driver is None and self.gui is None, "previous_gui_session_not_closed")
         artifacts.mkdir(parents=True, exist_ok=True)
-        self.driver = WebViewDriver(self.driver_path, self.app, self.processes, self.desktop, artifacts)
+        self.driver = NativeDriver(self.app, self.processes, self.desktop, artifacts)
         gui = wait_until(lambda: self.processes.at_paths([self.app]), "gui_process_not_found")
         require(len(gui) == 1, "multiple_gui_processes")
         self.gui = gui[0]
@@ -1141,7 +1373,7 @@ class Acceptance:
         started = time.monotonic()
         self.report["guiToken"] = self.launch_gui(self.artifacts / "automatic-startup")
         self.mark("non_elevated_gui")
-        wait_until(lambda: self.driver.execute("return typeof window.__TAURI_INTERNALS__?.invoke === 'function' && !!document.querySelector('.desktop-statusbar');"),
+        wait_until(lambda: self.driver.snapshot().get("ready") is True,
                    "automatic_startup_ui_not_loaded", 15)
         wait_until(lambda: self.resources.count("/rules.yaml") > 0, "automatic_startup_resource_not_requested", 15)
         require(not cache.exists(), "automatic_startup_resource_released_before_inspection")
@@ -1160,28 +1392,29 @@ class Acceptance:
                     "automatic_startup_preparation_status_invalid")
             require(self.wininet.read() == self.proxy_disabled, "automatic_startup_enabled_system_proxy_early")
 
-        self.driver.execute("location.hash = '#/proxies';")
-        wait_until(lambda: self.driver.execute("return !!document.querySelector('.desktop-recovery-page[data-phase=\"starting\"]') && !!document.querySelector('.desktop-statusbar .desktop-phase.is-starting');"),
+        self.driver.navigate("proxies")
+        wait_until(lambda: self.driver.snapshot().get("phase") == "starting",
                    "automatic_startup_preparing_ui_missing", 8)
-        require(self.driver.execute("""
-            const page = document.querySelector('.desktop-recovery-page[data-phase="starting"]');
-            const start = [...document.querySelectorAll('.desktop-status-actions button')]
-                .find(button => /^(启动内核|Start core)$/i.test(button.textContent.trim()));
-            return !!page && /正在启动本机内核|Starting the local core/i.test(page.querySelector('h1')?.textContent || '')
-                && !/本机内核尚未运行|导入完整配置|The local core is not running|Import a complete configuration/i.test(page.innerText)
-                && !page.querySelector('.desktop-error') && !!start && start.disabled;
-        """), "automatic_startup_ui_reported_failure_or_enabled_start")
-        self.driver.execute("location.hash = '#/settings';")
-        wait_until(lambda: self.driver.execute("return !!document.querySelector('.desktop-controls .desktop-phase.is-starting');"),
+        require(not self.driver.snapshot().get("error"), "automatic_startup_ui_reported_failure")
+        visible = self.driver.ui("*")
+        preparing_text = "\n".join(item.get("name", "") for item in visible.get("elements", []))
+        require(visible.get("found") and "正在准备启动资源" in preparing_text,
+                "automatic_startup_proxy_preparation_message_missing")
+        require(not re.search(r"请先.*启动内核|内核尚未运行|没有代理策略组|导入订阅", preparing_text),
+                "automatic_startup_proxy_stopped_hint_visible")
+        self.driver.navigate("home")
+        start_button = self.driver.ui("StartCore")
+        restart_button = self.driver.ui("RestartCore")
+        require(start_button.get("found") and not start_button.get("enabled")
+                and restart_button.get("found") and not restart_button.get("enabled"),
+                "automatic_startup_actions_enabled_during_preparation")
+        phase_control = self.driver.ui("CorePhase")
+        require(phase_control.get("found") and re.search(r"正在启动|Starting", phase_control.get("name", ""), re.I),
+                "automatic_startup_native_phase_missing")
+        self.driver.navigate("settings")
+        wait_until(lambda: self.driver.snapshot().get("phase") == "starting",
                    "automatic_startup_settings_not_responsive", 8)
-        require(self.driver.execute("""
-            const controls = document.querySelector('.desktop-controls');
-            const restart = [...controls.querySelectorAll('button')]
-                .find(button => /^(重启内核|Restart core)$/i.test(button.textContent.trim()));
-            const start = [...document.querySelectorAll('.desktop-status-actions button')]
-                .find(button => /^(启动内核|Start core)$/i.test(button.textContent.trim()));
-            return !controls.querySelector('.desktop-error') && !!restart && restart.disabled && !!start && start.disabled;
-        """), "automatic_startup_actions_enabled_during_preparation")
+        require(not self.driver.snapshot().get("error"), "automatic_startup_settings_reported_failure")
         preparing = self.status(timeout=3)
         require(preparing.get("phase") == "starting" and preparing.get("lastError") is None
                 and preparing.get("controller") is None and not cache.exists(),
@@ -1203,7 +1436,7 @@ class Acceptance:
         require(running.get("systemProxy") is False and self.wininet.read() == self.proxy_disabled,
                 "automatic_startup_changed_system_proxy")
         self.resources.require_direct_preparation(0)
-        wait_until(lambda: self.driver.execute("return !!document.querySelector('.desktop-statusbar .desktop-phase.is-running');"),
+        wait_until(lambda: self.driver.snapshot().get("phase") == "running",
                    "automatic_startup_running_ui_missing", 8)
         evidence.update({"readyWithoutStartOrRestart": True, "cachePersisted": True,
                          "startupSeconds": round(time.monotonic() - started, 3),
@@ -1231,13 +1464,23 @@ class Acceptance:
         self.driver.invoke("desktop_stop")
         self.capture_children()
         first_children = list(self.owned_children.values())
-        self.driver.execute("setTimeout(() => { void window.__TAURI_INTERNALS__.invoke('desktop_exit', {force: true}).catch(() => {}); }, 0); return true;")
-        wait_until(lambda: not self.processes.at_paths([self.app, self.core, self.helper]),
+        # Exercise the actual elevated installer's --quit path against the
+        # ordinary UI, including both sides' pipe/process identity checks.
+        quit_result = subprocess.run([str(self.app), "--quit"], cwd=self.app.parent,
+                                     timeout=45, creationflags=subprocess.CREATE_NO_WINDOW)
+        require(quit_result.returncode == 0, "elevated_installer_quit_failed")
+        evidence["elevatedInstallerQuit"] = True
+        # A terminating process can disappear from image-path enumeration before
+        # its original process handle is signaled. Confirm normal exit on that
+        # exact handle before close(), whose fallback terminates live fixtures.
+        require(self.driver.process.wait(timeout=20) == 0, "automatic_startup_gui_exit_code_nonzero")
+        evidence["normalGuiExitConfirmed"] = True
+        wait_until(lambda: not self.processes.at_paths([self.app, self.host, self.core, self.helper]),
                    "automatic_startup_gui_did_not_exit", 20)
         self.driver.close()
         self.driver, self.gui = None, None
         wait_until(lambda: all(self.processes.identity(identity.pid) != identity for identity in first_children),
-                   "automatic_startup_webview_children_survived", 15)
+                   "automatic_startup_native_children_survived", 15)
         require(all(not listening(port) for port in self.ports), "automatic_startup_ports_survived_exit")
         self.update_cache.close()
         self.update_cache = None
@@ -1570,10 +1813,22 @@ class Acceptance:
 
     def run(self) -> None:
         require(self.core.is_file() and self.helper.is_file(), "installed_sidecars_missing")
-        require(not self.processes.at_paths([self.app, self.core, self.helper]), "preexisting_mihomo_process")
+        require(not self.processes.at_paths([self.app, self.host, self.core, self.helper]), "preexisting_mihomo_process")
         require(not service_installed(), "preexisting_mihomo_service")
+        before_proxy = self.wininet.read()
+        source = self.directory / "config.yaml"
+        before_source = source.read_bytes() if source.exists() else None
+        rejected = subprocess.run([str(self.host), "--stdio", "--parent-pid", str(os.getpid())],
+            input=b"", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+            env=child_environment(), creationflags=subprocess.CREATE_NO_WINDOW)
+        require(rejected.returncode != 0 and b"desktop_parent_invalid" in rejected.stderr,
+                "native_host_accepted_unrelated_parent")
+        require(self.wininet.read() == before_proxy
+                and (source.read_bytes() if source.exists() else None) == before_source,
+                "native_parent_rejection_changed_user_state")
+        self.mark("native_host_parent_binding")
         self.directory.mkdir(parents=True, exist_ok=True)
-        for name in ("config.yaml", "config.yaml.bak", "preferences.json"):
+        for name in ("config.yaml", "config.yaml.bak", "preferences.json", "native-appearance.json", "native-proxies.json", "native-shell.json"):
             path = self.directory / name
             self.original_files[path] = path.read_bytes() if path.exists() else None
         require(not (self.directory / "system-proxy-recovery.json").exists(), "preexisting_proxy_recovery")
@@ -1596,14 +1851,20 @@ class Acceptance:
         (self.directory / "preferences.json").write_text(json.dumps({"desiredRunning": True, "systemProxy": False, "tun": False}), encoding="utf-8")
         self.stage = "startup_recovery"
         self.report["recoveryGuiToken"] = self.launch_gui(self.artifacts)
-        wait_until(lambda: self.driver.execute("return typeof window.__TAURI_INTERNALS__?.invoke === 'function' && !!document.querySelector('.desktop-statusbar');"), "desktop_ui_not_loaded")
+        wait_until(lambda: self.driver.snapshot().get("ready") is True, "desktop_ui_not_loaded")
         failed = self.phase("error")
         require(bool(failed.get("lastError")) and failed.get("controller") is None, "startup_failure_not_reported")
-        self.driver.execute("location.hash = '#/settings';")
-        wait_until(lambda: self.driver.execute("return !!document.querySelector('.desktop-controls .desktop-error');"), "recovery_settings_not_available")
-        require(self.driver.execute("const button=[...document.querySelectorAll('.desktop-controls button')].find(item=>/编辑配置文件|Edit config/i.test(item.textContent)); if (!button || button.disabled) return false; button.click(); return true;"), "offline_editor_action_unavailable")
-        wait_until(lambda: self.driver.execute("const area=document.querySelector('textarea.config-editor-text'); return !!area && !area.readOnly && area.value === arguments[0];", BAD_CONFIG), "offline_editor_not_editable")
-        require(self.driver.execute("const button=[...document.querySelectorAll('.config-editor-footer button')].find(item=>/^(关闭|Close)$/.test(item.textContent.trim())); if (!button) return false; button.click(); return true;"), "offline_editor_close_failed")
+        self.driver.navigate("profiles")
+        wait_until(lambda: bool(self.driver.snapshot().get("error")), "recovery_error_not_available")
+        edit = self.driver.ui("EditConfig")
+        require(edit.get("found") and edit.get("enabled"), "offline_editor_action_unavailable")
+        require(self.driver.ui("EditConfig", "invoke").get("invoked"), "offline_editor_open_failed")
+        def editable_broken_configuration():
+            area = self.driver.ui("ConfigEditor")
+            return (area.get("found") and area.get("readOnly") is False
+                    and area.get("value", "").replace("\r\n", "\n") == BAD_CONFIG)
+        wait_until(editable_broken_configuration, "offline_editor_not_editable")
+        require(self.driver.ui("CloseEditor", "invoke").get("invoked"), "offline_editor_close_failed")
         document = self.driver.invoke("desktop_read_config")
         require(document.get("content") == BAD_CONFIG and document.get("writable") is True, "broken_source_cannot_be_read")
         saved = self.driver.invoke("desktop_save_config", {"content": valid, "expectedRevision": document["revision"]})
@@ -1705,7 +1966,9 @@ class Acceptance:
         require(len(self.processes.at_paths([self.app])) == 1, "second_gui_survived")
         self.driver.screenshot(self.artifacts / "windows-settings.png", self.secrets)
         self.report["screenshot"] = "windows-settings.png"
-        self.mark("single_instance_and_webview2_ui")
+        self.mark("single_instance_and_native_ui")
+
+        self.check_native_redesign_ui(valid, base)
 
         self.stage = "tun_forwarding"
         self.driver.invoke("desktop_stop")
@@ -1815,7 +2078,7 @@ class Acceptance:
         # Do not stop the driver/helper or manually restore proxy/core until the
         # actual watchdog and native Job Object have passed these assertions.
         wait_until(lambda: self.wininet.read() == self.proxy_disabled, "watchdog_did_not_restore_system_proxy")
-        wait_until(lambda: not self.processes.at_paths([self.core]) and all(not listening(port) for port in self.ports), "job_did_not_stop_core_after_gui_crash")
+        wait_until(lambda: not self.processes.at_paths([self.host, self.core]) and all(not listening(port) for port in self.ports), "host_did_not_stop_after_gui_crash")
         wait_until(lambda: not self.processes.at_paths([self.helper]), "watchdog_process_survived_gui_crash")
         require(not service_installed(), "service_reappeared_after_crash")
         self.mark("crash_cleanup")
@@ -1846,7 +2109,7 @@ class Acceptance:
                 self.service_action("uninstall")
                 wait_until(lambda: not service_installed(), "cleanup_service_still_installed", 15)
             attempt("service_uninstall", uninstall)
-        for identity in self.processes.at_paths([self.app, self.core, self.helper]):
+        for identity in self.processes.at_paths([self.app, self.host, self.core, self.helper]):
             attempt("owned_process_termination", lambda identity=identity: self.processes.kill(identity))
         for identity in self.owned_children.values():
             if self.processes.identity(identity.pid) == identity:
@@ -1874,7 +2137,7 @@ class Acceptance:
         attempt("recovery_record_cleanup", lambda: (self.directory / "system-proxy-recovery.json").unlink(missing_ok=True))
         attempt("proxy_restore_check", lambda: require(self.wininet.read() == self.proxy_before, "proxy_not_restored"))
         attempt("autostart_restore_check", lambda: require(read_autostart() == self.autostart_before, "autostart_not_restored"))
-        attempt("process_cleanup_check", lambda: require(not self.processes.at_paths([self.app, self.core, self.helper]), "owned_process_remains"))
+        attempt("process_cleanup_check", lambda: require(not self.processes.at_paths([self.app, self.host, self.core, self.helper]), "owned_process_remains"))
         attempt("service_cleanup_check", lambda: require(not service_installed(), "owned_service_remains"))
         if self.service_owned:
             attempt("firewall_cleanup_check", lambda: require(owned_firewall_rule_count(self.core) == 0, "owned_firewall_rule_remains"))
@@ -1894,16 +2157,40 @@ def main() -> int:
         artifacts.mkdir(parents=True, exist_ok=True)
         require(ctypes.windll.shell32.IsUserAnAdmin(), "elevated_runner_required_for_service_acceptance")
         app = Path(os.environ.get("MIHOMO_TEST_APP", "")).resolve(strict=True)
-        driver = Path(os.environ.get("MIHOMO_TEST_DRIVER", "")).resolve(strict=True)
         expected = (Path(os.environ["ProgramFiles"]) / "Mihomo Optimized" / "mihomo-optimized.exe").resolve()
-        require(app == expected and app.is_file() and driver.is_file(), "installed_application_or_driver_missing")
-        acceptance = Acceptance(app, driver, artifacts)
+        require(app == expected and app.is_file(), "installed_application_missing")
+        acceptance = Acceptance(app, artifacts)
         acceptance.run()
     except Exception as error:
         code = safe_code(str(error)) if isinstance(error, SmokeFailure) else "unexpected_" + type(error).__name__
         print("FAIL: " + code, file=sys.stderr, flush=True)
         if acceptance:
-            acceptance.report["diagnostics"].append({"stage": acceptance.stage, "code": code})
+            diagnostic = {"stage": acceptance.stage, "code": code}
+            if not isinstance(error, SmokeFailure):
+                # Retain locations and numeric Win32 failures, never exception
+                # text or locals (which may contain configuration credentials).
+                import traceback
+                diagnostic["frames"] = [{"function": safe_code(frame.name), "line": frame.lineno}
+                    for frame in traceback.extract_tb(error.__traceback__)
+                    if Path(frame.filename).name == Path(__file__).name][-8:]
+                for key in ("winerror", "errno"):
+                    number = getattr(error, key, None)
+                    if isinstance(number, int):
+                        diagnostic[key] = number
+                function = getattr(error, "funcname", None)
+                if isinstance(function, str):
+                    diagnostic["function"] = safe_code(function)
+                if acceptance.driver:
+                    with contextlib.suppress(Exception):
+                        diagnostic["guiExitCode"] = acceptance.driver.process.poll()
+            acceptance.report["diagnostics"].append(diagnostic)
+            if acceptance.stage == "native_redesign_ui" and acceptance.driver:
+                try:
+                    acceptance.driver.screenshot(artifacts / "windows-ui-failure.png", acceptance.secrets, page=None)
+                    acceptance.report["nativeUiFailureCapture"] = "windows-ui-failure.png"
+                except Exception:
+                    # The normal credential guard also applies to diagnostics.
+                    pass
         else:
             if runner_allowed:
                 (artifacts / "verification.json").write_text(json.dumps({
@@ -1917,8 +2204,8 @@ def main() -> int:
                 acceptance.cleanup()
             except Exception as error:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": "unexpected_" + type(error).__name__})
-            required = {"update_cache_cleanup", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
-                        "single_instance_and_webview2_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
+            required = {"native_host_parent_binding", "update_cache_cleanup", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
+                        "single_instance_and_native_ui", "native_redesign_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
                         "resource_bootstrap_recovery", "system_proxy_service_recovery"}
             acceptance.report["passed"] = all(acceptance.report["tests"].get(name) is True for name in required) and not acceptance.report["diagnostics"]

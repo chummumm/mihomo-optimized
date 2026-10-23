@@ -4,6 +4,7 @@ use crate::{
     core::quiet_command,
     desktop::HostState,
     error::{AppError, Result},
+    host::HostContext,
     update_cache::UpdateWorkspace,
 };
 use reqwest::{blocking::Client, Url};
@@ -21,7 +22,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter, Manager, State};
 
 const REPOSITORY: &str = "chummumm/mihomo-optimized";
 const REPOSITORY_ID: &str = "1410715865";
@@ -75,6 +75,8 @@ struct Candidate {
 #[derive(Serialize, Deserialize)]
 struct MonitorPlan {
     parent_pid: u32,
+    host: PathBuf,
+    ui_pid: u32,
     application: PathBuf,
     candidate: Candidate,
 }
@@ -115,8 +117,8 @@ fn installed_update_dir(original_application: Option<&Path>) -> Result<PathBuf> 
     } else {
         crate::windows::protected_install_dir()?
     };
-    // Pinned tauri-cli-v2.12.3 NSIS: perMachine selects HKLM, x64 selects the
-    // 64-bit view, and InstallLocation is written as a quoted "$INSTDIR" string.
+    // Keep the existing NSIS upgrade identity: HKLM in the 64-bit view,
+    // the same application filename, and quoted or plain InstallLocation.
     let key = winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(UNINSTALL_KEY, KEY_READ | KEY_WOW64_64KEY)
         .map_err(|_| unavailable())?;
@@ -143,7 +145,13 @@ fn installed_update_dir(original_application: Option<&Path>) -> Result<PathBuf> 
     Ok(directory)
 }
 
-fn emit(app: &AppHandle, stage: &str, downloaded: Option<u64>, total: Option<u64>, message: &str) {
+fn emit(
+    app: &HostContext,
+    stage: &str,
+    downloaded: Option<u64>,
+    total: Option<u64>,
+    message: &str,
+) {
     let _ = app.emit(
         "desktop-update-progress",
         serde_json::json!({
@@ -283,7 +291,7 @@ fn asset(release: &Release, name: &str, maximum: u64) -> Result<Asset> {
     Ok(asset.clone())
 }
 
-fn check(app: &AppHandle, proxy: Option<String>) -> Result<UpdateInfo> {
+fn check(app: &HostContext, proxy: Option<String>) -> Result<UpdateInfo> {
     let deadline = Instant::now() + CHECK_TIMEOUT;
     *CANDIDATE
         .get_or_init(|| Mutex::new(None))
@@ -370,7 +378,7 @@ fn check(app: &AppHandle, proxy: Option<String>) -> Result<UpdateInfo> {
 }
 
 fn download(
-    app: &AppHandle,
+    app: &HostContext,
     client: &Client,
     asset: &Asset,
     destination: &Path,
@@ -433,17 +441,13 @@ fn download(
     Ok(())
 }
 
-fn verify(app: &AppHandle, directory: &Path, candidate: &Candidate) -> Result<()> {
+fn verify(app: &HostContext, directory: &Path, candidate: &Candidate) -> Result<()> {
     let executable = std::env::current_exe().map_err(|e| AppError::io("无法定位验证程序", e))?;
     let verifier = executable
         .parent()
         .ok_or_else(|| AppError::new("update_verifier_missing", "缺少更新验证程序"))?
         .join("mihomo-update-verify.exe");
-    let trust = app
-        .path()
-        .resource_dir()
-        .map_err(|_| AppError::new("update_verifier_missing", "无法定位验证证书"))?
-        .join("resources/trusted-root.jsonl");
+    let trust = app.resource_directory()?.join("trusted-root.jsonl");
     verify_at(&verifier, &trust, directory, candidate)
 }
 
@@ -562,10 +566,11 @@ fn verified_repository_id(bytes: &[u8]) -> bool {
 // The monitor executes from a private staging copy, so it never locks a file
 // NSIS needs to replace. It survives the GUI and restarts it after either a
 // successful installation or an installation failure.
-fn handoff_to_monitor(directory: &Path, candidate: &Candidate) -> Result<()> {
-    let application = std::env::current_exe().map_err(|e| AppError::io("无法定位桌面程序", e))?;
+fn handoff_to_monitor(app: &HostContext, directory: &Path, candidate: &Candidate) -> Result<()> {
+    let host = std::env::current_exe().map_err(|e| AppError::io("无法定位桌面后台", e))?;
+    let application = app.application_path().to_owned();
     let executable = directory.join("desktop-update-monitor.exe");
-    fs::copy(&application, &executable).map_err(|e| AppError::io("无法准备更新恢复程序", e))?;
+    fs::copy(&host, &executable).map_err(|e| AppError::io("无法准备更新恢复程序", e))?;
     let mut child = quiet_command(&executable)
         .arg("--desktop-update-monitor")
         .current_dir(directory)
@@ -576,6 +581,8 @@ fn handoff_to_monitor(directory: &Path, candidate: &Candidate) -> Result<()> {
         .map_err(|e| AppError::io("无法启动更新恢复程序", e))?;
     let plan = MonitorPlan {
         parent_pid: std::process::id(),
+        host,
+        ui_pid: app.owner.pid,
         application,
         candidate: candidate.clone(),
     };
@@ -744,7 +751,10 @@ fn monitor() -> Result<()> {
             .source_sha
             .bytes()
             .all(|b| b.is_ascii_hexdigit())
-        || plan.application.file_name().and_then(|s| s.to_str()) != Some("mihomo-optimized.exe")
+        || plan.application.file_name().and_then(|s| s.to_str())
+            != Some(crate::windows::APPLICATION_EXE)
+        || plan.host.file_name().and_then(|s| s.to_str()) != Some(crate::windows::HOST_EXE)
+        || crate::host::actual_parent_pid()? != plan.parent_pid
     {
         return Err(AppError::new("update_monitor_invalid", "更新目标无效"));
     }
@@ -763,8 +773,10 @@ fn monitor() -> Result<()> {
         OwnedHandle::from_raw_handle(handle)
     };
     let (parent_path, parent_sid) = crate::windows::process_handle_identity(&parent)?;
+    crate::windows::reject_reparse_path(&plan.host)?;
+    crate::windows::require_admin_protected(&plan.host)?;
     let expected_path = plan
-        .application
+        .host
         .canonicalize()
         .map_err(|_| AppError::new("update_monitor_identity", "更新发起程序路径无效"))?;
     let actual_path = parent_path
@@ -774,6 +786,34 @@ fn monitor() -> Result<()> {
         return Err(AppError::new(
             "update_monitor_identity",
             "无法验证更新发起程序",
+        ));
+    }
+    let ui = unsafe {
+        let handle = OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            plan.ui_pid,
+        );
+        if handle.is_null() {
+            return Err(AppError::new(
+                "update_monitor_identity",
+                "原生桌面程序已经退出",
+            ));
+        }
+        OwnedHandle::from_raw_handle(handle)
+    };
+    let (ui_path, ui_sid) = crate::windows::process_handle_identity(&ui)?;
+    let application = plan
+        .application
+        .canonicalize()
+        .map_err(|_| AppError::new("update_monitor_identity", "无法确认原生桌面程序路径"))?;
+    if ui_sid != parent_sid
+        || ui_path.canonicalize().ok().as_ref() != Some(&application)
+        || application.parent() != expected_path.parent()
+    {
+        return Err(AppError::new(
+            "update_monitor_identity",
+            "无法验证原生桌面程序",
         ));
     }
     let monitor_exe =
@@ -803,6 +843,12 @@ fn monitor() -> Result<()> {
             return Err(AppError::new(
                 "update_monitor_wait_failed",
                 "无法等待桌面程序退出，请检查安装进度",
+            ));
+        }
+        if unsafe { WaitForSingleObject(ui.as_raw_handle(), u32::MAX) } != 0 {
+            return Err(AppError::new(
+                "update_monitor_wait_failed",
+                "无法等待原生桌面程序退出，请检查安装进度",
             ));
         }
         if unsafe { WaitForSingleObject(installer.as_raw_handle(), u32::MAX) } != 0 {
@@ -864,70 +910,105 @@ pub(crate) fn take_install_result() -> Option<String> {
     }
 }
 
-#[tauri::command]
-pub async fn desktop_check_update(
-    app: AppHandle,
-    state: State<'_, HostState>,
-) -> Result<UpdateInfo> {
-    let operation = Operation::acquire()?;
-    let manager = state.0.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let _operation = operation;
-        let proxy = manager
-            .lock()
-            .map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?
-            .update_proxy_url();
-        let result = check(&app, proxy);
-        if let Err(error) = &result {
-            emit(&app, "error", None, None, &error.message);
-        }
-        result
-    })
-    .await
-    .map_err(|_| AppError::new("update_task_failed", "更新检查被中断"))?
+pub fn desktop_check_update(app: &HostContext, state: &HostState) -> Result<UpdateInfo> {
+    let _operation = Operation::acquire()?;
+    let proxy = state
+        .0
+        .lock()
+        .map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?
+        .update_proxy_url();
+    let result = check(app, proxy);
+    if let Err(error) = &result {
+        emit(app, "error", None, None, &error.message);
+    }
+    result
 }
 
-#[tauri::command]
-pub async fn desktop_install_update(app: AppHandle, state: State<'_, HostState>) -> Result<()> {
-    let operation = Operation::acquire()?;
-    let manager = state.0.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let _operation = operation;
-        if installed_update_dir(None).is_err() {
-            return Err(AppError::new("update_installation_required", "便携版或未受保护的安装目录不能直接安装更新，请从可信发布页下载完整安装包并完成安装"));
-        }
-        let candidate = CANDIDATE.get_or_init(|| Mutex::new(None)).lock().map_err(|_| AppError::new("update_state_failed", "更新状态不可用"))?
-            .clone().ok_or_else(|| AppError::new("update_check_required", "请先检查桌面更新"))?;
-        let proxy = manager.lock().map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?.update_proxy_url();
-        let workspace = UpdateWorkspace::create()?;
-        let directory = workspace.path();
-        let result = (|| {
-            let client = client(proxy)?;
-            emit(&app, "downloading", Some(0), Some(candidate.installer.size), "正在下载桌面更新");
-            download(&app, &client, &candidate.installer, &directory.join(&candidate.installer.name), true)?;
-            download(&app, &client, &candidate.bundle, &directory.join(&candidate.bundle.name), false)?;
-            emit(&app, "installing", None, None, "正在验证构建签名");
-            verify(&app, directory, &candidate)?;
-            let was_running = manager.lock().map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?.prepare_update()?;
-            if let Err(error) = handoff_to_monitor(directory, &candidate) {
-                if let Err(recovery) = manager.lock().map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?.resume_after_update(was_running) {
-                    return Err(AppError::new("update_recovery_failed", format!("{}；{}", error.message, recovery.message)));
-                }
-                return Err(error);
+pub fn desktop_install_update(app: &HostContext, state: &HostState) -> Result<()> {
+    let _operation = Operation::acquire()?;
+    let manager = &state.0;
+    if installed_update_dir(None).is_err() {
+        return Err(AppError::new(
+            "update_installation_required",
+            "便携版或未受保护的安装目录不能直接安装更新，请从可信发布页下载完整安装包并完成安装",
+        ));
+    }
+    let candidate = CANDIDATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| AppError::new("update_state_failed", "更新状态不可用"))?
+        .clone()
+        .ok_or_else(|| AppError::new("update_check_required", "请先检查桌面更新"))?;
+    let proxy = manager
+        .lock()
+        .map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?
+        .update_proxy_url();
+    let workspace = UpdateWorkspace::create()?;
+    let directory = workspace.path();
+    let result = (|| {
+        let client = client(proxy)?;
+        emit(
+            app,
+            "downloading",
+            Some(0),
+            Some(candidate.installer.size),
+            "正在下载桌面更新",
+        );
+        download(
+            app,
+            &client,
+            &candidate.installer,
+            &directory.join(&candidate.installer.name),
+            true,
+        )?;
+        download(
+            app,
+            &client,
+            &candidate.bundle,
+            &directory.join(&candidate.bundle.name),
+            false,
+        )?;
+        emit(app, "installing", None, None, "正在验证构建签名");
+        verify(app, directory, &candidate)?;
+        let was_running = manager
+            .lock()
+            .map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?
+            .prepare_update()?;
+        if let Err(error) = handoff_to_monitor(app, directory, &candidate) {
+            if let Err(recovery) = manager
+                .lock()
+                .map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?
+                .resume_after_update(was_running)
+            {
+                return Err(AppError::new(
+                    "update_recovery_failed",
+                    format!("{}；{}", error.message, recovery.message),
+                ));
             }
-            emit(&app, "installing", None, None, "安装程序已启动，桌面程序即将退出");
-            manager.lock().map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?.exiting = true;
-            app.exit(0);
-            Ok(())
-        })();
-        if let Err(error) = &result {
-            emit(&app, "error", None, None, &error.message);
+            return Err(error);
         }
-        // The monitor acquires its own workspace lease before acknowledging the
-        // handoff. Releasing this one cannot expose an active installer to cleanup.
-        workspace.finish();
-        result
-    }).await.map_err(|_| AppError::new("update_task_failed", "更新安装被中断"))?
+        emit(
+            app,
+            "installing",
+            None,
+            None,
+            "安装程序已启动，桌面程序即将退出",
+        );
+        manager
+            .lock()
+            .map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?
+            .exiting = true;
+        // The protocol owner flushes the success reply and update-exit event
+        // before terminating. The independent monitor waits for both images.
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        emit(app, "error", None, None, &error.message);
+    }
+    // The monitor owns its lease before handoff succeeds; collection cannot
+    // delete an installer or monitor that is still active.
+    workspace.finish();
+    result
 }
 
 #[cfg(test)]

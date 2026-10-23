@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the published 0.1.1 uninstaller and the candidate NSIS installer.
+"""Exercise published 0.1.1 uninstall recovery and direct 0.1.7 migration.
 
 Only disposable GitHub Actions Windows runners may run this elevated fixture.
 A read handle without FILE_SHARE_DELETE reproduces a leftover old helper after
@@ -43,9 +43,16 @@ LEGACY_URL = (
     "mihomo-desktop-v0.1.1/mihomo-desktop-0.1.1-windows-x64-setup.exe"
 )
 LEGACY_SHA256 = "64326bf2d2672cfc76fbb1c1dbd25138a438ee0e78751ab72ac2a91a62f84690"
+PREVIOUS_VERSION = "0.1.7"
+PREVIOUS_SOURCE = "32a5fc0d70a772627fdca2c5d85e891c03f28331"
+PREVIOUS_URL = (
+    "https://github.com/chummumm/mihomo-optimized/releases/download/"
+    "mihomo-desktop-v0.1.7/mihomo-desktop-0.1.7-windows-x64-setup.exe"
+)
+PREVIOUS_SHA256 = "7a7a3a0014a00a14d8688fcf556e1fb62016dbec187030e994bb8b4f61c77a4c"
 EXECUTABLES = (
     "mihomo-optimized.exe", "mihomo-core.exe", "mihomo-desktop-service.exe",
-    "mihomo-update-verify.exe",
+    "mihomo-update-verify.exe", "mihomo-desktop-host.exe",
 )
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized"
 
@@ -90,12 +97,12 @@ def executable_path(value: str) -> str:
     return os.path.normcase(str(Path(value).resolve()))
 
 
-def registration() -> dict | None:
+def registration(view: int = 64) -> dict | None:
     import winreg
 
     try:
         key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0,
-                             winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+                             winreg.KEY_READ | (winreg.KEY_WOW64_64KEY if view == 64 else winreg.KEY_WOW64_32KEY))
     except FileNotFoundError:
         return None
     with key:
@@ -134,7 +141,7 @@ class UpgradeAcceptance:
     def __init__(self, artifacts: Path) -> None:
         self.artifacts = artifacts
         self.install_dir = Path(os.environ["ProgramFiles"]) / PRODUCT
-        self.app, self.core, self.helper, self.verifier = [self.install_dir / name for name in EXECUTABLES]
+        self.app, self.core, self.helper, self.verifier, self.host = [self.install_dir / name for name in EXECUTABLES]
         self.config = Path(os.environ["LOCALAPPDATA"]) / PRODUCT / "config.yaml"
         self.owner_file = Path(os.environ["PROGRAMDATA"]) / PRODUCT / "service" / "owner.sid"
         self.processes = Processes()
@@ -147,7 +154,9 @@ class UpgradeAcceptance:
         self.report = {"passed": False, "platform": "windows", "tests": {},
                        "commands": [], "diagnostics": [],
                        "baseline": {"version": LEGACY_VERSION, "source": LEGACY_SOURCE,
-                                    "url": LEGACY_URL, "sha256": LEGACY_SHA256}}
+                                    "url": LEGACY_URL, "sha256": LEGACY_SHA256},
+                       "previousRelease": {"version": PREVIOUS_VERSION, "source": PREVIOUS_SOURCE,
+                                           "url": PREVIOUS_URL, "sha256": PREVIOUS_SHA256}}
 
     def write_report(self) -> None:
         temporary = self.artifacts / "upgrade.json.tmp"
@@ -214,7 +223,7 @@ class UpgradeAcceptance:
         self.info = json.loads((distribution / "build-info.json").read_text(encoding="utf-8-sig"))
         version = self.info.get("desktopVersion", "")
         require(re.fullmatch(r"\d+\.\d+\.\d+", version), "candidate_version_invalid")
-        require(tuple(map(int, version.split("."))) > (0, 1, 1), "candidate_must_follow_0_1_1")
+        require(tuple(map(int, version.split("."))) > (0, 1, 7), "candidate_must_follow_0_1_7")
         require(self.info.get("target") == TARGET
                 and self.info.get("repository") == "chummumm/mihomo-optimized"
                 and re.fullmatch(r"[0-9a-f]{40}", self.info.get("uiCommit", ""))
@@ -234,37 +243,30 @@ class UpgradeAcceptance:
         self.expected_hashes = {}
         self.expected_sizes = {}
         portable_hashes = {}
-        marker_patch = {}
         with zipfile.ZipFile(archive) as bundle:
             info_member = PRODUCT + "/resources/build-info.json"
             require(bundle.namelist().count(info_member) == 1
-                    and bundle.getinfo(info_member).file_size < 65536, "portable_build_info_invalid")
+                    and bundle.getinfo(info_member).file_size < 256 * 1024, "portable_build_info_invalid")
             require(json.loads(bundle.read(info_member)) == self.info, "portable_source_mismatch")
-            for name in EXECUTABLES:
+            runtime = self.info.get("runtimeFiles", {})
+            require(isinstance(runtime, dict) and all(name in runtime for name in EXECUTABLES),
+                    "native_runtime_manifest_missing")
+            require(self.info.get("desktopFramework") == "WPF", "candidate_not_native_wpf")
+            require(set(bundle.namelist()) == {PRODUCT + "/" + name for name in runtime} | {info_member},
+                    "portable_runtime_manifest_members_mismatch")
+            for name, expected in runtime.items():
+                require(isinstance(name, str) and not name.startswith(("/", "\\"))
+                        and ".." not in Path(name).parts and "\\" not in name
+                        and re.fullmatch(r"[0-9a-f]{64}", expected), "native_runtime_manifest_invalid")
                 member = PRODUCT + "/" + name
                 require(bundle.namelist().count(member) == 1
-                        and 0 < bundle.getinfo(member).file_size < 256 * 1024 * 1024,
+                        and 0 <= bundle.getinfo(member).file_size < 256 * 1024 * 1024,
                         "portable_binary_invalid")
                 with bundle.open(member) as stream:
-                    if name == "mihomo-optimized.exe":
-                        data = stream.read()
-                        portable_hashes[name] = hashlib.sha256(data).hexdigest()
-                        unknown = b"__TAURI_BUNDLE_TYPE_VAR_UNK"
-                        nsis = b"__TAURI_BUNDLE_TYPE_VAR_NSS"
-                        require(data.count(unknown) == 1 and data.count(nsis) == 0,
-                                "portable_gui_bundle_marker_invalid")
-                        # Locked tauri-cli 2.12.3 patches the first UNK marker for
-                        # NSIS, then restores the original build for other bundles.
-                        # https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.3/crates/tauri-bundler/src/bundle.rs
-                        # Hash the complete expected installed file; no bytes are
-                        # excluded from the subsequent strict installed comparison.
-                        self.expected_hashes[name] = hashlib.sha256(data.replace(unknown, nsis, 1)).hexdigest()
-                        marker_patch = {"binary": name, "tauriCliVersion": "2.12.3",
-                                        "from": unknown.decode("ascii"), "to": nsis.decode("ascii"),
-                                        "offset": data.index(unknown), "replacements": 1}
-                    else:
-                        self.expected_hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
-                        portable_hashes[name] = self.expected_hashes[name]
+                    actual = hashlib.file_digest(stream, "sha256").hexdigest()
+                require(actual == expected, "portable_runtime_file_mismatch")
+                self.expected_hashes[name] = actual
+                portable_hashes[name] = actual
                 self.expected_sizes[name] = bundle.getinfo(member).file_size
             for name in EXECUTABLES[1:]:
                 companion = name.removesuffix(".exe") + "-" + TARGET + ".exe"
@@ -275,17 +277,17 @@ class UpgradeAcceptance:
                                     "installer": self.candidate.name, "sha256": digest(self.candidate),
                                     "portableBinarySha256": portable_hashes,
                                     "installedBinarySha256": self.expected_hashes,
-                                    "markerPatch": marker_patch}
+                                    "runtimeFramework": "WPF", "runtimeFileCount": len(self.expected_hashes)}
 
-    def download_legacy(self) -> Path:
+    def download_baseline(self, version: str, url: str, checksum: str) -> Path:
         # Keep this outside artifacts/desktop so the candidate remains unique.
-        destination = Path("artifacts/legacy").resolve() / "mihomo-desktop-0.1.1-windows-x64-setup.exe"
+        destination = Path("artifacts/legacy").resolve() / f"mihomo-desktop-{version}-windows-x64-setup.exe"
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
             temporary = destination.with_suffix(".exe.part")
             started = time.monotonic()
             try:
-                request = Request(LEGACY_URL, headers={"User-Agent": "mihomo-upgrade-acceptance"})
+                request = Request(url, headers={"User-Agent": "mihomo-upgrade-acceptance"})
                 with urlopen(request, timeout=30) as response, temporary.open("wb") as output:
                     size = 0
                     while chunk := response.read(1024 * 1024):
@@ -293,11 +295,11 @@ class UpgradeAcceptance:
                         require(size <= 64 * 1024 * 1024, "legacy_download_too_large")
                         require(time.monotonic() - started < 180, "legacy_download_timeout")
                         output.write(chunk)
-                require(digest(temporary) == LEGACY_SHA256, "legacy_download_checksum_mismatch")
+                require(digest(temporary) == checksum, "legacy_download_checksum_mismatch")
                 temporary.replace(destination)
             finally:
                 temporary.unlink(missing_ok=True)
-        require(digest(destination) == LEGACY_SHA256, "legacy_installer_checksum_mismatch")
+        require(digest(destination) == checksum, "legacy_installer_checksum_mismatch")
         return destination
 
     def assert_registration(self, version: str) -> None:
@@ -306,6 +308,7 @@ class UpgradeAcceptance:
         require(os.path.normcase(entry["InstallLocation"].strip('"')) == os.path.normcase(str(self.install_dir))
                 and os.path.normcase(entry["UninstallString"].strip('"'))
                 == os.path.normcase(str(self.install_dir / "uninstall.exe")), "installed_registry_path_mismatch")
+        require(registration(32) is None, "duplicate_32_bit_uninstall_registration")
 
     def assert_marker(self) -> None:
         require(self.config.is_file() and digest(self.config) == self.marker_hash, "user_configuration_not_preserved")
@@ -364,8 +367,8 @@ class UpgradeAcceptance:
                     item["actualSha256"] = digest(path)
                 except OSError as error:
                     item["readError"] = failure_code(error)
-        # Preserve all four observations before the first strict assertion can
-        # fail, including a stale GUI alongside otherwise current companions.
+        # Preserve every runtime observation before asserting, including stale
+        # UI assemblies alongside current companion executables.
         self.report.setdefault("installedFileChecks", []).append(evidence)
         self.write_report()
         installed = json.loads((self.install_dir / "resources/build-info.json").read_text(encoding="utf-8-sig"))
@@ -375,6 +378,10 @@ class UpgradeAcceptance:
         for name, item in evidence["files"].items():
             require(not item["missing"] and item["actualSha256"] == item["expectedSha256"]
                     and item["actualSize"] == item["expectedSize"], "installed_binary_mismatch_" + name)
+        actual_files = {path.relative_to(self.install_dir).as_posix()
+                        for path in self.install_dir.rglob("*") if path.is_file()}
+        require(actual_files == set(self.expected_hashes) | {"resources/build-info.json", "uninstall.exe"},
+                "installed_unexpected_legacy_runtime_file")
         self.assert_registration(self.info["desktopVersion"])
         self.assert_marker()
 
@@ -384,9 +391,10 @@ class UpgradeAcceptance:
         import win32file
         import win32security
 
-        require(not self.install_dir.exists() and registration() is None, "preexisting_application_installation")
+        require(not self.install_dir.exists() and registration() is None and registration(32) is None,
+                "preexisting_application_installation")
         require(service_snapshot().get("winError") == 1060, "preexisting_mihomo_service")
-        require(not self.processes.at_paths([self.app, self.core, self.helper]), "preexisting_mihomo_process")
+        require(not self.processes.at_paths([self.app, self.core, self.helper, self.host]), "preexisting_mihomo_process")
         require(not self.config.parent.exists() and not self.owner_file.parent.exists(), "preexisting_mihomo_data")
         require(owned_firewall_rule_count(self.core) == 0, "preexisting_mihomo_firewall_rule")
         token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32security.TOKEN_QUERY)
@@ -396,7 +404,8 @@ class UpgradeAcceptance:
             token.Close()
         self.load_candidate()
         self.stage = "legacy_download"
-        legacy = self.download_legacy()
+        legacy = self.download_baseline(LEGACY_VERSION, LEGACY_URL, LEGACY_SHA256)
+        previous = self.download_baseline(PREVIOUS_VERSION, PREVIOUS_URL, PREVIOUS_SHA256)
         self.mark("published_baseline_verified")
 
         self.stage = "legacy_install"
@@ -433,7 +442,7 @@ class UpgradeAcceptance:
             self.report["legacyUninstall"]["service"] = self.assert_no_service()
             require(not self.app.exists() and not self.core.exists(), "legacy_uninstall_left_main_or_core")
             require(self.helper.is_file() and digest(self.helper) == legacy_helper_hash, "legacy_helper_not_retained")
-            wait_until(lambda: not self.processes.at_paths([self.app, self.core, self.helper]), "legacy_process_survived_uninstall", 15)
+            wait_until(lambda: not self.processes.at_paths([self.app, self.core, self.helper, self.host]), "legacy_process_survived_uninstall", 15)
             require(registration() is None, "legacy_uninstall_registration_remains")
             self.assert_marker()
             self.report["legacyUninstall"].update({"mainRemoved": True, "coreRemoved": True,
@@ -467,8 +476,7 @@ class UpgradeAcceptance:
         self.stage = "candidate_overwrite_running_service"
         before = self.install_service("candidate_service_install")
         owner_before = self.owner_file.read_bytes()
-        # Silent mode skips Tauri's reinstall-choice page and executes the same
-        # Install section, including the real PREINSTALL and POSTINSTALL hooks.
+        # Silent mode executes the same native Install section and maintenance hooks.
         result = self.command("candidate_overwrite", self.candidate, ["/S"], 180)
         require(result["exitCode"] == 0, "candidate_overwrite_failed")
         after = self.running_service()
@@ -487,7 +495,7 @@ class UpgradeAcceptance:
         raw = uninstall_command(uninstaller)
         self.report["candidateUninstall"] = {"commandLine": raw, "servicePidBefore": running.pid}
         result = self.command("candidate_uninstall", uninstaller, raw, 180)
-        remaining = {name: (self.install_dir / name).exists() for name in EXECUTABLES}
+        remaining = {name: (self.install_dir / name).exists() for name in self.expected_hashes}
         self.report["candidateUninstall"]["remainingFiles"] = remaining
         self.write_report()
         require(result["exitCode"] == 0, "candidate_uninstall_failed")
@@ -496,15 +504,46 @@ class UpgradeAcceptance:
         require(not self.owner_file.exists(), "uninstalled_service_owner_remains")
         require(registration() is None, "candidate_uninstall_registration_remains")
         self.assert_marker()
-        wait_until(lambda: not self.processes.at_paths([self.app, self.core, self.helper]), "upgrade_process_remains", 15)
+        wait_until(lambda: not self.processes.at_paths([self.app, self.core, self.helper, self.host]), "upgrade_process_remains", 15)
         self.report["candidateUninstall"].update({"ownerRemoved": True, "registrationRemoved": True,
                                                    "configurationPreserved": True})
         # Only the in-place uninstaller needs parent cleanup. The assertions
-        # above require NSIS itself to have removed all four installed programs.
+        # above require NSIS itself to have removed every declared runtime file.
         uninstaller.unlink(missing_ok=True)
         with contextlib.suppress(OSError):
             self.install_dir.rmdir()
         self.mark("candidate_application_fully_uninstalled")
+
+        # One additional real-version upgrade covers the currently published
+        # Tauri application without repeating the costly integration matrix.
+        self.stage = "published_0_1_7_install"
+        require(self.command("previous_install", previous, ["/S"], 180)["exitCode"] == 0,
+                "previous_install_failed")
+        self.assert_registration(PREVIOUS_VERSION)
+        previous_info = json.loads((self.install_dir / "resources/build-info.json").read_text(encoding="utf-8-sig"))
+        require(previous_info.get("desktopVersion") == PREVIOUS_VERSION
+                and previous_info.get("uiCommit") == PREVIOUS_SOURCE, "installed_previous_source_mismatch")
+        require(previous_info.get("companions", {}).get("mihomo-desktop-service-" + TARGET + ".exe")
+                == digest(self.helper), "installed_previous_helper_mismatch")
+        require(not self.host.exists(), "previous_release_has_unexpected_native_host")
+        self.assert_marker()
+        previous_service = self.install_service("previous_service_install")
+        previous_owner = self.owner_file.read_bytes()
+        self.stage = "native_direct_upgrade_from_0_1_7"
+        require(self.command("previous_to_native_upgrade", self.candidate, ["/S"], 180)["exitCode"] == 0,
+                "previous_to_native_upgrade_failed")
+        native_service = self.running_service()
+        require(native_service != previous_service, "previous_service_process_was_not_replaced")
+        require(self.owner_file.read_bytes() == previous_owner, "native_migration_changed_service_owner")
+        require(owned_firewall_rule_count(self.core) == 1, "native_migration_lost_firewall_rule")
+        self.assert_candidate_files()
+        self.report["previousRelease"].update({"directUpgradePassed": True, "registryView": 64,
+            "pidBefore": previous_service.pid, "pidAfter": native_service.pid,
+            "configurationPreserved": True, "ownerSidPreserved": True, "unexpectedRuntimeFiles": []})
+        self.mark("published_0_1_7_direct_upgrade")
+        require(self.command("native_migration_service_remove", self.helper, ["--uninstall"])["exitCode"] == 0,
+                "native_migration_service_remove_failed")
+        self.assert_no_service()
 
         self.stage = "candidate_reinstall_for_gui"
         require(self.command("candidate_reinstall", self.candidate, ["/S"], 180)["exitCode"] == 0,
@@ -512,7 +551,7 @@ class UpgradeAcceptance:
         self.assert_candidate_files()
         self.report["candidate"]["serviceAfterReinstall"] = self.assert_no_service()
         require(not self.owner_file.exists(), "candidate_reinstall_created_service_owner")
-        wait_until(lambda: not self.processes.at_paths([self.app, self.core, self.helper]), "reinstall_started_process", 15)
+        wait_until(lambda: not self.processes.at_paths([self.app, self.core, self.helper, self.host]), "reinstall_started_process", 15)
         self.mark("candidate_reinstalled_for_gui")
 
     def remove_owned_service(self) -> None:
@@ -586,7 +625,7 @@ class UpgradeAcceptance:
             attempt("owned_firewall_remove", self.remove_owned_firewall_rule)
             attempt("service_absence_check", self.assert_no_service)
         attempt("process_absence_check", lambda: require(
-            not self.processes.at_paths([self.app, self.core, self.helper]), "owned_process_remains"))
+            not self.processes.at_paths([self.app, self.core, self.helper, self.host]), "owned_process_remains"))
         if self.marker_hash:
             # Preserve this owned marker for the following GUI test to snapshot
             # and restore. Never remove or replace a preexisting user config.
@@ -624,7 +663,7 @@ def main() -> int:
             required = {"published_baseline_verified", "legacy_service_running", "uninstall_retained_locked_helper",
                         "published_old_helper_failure_reproduced", "candidate_repairs_uninstall_residue",
                         "overwrite_restarts_existing_service", "candidate_application_fully_uninstalled",
-                        "candidate_reinstalled_for_gui", "final_cleanup"}
+                        "published_0_1_7_direct_upgrade", "candidate_reinstalled_for_gui", "final_cleanup"}
             acceptance.report["passed"] = (all(acceptance.report["tests"].get(name) is True for name in required)
                                            and not acceptance.report["diagnostics"])
             acceptance.write_report()

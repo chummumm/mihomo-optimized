@@ -1,0 +1,9 @@
+{
+  "productName": "Mihomo Optimized",
+  "version": "0.2.0",
+  "identifier": "com.chummumm.mihomo-optimized",
+  "executable": "mihomo-optimized.exe",
+  "hostExecutable": "mihomo-desktop-host.exe",
+  "framework": "WPF",
+  "minimumWindowsVersion": "10.0.17763.0"
+}

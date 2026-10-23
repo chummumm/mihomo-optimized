@@ -20,7 +20,7 @@ jobs:
   build:
     name: Build and exercise Windows x64 desktop
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
       CARGO_INCREMENTAL: '0'
       GOTOOLCHAIN: local
@@ -57,12 +57,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.402'
+      - name: Exercise native protocol boundaries and cancellation
+        run: dotnet run --project desktop/tests/protocol/ProtocolTests.csproj -c Release
+      - name: Install native Windows installer compiler
+        run: choco install nsis --version=3.11 --yes --no-progress
       - name: Install Windows acceptance API bindings
         run: |
           python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
-      - name: Check UI and build both targets
+      - name: Verify the unchanged web dashboard
         shell: pwsh
         run: |
           pnpm typecheck
@@ -70,15 +77,6 @@ jobs:
           pnpm test:unit
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           pnpm build
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          pnpm build:desktop
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Test desktop startup updates and native UI commands
-        shell: pwsh
-        run: |
-          $env:PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
-          if (-not (Test-Path $env:PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH)) { throw 'Microsoft Edge is required for desktop UI tests' }
-          pnpm test:desktop
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Exercise managed core and resource bootstrap on Windows
         working-directory: core-src
@@ -93,15 +91,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src-tauri/target
-          key: desktop-windows-msvc-v1-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: desktop-windows-msvc-v1-
+          key: desktop-native-windows-msvc-v2-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: desktop-native-windows-msvc-v2-
       - name: Build and stage fixed companion programs
         run: python scripts/prepare-desktop.py --core-dir core-src
       - name: Exercise native settings and update policies
         working-directory: src-tauri
         run: cargo test --locked --target x86_64-pc-windows-msvc --lib
-      - name: Build Windows application and NSIS installer
-        run: pnpm exec tauri build --ci --target x86_64-pc-windows-msvc --bundles nsis
+      - name: Build native WPF application, host and NSIS installer
+        run: python scripts/build-native-desktop.py
       - name: Assemble installer and portable distribution
         run: python scripts/package-desktop.py
       - name: Cache completed Windows compilation
@@ -126,9 +124,9 @@ jobs:
         run: python desktop/tests/core_smoke.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe
       - name: Test real Windows bootstrap groups, offline cache and cancellation
         run: python core-src/scripts/test-resource-bootstrap.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe --report artifacts/verification/resource-bootstrap-core.json
-      - name: Test uninstall-first upgrade from 0.1.1 and prepare WebView2 driver
+      - name: Test 0.1.1 uninstall recovery and direct 0.1.7 native migration
         run: ./desktop/tests/setup-windows.ps1
-      - name: Test installed WebView2 UI, system proxy, TUN forwarding and cleanup
+      - name: Test installed native UI, system proxy, TUN forwarding and cleanup
         run: python desktop/tests/windows_smoke.py
       - name: Upload Windows verification evidence
         if: always()

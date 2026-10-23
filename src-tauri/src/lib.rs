@@ -7,6 +7,9 @@ pub mod desktop;
 pub mod error;
 #[cfg(windows)]
 mod firewall;
+#[cfg(all(windows, feature = "desktop"))]
+mod host;
+pub mod protocol;
 #[cfg(windows)]
 pub mod proxy;
 #[cfg(windows)]
@@ -25,7 +28,10 @@ pub fn run() {
     if update::run_monitor_if_requested() {
         return;
     }
-    desktop::run();
+    if let Err(error) = host::run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 }
 #[cfg(all(not(windows), feature = "desktop"))]
 pub fn run() {

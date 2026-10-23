@@ -1,0 +1,137 @@
+param(
+    [Parameter(Mandatory=$true)][int]$ApplicationProcessId,
+    [Parameter(Mandatory=$true)][string]$AutomationId,
+    [ValidateSet('read', 'invoke', 'set', 'select', 'toggle', 'scroll')][string]$Action = 'read',
+    [AllowEmptyString()][string]$Value = ''
+)
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$script:operationStage = 'initialize'
+trap {
+    # Keep CI diagnostics useful without printing control values, YAML or URLs.
+    $exception = $_.Exception
+    while ($exception.InnerException) { $exception = $exception.InnerException }
+    @{found=$false; error='uia_operation_failed'; stage=$script:operationStage;
+        exception=$exception.GetType().Name} | ConvertTo-Json -Compress
+    exit 1
+}
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$processCondition = [System.Windows.Automation.PropertyCondition]::new(
+    [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $ApplicationProcessId)
+$windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+    [System.Windows.Automation.TreeScope]::Children, $processCondition)
+if ($windows.Count -eq 0) { @{found=$false} | ConvertTo-Json -Compress; exit 0 }
+if ($AutomationId -eq '*') {
+    $visible = @()
+    foreach ($window in $windows) {
+        $elements = $window.FindAll([System.Windows.Automation.TreeScope]::Subtree,
+            [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($item in $elements) {
+            if ($item.Current.IsOffscreen) { continue }
+            $row = @{id=$item.Current.AutomationId; name=$item.Current.Name}
+            $pattern = $null
+            if ($item.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
+                $row.value = $pattern.Current.Value
+            }
+            $visible += $row
+        }
+    }
+    @{found=$true; elements=$visible} | ConvertTo-Json -Compress -Depth 4
+    exit 0
+}
+$idCondition = [System.Windows.Automation.PropertyCondition]::new(
+    [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $AutomationId)
+$element = $null
+foreach ($window in $windows) {
+    $element = $window.FindFirst([System.Windows.Automation.TreeScope]::Subtree, $idCondition)
+    if ($element) { break }
+}
+if (-not $element) { @{found=$false} | ConvertTo-Json -Compress; exit 0 }
+$result = @{ found=$true; enabled=$element.Current.IsEnabled; offscreen=$element.Current.IsOffscreen;
+    name=$element.Current.Name; focused=$element.Current.HasKeyboardFocus;
+    controlType=$element.Current.ControlType.ProgrammaticName }
+$script:operationStage = $Action
+switch ($Action) {
+    'invoke' {
+        $pattern = $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        $pattern.Invoke()
+        $result.invoked = $true
+    }
+    'set' {
+        $pattern = $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        $pattern.SetValue($Value)
+        $result.changed = $true
+    }
+    'toggle' {
+        $pattern = $element.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+        $pattern.Toggle()
+        $result.toggled = $true
+    }
+    'select' {
+        if ($Value -eq '') {
+            $pattern = $element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+            $pattern.Select()
+        } else {
+            $script:operationStage = 'select_expand'
+            $expand = $null
+            if ($element.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) {
+                $expand.Expand()
+            }
+            $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::NameProperty, $Value)
+            $selectionCondition = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::IsSelectionItemPatternAvailableProperty, $true)
+            $condition = [System.Windows.Automation.AndCondition]::new($nameCondition, $selectionCondition)
+            # Expanding the popup schedules item containers for layout. Wait for
+            # the selectable item, rather than accidentally matching its text child.
+            $script:operationStage = 'select_find_option'
+            $deadline = [DateTime]::UtcNow.AddSeconds(5)
+            do {
+                $choice = $element.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+                if ($choice) { break }
+                Start-Sleep -Milliseconds 50
+            } while ([DateTime]::UtcNow -lt $deadline)
+            if (-not $choice) { throw [System.InvalidOperationException]::new('The requested option is not present.') }
+            $script:operationStage = 'select_option'
+            $pattern = $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+            $pattern.Select()
+            # Language/theme changes can regenerate item peers. Obtain the
+            # current combo peer before closing the popup; do not reuse the item.
+            $script:operationStage = 'select_collapse'
+            foreach ($window in $windows) {
+                $current = $window.FindFirst([System.Windows.Automation.TreeScope]::Subtree, $idCondition)
+                if (-not $current) { continue }
+                $currentExpand = $null
+                if ($current.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$currentExpand)) {
+                    $currentExpand.Collapse()
+                }
+                break
+            }
+        }
+        $result.selected = $true
+    }
+    'scroll' {
+        $pattern = $element.GetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern)
+        $percent = [double]::Parse($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+        if ($percent -lt 0 -or $percent -gt 100) { throw 'Scroll percent is out of range.' }
+        $pattern.SetScrollPercent([System.Windows.Automation.ScrollPattern]::NoScroll, $percent)
+        $result.scrolled = $true
+    }
+    default {
+        $pattern = $null
+        if ($element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
+            $result.value = $pattern.Current.Value
+            $result.readOnly = $pattern.Current.IsReadOnly
+        }
+        $pattern = $null
+        if ($element.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$pattern)) {
+            $result.selection = @($pattern.Current.GetSelection() | ForEach-Object { $_.Current.Name })
+        }
+        $pattern = $null
+        if ($element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
+            $result.toggleState = $pattern.Current.ToggleState.ToString()
+        }
+    }
+}
+$result | ConvertTo-Json -Compress -Depth 4
