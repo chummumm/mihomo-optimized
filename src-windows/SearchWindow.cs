@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -70,6 +71,7 @@ internal sealed class SearchWindow : Window
     private string commandState = "";
     private string? loadError;
     private bool loading;
+    private bool closing;
     private bool closed;
     private bool choosing;
 
@@ -124,7 +126,7 @@ internal sealed class SearchWindow : Window
             AttachOwner(); PositionFlyout(); FocusInput(); FluentMotion.Enter(layout);
             await LoadCoreEntries();
         };
-        Deactivated += (_, _) => { if (IsLoaded && !closed) Close(); };
+        Deactivated += (_, _) => { if (IsLoaded) ClosePalette(); };
         Closed += (_, _) =>
         {
             closed = true; searchDelay.Stop(); lifetime.Cancel(); lifetime.Dispose();
@@ -140,7 +142,26 @@ internal sealed class SearchWindow : Window
         RebuildEntries();
     }
 
-    public void FocusInput() { Activate(); search.Focus(); search.SelectAll(); }
+    public void FocusInput()
+    {
+        if (closing || closed) return;
+        Activate(); search.Focus(); search.SelectAll();
+    }
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        // Destroying an active HWND can synchronously raise Deactivated before
+        // Closed. Treat that interval as closing, including owner-driven exits.
+        closing = true;
+        base.OnClosing(e);
+        if (e.Cancel) closing = false;
+    }
+    private void ClosePalette()
+    {
+        if (closing || closed) return;
+        closing = true;
+        try { Close(); }
+        finally { if (!closed) closing = false; }
+    }
     private void AttachOwner()
     {
         if (Owner is null || anchorOwner is not null) return;
@@ -148,13 +169,14 @@ internal sealed class SearchWindow : Window
         anchorOwner.LocationChanged += CloseForOwnerChange; anchorOwner.SizeChanged += CloseForOwnerSize;
         anchorOwner.StateChanged += CloseForOwnerChange; anchorOwner.IsVisibleChanged += CloseForOwnerVisibility;
     }
-    private void CloseForOwnerChange(object? sender, EventArgs e) { if (!closed) Close(); }
-    private void CloseForOwnerSize(object sender, SizeChangedEventArgs e) { if (!closed) Close(); }
-    private void CloseForOwnerVisibility(object sender, DependencyPropertyChangedEventArgs e) { if (e.NewValue is false && !closed) Close(); }
+    private void CloseForOwnerChange(object? sender, EventArgs e) => ClosePalette();
+    private void CloseForOwnerSize(object sender, SizeChangedEventArgs e) => ClosePalette();
+    private void CloseForOwnerVisibility(object sender, DependencyPropertyChangedEventArgs e) { if (e.NewValue is false) ClosePalette(); }
     private void PositionFlyout()
     {
+        if (closing || closed || positioning || Owner is null) return;
         var handle = new WindowInteropHelper(this).Handle;
-        if (closed || positioning || Owner is null || handle == IntPtr.Zero) return;
+        if (handle == IntPtr.Zero) return;
         positioning = true;
         try
         {
@@ -234,7 +256,7 @@ internal sealed class SearchWindow : Window
 
     private void Filter(bool preserveSelection = false)
     {
-        if (closed) return;
+        if (closing || closed) return;
         string? selectedKey = preserveSelection && results.SelectedItem is ListBoxItem { Tag: Entry previous } ? previous.Key : null;
         string query = search.Text.Trim();
         var candidates = query.Length == 0 ? entries.Where(entry => entry.Category == "command").Take(6).ToArray()
@@ -271,7 +293,7 @@ internal sealed class SearchWindow : Window
         var text = Ui.Column(title, detail); Grid.SetColumn(text, 1); row.Children.Add(text);
         string category = L.T(entry.Category switch { "command" => "命令", "page" => "页面", "group" => "策略组", "node" => "节点", "setting" => "设置", _ => "规则" });
         var label = Ui.Muted(category, 11); label.Margin = new Thickness(16, 0, 0, 0); Grid.SetColumn(label, 2); row.Children.Add(label);
-        var item = new ResultItem { Execute = () => RunEntry(entry), CanExecute = () => entry.IsEnabled && !closed && !choosing,
+        var item = new ResultItem { Execute = () => RunEntry(entry), CanExecute = () => entry.IsEnabled && !closing && !closed && !choosing,
             Content = row, Tag = entry, Padding = new Thickness(12, 10, 12, 10), Margin = new Thickness(0, 2, 0, 2), HorizontalContentAlignment = HorizontalAlignment.Stretch,
             Opacity = entry.IsEnabled ? 1 : 0.5, ToolTip = entry.IsEnabled ? null : L.T("当前状态无法执行此命令，请等待正在进行的操作完成。") }.Id("SearchResult_" + entry.Key);
         AutomationProperties.SetName(item, entry.Title + " · " + category + (entry.Detail.Length > 0 ? " · " + entry.Detail : ""));
@@ -360,7 +382,7 @@ internal sealed class SearchWindow : Window
 
     private async void OnKeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Escape) { e.Handled = true; Close(); return; }
+        if (e.Key == Key.Escape) { e.Handled = true; ClosePalette(); return; }
         if (e.Key == Key.K && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; search.Focus(); search.SelectAll(); return; }
         if (e.Key == Key.T && Keyboard.Modifiers == ModifierKeys.Control)
         {
@@ -388,12 +410,15 @@ internal sealed class SearchWindow : Window
 
     private async Task RunEntry(Entry entry)
     {
-        if (choosing || closed) return;
+        if (choosing || closing || closed) return;
         if (!entry.IsEnabled) { state.Text = L.T("当前状态无法执行此命令，请等待正在进行的操作完成。"); return; }
         choosing = true;
-        // Close the palette before navigation so the destination receives keyboard focus.
-        Close();
-        try { await entry.Run(); }
+        try
+        {
+            // Close the palette before navigation so the destination receives keyboard focus.
+            ClosePalette();
+            await entry.Run();
+        }
         catch (Exception error) { session.Notify(error.Message, true); }
     }
 

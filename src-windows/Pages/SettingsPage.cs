@@ -242,7 +242,7 @@ public sealed class SettingsPage : NativePage
         applying = true;
         theme.ItemsSource = new[] { new Choice(L.T("跟随系统"), "system"), new Choice(L.T("浅色"), "light"), new Choice(L.T("深色"), "dark") };
         language.ItemsSource = new[] { new Choice(L.T("跟随系统"), "system"), new Choice("中文", "zh-CN"), new Choice("English", "en-US") };
-        mode.ItemsSource = new[] { new Choice(L.T("规则"), "rule"), new Choice(L.T("全局"), "global"), new Choice(L.T("直连"), "direct") };
+        mode.ItemsSource = new[] { new Choice(L.ShortMode("rule"), "rule"), new Choice(L.ShortMode("global"), "global"), new Choice(L.ShortMode("direct"), "direct") };
         theme.SelectedValue = Session.Theme; language.SelectedValue = Session.Language;
         mode.SelectedValue = runtime.Text("mode"); applying = false;
     }

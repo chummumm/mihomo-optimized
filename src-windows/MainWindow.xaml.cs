@@ -430,7 +430,9 @@ public partial class MainWindow : Window
                 FrameworkElement surface;
                 if (traySurface) surface = tray.VisibleSurface ?? throw new InvalidOperationException("Open the real tray flyout before capturing it.");
                 else if (surfaceName == "search") surface = searchWindow is { IsVisible: true, Content: FrameworkElement content } ? content : throw new InvalidOperationException("Open the real search flyout before capturing it.");
-                else { ShowMain(); surface = ClientArea; }
+                // Include the Window template's AdornerLayer, which contains
+                // native input hints and focus adorners outside ClientArea.
+                else { ShowMain(); surface = this; }
                 surface.UpdateLayout();
                 var dpi = VisualTreeHelper.GetDpi(surface);
                 int pixelsWide = Math.Max(1, (int)Math.Ceiling(surface.ActualWidth * dpi.DpiScaleX));

@@ -2180,6 +2180,9 @@ def main() -> int:
                 function = getattr(error, "funcname", None)
                 if isinstance(function, str):
                     diagnostic["function"] = safe_code(function)
+                if acceptance.driver:
+                    with contextlib.suppress(Exception):
+                        diagnostic["guiExitCode"] = acceptance.driver.process.poll()
             acceptance.report["diagnostics"].append(diagnostic)
             if acceptance.stage == "native_redesign_ui" and acceptance.driver:
                 try:
