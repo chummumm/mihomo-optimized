@@ -15,12 +15,11 @@ use windows_sys::Win32::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
             ConvertStringSidToSidW, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo,
-            EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE,
-            SE_KERNEL_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+            EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_KERNEL_OBJECT, TRUSTEE_IS_SID,
+            TRUSTEE_IS_USER, TRUSTEE_W,
         },
         GetTokenInformation, IsValidAcl, SetFileSecurityW, TokenUser, DACL_SECURITY_INFORMATION,
-        NO_INHERITANCE,
-        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+        NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
     },
     System::{
         Com::CoTaskMemFree,
@@ -279,6 +278,22 @@ pub fn configure_tun_firewall(directory: &Path, install: bool) -> Result<()> {
     crate::firewall::configure(program, install)
 }
 
+pub const APPLICATION_EXE: &str = "mihomo-optimized.exe";
+pub const HOST_EXE: &str = "mihomo-desktop-host.exe";
+
+pub fn application_path() -> Result<PathBuf> {
+    let executable = std::env::current_exe().map_err(|e| AppError::io("无法定位桌面程序", e))?;
+    let path = executable.with_file_name(APPLICATION_EXE);
+    reject_reparse_path(&path)?;
+    if !path.is_file() {
+        return Err(AppError::new(
+            "application_missing",
+            "原生桌面程序缺失，请重新安装完整程序",
+        ));
+    }
+    Ok(path)
+}
+
 pub fn protected_install_dir() -> Result<PathBuf> {
     let executable = std::env::current_exe().map_err(|e| AppError::io("无法定位程序", e))?;
     reject_reparse_path(&executable)?;
@@ -305,6 +320,7 @@ pub fn protected_install_dir() -> Result<PathBuf> {
     for filename in [
         "mihomo-core.exe",
         "mihomo-optimized.exe",
+        "mihomo-desktop-host.exe",
         "mihomo-desktop-service.exe",
     ] {
         reject_reparse_path(&directory.join(filename))?;
@@ -664,7 +680,7 @@ pub fn autostart_enabled() -> Result<bool> {
 }
 
 fn autostart_value() -> Result<String> {
-    let path = std::env::current_exe().map_err(|e| AppError::io("无法定位启动程序", e))?;
+    let path = application_path()?;
     Ok(format!("\"{}\" --tray", path.display()))
 }
 

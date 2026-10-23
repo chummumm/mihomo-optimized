@@ -345,7 +345,7 @@ pub fn watch_user(pid: u32, instance: &str) -> Result<()> {
     let (path, sid) = windows::process_handle_identity(&process)?;
     let parent = std::env::current_exe()
         .map_err(|e| AppError::io("无法定位程序", e))?
-        .with_file_name("mihomo-optimized.exe");
+        .with_file_name("mihomo-desktop-host.exe");
     let same_executable = matches!((path.canonicalize(), parent.canonicalize()), (Ok(actual), Ok(expected)) if actual == expected);
     if sid != windows::current_sid()? || !same_executable {
         return Err(AppError::new(

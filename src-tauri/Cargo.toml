@@ -1,17 +1,17 @@
 [package]
 name = "mihomo-desktop"
-version = "0.1.7"
+version = "0.2.0"
 description = "Windows desktop host for Mihomo Optimized"
 edition = "2021"
 rust-version = "1.85"
-default-run = "mihomo-optimized"
+default-run = "mihomo-desktop-host"
 
 [lib]
 name = "mihomo_desktop"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mihomo-optimized"
+name = "mihomo-desktop-host"
 path = "src/main.rs"
 required-features = ["desktop"]
 
@@ -22,11 +22,8 @@ required-features = ["service"]
 
 [features]
 default = ["desktop"]
-desktop = ["dep:tauri", "dep:tauri-plugin-single-instance"]
+desktop = []
 service = []
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -37,8 +34,6 @@ hex = "0.4"
 semver = "1"
 getrandom = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
-tauri-plugin-single-instance = { version = "2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.1"
@@ -49,7 +44,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization",
   "Win32_Storage_FileSystem", "Win32_System_Environment", "Win32_System_IO",
   "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Pipes",
-  "Win32_System_Threading", "Win32_System_Registry", "Win32_System_Com",
+  "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Registry", "Win32_System_Com",
   "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Networking_WinInet"
 ] }
 

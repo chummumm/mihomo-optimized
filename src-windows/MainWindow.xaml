@@ -1,0 +1,57 @@
+<Window x:Class="Mihomo.Desktop.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Mihomo Optimized" Width="1180" Height="780" MinWidth="640" MinHeight="520"
+        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI Variable, Segoe UI, Microsoft YaHei UI"
+        FontSize="14" Background="{DynamicResource AppBackgroundBrush}" Foreground="{DynamicResource TextPrimaryBrush}"
+        Icon="Assets/icon.ico" AutomationProperties.AutomationId="MainWindow">
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="52" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+    <Grid Margin="14,4,18,4">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+      <Button x:Name="NavigationToggle" Content="&#xE700;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Width="36" Height="32"
+              ToolTip="展开或收起导航" AutomationProperties.Name="展开或收起导航" Click="ToggleNavigation" />
+      <TextBlock Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center" FontWeight="SemiBold" Text="Mihomo Optimized" />
+      <Button Grid.Column="2" x:Name="SearchButton" MinWidth="240" Padding="12,5" Click="OpenSearch" AutomationProperties.AutomationId="GlobalSearch">
+        <Grid><Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+          <TextBlock Text="搜索页面、节点或命令" Foreground="{DynamicResource TextSecondaryBrush}" />
+          <TextBlock Grid.Column="1" Text="Ctrl+K" Margin="20,0,0,0" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12" />
+        </Grid>
+      </Button>
+    </Grid>
+    <Grid Grid.Row="1">
+      <Grid.ColumnDefinitions><ColumnDefinition x:Name="NavigationColumn" Width="224" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+      <Grid x:Name="NavigationPane" Margin="8,4,8,10">
+        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+        <Border Padding="14,12" Margin="6,0,6,12" CornerRadius="6" Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1">
+          <StackPanel>
+            <TextBlock Text="本地内核" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12" Margin="0,0,0,6" />
+            <TextBlock x:Name="PhaseText" Text="正在连接…" FontWeight="SemiBold" AutomationProperties.AutomationId="CorePhase" />
+            <TextBlock x:Name="VersionText" FontSize="11" Margin="0,5,0,0" Foreground="{DynamicResource TextSecondaryBrush}" TextTrimming="CharacterEllipsis" />
+          </StackPanel>
+        </Border>
+        <ListBox x:Name="NavigationList" Grid.Row="1" Background="Transparent" BorderThickness="0" ItemContainerStyle="{StaticResource NavigationItem}"
+                 SelectionChanged="NavigationChanged" ScrollViewer.HorizontalScrollBarVisibility="Disabled" AutomationProperties.AutomationId="Navigation">
+          <ListBoxItem Tag="home" AutomationProperties.AutomationId="NavHome"><StackPanel Orientation="Horizontal"><TextBlock Text="&#xE80F;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Width="30" /><TextBlock Text="主页" /></StackPanel></ListBoxItem>
+          <ListBoxItem Tag="proxies" AutomationProperties.AutomationId="NavProxies"><StackPanel Orientation="Horizontal"><TextBlock Text="&#xE968;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Width="30" /><TextBlock Text="代理" /></StackPanel></ListBoxItem>
+          <ListBoxItem Tag="connections" AutomationProperties.AutomationId="NavConnections"><StackPanel Orientation="Horizontal"><TextBlock Text="&#xE839;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Width="30" /><TextBlock Text="连接" /></StackPanel></ListBoxItem>
+          <ListBoxItem Tag="dns" AutomationProperties.AutomationId="NavDns"><StackPanel Orientation="Horizontal"><TextBlock Text="&#xE774;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Width="30" /><TextBlock Text="DNS" /></StackPanel></ListBoxItem>
+          <ListBoxItem Tag="rules" AutomationProperties.AutomationId="NavRules"><StackPanel Orientation="Horizontal"><TextBlock Text="&#xE8A5;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Width="30" /><TextBlock Text="规则" /></StackPanel></ListBoxItem>
+          <ListBoxItem Tag="logs" AutomationProperties.AutomationId="NavLogs"><StackPanel Orientation="Horizontal"><TextBlock Text="&#xE9D9;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Width="30" /><TextBlock Text="日志" /></StackPanel></ListBoxItem>
+          <ListBoxItem Tag="profiles" AutomationProperties.AutomationId="NavProfiles"><StackPanel Orientation="Horizontal"><TextBlock Text="&#xE8A5;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Width="30" /><TextBlock Text="配置" /></StackPanel></ListBoxItem>
+          <ListBoxItem Tag="settings" AutomationProperties.AutomationId="NavSettings"><StackPanel Orientation="Horizontal"><TextBlock Text="&#xE713;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Width="30" /><TextBlock Text="设置" /></StackPanel></ListBoxItem>
+        </ListBox>
+        <TextBlock Grid.Row="2" Margin="20,12,0,0" Text="Windows · 0.2.0" FontSize="11" Foreground="{DynamicResource TextSecondaryBrush}" />
+      </Grid>
+      <Border Grid.Column="1" Margin="0,4,12,12" CornerRadius="8" Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" ClipToBounds="True">
+        <Grid><Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+          <Border x:Name="NoticeBorder" Visibility="Collapsed" Padding="14,10" Margin="20,16,20,0" CornerRadius="4" Background="{DynamicResource SubtleSurfaceBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1">
+            <DockPanel><Button DockPanel.Dock="Right" Content="&#xE711;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" ToolTip="关闭提示" AutomationProperties.Name="关闭提示" Click="DismissNotice" Margin="12,0,0,0" />
+              <TextBlock x:Name="NoticeText" TextWrapping="Wrap" VerticalAlignment="Center" AutomationProperties.AutomationId="MainError" /></DockPanel>
+          </Border>
+          <ContentControl x:Name="PageContent" Grid.Row="1" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch" />
+        </Grid>
+      </Border>
+    </Grid>
+  </Grid>
+</Window>

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage pinned companion executables for the Windows Tauri build."""
+"""Stage pinned companion executables for the native Windows build."""
 import argparse
 import hashlib
 import json
@@ -84,10 +84,10 @@ def main():
     parser.add_argument("--allow-local-core", action="store_true", help="Development only; marks build as dirty and cannot be used in release CI")
     args = parser.parse_args()
     core = args.core_dir.resolve()
-    application = json.loads((ROOT / 'src-tauri/tauri.conf.json').read_text())
+    application = json.loads((ROOT / 'desktop/app.json').read_text())
     cargo = tomllib.loads((ROOT / 'src-tauri/Cargo.toml').read_text())
     if application['version'] != cargo['package']['version']:
-        raise ValueError('Tauri and Cargo desktop versions must agree')
+        raise ValueError('Application and Cargo desktop versions must agree')
     spec = json.loads((ROOT / "desktop/core.json").read_text())
     if spec["repository"] != "chummumm/mihomo-optimized" or not re.fullmatch(r"[0-9a-f]{40}", spec["commit"]):
         raise ValueError("The desktop core must be pinned to a full commit in the project repository")
@@ -127,7 +127,8 @@ def main():
     for path in (ROOT / "public/licenses").glob("*"):
         shutil.copy2(path, RESOURCES / "licenses" / path.name)
     info = {
-        "desktopVersion": json.loads((ROOT / "src-tauri/tauri.conf.json").read_text())["version"],
+        "desktopVersion": application["version"],
+        "desktopFramework": "WPF",
         "uiVersion": json.loads((ROOT / "package.json").read_text())["version"],
         "coreVersion": core_version, "coreCommit": actual, "coreDirty": dirty,
         "uiCommit": run("git", "rev-parse", "HEAD"),

@@ -200,9 +200,8 @@ FunctionEnd
 ; Service installation stays opt-in. Stop existing installations before copying
 ; new files, then restart an installed service with its existing owner SID.
 !macro NSIS_HOOK_PREINSTALL
-  ; The template's GUI check is after this hook; close it before awaiting its
-  ; proxy recovery watchdog. The later template check can safely run again.
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\mihomo-optimized.exe" "${PRODUCTNAME}"
+  ; The native installer verifies both UI and host images are released before
+  ; entering this hook, then lets the proxy recovery watchdog finish naturally.
   Call MihomoPrepareInstallation
   ${If} $MihomoMaintenanceError != 0
     DetailPrint "Mihomo installation preparation failed: stage=$MihomoMaintenanceStage, Win32=$MihomoMaintenanceError"
@@ -228,7 +227,7 @@ FunctionEnd
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\mihomo-optimized.exe" "${PRODUCTNAME}"
+  ; The native uninstaller already awaited the UI and host before this hook.
   IfFileExists "$INSTDIR\mihomo-desktop-service.exe" 0 mihomo_preuninstall_delete_helper
   System::Store "s"
   nsExec::ExecToStack '"$INSTDIR\mihomo-desktop-service.exe" --uninstall'

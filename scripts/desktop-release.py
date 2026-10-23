@@ -69,13 +69,14 @@ def main():
     args = parser.parse_args()
     if os.environ.get('GITHUB_REPOSITORY') != REPOSITORY or os.environ.get('GITHUB_REF') != 'refs/heads/clash-dashboard':
         raise ValueError('Desktop releases must originate on the trusted dashboard branch')
-    version = json.loads((ROOT / 'src-tauri/tauri.conf.json').read_text())['version']
+    version = json.loads((ROOT / 'desktop/app.json').read_text())['version']
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
         raise ValueError('Invalid desktop version')
     source = os.environ['GITHUB_SHA']
     info = json.loads((ROOT / 'artifacts/desktop/build-info.json').read_text())
     core = json.loads((ROOT / 'desktop/core.json').read_text())
-    if info['uiCommit'] != source or info['coreDirty'] or info['coreCommit'] != core['commit']:
+    if (info['uiCommit'] != source or info['coreDirty'] or info['coreCommit'] != core['commit']
+            or info.get('desktopVersion') != version or info.get('desktopFramework') != 'WPF'):
         raise ValueError('Packaged source provenance does not match the release workflow')
     tag = f'mihomo-desktop-v{version}'
     release = release_for_tag(tag)

@@ -2,6 +2,7 @@ use crate::{
     config::{self, ConfigDocument, Preferences},
     core::{self, Controller, CoreStatus, CoreSupervisor},
     error::{AppError, Result},
+    host::HostContext,
     proxy::SystemProxy,
     service::{self, ServiceStatusView},
     service_ipc::{Client as ServiceClient, Request},
@@ -11,10 +12,7 @@ use serde::Serialize;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
-    thread,
-    time::Duration,
 };
-use tauri::{Emitter, Manager};
 
 #[derive(Clone)]
 pub struct HostState(pub Arc<Mutex<DesktopManager>>);
@@ -56,40 +54,13 @@ pub struct DesktopStatus {
     pub app_version: String,
 }
 
-/// Startup can hold the operation mutex while downloading resources. Keep the
-/// last published view independently readable, including for a WebView that
-/// subscribes after the initial Starting event. This lock only copies a view;
-/// it is never held across core, service, registry or event operations.
-#[derive(Clone)]
-pub struct PublishedDesktopStatus(Arc<Mutex<DesktopStatus>>);
-
-impl PublishedDesktopStatus {
-    fn new(status: DesktopStatus) -> Self {
-        Self(Arc::new(Mutex::new(status)))
-    }
-
-    pub fn read(&self) -> DesktopStatus {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    fn replace(&self, status: DesktopStatus) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
-    }
-}
-
 enum RunningCore {
     Direct(CoreSupervisor),
     Service(ServiceClient),
 }
 
 pub struct DesktopManager {
-    app: tauri::AppHandle,
+    app: HostContext,
     directory: PathBuf,
     config_path: PathBuf,
     logs: PathBuf,
@@ -106,7 +77,7 @@ pub struct DesktopManager {
 }
 
 impl DesktopManager {
-    fn new(app: tauri::AppHandle) -> Result<Self> {
+    pub fn new(app: HostContext) -> Result<Self> {
         let directory = windows::user_data_dir()?;
         windows::secure_directory(&directory, Some(&windows::current_sid()?))?;
         let (config_path, logs) = config::data_paths(&directory);
@@ -140,6 +111,22 @@ impl DesktopManager {
         })
     }
 
+    /// Publish Starting before the worker can enter resource preparation.
+    pub fn prepare_startup(&mut self) -> bool {
+        let should_start = self.preferences.desired_running;
+        if should_start {
+            self.phase = Phase::Starting;
+            self.last_error = None;
+        }
+        self.publish();
+        should_start
+    }
+
+    pub fn report_error(&mut self, message: String) {
+        self.last_error = Some(message);
+        self.publish();
+    }
+
     pub fn status(&self) -> DesktopStatus {
         DesktopStatus {
             phase: self.phase,
@@ -169,10 +156,7 @@ impl DesktopManager {
 
     pub fn publish(&self) {
         let status = self.status();
-        self.app
-            .state::<PublishedDesktopStatus>()
-            .replace(status.clone());
-        let _ = self.app.emit("desktop-status", status);
+        self.app.publish_status(status);
     }
 
     fn active_log_directory(&self) -> PathBuf {
@@ -518,14 +502,17 @@ impl DesktopManager {
         }
     }
 
-    fn poll(&mut self) {
+    pub fn poll(&mut self) {
         if self.updating || self.exiting {
             return;
         }
         let result = match self.running.as_mut() {
             Some(RunningCore::Direct(core)) => core.poll(),
             Some(RunningCore::Service(client)) => client.call(&Request::Status),
-            None => return,
+            None => {
+                self.publish();
+                return;
+            }
         };
         match result {
             Ok(status) => {
@@ -565,8 +552,10 @@ impl DesktopManager {
 
     pub fn request_exit(&mut self, force: bool) -> Result<bool> {
         if self.dirty && !force {
-            show_main(&self.app);
-            let _ = self.app.emit("desktop-exit-requested", ());
+            self.app.emit(
+                "desktop-exit-requested",
+                serde_json::json!({"reason":"unsaved-config","force":false}),
+            );
             return Ok(false);
         }
         self.stop(false)?;
@@ -579,214 +568,5 @@ fn stop_running(running: &mut RunningCore) -> Result<()> {
     match running {
         RunningCore::Direct(core) => core.stop(),
         RunningCore::Service(client) => client.call(&Request::Stop).map(|_| ()),
-    }
-}
-
-pub fn show_main(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = app.emit("desktop-visibility", serde_json::json!({"visible":true}));
-    }
-}
-
-fn tray_exit(app: &tauri::AppHandle) {
-    let app = app.clone();
-    thread::spawn(move || {
-        let state = app.state::<HostState>();
-        let should_exit = if let Ok(mut manager) = state.0.lock() {
-            match manager.request_exit(false) {
-                Ok(value) => value,
-                Err(error) => {
-                    manager.last_error = Some(error.message);
-                    manager.publish();
-                    show_main(&app);
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        if should_exit {
-            app.exit(0);
-        }
-    });
-}
-
-pub fn run() {
-    let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            show_main(app)
-        }))
-        .plugin(
-            tauri::plugin::Builder::<tauri::Wry>::new("local-navigation")
-                .on_navigation(|_, url| {
-                    (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
-                        || (["http", "https"].contains(&url.scheme())
-                            && url.host_str() == Some("tauri.localhost")
-                            && url.port().is_none())
-                        || (cfg!(debug_assertions)
-                            && url.scheme() == "http"
-                            && url.host_str() == Some("localhost")
-                            && url.port() == Some(3000))
-                })
-                .build(),
-        )
-        .invoke_handler(tauri::generate_handler![
-            crate::commands::desktop_status,
-            crate::commands::desktop_start,
-            crate::commands::desktop_stop,
-            crate::commands::desktop_restart,
-            crate::commands::desktop_set_system_proxy,
-            crate::commands::desktop_set_tun,
-            crate::commands::desktop_set_autostart,
-            crate::commands::desktop_read_config,
-            crate::commands::desktop_save_config,
-            crate::commands::desktop_import_config,
-            crate::commands::desktop_import_config_url,
-            crate::commands::desktop_reload_config,
-            crate::commands::desktop_patch_config,
-            crate::commands::desktop_set_dirty,
-            crate::commands::desktop_open_directory,
-            crate::commands::desktop_open_external,
-            crate::commands::desktop_install_service,
-            crate::commands::desktop_uninstall_service,
-            crate::commands::desktop_exit,
-            crate::update::desktop_check_update,
-            crate::update::desktop_install_update
-        ])
-        .setup(|app| {
-            let mut manager = DesktopManager::new(app.handle().clone())?;
-            let should_start = manager.preferences.desired_running;
-            if should_start {
-                manager.phase = Phase::Starting;
-                manager.last_error = None;
-            }
-            app.manage(PublishedDesktopStatus::new(manager.status()));
-            let state = HostState(Arc::new(Mutex::new(manager)));
-            app.manage(state.clone());
-            let show =
-                tauri::menu::MenuItem::with_id(app, "show", "打开主界面", true, None::<&str>)?;
-            let stop = tauri::menu::MenuItem::with_id(
-                app,
-                "stop",
-                "停止代理并恢复网络",
-                true,
-                None::<&str>,
-            )?;
-            let quit = tauri::menu::MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&show, &stop, &quit])?;
-            let mut tray = tauri::tray::TrayIconBuilder::with_id("main-tray")
-                .tooltip("Mihomo Optimized")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_tray_icon_event(|tray, event| {
-                    if matches!(
-                        event,
-                        tauri::tray::TrayIconEvent::Click {
-                            button: tauri::tray::MouseButton::Left,
-                            button_state: tauri::tray::MouseButtonState::Up,
-                            ..
-                        }
-                    ) {
-                        show_main(tray.app_handle());
-                    }
-                })
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => show_main(app),
-                    "quit" => tray_exit(app),
-                    "stop" => {
-                        let app = app.clone();
-                        thread::spawn(move || {
-                            let state = app.state::<HostState>();
-                            if let Ok(mut manager) = state.0.lock() {
-                                if let Err(error) = manager.stop(true) {
-                                    manager.last_error = Some(error.message);
-                                    manager.publish();
-                                    show_main(&app);
-                                }
-                            };
-                        });
-                    }
-                    _ => {}
-                });
-            if let Some(icon) = app.default_window_icon() {
-                tray = tray.icon(icon.clone());
-            }
-            tray.build(app)?;
-            if !std::env::args().any(|argument| argument == "--tray") {
-                show_main(app.handle());
-            }
-            crate::update_cache::start_cleanup_worker();
-            thread::spawn(move || {
-                if should_start {
-                    if let Ok(mut manager) = state.0.lock() {
-                        let _ = manager.start(false);
-                    }
-                }
-                if let Some(message) = crate::update::take_install_result() {
-                    if let Ok(mut manager) = state.0.lock() {
-                        manager.last_error = Some(message);
-                        manager.publish();
-                    }
-                }
-                loop {
-                    thread::sleep(Duration::from_secs(2));
-                    if let Ok(mut manager) = state.0.try_lock() {
-                        if manager.exiting {
-                            break;
-                        }
-                        manager.poll();
-                    }
-                }
-            });
-            Ok(())
-        })
-        .on_window_event(|window, event| match event {
-            tauri::WindowEvent::CloseRequested { api, .. } => {
-                api.prevent_close();
-                let _ = window.hide();
-                let _ = window
-                    .app_handle()
-                    .emit("desktop-visibility", serde_json::json!({"visible":false}));
-            }
-            tauri::WindowEvent::Focused(_) | tauri::WindowEvent::Resized(_) => {
-                let visible =
-                    window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false);
-                let _ = window
-                    .app_handle()
-                    .emit("desktop-visibility", serde_json::json!({"visible":visible}));
-            }
-            _ => {}
-        });
-    match builder.build(tauri::generate_context!()) {
-        Ok(app) => app.run(|handle, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                let state = handle.state::<HostState>();
-                let exiting = state
-                    .0
-                    .lock()
-                    .map(|manager| manager.exiting)
-                    .unwrap_or(false);
-                if !exiting {
-                    api.prevent_exit();
-                    tray_exit(handle);
-                }
-            }
-        }),
-        Err(error) => {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
-            let message = windows::wide(format!("桌面程序无法启动：{error}"));
-            let title = windows::wide("Mihomo Optimized");
-            unsafe {
-                MessageBoxW(
-                    std::ptr::null_mut(),
-                    message.as_ptr(),
-                    title.as_ptr(),
-                    MB_OK | MB_ICONERROR,
-                );
-            }
-        }
     }
 }

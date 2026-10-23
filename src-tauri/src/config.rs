@@ -234,7 +234,15 @@ pub fn runtime_config(content: &str, tun: bool, port: u16) -> Result<String> {
         key("external-controller"),
         key(&format!("127.0.0.1:{port}")),
     );
-    document.insert(key("external-controller-cors"), serde_yaml::to_value(serde_json::json!({"allow-origins": ["http://tauri.localhost", "https://tauri.localhost", "tauri://localhost", "http://localhost:3000"], "allow-private-network": true})).map_err(|_| AppError::new("config_invalid", "无法设置本地控制接口"))?);
+    // The WPF client uses authenticated native HTTP; no browser origin needs
+    // access to this private, ephemeral controller.
+    document.insert(
+        key("external-controller-cors"),
+        serde_yaml::to_value(
+            serde_json::json!({"allow-origins": [], "allow-private-network": false}),
+        )
+        .map_err(|_| AppError::new("config_invalid", "无法设置本地控制接口"))?,
+    );
     let tun_config = document
         .entry(key("tun"))
         .or_insert(Value::Mapping(Mapping::new()));

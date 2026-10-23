@@ -102,6 +102,7 @@ fn install(owner_sid: &str) -> Result<()> {
     for filename in [
         "mihomo-core.exe",
         "mihomo-optimized.exe",
+        "mihomo-desktop-host.exe",
         "mihomo-desktop-service.exe",
         "wintun.dll",
     ] {
@@ -451,7 +452,7 @@ fn run_service() -> Result<()> {
             return Err(AppError::new("invalid_owner", "服务所有者记录损坏"));
         }
         windows::allow_service_identity_query(owner)?;
-        let server = Server::new(owner.into(), directory.join("mihomo-optimized.exe"))?;
+        let server = Server::new(owner.into(), directory.join("mihomo-desktop-host.exe"))?;
         let mut core = CoreSupervisor::new(
             directory.join("mihomo-core.exe"),
             data.join("runtime"),

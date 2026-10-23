@@ -1,9 +1,17 @@
-# Desktop UI adapter
+# Legacy Tauri UI adapter
 
-The Windows build uses the existing React dashboard, routes, components, themes,
+The Windows application from 0.2.0 uses the C# WPF project in `src-windows`.
+Its development, packaging and acceptance instructions are in
+[`desktop/README.zh-CN.md`](../../desktop/README.zh-CN.md). The adapter described
+below is retained for historical web fixtures; it is not part of the native
+Windows package. `pnpm desktop:dev` and `pnpm build:desktop` now build the WPF
+application. The explicitly named `desktop-legacy` commands below only exercise
+the former web adapter.
+
+The former Windows build used the existing React dashboard, routes, components, themes,
 and translations. `vite --mode desktop` defines `__DESKTOP__` and omits the PWA
 plugin. `pnpm build` still produces the browser dashboard with its existing
-controller selection and PWA support; `pnpm build:desktop` writes `dist-desktop`.
+controller selection and PWA support; `pnpm build:desktop-legacy` writes `dist-desktop`.
 
 ## Boundary and ownership
 
@@ -131,8 +139,8 @@ pnpm typecheck
 pnpm test:unit
 pnpm build
 pnpm test:browser
-pnpm build:desktop
-pnpm test:desktop
+pnpm build:desktop-legacy
+pnpm test:desktop-legacy
 ```
 
 Browser tests use Playwright Chromium. Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`

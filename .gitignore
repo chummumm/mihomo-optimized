@@ -19,3 +19,9 @@ src-tauri/resources/licenses/
 desktop-cache/
 core-src/
 __pycache__/
+/dist-native/
+/desktop/generated/
+/src-windows/bin/
+/src-windows/obj/
+/desktop/tests/protocol/bin/
+/desktop/tests/protocol/obj/
