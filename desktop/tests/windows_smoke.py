@@ -792,9 +792,9 @@ class NativeDriver:
         except (ValueError, TypeError):
             response = {}
         if result.returncode:
-            # The helper emits only a bounded operation stage and exception type.
+            # The helper emits only a bounded operation stage, exception type and HRESULT.
             # Never include raw PowerShell stderr or user-controlled UI values.
-            detail = "_".join(safe_code(response.get(key, "unknown")) for key in ("stage", "exception"))
+            detail = "_".join(safe_code(response.get(key, "unknown")) for key in ("stage", "exception", "hresult"))
             raise SmokeFailure("native_uia_query_failed_" + safe_code(automation_id) + "_" + detail)
         require(isinstance(response, dict) and "found" in response, "native_uia_response_invalid")
         return response

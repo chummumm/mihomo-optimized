@@ -12,7 +12,8 @@ trap {
     $exception = $_.Exception
     while ($exception.InnerException) { $exception = $exception.InnerException }
     @{found=$false; error='uia_operation_failed'; stage=$script:operationStage;
-        exception=$exception.GetType().Name} | ConvertTo-Json -Compress
+        exception=$exception.GetType().Name;
+        hresult=('0x{0:X8}' -f ([long]$exception.HResult -band 0xFFFFFFFFL))} | ConvertTo-Json -Compress
     exit 1
 }
 Add-Type -AssemblyName UIAutomationClient
@@ -205,19 +206,23 @@ public static class NativeEscapeInput {
     }
     default {
         $pattern = $null
+        $script:operationStage = 'read_value'
         if ($element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
             $result.value = $pattern.Current.Value
             $result.readOnly = $pattern.Current.IsReadOnly
         }
         $pattern = $null
+        $script:operationStage = 'read_selection'
         if ($element.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$pattern)) {
             $result.selection = @($pattern.Current.GetSelection() | ForEach-Object { $_.Current.Name })
         }
         $pattern = $null
+        $script:operationStage = 'read_toggle'
         if ($element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
             $result.toggleState = $pattern.Current.ToggleState.ToString()
         }
         $pattern = $null
+        $script:operationStage = 'read_scroll'
         if ($element.TryGetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern, [ref]$pattern)) {
             $result.scroll = @{ horizontalScrollable=$pattern.Current.HorizontallyScrollable;
                 horizontalPercent=$pattern.Current.HorizontalScrollPercent;
@@ -227,18 +232,24 @@ public static class NativeEscapeInput {
         }
         if ($AutomationId -eq 'ConfigEditor') {
             $pattern = $null
+            $script:operationStage = 'read_text_pattern'
             if ($element.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$pattern)) {
+                $script:operationStage = 'read_text_document'
                 $document = $pattern.DocumentRange
                 $start = [System.Windows.Automation.Text.TextPatternRangeEndpoint]::Start
                 $end = [System.Windows.Automation.Text.TextPatternRangeEndpoint]::End
+                $script:operationStage = 'read_text_visible_ranges'
                 $visible = @($pattern.GetVisibleRanges())
                 $startsDocument = $false; $endsDocument = $false
+                $script:operationStage = 'read_text_visible_endpoints'
                 foreach ($range in $visible) {
                     $startsDocument = $startsDocument -or ($range.CompareEndpoints($start, $document, $start) -eq 0)
                     $endsDocument = $endsDocument -or ($range.CompareEndpoints($end, $document, $end) -eq 0)
                 }
+                $script:operationStage = 'read_text_selection'
                 $selection = @($pattern.GetSelection())
                 $caretAtStart = $false; $caretAtEnd = $false
+                $script:operationStage = 'read_text_caret_endpoints'
                 if ($selection.Count -eq 1 -and $selection[0].CompareEndpoints($start, $selection[0], $end) -eq 0) {
                     $caretAtStart = $selection[0].CompareEndpoints($start, $document, $start) -eq 0
                     $caretAtEnd = $selection[0].CompareEndpoints($end, $document, $end) -eq 0
