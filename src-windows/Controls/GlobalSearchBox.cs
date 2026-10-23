@@ -57,7 +57,8 @@ public sealed class GlobalSearchBox : Grid
             Margin = new Thickness(0, 8, 10, 0), IsHitTestVisible = false
         };
         glyph.SetResourceReference(Control.ForegroundProperty, "TextSecondaryBrush"); Children.Add(glyph);
-        Input.GotKeyboardFocus += (_, _) => RequestOpen("focus");
+        Input.PreviewGotKeyboardFocus += (_, _) => NativeMotionCapture.Mark("search-input-preview-focus");
+        Input.GotKeyboardFocus += (_, _) => { NativeMotionCapture.Mark("search-input-got-focus"); RequestOpen("focus"); };
         Input.PreviewMouseLeftButtonDown += (_, _) => RequestOpen("pointer");
         Input.TextChanged += (_, _) =>
         {
@@ -117,6 +118,7 @@ public sealed class GlobalSearchBox : Grid
     }
     private void RequestOpen(string reason)
     {
+        NativeMotionCapture.Mark("search-request-open", reason);
         if (suppressOpen > 0) { suppressedRequests++; return; }
         openRequests++; lastOpenReason = reason; OpenRequested?.Invoke();
     }

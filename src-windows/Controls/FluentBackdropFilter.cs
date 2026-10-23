@@ -6,6 +6,7 @@ using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using Mihomo.Desktop.Services;
 
 namespace Mihomo.Desktop.Controls;
 
@@ -474,6 +475,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
             captureOperation = null;
             if (disposed || !listening || !CanProcess || processing is not null || !sourceDirty) return;
             capturing = true;
+            long timingSession = 0, timingStarted = 0, timingRendered = 0, timingCopied = 0, timingGeneration = 0, timingRevision = 0;
             try
             {
                 captureQueueMilliseconds = Stopwatch.GetElapsedTime(queued).TotalMilliseconds;
@@ -486,11 +488,18 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
                 if (width <= 0 || height <= 0) return;
                 long captureStarted = Stopwatch.GetTimestamp(); lastCaptureAt = clock.Elapsed.TotalMilliseconds;
                 double sampleStartedAt = lastCaptureAt;
+                timingSession = NativeMotionCapture.TimingSession;
+                if (timingSession != 0) { timingStarted = captureStarted; timingGeneration = generation; timingRevision = revision; }
                 var snapshot = new RenderTargetBitmap(width, height, dpiX * 96, dpiY * 96, PixelFormats.Pbgra32);
                 try { snapshot.Render(captureVisual); }
-                finally { RearmObservers(); }
+                finally
+                {
+                    if (timingSession != 0) timingRendered = Stopwatch.GetTimestamp();
+                    RearmObservers();
+                }
                 if (scratch?.Length != length) scratch = new byte[length];
                 snapshot.CopyPixels(scratch, stride, 0); captures++;
+                if (timingSession != 0) timingCopied = Stopwatch.GetTimestamp();
                 captureMilliseconds = Stopwatch.GetElapsedTime(captureStarted).TotalMilliseconds;
                 double sampleCompletedAt = clock.Elapsed.TotalMilliseconds;
                 long compareStarted = Stopwatch.GetTimestamp();
@@ -505,7 +514,13 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
             }
             catch (Exception error) when (error is COMException or NotSupportedException or InvalidOperationException or ArgumentException or OverflowException)
             { Fallback("capture-unavailable-" + error.GetType().Name); }
-            finally { capturing = false; }
+            finally
+            {
+                capturing = false;
+                if (timingSession != 0)
+                    NativeMotionCapture.BackdropCapture(timingSession, this, timingGeneration, timingRevision,
+                        timingStarted, timingRendered, timingCopied, Stopwatch.GetTimestamp());
+            }
         }));
     }
 

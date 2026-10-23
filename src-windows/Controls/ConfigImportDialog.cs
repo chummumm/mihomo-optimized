@@ -157,8 +157,18 @@ internal sealed class ConfigImportDialog
             Width = 12, Height = 12, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Bottom,
             Cursor = Cursors.SizeNS, Focusable = false, Margin = new Thickness(0, 0, 2, 2),
             Template = (ControlTemplate)XamlReader.Parse("""
-                <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Thumb">
-                  <Grid Background="Transparent"><Path Data="M 4 10 L 10 4 M 7 10 L 10 7" Stroke="{DynamicResource ControlStrongBrush}" StrokeThickness="1"/></Grid>
+                <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Thumb">
+                  <Grid Background="Transparent">
+                    <!-- Chromium's grip has two one-pixel stair diagonals, seven and three pixels long. -->
+                    <Path x:Name="Grip" Fill="#666666" RenderOptions.EdgeMode="Aliased"
+                          Tag="{DynamicResource {x:Static SystemParameters.HighContrastKey}}"
+                          Data="M 10 4 h 1 v 1 h -1 Z M 9 5 h 1 v 1 h -1 Z M 8 6 h 1 v 1 h -1 Z M 7 7 h 1 v 1 h -1 Z M 6 8 h 1 v 1 h -1 Z M 5 9 h 1 v 1 h -1 Z M 4 10 h 1 v 1 h -1 Z M 10 8 h 1 v 1 h -1 Z M 9 9 h 1 v 1 h -1 Z M 8 10 h 1 v 1 h -1 Z"/>
+                  </Grid>
+                  <ControlTemplate.Triggers>
+                    <DataTrigger Binding="{Binding Tag, ElementName=Grip}" Value="True">
+                      <Setter TargetName="Grip" Property="Fill" Value="{DynamicResource {x:Static SystemColors.WindowTextBrushKey}}"/>
+                    </DataTrigger>
+                  </ControlTemplate.Triggers>
                 </ControlTemplate>
                 """)
         };

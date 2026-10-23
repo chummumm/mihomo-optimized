@@ -14,6 +14,20 @@ namespace Mihomo.Desktop.Services;
 internal static class NativeMotionCapture
 {
     private static Recording? current;
+    private static long nextRecording;
+    // The shared QPC origin belongs to the real routed input event. These
+    // bounded probes are inert unless an opt-in recording is currently active.
+    internal static long TimingSession => current is { } recording && recording.AcceptTiming ? recording.Id : 0;
+    internal static void Mark(string phase, string? detail = null) => current?.Mark(phase, detail);
+    internal static void Mark(long session, string phase)
+    {
+        if (current is { } recording && recording.Id == session) recording.Mark(phase, null);
+    }
+    internal static bool SearchRendering(long session, int instance, double opacity, double translateY) =>
+        current is { } recording && recording.Id == session && recording.SearchRendering(instance, opacity, translateY);
+    internal static void BackdropCapture(long session, FrameworkElement filter, long generation, long revision,
+        long started, long rendered, long copied, long completed) => current?.BackdropCapture(session,
+            AutomationProperties.GetAutomationId(filter), generation, revision, started, rendered, copied, completed);
     internal static object Arm(Window owner, JsonElement args)
     {
         if (current is { Finished: false }) throw new InvalidOperationException("A motion recording is already armed.");
@@ -29,10 +43,14 @@ internal static class NativeMotionCapture
 
     private sealed class Recording
     {
+        private const double TimingWindowMilliseconds = 600;
         private static readonly double[] Schedule = [0, 16, 40, 83, 125, 167, 220, 250, 300, 333, 460, 700, 900, 1400, 1800, 2800];
+        internal long Id { get; } = Interlocked.Increment(ref nextRecording);
         private readonly Window owner;
         private readonly string directory, name, trigger, surface;
         private readonly List<object> frames = [];
+        private readonly object timingLock = new();
+        private readonly List<object> phases = [], renderings = [], captures = [];
         private readonly NativeVisualCapture.ScreenRegion bounds;
         private readonly bool reducedMotion;
         private readonly DispatcherTimer deadline = new() { Interval = TimeSpan.FromSeconds(20) };
@@ -45,6 +63,15 @@ internal static class NativeMotionCapture
         private object? diagnostics;
         private volatile bool finished;
         public bool Finished => finished;
+        internal bool AcceptTiming => TryTimingTimestamp(out _);
+        private bool TryTimingTimestamp(out long timestamp)
+        {
+            timestamp = 0;
+            long origin = Volatile.Read(ref started);
+            if (finished || origin == 0) return false;
+            timestamp = Stopwatch.GetTimestamp();
+            return Stopwatch.GetElapsedTime(origin, timestamp).TotalMilliseconds <= TimingWindowMilliseconds;
+        }
         internal Recording(Window owner, string directory, string name, string trigger, string surface)
         {
             this.owner = owner; this.directory = directory; this.name = name; this.trigger = trigger; this.surface = surface;
@@ -61,6 +88,46 @@ internal static class NativeMotionCapture
             deadline.Start();
         }
         internal object Status() => new { armed = started == 0 && !Finished, started = started != 0, finished = Finished, name, frames = Volatile.Read(ref frameCount), error };
+        internal void Mark(string phase, string? detail)
+        {
+            if (!TryTimingTimestamp(out long timestamp)) return;
+            lock (timingLock)
+                if (phases.Count < 64) phases.Add(new { phase, detail, timestamp,
+                    elapsedMilliseconds = Stopwatch.GetElapsedTime(started, timestamp).TotalMilliseconds });
+        }
+        internal bool SearchRendering(int instance, double opacity, double translateY)
+        {
+            if (!TryTimingTimestamp(out long timestamp)) return false;
+            lock (timingLock)
+            {
+                if (renderings.Count >= 32) return false;
+                renderings.Add(new { instance, timestamp, elapsedMilliseconds = Stopwatch.GetElapsedTime(started, timestamp).TotalMilliseconds, opacity, translateY });
+                return renderings.Count < 32;
+            }
+        }
+        internal void BackdropCapture(long session, string filter, long generation, long revision,
+            long captureStarted, long rendered, long copied, long completed)
+        {
+            if (finished || session != Id || started == 0 || captureStarted < started
+                || Stopwatch.GetElapsedTime(started, captureStarted).TotalMilliseconds > TimingWindowMilliseconds) return;
+            lock (timingLock)
+            {
+                if (captures.Count >= 16) return;
+                captures.Add(new { filter, generation, revision, startedTimestamp = captureStarted,
+                    renderedTimestamp = rendered == 0 ? (long?)null : rendered,
+                    copiedTimestamp = copied == 0 ? (long?)null : copied, completedTimestamp = completed,
+                    startedMilliseconds = Stopwatch.GetElapsedTime(started, captureStarted).TotalMilliseconds,
+                    renderedMilliseconds = rendered == 0 ? (double?)null : Stopwatch.GetElapsedTime(started, rendered).TotalMilliseconds,
+                    copiedMilliseconds = copied == 0 ? (double?)null : Stopwatch.GetElapsedTime(started, copied).TotalMilliseconds,
+                    completedMilliseconds = Stopwatch.GetElapsedTime(started, completed).TotalMilliseconds });
+            }
+        }
+        private object Timing()
+        {
+            lock (timingLock) return new { clock = "Stopwatch", frequency = Stopwatch.Frequency,
+                triggerTimestamp = started, windowMilliseconds = TimingWindowMilliseconds,
+                phases = phases.ToArray(), renderings = renderings.ToArray(), backdropCaptures = captures.ToArray() };
+        }
         private void Trigger(DependencyObject? item)
         {
             if (started != 0 || Finished) return;
@@ -113,7 +180,7 @@ internal static class NativeMotionCapture
         private void SaveReport()
         {
             var report = new { name, trigger, surface, captureKind = "screen-pixels", drivenBy = "independent-windows-uia",
-                recordedBy = "background-desktop-capture", reducedMotion, screen = bounds, frames, error, diagnostics,
+                recordedBy = "background-desktop-capture", reducedMotion, screen = bounds, frames, error, diagnostics, timing = Timing(),
                 caveat = "Only the visible desktop rectangle contains screen pixels; off-desktop areas are black. No WPF layout or render is requested by the recorder." };
             try { File.WriteAllText(Path.Combine(directory, name + ".json"), JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true })); }
             catch (Exception exception) { error = exception.GetType().Name; }

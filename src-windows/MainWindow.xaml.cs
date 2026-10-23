@@ -412,7 +412,8 @@ public partial class MainWindow : Window
         OverlayPaneHost.BeginAnimation(WidthProperty, null); OverlayPaneHost.Width = 280;
         OverlayPaneHost.Background = Brushes.Transparent;
         bool dark = TryFindResource("AppBackgroundBrush") is SolidColorBrush background && background.Color.R < 128;
-        OverlayPaneHost.Effect = new System.Windows.Media.Effects.DropShadowEffect { Color = Colors.Black, BlurRadius = 16, ShadowDepth = 8, Direction = 270, Opacity = dark ? .26 : .14 };
+        // CSS box-shadow blur 16 uses sigma 8; WPF's Gaussian radius is 3 sigma.
+        OverlayPaneHost.Effect = new System.Windows.Media.Effects.DropShadowEffect { Color = Colors.Black, BlurRadius = 24, ShadowDepth = 8, Direction = 270, Opacity = dark ? .26 : .14 };
         OverlayPaneHost.Visibility = NavigationScrim.Visibility = Visibility.Visible;
         navigationBackdrop.BeginPresentation();
         ApplyNavigationContent(navigationMode == "compact");
@@ -550,13 +551,18 @@ public partial class MainWindow : Window
     }
     private void ShowSearch()
     {
+        NativeMotionCapture.Mark("search-show-enter");
         if (EditorOpen) return;
         CloseOverlay(false);
         if (searchWindow is { IsVisible: true }) { searchWindow.FocusInput(); return; }
         // Verify current lower-layer pixels before HWND creation and popup
         // layout. Loaded checks the final viewport/revision again.
+        NativeMotionCapture.Mark("search-prepare-call");
         var preparation = searchBackdrop.PrepareAsync();
+        NativeMotionCapture.Mark("search-prepare-return");
+        NativeMotionCapture.Mark("search-new-before");
         var dialog = new SearchWindow(session, SearchButton, searchBackdrop, preparation) { Owner = this }; searchWindow = dialog;
+        NativeMotionCapture.Mark("search-new-after");
         dialog.Closed += (_, _) => { if (ReferenceEquals(searchWindow, dialog)) searchWindow = null; };
         dialog.Show(); dialog.FocusInput();
     }

@@ -86,7 +86,14 @@ internal sealed class SearchWindow : Window
 
     private const int MaximumVisibleResults = 8;
     private const double ShadowInset = 16;
-    private readonly Stopwatch openClock = Stopwatch.StartNew();
+    private readonly long timingSession = NativeMotionCapture.TimingSession;
+    private readonly Stopwatch openClock = StartOpenClock();
+    private static Stopwatch StartOpenClock()
+    {
+        var clock = Stopwatch.StartNew();
+        NativeMotionCapture.Mark("search-instance-fields");
+        return clock;
+    }
     private double constructorStartedMilliseconds, constructorCompletedMilliseconds;
     private double? sourceInitializedMilliseconds, sourceInitializedCompletedMilliseconds, loadedMilliseconds,
         attachOwnerCompletedMilliseconds, suggestionsStartedMilliseconds, coreRequestsStartedMilliseconds,
@@ -137,6 +144,7 @@ internal sealed class SearchWindow : Window
     public SearchWindow(AppSession session, GlobalSearchBox inputBox, FluentBackdropFilter? preparedBackdrop = null,
         Task<FluentBackdropFilter.PreparationTicket?>? preparedPixels = null)
     {
+        NativeMotionCapture.Mark(timingSession, "search-constructor-enter");
         constructorStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         this.session = session; this.inputBox = inputBox; search = inputBox.Input;
         ownsBackdrop = preparedBackdrop is null;
@@ -172,6 +180,7 @@ internal sealed class SearchWindow : Window
         search.TextChanged += QueryChanged;
         SourceInitialized += (_, _) =>
         {
+            NativeMotionCapture.Mark(timingSession, "search-source-initialized");
             sourceInitializedMilliseconds = openClock.Elapsed.TotalMilliseconds;
             var handle = new WindowInteropHelper(this).Handle;
             // The title-bar input owns keyboard focus even while the pointer is over suggestions.
@@ -182,9 +191,11 @@ internal sealed class SearchWindow : Window
                 if (source.CompositionTarget is { } target) target.BackgroundColor = Colors.Transparent;
             }
             sourceInitializedCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            NativeMotionCapture.Mark(timingSession, "search-source-initialized-completed");
         };
         Loaded += async (_, _) =>
         {
+            NativeMotionCapture.Mark(timingSession, "search-loaded");
             loadedMilliseconds = openClock.Elapsed.TotalMilliseconds;
             AttachOwner();
             attachOwnerCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
@@ -192,9 +203,11 @@ internal sealed class SearchWindow : Window
             backdropFilter.BeginPresentation();
             CompositionTarget.Rendering += FirstRendering;
             var coreLoad = LoadInitialEntries();
+            NativeMotionCapture.Mark(timingSession, "search-await-backdrop");
             if (preparedPixels is null) await backdropFilter.PrepareAsync();
             else await backdropFilter.CompletePreparationAsync(preparedPixels);
             backdropReadyMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            NativeMotionCapture.Mark(timingSession, "search-backdrop-ready");
             if (closing || closed) return;
             EnterSuggestions();
             await coreLoad;
@@ -220,6 +233,7 @@ internal sealed class SearchWindow : Window
         session.StatusChanged += OnStatusChanged; session.ThemeChanged += OnThemeChanged; L.Changed += OnLanguageChanged;
         RebuildEntries();
         constructorCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
+        NativeMotionCapture.Mark(timingSession, "search-constructor-completed");
     }
 
     private bool IsDark => TryFindResource("AppBackgroundBrush") is SolidColorBrush brush && brush.Color.R < 128;
@@ -229,6 +243,7 @@ internal sealed class SearchWindow : Window
     }
     private void EnterSuggestions()
     {
+        NativeMotionCapture.Mark(timingSession, "search-animation-start");
         suggestionsStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         suggestionBorder.Opacity = 1;
         if (!FluentMotion.Enabled) { suggestionBorder.RenderTransform = Transform.Identity; return; }
@@ -240,20 +255,35 @@ internal sealed class SearchWindow : Window
         var fade = new DoubleAnimationUsingKeyFrames { Duration = TimeSpan.FromMilliseconds(250), FillBehavior = FillBehavior.Stop };
         fade.KeyFrames.Add(new LinearDoubleKeyFrame(0, KeyTime.FromPercent(0)));
         fade.KeyFrames.Add(new SplineDoubleKeyFrame(1, KeyTime.FromPercent(1), new KeySpline(0, 0, 0, 1)));
-        fade.CurrentTimeInvalidated += (_, _) => entranceFirstTickMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
-        fade.Completed += (_, _) => entranceClockCompletedMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
+        fade.CurrentTimeInvalidated += (_, _) =>
+        {
+            if (entranceFirstTickMilliseconds is not null) return;
+            entranceFirstTickMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            NativeMotionCapture.Mark(timingSession, "search-animation-first-tick");
+        };
+        fade.Completed += (_, _) =>
+        {
+            entranceClockCompletedMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
+            NativeMotionCapture.Mark(timingSession, "search-animation-completed");
+        };
         CompositionTarget.Rendering += EntranceRendering;
         suggestionBorder.BeginAnimation(OpacityProperty, fade);
     }
     private void FirstRendering(object? sender, EventArgs args)
     {
         firstRenderingMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
-        CompositionTarget.Rendering -= FirstRendering;
+        // The opt-in recorder keeps at most 32 submission samples, all within
+        // 600 ms of the original routed input. Normal application use retains
+        // the previous single-callback behavior; Closed always unsubscribes.
+        if (!NativeMotionCapture.SearchRendering(timingSession, instance, suggestionBorder.Opacity,
+                suggestionBorder.RenderTransform is TranslateTransform movement ? movement.Y : 0))
+            CompositionTarget.Rendering -= FirstRendering;
     }
     private void EntranceRendering(object? sender, EventArgs args)
     {
         entranceFirstRenderingMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
         entranceFirstRenderedOpacity ??= suggestionBorder.Opacity;
+        NativeMotionCapture.Mark(timingSession, "search-animation-first-rendering");
         CompositionTarget.Rendering -= EntranceRendering;
     }
 
