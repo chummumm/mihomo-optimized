@@ -146,7 +146,7 @@ jobs:
           REFERENCE_SOURCE: artifacts/reference-source
           REFERENCE_FIXTURE: artifacts/verification/visual-fixture.json
           REFERENCE_OUTPUT: artifacts/verification/reference
-          REFERENCE_ALLOW_PARTIAL: ${{ failure() && '1' || '0' }}
+          REFERENCE_ALLOW_PARTIAL: ${{ job.status == 'failure' && '1' || '0' }}
         run: |
           if (Test-Path artifacts/verification/visual-fixture.json) {
             node desktop/tests/capture-reference.cjs
