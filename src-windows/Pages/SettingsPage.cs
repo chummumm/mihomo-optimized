@@ -16,7 +16,11 @@ namespace Mihomo.Desktop.Pages;
 
 public sealed class SettingsPage : NativePage
 {
-    private sealed record Choice(string Label, string Value);
+    private sealed record Choice(string Label, string Value)
+    {
+        // WPF item peers read Content.ToString(), independently of DisplayMemberPath.
+        public override string ToString() => Label;
+    }
     private sealed record Destination(SettingCard Card, Control? Control);
     private sealed class SettingCard : Border
     {

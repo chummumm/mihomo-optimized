@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Shell/TitleBar、Sidebar、Shell/nav-mode | MainWindow、NativeTitleBar | 48px 标题栏、返回、窗口按钮、拖动/缩放/贴靠、展开/紧凑/覆盖式导航、Escape 关闭覆盖导航 |
 | Shell/appearance、styles/tokens、components/Icon/Motion | AppSession、NativeBackdrop、FluentIcon、FluentMotion | 系统主题与强调色、Mica/Acrylic、原稿 Fluent 图标、状态和页面过渡、减少动画/高对比度/透明效果回退 |
-| Shell/CoreCard | MainWindow CoreCard | 内核状态、版本、当前模式与出口、启停/重启/日志/配置快捷入口 |
+| Shell/CoreCard | MainWindow CoreCard | 内核状态、版本、启停/重启/日志/配置快捷入口 |
 | Shell/GlobalSearch、search-targets、Settings/focus-target | SearchWindow、SearchTargets、NavigationTarget | 命令/页面/组/节点/设置/规则检索、匹配高亮、键盘操作、设置定位和短暂高亮、代理定位、规则筛选 |
 | Home/index | HomePage、ProxyExitSnapshot、ExitSummaryList | 运行状态、常用开关、模式、实时/累计流量、4 个出口摘要、点击设置及策略组 |
 | platform/TrayFlyout、tray.css | TrayController | 主窗口入口、系统代理/TUN/LAN 开关、三种模式、3 个出口、实时速率及 sparkline、内核电源、独立托盘菜单 |
@@ -16,7 +16,7 @@
 | DNS 页面与最终样式 | DnsPage、DnsTrendChart、DnsPageIndex | 统计/完整分钟趋势/热门来源、精确筛选、50/100 条分页、第一页/末页/指定页、原子锚点、上游与真实出口明细 |
 | Rules/index 与 Provider | RulesPage | 顺序规则、虚拟化列表、全文筛选/Escape、全局搜索带入查询、规则集合更新 |
 | Logs 与最终全局样式 | LogsPage | 默认/Debug/Info/Warn/Error/Silent、暂停暂存/继续、清空、跟随、数量与级别颜色 |
-| Profiles/index、Settings/ConfigEditor | ProfilesPage、ConfigCodeEditor | 当前配置摘要、文件/URL/粘贴/拖放、虚拟行号、光标与字节限制、Tab/Shift+Tab、Ctrl+S、原换行保留、只读/冲突、保存与重载分离、草稿确认、资源调度 |
+| Profiles/index、Settings/ConfigEditor | ProfilesPage、ConfigCodeEditor | 当前配置摘要、文件/URL/粘贴/拖放、虚拟行号、光标与字节限制、Tab 缩进与键盘导航、Ctrl+S、原换行保留、只读/冲突、保存与重载分离、草稿确认、资源调度 |
 | Settings/index、i18n | SettingsPage、L.* | 即时中文/英文、主题、系统/代理/服务设置、三个端口、探测 URL、目录入口、可信应用更新和进度 |
 
 ## 验收

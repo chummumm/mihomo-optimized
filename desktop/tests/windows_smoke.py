@@ -785,8 +785,17 @@ class NativeDriver:
             "-AutomationId", automation_id, "-Action", action, "-Value", value],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW)
-        require(result.returncode == 0, "native_uia_query_failed_" + safe_code(automation_id))
-        return json.loads(result.stdout.lstrip("\ufeff"))
+        try:
+            response = json.loads(result.stdout.lstrip("\ufeff"))
+        except (ValueError, TypeError):
+            response = {}
+        if result.returncode:
+            # The helper emits only a bounded operation stage and exception type.
+            # Never include raw PowerShell stderr or user-controlled UI values.
+            detail = "_".join(safe_code(response.get(key, "unknown")) for key in ("stage", "exception"))
+            raise SmokeFailure("native_uia_query_failed_" + safe_code(automation_id) + "_" + detail)
+        require(isinstance(response, dict) and "found" in response, "native_uia_response_invalid")
+        return response
 
     def screenshot(self, output: Path, secrets: set[str], page: str | None = "settings", surface: str = "main") -> dict:
         if page is not None:

@@ -6,6 +6,15 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$script:operationStage = 'initialize'
+trap {
+    # Keep CI diagnostics useful without printing control values, YAML or URLs.
+    $exception = $_.Exception
+    while ($exception.InnerException) { $exception = $exception.InnerException }
+    @{found=$false; error='uia_operation_failed'; stage=$script:operationStage;
+        exception=$exception.GetType().Name} | ConvertTo-Json -Compress
+    exit 1
+}
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $processCondition = [System.Windows.Automation.PropertyCondition]::new(
@@ -42,6 +51,7 @@ if (-not $element) { @{found=$false} | ConvertTo-Json -Compress; exit 0 }
 $result = @{ found=$true; enabled=$element.Current.IsEnabled; offscreen=$element.Current.IsOffscreen;
     name=$element.Current.Name; focused=$element.Current.HasKeyboardFocus;
     controlType=$element.Current.ControlType.ProgrammaticName }
+$script:operationStage = $Action
 switch ($Action) {
     'invoke' {
         $pattern = $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
@@ -63,17 +73,41 @@ switch ($Action) {
             $pattern = $element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
             $pattern.Select()
         } else {
+            $script:operationStage = 'select_expand'
             $expand = $null
             if ($element.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) {
                 $expand.Expand()
             }
-            $condition = [System.Windows.Automation.PropertyCondition]::new(
+            $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
                 [System.Windows.Automation.AutomationElement]::NameProperty, $Value)
-            $choice = $element.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-            if (-not $choice) { throw 'The requested option is not present.' }
+            $selectionCondition = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::IsSelectionItemPatternAvailableProperty, $true)
+            $condition = [System.Windows.Automation.AndCondition]::new($nameCondition, $selectionCondition)
+            # Expanding the popup schedules item containers for layout. Wait for
+            # the selectable item, rather than accidentally matching its text child.
+            $script:operationStage = 'select_find_option'
+            $deadline = [DateTime]::UtcNow.AddSeconds(5)
+            do {
+                $choice = $element.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+                if ($choice) { break }
+                Start-Sleep -Milliseconds 50
+            } while ([DateTime]::UtcNow -lt $deadline)
+            if (-not $choice) { throw [System.InvalidOperationException]::new('The requested option is not present.') }
+            $script:operationStage = 'select_option'
             $pattern = $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
             $pattern.Select()
-            if ($expand) { $expand.Collapse() }
+            # Language/theme changes can regenerate item peers. Obtain the
+            # current combo peer before closing the popup; do not reuse the item.
+            $script:operationStage = 'select_collapse'
+            foreach ($window in $windows) {
+                $current = $window.FindFirst([System.Windows.Automation.TreeScope]::Subtree, $idCondition)
+                if (-not $current) { continue }
+                $currentExpand = $null
+                if ($current.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$currentExpand)) {
+                    $currentExpand.Collapse()
+                }
+                break
+            }
         }
         $result.selected = $true
     }
