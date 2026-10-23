@@ -46,6 +46,17 @@ TUN_BODY = b"mihomo-windows-tun-socks-forwarded\n"
 BAD_CONFIG = "mixed-port: [unterminated\n"
 FIREWALL_RULE_PREFIX = "com.chummumm.mihomo-optimized.tun.tcp."
 FIREWALL_GROUP = "Mihomo Optimized TUN"
+UIA_STAGES = frozenset({
+    "initialize", "client_mta", "client_sta", "client_unknown",
+    "read_text_uia3_compile", "read_text_uia3", "load_automation_client",
+    "load_automation_types", "list_windows", "visible_list_windows",
+    "visible_snapshot", "visible_materialize", "find_element", "read_properties",
+    "read", "invoke", "set", "select", "toggle", "scroll", "scroll-horizontal",
+    "text-start", "text-end", "context", "escape", "select_expand",
+    "select_find_option", "select_option", "select_collapse", "context_focus",
+    "context_input", "context_open", "read_value", "read_selection", "read_toggle",
+    "read_scroll", "read_bounds", "serialize", "complete",
+})
 
 
 class SmokeFailure(Exception):
@@ -63,6 +74,19 @@ def require(condition: object, code: str) -> None:
 
 def safe_code(value: object) -> str:
     return value if isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9_. -]{1,100}", value) else "unspecified_error"
+
+
+def uia_stages(stderr: str | bytes | None) -> list[str]:
+    """Extract only bounded, fixed markers; never preserve raw helper output."""
+    text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr or ""
+    stages = []
+    for line in text[:16384].splitlines():
+        prefix = "MIHOMO_UIA_STAGE:"
+        if line.startswith(prefix) and line[len(prefix):] in UIA_STAGES:
+            stages.append(line[len(prefix):])
+            if len(stages) == 64:
+                break
+    return stages
 
 
 def wait_until(predicate, code: str, timeout: float = 45.0):
@@ -269,7 +293,16 @@ class Processes:
             return
         try:
             require(self.from_handle(handle, expected.pid) == expected, "process_identity_changed_before_termination")
-            require(self.api.TerminateProcess(handle, 87), "exact_process_termination_failed")
+            # Normal host/GUI shutdown can finish after identity verification.
+            # Only the same verified process handle proves that cleanup is done;
+            # path disappearance or ERROR_ACCESS_DENIED alone is not enough.
+            if self.api.WaitForSingleObject(handle, 0) == 0:
+                return
+            if not self.api.TerminateProcess(handle, 87):
+                failure = ctypes.get_last_error()
+                require(self.api.WaitForSingleObject(handle, 0) == 0,
+                        "exact_process_termination_failed_winerror_" + str(failure))
+                return
             require(self.api.WaitForSingleObject(handle, 10000) == 0, "exact_process_did_not_exit")
         finally:
             self.api.CloseHandle(handle)
@@ -784,9 +817,74 @@ class NativeDriver:
         self.invoke("native_navigate", {"page": page}, timeout=10)
         wait_until(lambda: self.snapshot().get("page") == page, "native_navigation_failed", 10)
 
+    def gui_timeout_probe(self) -> dict:
+        """One bounded WM_NULL probe, independent of UIA and the command pipe."""
+        started = time.monotonic()
+        deadline = started + 1.0
+        diagnostic = {"budgetMilliseconds": 1000, "enumeratedWindows": 0,
+            "windowFound": False, "messageAttempted": False}
+        try:
+            diagnostic["processRunning"] = self.process.poll() is None
+            if not diagnostic["processRunning"]:
+                return diagnostic
+            api = ctypes.WinDLL("user32", use_last_error=True)
+            callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, ctypes.c_ssize_t)
+            api.EnumWindows.argtypes = [callback_type, ctypes.c_ssize_t]
+            api.EnumWindows.restype = wintypes.BOOL
+            api.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            api.GetWindowThreadProcessId.restype = wintypes.DWORD
+            api.IsWindowVisible.argtypes = [wintypes.HWND]
+            api.IsWindowVisible.restype = wintypes.BOOL
+            api.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT,
+                ctypes.c_size_t, ctypes.c_ssize_t, wintypes.UINT, wintypes.UINT,
+                ctypes.POINTER(ctypes.c_size_t)]
+            api.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+            owned_window = None
+
+            @callback_type
+            def visit(window, _parameter):
+                nonlocal owned_window
+                if time.monotonic() >= deadline or diagnostic["enumeratedWindows"] >= 256:
+                    return False
+                diagnostic["enumeratedWindows"] += 1
+                pid = wintypes.DWORD()
+                api.GetWindowThreadProcessId(window, ctypes.byref(pid))
+                if pid.value == self.identity.pid and api.IsWindowVisible(window):
+                    owned_window = window
+                    return False
+                return True
+
+            api.EnumWindows(visit, 0)
+            diagnostic["windowFound"] = owned_window is not None
+            # The exact process handle is still owned. Recheck it and the HWND
+            # owner immediately before sending a message with no input payload.
+            if owned_window is not None and time.monotonic() < deadline and self.process.poll() is None:
+                pid = wintypes.DWORD()
+                api.GetWindowThreadProcessId(owned_window, ctypes.byref(pid))
+                remaining = int((deadline - time.monotonic()) * 1000)
+                if pid.value == self.identity.pid and remaining > 0:
+                    diagnostic["messageAttempted"] = True
+                    result = ctypes.c_size_t()
+                    ctypes.set_last_error(0)
+                    # BLOCK | ABORTIFHUNG | ERRORONEXIT; never broadcast and
+                    # never use NOTIMEOUTIFNOTHUNG, which can exceed the budget.
+                    responded = api.SendMessageTimeoutW(owned_window, 0, 0, 0,
+                        0x1 | 0x2 | 0x20, remaining, ctypes.byref(result))
+                    diagnostic["wmNullResponded"] = bool(responded)
+                    diagnostic["winerror"] = 0 if responded else ctypes.get_last_error()
+        except Exception:
+            # Diagnostic failure must not replace the original blocking UIA error.
+            diagnostic["probeFailed"] = True
+        finally:
+            diagnostic["elapsedMilliseconds"] = round((time.monotonic() - started) * 1000, 1)
+        return diagnostic
+
     def ui(self, automation_id: str, action: str = "read", value: str = "") -> dict:
         script = Path(__file__).with_name("uia-query.ps1").resolve()
-        arguments = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        identifier = "all_elements" if automation_id == "*" else safe_code(automation_id)
+        # Windows PowerShell 5.1 defaults to STA. UIA's headless client should
+        # use an MTA apartment; this does not establish the cause of a timeout.
+        arguments = ["powershell.exe", "-Mta", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
             "-File", str(script), "-ApplicationProcessId", str(self.identity.pid),
             "-AutomationId", automation_id, "-Action", action, "-Value", value]
         for attempt in range(3):
@@ -795,11 +893,14 @@ class NativeDriver:
                     encoding="utf-8", errors="replace", timeout=15,
                     creationflags=subprocess.CREATE_NO_WINDOW)
             except subprocess.TimeoutExpired as error:
+                stages = uia_stages(error.stderr)
                 diagnostic = {"action": safe_code(action),
-                    "automationId": safe_code(automation_id), "timedOut": True,
+                    "automationId": identifier, "timedOut": True,
                     "stdoutLength": len(error.stdout or b""),
-                    "stderrLength": len(error.stderr or b"")}
-                raise SmokeFailure("native_uia_query_timeout_" + safe_code(automation_id),
+                    "stderrLength": len(error.stderr or b""), "stages": stages,
+                    "lastStage": stages[-1] if stages else "not_reported",
+                    "guiMessageProbe": self.gui_timeout_probe()}
+                raise SmokeFailure("native_uia_query_timeout_" + identifier,
                                    uia=diagnostic) from None
             try:
                 response = json.loads(result.stdout.lstrip("\ufeff"))
@@ -820,11 +921,13 @@ class NativeDriver:
             # Preserve process-exit evidence even if the helper cannot emit JSON.
             # Counts and fixed markers are safe; stdout/stderr can contain text
             # from the editor or a configuration and must never enter artifacts.
+            stages = uia_stages(result.stderr)
             diagnostic = {"action": safe_code(action),
-                "automationId": safe_code(automation_id), "returnCode": result.returncode,
+                "automationId": identifier, "returnCode": result.returncode,
                 "exitCodeHex": f"0x{result.returncode & 0xFFFFFFFF:08X}",
                 "stdoutLength": len(result.stdout), "stderrLength": len(result.stderr),
-                "jsonParsed": parsed,
+                "jsonParsed": parsed, "stages": stages,
+                "lastStage": stages[-1] if stages else "not_reported",
                 "stderrIndicators": [marker for marker in (
                     "ParserError", "ParameterBindingValidationException", "AccessViolationException",
                     "TypeNotFound", "COMException", "Add-Type") if marker in result.stderr]}
@@ -836,7 +939,7 @@ class NativeDriver:
             # Never include raw PowerShell stderr or user-controlled UI values.
             error_fields = response if isinstance(response, dict) else {}
             detail = "_".join(safe_code(error_fields.get(key, "unknown")) for key in ("stage", "exception", "hresult"))
-            raise SmokeFailure("native_uia_query_failed_" + safe_code(automation_id) + "_" + detail,
+            raise SmokeFailure("native_uia_query_failed_" + identifier + "_" + detail,
                                uia=diagnostic)
         if not (isinstance(response, dict) and "found" in response):
             raise SmokeFailure("native_uia_response_invalid", uia=diagnostic)
@@ -2408,12 +2511,22 @@ class Acceptance:
         if not self.mutations_started:
             return
         errors = []
+        failure_details = []
 
         def attempt(code: str, operation) -> None:
             try:
                 operation()
-            except Exception:
+            except Exception as error:
                 errors.append(code)
+                # Fixed codes and numeric OS errors only; exception messages
+                # from native APIs can contain paths or configuration data.
+                detail = safe_code(str(error)) if isinstance(error, SmokeFailure) else "unexpected_" + type(error).__name__
+                failure = {"stage": "cleanup", "code": code, "detail": detail}
+                for key in ("winerror", "errno"):
+                    number = getattr(error, key, None)
+                    if isinstance(number, int):
+                        failure[key] = number
+                failure_details.append(failure)
                 print("CLEANUP error: " + code, flush=True)
 
         if self.driver:
@@ -2467,7 +2580,7 @@ class Acceptance:
         if self.desktop:
             attempt("restricted_token_close", self.desktop.close)
         self.report["tests"]["final_cleanup"] = not errors
-        self.report["diagnostics"].extend({"stage": "cleanup", "code": code} for code in errors)
+        self.report["diagnostics"].extend(failure_details)
         print("FAIL: final_cleanup" if errors else "PASS: final_cleanup", flush=True)
 
 
