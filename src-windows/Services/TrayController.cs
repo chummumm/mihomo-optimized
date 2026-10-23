@@ -38,6 +38,7 @@ internal sealed class TrayController : IDisposable
     private DateTime suppressClicksUntil;
     public bool IsFlyoutVisible => flyout?.IsVisible == true;
     public FrameworkElement? VisibleSurface => flyout?.IsVisible == true ? flyout : null;
+    internal Panel? NotificationSurface => flyout is { IsVisible: true, IsClosing: false } ? flyout.ClientArea : null;
     public string Material => flyout?.Material ?? "solid";
 
     public TrayController(MainWindow main, AppSession session)
@@ -75,12 +76,16 @@ internal sealed class TrayController : IDisposable
         L.Changed += Refresh; Refresh();
     }
     private bool IsRunning => session.Status.Text("phase") == "running";
-    private async Task Run(string command, object? args = null)
+    private async Task Run(string command, object? args = null, bool reportError = true)
     {
         if (commandBusy) return;
         commandBusy = true; Refresh();
         try { await session.CommandAsync(command, args); }
-        catch (Exception error) { main.ShowMain(); session.Notify(error.Message, true); }
+        catch (Exception error) when (reportError)
+        {
+            if (NotificationSurface is null) main.ShowMain();
+            main.RestoreNotifications(); session.Notify(error.Message, true);
+        }
         finally { commandBusy = false; Refresh(); }
     }
     private async Task ChangeTun(bool enabled)
@@ -90,7 +95,11 @@ internal sealed class TrayController : IDisposable
         {
             flyout?.HideFlyout(); main.ShowMain();
             commandBusy = true; Refresh();
-            try { await TunConsentDialog.Run(main, async () => { await session.CommandAsync("desktop_set_tun", new { enabled }); }, error => session.Notify(error, true)); }
+            try
+            {
+                await TunConsentDialog.Run(main, async () => { await session.CommandAsync("desktop_set_tun", new { enabled }); }, error => session.Notify(error, true),
+                    onSuccess: () => session.NotifySuccess("TUN 模式已开启"));
+            }
             finally { commandBusy = false; Refresh(); }
             return;
         }
@@ -114,8 +123,12 @@ internal sealed class TrayController : IDisposable
     {
         if (flyout is null)
         {
-            flyout = new TrayWindow(main, session, Run, ChangeTun);
-            flyout.IsVisibleChanged += (_, _) => { if (!flyout.IsVisible) lastHidden = DateTime.UtcNow; };
+            flyout = new TrayWindow(main, session, (method, args) => Run(method, args, reportError: false), ChangeTun);
+            flyout.IsVisibleChanged += (_, _) =>
+            {
+                if (!flyout.IsVisible) lastHidden = DateTime.UtcNow;
+                main.RestoreNotifications();
+            };
         }
         if (flyout.IsVisible) { flyout.Activate(); return; }
         flyout.Refresh(commandBusy); PositionFlyout();
@@ -196,6 +209,7 @@ internal sealed class TrayWindow : Window
     private bool closed;
     private long snapshotSequence;
     public Grid ClientArea { get; } = new();
+    internal bool IsClosing => closing || closed;
     public string Material => backdrop.Material;
     private bool Running => session.Status.Text("phase") == "running";
     private string Controller => session.Status.Get("controller").Text("url") + "\n" + session.Status.Get("controller").Text("secret");
@@ -260,7 +274,7 @@ internal sealed class TrayWindow : Window
         Deactivated += (_, _) => HideFlyout();
         PreviewKeyDown += (_, e) => { if (e.Key == Key.Escape) { HideFlyout(); e.Handled = true; } };
         L.Changed += LanguageChanged;
-        Closed += (_, _) => { closed = true; L.Changed -= LanguageChanged; visible?.Cancel(); visible?.Dispose(); visible = null; backdrop.Dispose(); };
+        Closed += (_, _) => { closed = true; L.Changed -= LanguageChanged; visible?.Cancel(); visible?.Dispose(); visible = null; backdrop.Dispose(); main.RestoreNotifications(); };
         Refresh(false);
     }
     internal void HideFlyout()
@@ -298,7 +312,7 @@ internal sealed class TrayWindow : Window
         if (applying || !tun.IsEnabled || changing) return;
         changing = true; bool enabled = tun.IsChecked == true; Refresh(outerBusy);
         try { await changeTun(enabled); }
-        catch (Exception error) { ShowError(error.Message); }
+        catch (Exception error) { ReportActionError(error.Message); }
         finally { changing = false; Refresh(outerBusy); }
     }
     private void LanguageChanged() => Refresh(outerBusy);
@@ -340,8 +354,13 @@ internal sealed class TrayWindow : Window
         changing = true; Refresh(outerBusy);
         try { await command(method, args); if (IsVisible && Running && visible is { } lifetime) await ReadSnapshotAsync(lifetime.Token); }
         catch (OperationCanceledException) { }
-        catch (Exception error) { ShowError(error.Message); }
+        catch (Exception error) { ReportActionError(error.Message); }
         finally { changing = false; Refresh(outerBusy); }
+    }
+    private void ReportActionError(string error)
+    {
+        if (!IsVisible || IsClosing) main.ShowMain();
+        main.RestoreNotifications(); session.Notify(error, true);
     }
     private void ShowError(string error) { notice.Text = error; notice.Visibility = error.Length > 0 ? Visibility.Visible : Visibility.Collapsed; }
     private async Task ObserveLiveAsync(CancellationToken token)

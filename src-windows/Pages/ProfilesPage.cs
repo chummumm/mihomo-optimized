@@ -52,6 +52,10 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private readonly Button importUrlButton;
     private readonly Button readAgain;
     private readonly Button save;
+    private readonly StackPanel saveContent = new() { Orientation = Orientation.Horizontal };
+    private readonly FluentIcon saveGlyph = new("save", 16) { Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center };
+    private readonly FluentProgressRing saveSpinner = new() { Width = 16, Height = 16, IsButtonSpinner = true, IsActive = false, Visibility = Visibility.Collapsed, Margin = new Thickness(0, 0, 8, 0) };
+    private readonly TextBlock saveLabel = Ui.Text("");
     private readonly MenuItem saveOnly;
     private readonly MenuItem discard;
     private readonly Button closeEditor;
@@ -110,6 +114,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         readAgain = IconAction("从文件重新读取", "ConfigReadAgain", "update", Reread);
         closeEditor = IconAction("关闭", "CloseEditor", "close", CloseEditor);
         save = IconAction("保存并重新加载", "SaveConfig", "save", () => Save(true), true);
+        saveContent.Children.Add(saveGlyph); saveContent.Children.Add(saveSpinner); saveContent.Children.Add(saveLabel); save.Content = saveContent;
         saveOnly = L.Bind(new MenuItem().Id("SaveOnlyConfig"), HeaderedItemsControl.HeaderProperty, "仅保存"); saveOnly.Click += async (_, _) => await RunAsync(() => Save(false));
         discard = L.Bind(new MenuItem().Id("DiscardConfig"), HeaderedItemsControl.HeaderProperty, "放弃修改"); discard.Click += async (_, _) => await RunAsync(Reread);
         var editorCommands = new ContextMenu(); editorCommands.Items.Add(saveOnly); editorCommands.Items.Add(discard); save.ContextMenu = editorCommands; editorFooter.ContextMenu = editorCommands;
@@ -296,7 +301,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
             if (wasOpen && animate && ProxyVisuals.Animate && IsLoaded)
             {
                 var scale = editPane.RenderTransform as ScaleTransform ?? new ScaleTransform(); editPane.RenderTransform = scale;
-                ProxyVisuals.Tween(scale, ScaleTransform.ScaleXProperty, scale.ScaleX, .98, 83, new Point(1, 0), new Point(1, 1)); ProxyVisuals.Tween(scale, ScaleTransform.ScaleYProperty, scale.ScaleY, .98, 83, new Point(1, 0), new Point(1, 1)); ProxyVisuals.Tween(editPane, OpacityProperty, editPane.Opacity, 0, 83, Complete);
+                ProxyVisuals.Tween(scale, ScaleTransform.ScaleXProperty, scale.ScaleX, .98, 83, new Point(1, 0), new Point(1, 1)); ProxyVisuals.Tween(scale, ScaleTransform.ScaleYProperty, scale.ScaleY, .98, 83, new Point(1, 0), new Point(1, 1)); ProxyVisuals.Tween(editPane, OpacityProperty, editPane.Opacity, 0, 83, Complete, new Point(1, 0), new Point(1, 1));
             }
             else Complete();
         }
@@ -316,7 +321,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     }
     private void SetConfirmation(Confirmation value)
     {
-        confirmation = value; editorFooter.Visibility = value == Confirmation.None ? Visibility.Visible : Visibility.Collapsed; confirmationPane.Visibility = value == Confirmation.None ? Visibility.Collapsed : Visibility.Visible;
+        var previous = confirmation; confirmation = value; editorFooter.Visibility = value == Confirmation.None ? Visibility.Visible : Visibility.Collapsed; confirmationPane.Visibility = value == Confirmation.None ? Visibility.Collapsed : Visibility.Visible;
         if (value != Confirmation.None)
         {
             confirmationTitle.Text = L.T(value == Confirmation.Close ? "放弃修改并关闭？" : "放弃修改并重新读取？"); confirmationText.Text = L.T(confirmation == Confirmation.Close ? "关闭后将丢弃尚未保存的修改。确定关闭吗？" : "重新读取会丢弃当前草稿。确定从配置文件重新读取吗？");
@@ -325,7 +330,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
             var move = new TranslateTransform(); var scale = new ScaleTransform(); var motion = new TransformGroup(); motion.Children.Add(scale); motion.Children.Add(move); confirmationPane.RenderTransform = motion;
             ProxyVisuals.Tween(move, TranslateTransform.YProperty, 14, 0, 167); ProxyVisuals.Tween(scale, ScaleTransform.ScaleXProperty, .97, 1, 167); ProxyVisuals.Tween(scale, ScaleTransform.ScaleYProperty, .97, 1, 167); ProxyVisuals.Tween(confirmationPane, OpacityProperty, 0, 1, 167); Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(() => keepEditing.Focus()));
         }
-        else if (IsLoaded)
+        else if (previous != Confirmation.None && IsLoaded && editorOpen)
         {
             var move = new TranslateTransform(); editorFooter.RenderTransform = move; ProxyVisuals.Tween(move, TranslateTransform.YProperty, -6, 0, 167); ProxyVisuals.Tween(editorFooter, OpacityProperty, 0, 1, 167);
         }
@@ -404,7 +409,10 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         editorNotice.Text = L.T(problem.Length > 0 ? problem : !writable ? "内核当前无法写入此配置文件，已以只读方式打开。可以选择和复制内容；请检查文件及所在目录的权限，调整后重新读取以恢复编辑。" : saved ? reloadPending ? "配置已保存，点击“保存并重新加载”使其生效。" : IsRunning ? "配置文件已保存并重新加载。" : "配置已保存并校验，内核启动时将使用此配置。" : "保存并重新加载会先写入配置文件，再由内核校验并应用。控制器地址和密钥等启动配置需重启内核后生效。");
         editorNotice.SetResourceReference(TextBlock.ForegroundProperty, problem.Length > 0 || saved ? "TextPrimaryBrush" : "TextSecondaryBrush"); editorNoticeFrame.SetResourceReference(Border.BackgroundProperty, problem.Length > 0 ? "WarningBackgroundBrush" : saved ? "SuccessBackgroundBrush" : "InfoBackgroundBrush"); if (problem.Length > 0 || saved) editorNoticeFrame.BorderBrush = Brushes.Transparent; else editorNoticeFrame.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
         var title = saving ? reloading ? "正在重载…" : "正在保存…" : reloadPending && !dirty ? "重试重新加载" : "保存并重新加载";
-        save.Content = FluentControls.ButtonContent(saving ? "update" : "save", title); L.Bind(save, AutomationProperties.NameProperty, title);
+        saveLabel.Text = L.T(title); saveGlyph.Kind = reloading ? "update" : "save"; saveGlyph.Visibility = saving && !reloading ? Visibility.Collapsed : Visibility.Visible;
+        saveSpinner.IsActive = saving && !reloading; saveSpinner.Visibility = saveSpinner.IsActive ? Visibility.Visible : Visibility.Collapsed; ProxyVisuals.SetBusyIcon(saveGlyph, saving && reloading);
+        if (saving) saveContent.SetResourceReference(TextElement.ForegroundProperty, "TextSecondaryBrush"); else saveContent.ClearValue(TextElement.ForegroundProperty);
+        L.Bind(save, AutomationProperties.NameProperty, title);
         readAgain.Content = FluentControls.ButtonContent("update", loaded ? "从文件重新读取" : "重新读取"); L.Bind(readAgain, AutomationProperties.NameProperty, loaded ? "从文件重新读取" : "重新读取");
     }
     private void EnsureNoUpdate() { if (Session.IsUpdating) throw new InvalidOperationException(L.T("正在安装应用更新，请等待更新完成后再编辑、保存或导入配置。")); }

@@ -168,6 +168,66 @@
       </Grid>
     </ControlTemplate></Setter.Value></Setter>
   </Style>
+  <Style x:Key="FluentMenuSeparator" TargetType="Separator">
+    <Setter Property="Focusable" Value="False"/><Setter Property="IsTabStop" Value="False"/>
+    <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Separator"><Border Height="1" Margin="-4,4,-4,4" Background="{DynamicResource DividerBrush}"/></ControlTemplate></Setter.Value></Setter>
+  </Style>
+  <Style TargetType="ContextMenu">
+    <Style.Resources><Style TargetType="Separator" BasedOn="{StaticResource FluentMenuSeparator}"/></Style.Resources>
+    <Setter Property="FontFamily" Value="{DynamicResource BodyFont}"/><Setter Property="FontSize" Value="14"/>
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/><Setter Property="HasDropShadow" Value="False"/>
+    <Setter Property="c:FluentControlState.Kind" Value="Menu"/>
+    <Setter Property="KeyboardNavigation.DirectionalNavigation" Value="Cycle"/>
+    <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ContextMenu">
+      <Border x:Name="PART_PopupFrame" Margin="16" MinWidth="200" MaxWidth="360" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource AcrylicStrokeBrush}" Background="{DynamicResource AcrylicBrush}" Padding="4">
+        <Border.Effect><DropShadowEffect BlurRadius="16" ShadowDepth="8" Direction="270" Opacity="0.14"/></Border.Effect>
+        <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Cycle"/>
+      </Border>
+    </ControlTemplate></Setter.Value></Setter>
+  </Style>
+  <Style TargetType="MenuItem">
+    <Style.Resources><Style TargetType="Separator" BasedOn="{StaticResource FluentMenuSeparator}"/></Style.Resources>
+    <Setter Property="FontFamily" Value="{DynamicResource BodyFont}"/><Setter Property="FontSize" Value="14"/><Setter Property="FontWeight" Value="Normal"/>
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/><Setter Property="Padding" Value="11,0"/><Setter Property="MinHeight" Value="32"/>
+    <Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="c:FluentControlState.Kind" Value="MenuItem"/>
+    <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="MenuItem">
+      <Grid>
+        <Border x:Name="PART_Frame" CornerRadius="4" Background="Transparent" Padding="{TemplateBinding Padding}">
+          <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <Grid x:Name="Lead" Width="16" Height="16" Margin="0,0,12,0" VerticalAlignment="Center" Visibility="Collapsed">
+              <ContentPresenter x:Name="Icon" ContentSource="Icon" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              <c:FluentIcon x:Name="Check" Kind="check" Width="16" Height="16" Foreground="{TemplateBinding Foreground}" Visibility="Collapsed"/>
+            </Grid>
+            <Grid Grid.Column="1" VerticalAlignment="Center">
+              <ContentPresenter x:Name="Header" ContentSource="Header" RecognizesAccessKey="True" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+              <TextBlock x:Name="TextHeader" Text="{Binding Header,RelativeSource={RelativeSource TemplatedParent}}" FontFamily="{TemplateBinding FontFamily}" FontSize="{TemplateBinding FontSize}" FontWeight="{TemplateBinding FontWeight}" Foreground="{TemplateBinding Foreground}" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" Visibility="Collapsed"/>
+            </Grid>
+            <TextBlock x:Name="Accelerator" Grid.Column="2" Text="{TemplateBinding InputGestureText}" FontFamily="{DynamicResource BodyFont}" FontSize="12" LineHeight="17.16" Foreground="{DynamicResource TextTertiaryBrush}" Margin="36,0,0,0" VerticalAlignment="Center"/>
+            <c:FluentIcon x:Name="SubmenuArrow" Grid.Column="3" Kind="chevron-right" Width="12" Height="12" Margin="12,0,0,0" Foreground="{TemplateBinding Foreground}" Visibility="Collapsed"/>
+          </Grid>
+        </Border>
+        <Popup x:Name="PART_Popup" Placement="Right" HorizontalOffset="-12" VerticalOffset="-16" AllowsTransparency="True" Focusable="False" PopupAnimation="None" IsOpen="{Binding IsSubmenuOpen,RelativeSource={RelativeSource TemplatedParent},Mode=TwoWay}">
+          <Border x:Name="PART_PopupFrame" Margin="16" MinWidth="200" MaxWidth="360" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource AcrylicStrokeBrush}" Background="{DynamicResource AcrylicBrush}" Padding="4">
+            <Border.Effect><DropShadowEffect BlurRadius="16" ShadowDepth="8" Direction="270" Opacity="0.14"/></Border.Effect>
+            <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Cycle"/>
+          </Border>
+        </Popup>
+      </Grid>
+      <ControlTemplate.Triggers>
+        <Trigger Property="c:FluentControlState.MenuLeading" Value="True"><Setter TargetName="Lead" Property="Visibility" Value="Visible"/></Trigger>
+        <Trigger Property="c:FluentControlState.MenuText" Value="True"><Setter TargetName="Header" Property="Visibility" Value="Collapsed"/><Setter TargetName="TextHeader" Property="Visibility" Value="Visible"/></Trigger>
+        <Trigger Property="IsCheckable" Value="True"><Setter TargetName="Icon" Property="Visibility" Value="Collapsed"/></Trigger>
+        <Trigger Property="IsChecked" Value="True"><Setter TargetName="Check" Property="Visibility" Value="Visible"/></Trigger>
+        <Trigger Property="InputGestureText" Value=""><Setter TargetName="Accelerator" Property="Visibility" Value="Collapsed"/></Trigger>
+        <Trigger Property="HasItems" Value="True"><Setter TargetName="SubmenuArrow" Property="Visibility" Value="Visible"/></Trigger>
+        <Trigger Property="c:FluentControlState.MenuCaption" Value="True"><Setter TargetName="Lead" Property="Visibility" Value="Collapsed"/><Setter TargetName="TextHeader" Property="LineHeight" Value="17.16"/></Trigger>
+      </ControlTemplate.Triggers>
+    </ControlTemplate></Setter.Value></Setter>
+    <Style.Triggers>
+      <Trigger Property="c:FluentControlState.MenuCaption" Value="True"><Setter Property="MinHeight" Value="0"/><Setter Property="Padding" Value="11,8,11,4"/><Setter Property="FontSize" Value="12"/><Setter Property="FontWeight" Value="SemiBold"/></Trigger>
+    </Style.Triggers>
+  </Style>
   <Style TargetType="ToolTip">
     <Setter Property="MaxWidth" Value="440"/><Setter Property="FontFamily" Value="{DynamicResource BodyFont}"/><Setter Property="FontSize" Value="12"/>
     <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/><Setter Property="Background" Value="{DynamicResource ToolTipBrush}"/>

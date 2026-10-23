@@ -14,6 +14,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
 using Microsoft.Win32;
+using Mihomo.Desktop.Controls;
 
 namespace Mihomo.Desktop.Services;
 
@@ -47,7 +48,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public event PropertyChangedEventHandler? PropertyChanged;
     public event EventHandler? StatusChanged;
     public event Action<string, JsonElement>? HostEvent;
-    public event Action<string, bool>? Notification;
+    public event Action<string, TransientMessageKind>? Notification;
     public event Action<string>? NavigateRequested;
     public event Action<NavigationTarget>? NavigateTargetRequested;
     public event Action? ExitRequested;
@@ -469,7 +470,8 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     }
 
     private void OnSystemThemeChanged(object sender, UserPreferenceChangedEventArgs e) => Dispatch(ApplyTheme);
-    public void Notify(string message, bool error = false) => Dispatch(() => Notification?.Invoke(L.T(message), error));
+    public void Notify(string message, bool error = false) => Dispatch(() => { if (!exiting) Notification?.Invoke(L.T(message), error ? TransientMessageKind.Error : TransientMessageKind.Info); });
+    public void NotifySuccess(string message) => Dispatch(() => { if (!exiting) Notification?.Invoke(L.T(message), TransientMessageKind.Success); });
     public void Navigate(string key) => Dispatch(() => NavigateRequested?.Invoke(key));
     public void Navigate(NavigationTarget target) => Dispatch(() => NavigateTargetRequested?.Invoke(target));
     public void RequestExit() => Dispatch(() => ExitRequested?.Invoke());

@@ -27,6 +27,7 @@ internal sealed class SearchWindow : Window
           <Style x:Key="Results" TargetType="ListBox">
             <Setter Property="BorderThickness" Value="0"/><Setter Property="Padding" Value="0"/>
             <Setter Property="Background" Value="Transparent"/><Setter Property="Focusable" Value="False"/>
+            <Setter Property="ItemsPanel"><Setter.Value><ItemsPanelTemplate><StackPanel/></ItemsPanelTemplate></Setter.Value></Setter>
             <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBox"><ItemsPresenter/></ControlTemplate></Setter.Value></Setter>
           </Style>
           <Style x:Key="Result" TargetType="ListBoxItem">
@@ -80,6 +81,7 @@ internal sealed class SearchWindow : Window
     }
 
     private const int MaximumVisibleResults = 8;
+    private const double ShadowInset = 16;
     private readonly AppSession session;
     private readonly GlobalSearchBox inputBox;
     private readonly TextBox search;
@@ -93,10 +95,11 @@ internal sealed class SearchWindow : Window
     private readonly List<Entry> entries = new();
     private readonly List<Entry> coreEntries = new();
     private readonly CancellationTokenSource lifetime = new();
-    private readonly NativeBackdrop backdrop;
+    private readonly FluentBackdropFilter backdropFilter = new FluentBackdropFilter { CornerRadius = new CornerRadius(7) }.Id("SearchBackdrop");
     private readonly Grid flyoutSurface;
     private Window? anchorOwner;
     private bool positioning;
+    private bool positionQueued;
     private string coreIdentity = "";
     private string runtimeMode = "";
     private string commandState = "";
@@ -117,10 +120,10 @@ internal sealed class SearchWindow : Window
         this.session = session; this.inputBox = inputBox; search = inputBox.Input;
         L.Bind(this, TitleProperty, "搜索"); this.Id("GlobalSearchWindow");
         Width = 380; Height = 330; MinWidth = 0; MinHeight = 0;
-        WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize;
+        WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize; AllowsTransparency = true;
         WindowStartupLocation = WindowStartupLocation.Manual; ShowInTaskbar = false; ShowActivated = false; Focusable = false;
         FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Microsoft YaHei"); FontSize = 14;
-        SetResourceReference(BackgroundProperty, "AppBackgroundBrush"); SetResourceReference(ForegroundProperty, "TextPrimaryBrush");
+        Background = Brushes.Transparent; SetResourceReference(ForegroundProperty, "TextPrimaryBrush");
         results.Id("SearchResults"); resultCount.Id("SearchResultCount");
         state.Id("SearchStatus"); empty.Id("SearchEmpty");
         AutomationProperties.SetLiveSetting(resultCount, AutomationLiveSetting.Polite);
@@ -133,22 +136,25 @@ internal sealed class SearchWindow : Window
         // Status remains available to assistive technology; the original palette has no persistent footer.
         state.Visibility = Visibility.Collapsed; suggestions.Children.Add(state);
         suggestionScroll = new ScrollViewer { Content = suggestions, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Padding = new Thickness(4), CanContentScroll = false };
-        suggestionBorder = new Border { Child = suggestionScroll, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), MaxHeight = 380 };
-        suggestionBorder.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush"); suggestionBorder.SetResourceReference(Border.BackgroundProperty, "AcrylicBrush");
+        var content = new Grid(); content.Children.Add(backdropFilter); content.Children.Add(suggestionScroll);
+        suggestionBorder = new Border { Child = content, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), MaxHeight = 380, Margin = new Thickness(ShadowInset) };
+        suggestionBorder.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush");
         suggestionBorder.Effect = new DropShadowEffect { Direction = 270, ShadowDepth = 8, BlurRadius = 16, Color = Colors.Black, Opacity = IsDark ? .26 : .14 };
-        flyoutSurface = new Grid(); flyoutSurface.Children.Add(suggestionBorder);
+        flyoutSurface = new Grid { Background = Brushes.Transparent }; flyoutSurface.Children.Add(suggestionBorder);
         Content = flyoutSurface;
-        backdrop = new NativeBackdrop(this, flyoutSurface, session, transient: true);
         ScrollViewer.SetHorizontalScrollBarVisibility(results, ScrollBarVisibility.Disabled);
         ScrollViewer.SetVerticalScrollBarVisibility(results, ScrollBarVisibility.Auto);
         search.TextChanged += QueryChanged;
-        search.LostKeyboardFocus += InputLostFocus;
         SourceInitialized += (_, _) =>
         {
             var handle = new WindowInteropHelper(this).Handle;
             // The title-bar input owns keyboard focus even while the pointer is over suggestions.
             _ = SetWindowLongPtr(handle, -20, new IntPtr(GetWindowLongPtr(handle, -20).ToInt64() | 0x08000000));
-            HwndSource.FromHwnd(handle)?.AddHook(WindowMessage);
+            if (HwndSource.FromHwnd(handle) is { } source)
+            {
+                source.AddHook(WindowMessage);
+                if (source.CompositionTarget is { } target) target.BackgroundColor = Colors.Transparent;
+            }
             PositionFlyout();
         };
         Loaded += async (_, _) =>
@@ -159,16 +165,16 @@ internal sealed class SearchWindow : Window
         Closed += (_, _) =>
         {
             closed = true; lifetime.Cancel(); lifetime.Dispose();
-            search.TextChanged -= QueryChanged; search.LostKeyboardFocus -= InputLostFocus;
+            search.TextChanged -= QueryChanged;
             AutomationProperties.SetHelpText(search, "");
             session.StatusChanged -= OnStatusChanged; session.ThemeChanged -= OnThemeChanged; L.Changed -= OnLanguageChanged;
             if (anchorOwner is not null)
             {
                 anchorOwner.LocationChanged -= CloseForOwnerChange; anchorOwner.SizeChanged -= CloseForOwnerSize;
                 anchorOwner.StateChanged -= CloseForOwnerChange; anchorOwner.IsVisibleChanged -= CloseForOwnerVisibility;
-                anchorOwner.Deactivated -= CloseForOwnerChange; anchorOwner.PreviewMouseDown -= OwnerPointerDown;
+                anchorOwner.PreviewMouseDown -= OwnerPointerDown;
             }
-            backdrop.Dispose();
+            backdropFilter.Dispose();
         };
         session.StatusChanged += OnStatusChanged; session.ThemeChanged += OnThemeChanged; L.Changed += OnLanguageChanged;
         RebuildEntries();
@@ -216,12 +222,15 @@ internal sealed class SearchWindow : Window
     {
         if (Owner is null || anchorOwner is not null) return;
         anchorOwner = Owner;
+        if (anchorOwner.Content is FrameworkElement content) backdropFilter.SetSources(content, content);
         anchorOwner.LocationChanged += CloseForOwnerChange; anchorOwner.SizeChanged += CloseForOwnerSize;
         anchorOwner.StateChanged += CloseForOwnerChange; anchorOwner.IsVisibleChanged += CloseForOwnerVisibility;
-        anchorOwner.Deactivated += CloseForOwnerChange; anchorOwner.PreviewMouseDown += OwnerPointerDown;
+        // The supplied AutoSuggestBox closes for an outside pointer, resize or
+        // explicit choice/Escape. A focus/activation transition alone is not a
+        // dismissal: assistive-technology clients may activate a provider HWND.
+        anchorOwner.PreviewMouseDown += OwnerPointerDown;
     }
     private void QueryChanged(object sender, TextChangedEventArgs e) { if (!closing && !closed) Filter(); }
-    private void InputLostFocus(object sender, KeyboardFocusChangedEventArgs e) => ClosePalette();
     private void OwnerPointerDown(object sender, MouseButtonEventArgs e)
     {
         if (new Rect(inputBox.RenderSize).Contains(e.GetPosition(inputBox))) return;
@@ -230,6 +239,18 @@ internal sealed class SearchWindow : Window
     private void CloseForOwnerChange(object? sender, EventArgs e) => ClosePalette();
     private void CloseForOwnerSize(object sender, SizeChangedEventArgs e) => ClosePalette();
     private void CloseForOwnerVisibility(object sender, DependencyPropertyChangedEventArgs e) { if (e.NewValue is false) ClosePalette(); }
+    private void QueuePositionFlyout()
+    {
+        if (positionQueued || closing || closed || !IsLoaded) return;
+        positionQueued = true;
+        // ItemsChanged realizes containers during layout. Measuring the outer
+        // stack directly from TextChanged can reuse the previous query's list.
+        _ = Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
+        {
+            positionQueued = false;
+            PositionFlyout();
+        }));
+    }
     private void PositionFlyout()
     {
         if (closing || closed || positioning || Owner is null) return;
@@ -250,13 +271,30 @@ internal sealed class SearchWindow : Window
             double maximumRight = Math.Min(ownerOrigin.X + Owner.ActualWidth * scale, work.Right) - 8 * scale;
             double left = Math.Clamp(origin.X, minimumLeft, Math.Max(minimumLeft, maximumRight - width * scale));
             double top = origin.Y + 4 * verticalScale;
-            suggestions.Measure(new Size(Math.Max(1, width - 10), double.PositiveInfinity));
+            var measure = new Size(Math.Max(1, width - 10), double.PositiveInfinity);
+            // The reference renders at most eight ordinary rows. Measure those
+            // actual containers directly so an earlier list/scroll extent can
+            // never keep a filtered one-row palette at its old height.
+            double contentHeight = 0;
+            foreach (var element in new UIElement[] { resultCount, empty })
+            {
+                if (element.Visibility != Visibility.Visible) continue;
+                element.InvalidateMeasure(); element.Measure(measure);
+                contentHeight += element.DesiredSize.Height;
+            }
+            foreach (ResultItem item in results.Items)
+            {
+                item.ApplyTemplate(); item.InvalidateMeasure(); item.Measure(measure);
+                contentHeight += item.DesiredSize.Height;
+            }
+            results.InvalidateMeasure(); suggestions.InvalidateMeasure();
             double maxHeight = Math.Min(380, Math.Max(40, (work.Bottom - top) / verticalScale - 8));
-            double panelHeight = Math.Min(maxHeight, suggestions.DesiredSize.Height + 10);
+            double panelHeight = Math.Min(maxHeight, contentHeight + 10);
             suggestionBorder.MaxHeight = maxHeight; suggestionBorder.Height = panelHeight;
-            Width = width; Height = panelHeight;
+            Width = width + 2 * ShadowInset; Height = panelHeight + 2 * ShadowInset;
             // Physical coordinates keep the flyout on the owner's monitor at mixed DPI settings.
-            _ = SetWindowPos(handle, IntPtr.Zero, (int)Math.Round(left), (int)Math.Round(top), (int)Math.Round(width * scale), (int)Math.Round(panelHeight * verticalScale), 0x0014);
+            _ = SetWindowPos(handle, IntPtr.Zero, (int)Math.Round(left - ShadowInset * scale), (int)Math.Round(top - ShadowInset * verticalScale),
+                (int)Math.Round((width + 2 * ShadowInset) * scale), (int)Math.Round((panelHeight + 2 * ShadowInset) * verticalScale), 0x0014);
         }
         finally { positioning = false; }
     }
@@ -347,7 +385,7 @@ internal sealed class SearchWindow : Window
             : !RuntimeReady ? L.T("启动内核后，可搜索策略组、节点和规则。页面与设置始终可搜索。")
             : L.T("选择结果可定位到页面、控件或规则；节点结果会定位到节点。");
         AutomationProperties.SetHelpText(search, state.Text);
-        if (IsLoaded) PositionFlyout();
+        QueuePositionFlyout();
     }
 
     private ListBoxItem RenderResult(Entry entry, string query)

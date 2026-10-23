@@ -12,7 +12,72 @@ namespace Mihomo.Desktop.Services;
 /// <summary>Read-only evidence from real WPF visuals, including an owned search list at its actual position.</summary>
 internal static class NativeVisualCapture
 {
-    internal sealed record Frame(RenderTargetBitmap Bitmap, int Width, int Height, double Dpi);
+    internal sealed record Frame(BitmapSource Bitmap, int Width, int Height, double Dpi);
+    internal sealed record ScreenRegion(int X, int Y, int Width, int Height, double Dpi,
+        int VisibleX, int VisibleY, int VisibleWidth, int VisibleHeight);
+
+    // Resolve WPF geometry on the dispatcher once; the screen read itself runs
+    // independently so recording does not render or block the application's UI.
+    internal static ScreenRegion ScreenBounds(Window owner, string surface)
+    {
+        var target = Surface(owner, surface);
+        var dpi = VisualTreeHelper.GetDpi(target);
+        var origin = target.PointToScreen(new Point());
+        int x = (int)Math.Round(origin.X), y = (int)Math.Round(origin.Y);
+        int width = (int)Math.Ceiling(target.ActualWidth * dpi.DpiScaleX), height = (int)Math.Ceiling(target.ActualHeight * dpi.DpiScaleY);
+        if (width is < 1 or > 4000 || height is < 1 or > 3000) throw new InvalidOperationException("Capture bounds are invalid.");
+        var desktop = System.Windows.Forms.SystemInformation.VirtualScreen;
+        var visible = System.Drawing.Rectangle.Intersect(new System.Drawing.Rectangle(x, y, width, height), desktop);
+        if (visible.Width < 1 || visible.Height < 1) throw new InvalidOperationException("The recording surface is outside the desktop.");
+        return new(x, y, width, height, dpi.PixelsPerInchX, visible.X - x, visible.Y - y, visible.Width, visible.Height);
+    }
+
+    internal static Frame CaptureScreen(ScreenRegion bounds)
+    {
+        using var bitmap = new System.Drawing.Bitmap(bounds.Width, bounds.Height, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+        using (var graphics = System.Drawing.Graphics.FromImage(bitmap))
+        {
+            graphics.Clear(System.Drawing.Color.Black);
+            IntPtr screen = GetDC(IntPtr.Zero);
+            if (screen == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+            try
+            {
+                IntPtr destination = graphics.GetHdc();
+                try
+                {
+                    // CAPTUREBLT includes layered native dialogs and flyouts.
+                    if (!BitBlt(destination, bounds.VisibleX, bounds.VisibleY, bounds.VisibleWidth, bounds.VisibleHeight,
+                        screen, bounds.X + bounds.VisibleX, bounds.Y + bounds.VisibleY, 0x00CC0020 | 0x40000000))
+                        throw new System.ComponentModel.Win32Exception();
+                }
+                finally { graphics.ReleaseHdc(destination); }
+            }
+            finally { _ = ReleaseDC(IntPtr.Zero, screen); }
+        }
+        var data = bitmap.LockBits(new System.Drawing.Rectangle(0, 0, bounds.Width, bounds.Height),
+            System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+        byte[] pixels = new byte[checked(bounds.Width * bounds.Height * 4)];
+        try
+        {
+            int stride = bounds.Width * 4;
+            for (int row = 0; row < bounds.Height; row++)
+                System.Runtime.InteropServices.Marshal.Copy(IntPtr.Add(data.Scan0, row * data.Stride), pixels, row * stride, stride);
+        }
+        finally { bitmap.UnlockBits(data); }
+        // GDI's RGB32 fourth byte is undefined, not an alpha channel.
+        for (int index = 3; index < pixels.Length; index += 4) pixels[index] = 255;
+        var image = BitmapSource.Create(bounds.Width, bounds.Height, bounds.Dpi, bounds.Dpi, PixelFormats.Bgra32, null, pixels, bounds.Width * 4);
+        image.Freeze();
+        return new(image, bounds.Width, bounds.Height, bounds.Dpi);
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr GetDC(IntPtr window);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern int ReleaseDC(IntPtr window, IntPtr dc);
+    [System.Runtime.InteropServices.DllImport("gdi32.dll", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool BitBlt(IntPtr destination, int x, int y, int width, int height, IntPtr source, int sourceX, int sourceY, uint operation);
 
     internal static Frame Render(Window owner, string surface)
     {
@@ -53,23 +118,26 @@ internal static class NativeVisualCapture
         string path = Path.GetFullPath(args.Text("path"));
         if (!path.EndsWith(".png", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("Screenshot must be a PNG file.");
         string surface = args.Text("surface", fallback: "main");
-        var frame = Render(owner, surface);
         string captureKind = args.Text("capture") == "screen" ? "screen-pixels" : "wpf-visual-tree";
-        if (captureKind == "screen-pixels")
-        {
-            var origin = Surface(owner, surface).PointToScreen(new Point());
-            using var bitmap = new System.Drawing.Bitmap(frame.Width, frame.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-            using var graphics = System.Drawing.Graphics.FromImage(bitmap);
-            graphics.CopyFromScreen((int)Math.Round(origin.X), (int)Math.Round(origin.Y), 0, 0, new System.Drawing.Size(frame.Width, frame.Height), System.Drawing.CopyPixelOperation.SourceCopy);
-            bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
-        }
-        else
-        {
-            var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(frame.Bitmap));
-            using var file = File.Create(path); png.Save(file);
-        }
+        var frame = captureKind == "screen-pixels" ? CaptureScreen(ScreenBounds(owner, surface)) : Render(owner, surface);
+        var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(frame.Bitmap));
+        using (var file = File.Create(path)) png.Save(file);
         var publicUpdate = update.Fields().Where(field => field.Name is "currentVersion" or "available" or "canInstall" or "version" or "releaseUrl" or "body").ToDictionary(field => field.Name, field => field.Value.Clone());
-        return new { path, captureKind, surface, material, width = frame.Width, height = frame.Height, dpi = frame.Dpi, capturedAt = DateTimeOffset.UtcNow, appearance = Appearance(), elements = Geometry(Surface(owner, surface)), streams = Readings(Surface(owner, surface)), update = publicUpdate };
+        return new { path, captureKind, surface, material, width = frame.Width, height = frame.Height, dpi = frame.Dpi, capturedAt = DateTimeOffset.UtcNow, appearance = Appearance(), backdrops = Backdrops(owner), elements = Geometry(Surface(owner, surface)), streams = Readings(Surface(owner, surface)), update = publicUpdate };
+    }
+
+    private static object[] Backdrops(Window owner)
+    {
+        var filters = new List<object>();
+        void Visit(DependencyObject node)
+        {
+            if (node is FluentBackdropFilter { IsVisible: true } filter)
+                filters.Add(new { id = AutomationProperties.GetAutomationId(filter), state = filter.Describe() });
+            for (int index = 0; index < VisualTreeHelper.GetChildrenCount(node); index++) Visit(VisualTreeHelper.GetChild(node, index));
+        }
+        Visit(owner);
+        foreach (Window window in owner.OwnedWindows) if (window.IsVisible) Visit(window);
+        return filters.ToArray();
     }
 
     private static FrameworkElement Surface(Window owner, string surface) => surface switch

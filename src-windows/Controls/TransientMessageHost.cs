@@ -3,6 +3,7 @@ using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Automation.Peers;
 using System.Windows.Controls;
+using System.Windows.Data;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Effects;
@@ -34,6 +35,7 @@ public sealed class TransientMessageHost : Grid, IDisposable
         Loaded += OnLoaded;
         Unloaded += OnUnloaded;
         SizeChanged += OnSizeChanged;
+        IsVisibleChanged += OnVisibilityChanged;
     }
 
     /// <summary>Text is already localized by the caller. The returned action removes only this message.</summary>
@@ -79,15 +81,18 @@ public sealed class TransientMessageHost : Grid, IDisposable
             subscribed = true;
             DesignTokens.Changed += ApplyTheme;
             SystemParameters.StaticPropertyChanged += OnSystemSettingChanged;
+            LayoutUpdated += OnLayoutUpdated;
         }
         ApplyTheme();
         PlaceMessages();
+        RefreshBackdrops();
     }
 
     private void OnUnloaded(object sender, RoutedEventArgs args)
     {
         // Moving this one host above an owned modal must not restart or discard notices.
         Unsubscribe();
+        foreach (var message in messages) message.DetachBackdrop();
     }
 
     private void Unsubscribe()
@@ -96,9 +101,42 @@ public sealed class TransientMessageHost : Grid, IDisposable
         subscribed = false;
         DesignTokens.Changed -= ApplyTheme;
         SystemParameters.StaticPropertyChanged -= OnSystemSettingChanged;
+        LayoutUpdated -= OnLayoutUpdated;
     }
 
     private void OnSizeChanged(object sender, SizeChangedEventArgs args) => PlaceMessages();
+    private void OnVisibilityChanged(object sender, DependencyPropertyChangedEventArgs args)
+    {
+        if (IsVisible) RefreshBackdrops();
+    }
+    private void OnLayoutUpdated(object? sender, EventArgs args) => RefreshBackdrops();
+    private void RefreshBackdrops()
+    {
+        if (disposed || !IsLoaded || !IsVisible || messages.Count == 0 || Parent is not Panel surface) return;
+        Panel background = surface;
+        var sources = new List<FrameworkElement>();
+        if (Window.GetWindow(this) is FluentDialog { Owner.Content: Panel ownerSurface })
+        {
+            // An owned modal is a separate HWND. Explicitly composite the owner
+            // below its smoke/card; neither complete root is sampled as a visual.
+            background = ownerSurface;
+            sources.AddRange(LowerLayers(ownerSurface, null));
+        }
+        sources.AddRange(LowerLayers(surface, this));
+        var layers = sources.ToArray();
+        foreach (var message in messages) message.AttachBackdrop(surface, background, layers);
+    }
+    private static IEnumerable<FrameworkElement> LowerLayers(Panel panel, TransientMessageHost? boundary)
+    {
+        int boundaryIndex = boundary is null ? int.MaxValue : panel.Children.IndexOf(boundary);
+        int boundaryZ = boundary is null ? int.MaxValue : GetZIndex(boundary);
+        return panel.Children.Cast<UIElement>()
+            .Select((element, index) => (element, index, z: GetZIndex(element)))
+            .Where(item => item.element is FrameworkElement and not TransientMessageHost
+                && (item.z < boundaryZ || item.z == boundaryZ && item.index < boundaryIndex))
+            .OrderBy(item => item.z).ThenBy(item => item.index)
+            .Select(item => (FrameworkElement)item.element);
+    }
     private void PlaceMessages()
     {
         foreach (var message in messages) message.Place(ActualWidth);
@@ -142,12 +180,14 @@ public sealed class TransientMessageHost : Grid, IDisposable
         Loaded -= OnLoaded;
         Unloaded -= OnUnloaded;
         SizeChanged -= OnSizeChanged;
+        IsVisibleChanged -= OnVisibilityChanged;
     }
 
     private sealed class Message
     {
         private readonly TransientMessageHost host;
         private readonly FluentIcon icon;
+        private readonly FluentBackdropFilter backdrop = new() { CornerRadius = new CornerRadius(8), Sigma = 30, Saturation = 1.5 };
         private readonly DropShadowEffect shadow = new()
         {
             Color = Colors.Black, BlurRadius = 16, ShadowDepth = 8, Direction = 270,
@@ -157,6 +197,8 @@ public sealed class TransientMessageHost : Grid, IDisposable
         private readonly DispatcherTimer leave;
         private readonly DispatcherTimer fallback;
         private bool started, closing, removed;
+        private Panel? sourceRoot, backgroundRoot;
+        private FrameworkElement[] sourceLayers = [];
 
         internal string Text { get; }
         internal TransientMessageKind Kind { get; }
@@ -184,19 +226,42 @@ public sealed class TransientMessageHost : Grid, IDisposable
             content.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             content.ColumnDefinitions.Add(new ColumnDefinition());
             content.Children.Add(icon); Grid.SetColumn(Content, 1); content.Children.Add(Content);
+            var foreground = new Border
+            {
+                Child = content, Background = Brushes.Transparent, CornerRadius = new CornerRadius(8), Padding = new Thickness(16, 12, 16, 12), BorderThickness = new Thickness(1),
+            };
+            foreground.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush");
+            var layers = new Grid();
+            AutomationProperties.SetAutomationId(backdrop, "MessageBackdrop");
+            layers.Children.Add(backdrop); layers.Children.Add(foreground);
             Surface = new Border
             {
-                Child = content, CornerRadius = new CornerRadius(8), Padding = new Thickness(16, 12, 16, 12),
-                BorderThickness = new Thickness(1), VerticalAlignment = VerticalAlignment.Bottom,
+                Child = layers, CornerRadius = new CornerRadius(8), VerticalAlignment = VerticalAlignment.Bottom,
                 HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 24),
                 RenderTransform = movement, Opacity = 0,
             };
-            Surface.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush");
             Surface.Loaded += Loaded;
             leave = new DispatcherTimer(DispatcherPriority.Normal, host.Dispatcher) { Interval = TimeSpan.FromMilliseconds(duration) };
             fallback = new DispatcherTimer(DispatcherPriority.Normal, host.Dispatcher) { Interval = TimeSpan.FromMilliseconds(duration + 250) };
             leave.Tick += Leave;
             fallback.Tick += Fallback;
+        }
+
+        internal void AttachBackdrop(Panel root, Panel background, FrameworkElement[] sources)
+        {
+            if (removed || ReferenceEquals(sourceRoot, root) && ReferenceEquals(backgroundRoot, background) && sourceLayers.SequenceEqual(sources)) return;
+            sourceRoot = root; backgroundRoot = background; sourceLayers = sources;
+            backdrop.SetBinding(FluentBackdropFilter.BaseBrushProperty, new Binding(nameof(Panel.Background)) { Source = background, Mode = BindingMode.OneWay });
+            backdrop.SetSources(root, sources);
+        }
+
+        internal void DetachBackdrop()
+        {
+            if (removed || sourceRoot is null) return;
+            sourceRoot = backgroundRoot = null; sourceLayers = [];
+            BindingOperations.ClearBinding(backdrop, FluentBackdropFilter.BaseBrushProperty);
+            backdrop.SetResourceReference(FluentBackdropFilter.BaseBrushProperty, "AppBackgroundBrush");
+            backdrop.SetSources(host, []);
         }
 
         internal void Place(double viewportWidth)
@@ -216,7 +281,7 @@ public sealed class TransientMessageHost : Grid, IDisposable
                 TransientMessageKind.Success => "SuccessBackgroundBrush", TransientMessageKind.Warning => "WarningBackgroundBrush",
                 TransientMessageKind.Error => "CriticalBackgroundBrush", _ => null,
             };
-            Surface.Background = new SolidColorBrush(fill is null ? acrylic : Mix(Color(fill), acrylic, .7));
+            backdrop.TintBrush = new SolidColorBrush(fill is null ? acrylic : Mix(Color(fill), acrylic, .7));
             icon.SetResourceReference(Control.ForegroundProperty, Kind switch
             {
                 TransientMessageKind.Success => "SuccessBrush", TransientMessageKind.Warning => "WarningBrush",
@@ -241,7 +306,9 @@ public sealed class TransientMessageHost : Grid, IDisposable
 
         private void Loaded(object sender, RoutedEventArgs args)
         {
-            if (started || removed) return;
+            if (removed) return;
+            host.RefreshBackdrops();
+            if (started) return;
             started = true;
             Surface.Opacity = 1;
             Surface.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(0, 1, FluentMotion.Fast) { FillBehavior = FillBehavior.Stop });
@@ -291,6 +358,9 @@ public sealed class TransientMessageHost : Grid, IDisposable
             Surface.Loaded -= Loaded;
             Surface.BeginAnimation(UIElement.OpacityProperty, null);
             StopTranslation();
+            backdrop.Dispose();
+            BindingOperations.ClearBinding(backdrop, FluentBackdropFilter.BaseBrushProperty);
+            sourceRoot = backgroundRoot = null; sourceLayers = [];
         }
     }
 }

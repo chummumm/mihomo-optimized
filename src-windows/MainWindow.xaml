@@ -150,7 +150,7 @@
         </Grid>
       </Border>
       <Border x:Name="NavigationScrim" Grid.ColumnSpan="2" Background="Transparent" Visibility="Collapsed" MouseLeftButtonDown="CloseNavigationOverlay" Panel.ZIndex="5"/>
-      <Border x:Name="OverlayPaneHost" Grid.ColumnSpan="2" Width="280" HorizontalAlignment="Left" CornerRadius="0,8,8,0" Background="{DynamicResource AcrylicBrush}" BorderBrush="{DynamicResource AcrylicStrokeBrush}" BorderThickness="0,0,1,0" Visibility="Collapsed" Panel.ZIndex="6" ClipToBounds="True">
+      <Border x:Name="OverlayPaneHost" Grid.ColumnSpan="2" Width="280" HorizontalAlignment="Left" CornerRadius="0,8,8,0" Background="Transparent" BorderBrush="{DynamicResource AcrylicStrokeBrush}" BorderThickness="0,0,1,0" Visibility="Collapsed" Panel.ZIndex="6" ClipToBounds="True">
         <Border.Effect><DropShadowEffect Color="Black" BlurRadius="16" ShadowDepth="8" Direction="270" Opacity="0.14"/></Border.Effect>
       </Border>
       <Border x:Name="DropOverlay" Grid.ColumnSpan="2" Margin="16" CornerRadius="8" Background="{DynamicResource SurfaceBrush}" BorderThickness="2" BorderBrush="{DynamicResource AccentBrush}" Visibility="Collapsed" IsHitTestVisible="False" Panel.ZIndex="10">

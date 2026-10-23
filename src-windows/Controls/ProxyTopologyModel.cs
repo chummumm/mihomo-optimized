@@ -98,7 +98,7 @@ internal sealed class ProxyTopologyModelBuilder
         Place(2, "x:", Rank(exits), (name, _) =>
         {
             proxies.TryGetValue(name, out var proxy); var kind = Kind(name);
-            var subtitle = kind == "direct" ? L.T("直接连接") : kind == "reject" ? L.T("拒绝连接") : proxy?.History.Count > 0 ? proxy.DelayLabel : proxy?.Type ?? "";
+            var subtitle = kind == "direct" ? L.T("直连") : kind == "reject" ? L.T("拒绝") : proxy?.History.Count > 0 ? proxy.DelayLabel : proxy?.Type ?? "";
             return new("x:" + name, 2, "exit", name, subtitle, kind == "direct" ? "quiet" : kind == "reject" ? "bad" : proxy?.Tone ?? "idle", kind == "proxy" && proxy is not null ? name : null, proxy?.History.LastOrDefault()?.Stamp);
         });
         var links = new Dictionary<(string From, string To), TopologyLink>();

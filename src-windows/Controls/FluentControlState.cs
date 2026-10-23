@@ -5,6 +5,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using System.Windows.Media.Effects;
 using System.Windows.Threading;
 
 namespace Mihomo.Desktop.Controls;
@@ -16,6 +17,15 @@ public static class FluentControlState
     private static readonly DependencyProperty StateProperty = DependencyProperty.RegisterAttached("State", typeof(State), typeof(FluentControlState));
     public static string GetKind(DependencyObject item) => (string)item.GetValue(KindProperty);
     public static void SetKind(DependencyObject item, string value) => item.SetValue(KindProperty, value);
+    public static readonly DependencyProperty MenuLeadingProperty = DependencyProperty.RegisterAttached("MenuLeading", typeof(bool), typeof(FluentControlState), new PropertyMetadata(false));
+    public static bool GetMenuLeading(DependencyObject item) => (bool)item.GetValue(MenuLeadingProperty);
+    public static void SetMenuLeading(DependencyObject item, bool value) => item.SetValue(MenuLeadingProperty, value);
+    public static readonly DependencyProperty MenuCaptionProperty = DependencyProperty.RegisterAttached("MenuCaption", typeof(bool), typeof(FluentControlState), new PropertyMetadata(false));
+    public static bool GetMenuCaption(DependencyObject item) => (bool)item.GetValue(MenuCaptionProperty);
+    public static void SetMenuCaption(DependencyObject item, bool value) => item.SetValue(MenuCaptionProperty, value);
+    public static readonly DependencyProperty MenuTextProperty = DependencyProperty.RegisterAttached("MenuText", typeof(bool), typeof(FluentControlState), new PropertyMetadata(false));
+    public static bool GetMenuText(DependencyObject item) => (bool)item.GetValue(MenuTextProperty);
+    public static void SetMenuText(DependencyObject item, bool value) => item.SetValue(MenuTextProperty, value);
     private static void Changed(DependencyObject item, DependencyPropertyChangedEventArgs args)
     {
         if (item is not Control control) return;
@@ -30,7 +40,10 @@ public static class FluentControlState
         private bool attached;
         private bool ready;
         private Popup? popup;
+        private PopupBackdrop? backdrop;
         private int popupGeneration;
+        private bool menuOpen, menuPressed;
+        private double menuX, menuY;
         internal State(Control control)
         {
             this.control = control;
@@ -58,19 +71,40 @@ public static class FluentControlState
                     popup.PlacementTarget = combo;
                     popup.CustomPopupPlacementCallback = (_, _, _) => PlacePopup(combo);
                     popup.Opened += PopupOpened;
+                    popup.Closed += PopupClosed;
                 }
             }
+            if (control is ContextMenu menu)
+            {
+                menu.Opened += MenuOpened; menu.Closed += MenuClosed;
+                if (menu.IsOpen) control.Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => { if (attached && menu.IsOpen) OpenMenu(menu); }));
+            }
+            if (control is MenuItem item)
+            {
+                SetMenuText(item, item.Header is string); Watch(MenuItem.IsHighlightedProperty); Watch(HeaderedItemsControl.HeaderProperty);
+                item.PreviewMouseLeftButtonDown += MenuDown; item.PreviewMouseLeftButtonUp += MenuUp;
+                popup = control.Template?.FindName("PART_Popup", control) as Popup;
+                if (popup is not null) { popup.Opened += SubmenuOpened; popup.Closed += PopupClosed; }
+            }
             DesignTokens.Changed += ThemeChanged;
-            Update(false); ready = true;
+            Update(false); UpdatePopupShadow(); ready = true;
         }
         private void Watch(DependencyProperty property)
         {
             var descriptor = DependencyPropertyDescriptor.FromProperty(property, control.GetType());
-            EventHandler handler = (_, _) => { Update(ready); if (property == ComboBox.IsDropDownOpenProperty) ChangePopup(); };
+            EventHandler handler = (_, _) => { if (control is MenuItem item && property == HeaderedItemsControl.HeaderProperty) SetMenuText(item, item.Header is string); Update(ready); if (property == ComboBox.IsDropDownOpenProperty) ChangePopup(); };
             descriptor.AddValueChanged(control, handler); subscriptions.Add((descriptor, handler));
         }
-        private void ThemeChanged() => Update(false);
-        private void Mouse(object sender, MouseEventArgs e) => Update(ready);
+        private void ThemeChanged() { Update(false); UpdatePopupShadow(); }
+        private void UpdatePopupShadow()
+        {
+            if (Part("PART_PopupFrame") is not { Effect: DropShadowEffect shadow } frame) return;
+            if (shadow.IsFrozen) { shadow = shadow.CloneCurrentValue(); frame.Effect = shadow; }
+            shadow.Opacity = SystemParameters.HighContrast ? 0 : Color("AppBackgroundBrush").R < 128 ? .26 : .14;
+        }
+        private void Mouse(object sender, MouseEventArgs e) { if (!control.IsMouseOver) menuPressed = false; Update(ready); }
+        private void MenuDown(object sender, MouseButtonEventArgs e) { menuPressed = control.IsEnabled; Update(false); }
+        private void MenuUp(object sender, MouseButtonEventArgs e) { menuPressed = false; Update(false); }
         private void Focus(object sender, KeyboardFocusChangedEventArgs e) => Update(ready);
         private void Enabled(object sender, DependencyPropertyChangedEventArgs e) => Update(ready);
         private void Detach()
@@ -83,7 +117,10 @@ public static class FluentControlState
             DesignTokens.Changed -= ThemeChanged;
             foreach (var (descriptor, handler) in subscriptions) descriptor.RemoveValueChanged(control, handler);
             subscriptions.Clear();
-            if (popup is not null) { popup.Opened -= PopupOpened; popup.IsOpen = false; popup = null; }
+            if (control is ContextMenu menu) { menu.Opened -= MenuOpened; menu.Closed -= MenuClosed; ResetMenu(menu); }
+            if (control is MenuItem item) { item.PreviewMouseLeftButtonDown -= MenuDown; item.PreviewMouseLeftButtonUp -= MenuUp; }
+            if (popup is not null) { popup.Opened -= PopupOpened; popup.Opened -= SubmenuOpened; popup.Closed -= PopupClosed; popup.IsOpen = false; popup = null; }
+            ReleaseBackdrop();
         }
         public void Dispose() { Detach(); control.Loaded -= Loaded; control.Unloaded -= Unloaded; }
         private Border? Part(string name) => control.Template?.FindName(name, control) as Border;
@@ -97,7 +134,12 @@ public static class FluentControlState
             bool selected = control is ToggleButton toggle && toggle.IsChecked == true || kind == "HomeMore" && control.Tag is true;
             double milliseconds = kind == "Switch" ? 167 : 83;
             string fill = "ControlBrush", stroke = "ControlStrokeBrush", foreground = "TextPrimaryBrush";
-            if (kind is "Switch" or "CheckBox")
+            if (control is MenuItem menuItem)
+            {
+                fill = !enabled ? "Transparent" : menuPressed ? "SubtlePressedBrush" : menuItem.IsHighlighted ? "SubtleHoverBrush" : "Transparent";
+                stroke = "Transparent"; foreground = GetMenuCaption(menuItem) ? "TextSecondaryBrush" : !enabled ? "TextDisabledBrush" : menuPressed ? "TextSecondaryBrush" : "TextPrimaryBrush"; animate = false;
+            }
+            else if (kind is "Switch" or "CheckBox")
             {
                 fill = selected ? hover ? "AccentHoverBrush" : "AccentBrush" : hover ? "ControlAltHoverBrush" : "ControlAltBrush";
                 stroke = selected ? "AccentBrush" : "ControlStrongBrush";
@@ -220,6 +262,7 @@ public static class FluentControlState
         private void PopupOpened(object? sender, EventArgs e)
         {
             if (control is not ComboBox combo || Part("PART_PopupFrame") is not { } frame) return;
+            ReleaseBackdrop(); backdrop = PopupBackdrop.Attach(frame, combo, "SelectBackdrop");
             frame.BeginAnimation(UIElement.OpacityProperty, null); frame.Opacity = 1;
             frame.UpdateLayout();
             if (combo.ItemContainerGenerator.ContainerFromIndex(combo.SelectedIndex) is ComboBoxItem selected) selected.BringIntoView();
@@ -232,6 +275,55 @@ public static class FluentControlState
             var reveal = new RectAnimation(new Rect(0, top, width, Math.Min(32, height)), new Rect(0, 0, width, height), FluentMotion.Normal) { EasingFunction = FluentMotion.Decelerate, FillBehavior = FillBehavior.Stop };
             clip.BeginAnimation(RectangleGeometry.RectProperty, reveal);
             frame.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(.6, 1, FluentMotion.Normal) { EasingFunction = FluentMotion.Decelerate, FillBehavior = FillBehavior.Stop });
+        }
+        private void PopupClosed(object? sender, EventArgs e) => ReleaseBackdrop();
+        private void ReleaseBackdrop() { backdrop?.Dispose(); backdrop = null; }
+        private static void PrepareMenuItems(ItemsControl owner)
+        {
+            var items = owner.Items.Cast<object>().Select((value, index) => (Value: value, Item: value as MenuItem ?? owner.ItemContainerGenerator.ContainerFromIndex(index) as MenuItem)).ToArray();
+            bool leading = items.Any(entry => entry.Item is { } item && (item.Icon is not null || item.IsCheckable));
+            for (int index = 0; index < items.Length; index++)
+            {
+                if (items[index].Item is not { } item) continue;
+                bool caption = index == 0 && !item.IsEnabled && item.Icon is null && item.Header is string && index + 1 < items.Length && items[index + 1].Value is Separator;
+                SetMenuLeading(item, leading); SetMenuCaption(item, caption); SetMenuText(item, item.Header is string);
+                item.Margin = new Thickness(0, index > 0 && items[index - 1].Item is { } previous && !GetMenuCaption(previous) ? 2 : 0, 0, 0);
+                if (item.GetValue(StateProperty) is State state) state.Update(false);
+            }
+        }
+        private void MenuOpened(object sender, RoutedEventArgs e) { if (control is ContextMenu menu) OpenMenu(menu); }
+        private void OpenMenu(ContextMenu menu)
+        {
+            if (menuOpen || Part("PART_PopupFrame") is not { } frame) return;
+            menuOpen = true; PrepareMenuItems(menu);
+            var owner = menu.PlacementTarget is FrameworkElement anchor ? PopupBackdrop.Owner(anchor) : null;
+            if (owner?.Content is FrameworkElement viewport) { frame.MaxWidth = Math.Min(360, Math.Max(0, viewport.ActualWidth - 16)); frame.MinWidth = Math.Min(200, frame.MaxWidth); }
+            // The outer 16 px is shadow room, not part of the CSS menu box.
+            menuX = menu.HorizontalOffset; menuY = menu.VerticalOffset;
+            menu.SetCurrentValue(ContextMenu.HorizontalOffsetProperty, menuX - 16 + (menu.Placement == PlacementMode.Right ? 4 : 0));
+            menu.SetCurrentValue(ContextMenu.VerticalOffsetProperty, menuY - 16 + (menu.Placement == PlacementMode.Bottom ? 4 : menu.Placement == PlacementMode.Top ? -4 : 0));
+            ReleaseBackdrop(); if (menu.PlacementTarget is FrameworkElement target) backdrop = PopupBackdrop.Attach(frame, target, "MenuBackdrop");
+            UpdatePopupShadow(); AnimateMenu(frame, menu.Placement);
+        }
+        private void MenuClosed(object sender, RoutedEventArgs e) { if (control is ContextMenu menu) ResetMenu(menu); }
+        private void ResetMenu(ContextMenu menu)
+        {
+            ReleaseBackdrop(); if (!menuOpen) return; menuOpen = false;
+            menu.SetCurrentValue(ContextMenu.HorizontalOffsetProperty, menuX); menu.SetCurrentValue(ContextMenu.VerticalOffsetProperty, menuY);
+        }
+        private void SubmenuOpened(object? sender, EventArgs e)
+        {
+            if (control is not MenuItem item || Part("PART_PopupFrame") is not { } frame) return;
+            PrepareMenuItems(item); ReleaseBackdrop(); backdrop = PopupBackdrop.Attach(frame, item, "SubmenuBackdrop"); UpdatePopupShadow(); AnimateMenu(frame, PlacementMode.Right);
+        }
+        private static void AnimateMenu(Border frame, PlacementMode placement)
+        {
+            frame.BeginAnimation(UIElement.OpacityProperty, null); frame.Opacity = 1;
+            var move = new TranslateTransform(); frame.RenderTransform = move;
+            if (!FluentMotion.Enabled) return;
+            var axis = placement is PlacementMode.Right or PlacementMode.Left ? TranslateTransform.XProperty : TranslateTransform.YProperty;
+            move.BeginAnimation(axis, new DoubleAnimation(placement == PlacementMode.Top ? 12 : -12, 0, FluentMotion.Normal) { EasingFunction = FluentMotion.Decelerate, FillBehavior = FillBehavior.Stop });
+            frame.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(0, 1, FluentMotion.Normal) { EasingFunction = FluentMotion.Decelerate, FillBehavior = FillBehavior.Stop });
         }
     }
 }

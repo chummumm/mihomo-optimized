@@ -42,8 +42,8 @@ internal sealed class ProxyGroupCard : Border
         var iconWell = new Border { Width = 36, Height = 36, CornerRadius = new CornerRadius(4), Child = icon, HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Center };
         iconWell.SetResourceReference(BackgroundProperty, "ControlAltBrush"); icon.SetResourceReference(Control.ForegroundProperty, "AccentLinkBrush"); identity.Children.Add(iconWell);
         title.LineHeight = 20; title.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; title.TextWrapping = TextWrapping.NoWrap; title.TextTrimming = TextTrimming.CharacterEllipsis;
-        var now = new Grid(); now.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(3, GridUnitType.Star) }); now.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2, GridUnitType.Star) }); now.Children.Add(current);
-        via.Margin = new Thickness(6, 0, 0, 0); via.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); via.TextWrapping = TextWrapping.NoWrap; via.TextTrimming = TextTrimming.CharacterEllipsis; via.LineHeight = 16; via.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; Grid.SetColumn(via, 1); now.Children.Add(via);
+        var now = new CurrentProxyLine(); now.Children.Add(current);
+        via.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); via.TextWrapping = TextWrapping.NoWrap; via.TextTrimming = TextTrimming.CharacterEllipsis; via.LineHeight = 16; via.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; now.Children.Add(via);
         var copy = Ui.Column(title, now); Grid.SetColumn(copy, 1); identity.Children.Add(copy); ConnectedNavigation.SetTarget(identity, group); header.Children.Add(identity);
         var typeBadge = new Border { Child = type, Padding = new Thickness(6, 1, 6, 1), CornerRadius = new CornerRadius(4), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0) }; typeBadge.SetResourceReference(BackgroundProperty, "ControlAltBrush"); meta.Children.Add(typeBadge);
         count.Margin = new Thickness(0, 0, 12, 0); count.VerticalAlignment = VerticalAlignment.Center; meta.Children.Add(count);
@@ -62,7 +62,7 @@ internal sealed class ProxyGroupCard : Border
         title.Text = group.Name; title.ToolTip = group.Name; current.Set(group.Now.Length == 0 ? "—" : group.Now);
         icon.Kind = group.Type switch { "URLTest" => "top-speed", "Fallback" => "arrow-swap", "LoadBalance" => "data-area", _ => "nav-proxies" };
         var exitName = ProxyNodeInfo.ResolveExit(group.Now, nodes); var exit = exitName is null ? null : nodes.GetValueOrDefault(exitName);
-        via.Text = exitName == "DIRECT" ? L.T("直连，不经过代理") : exitName is "REJECT" or "REJECT-DROP" ? L.T("拒绝") : exitName is not null && exitName != group.Now ? "→ " + exitName : exit is null ? "" : exit.Type + (exit.Udp ? " · UDP" : ""); via.ToolTip = via.Text;
+        via.Text = exitName == "DIRECT" ? L.T("直连，不经过代理") : exitName is "REJECT" or "REJECT-DROP" ? L.T("拒绝") : exitName is not null && exitName != group.Now ? "→ " + exitName : exit is null ? "" : exit.Type + (exit.Udp ? " · UDP" : ""); via.ToolTip = via.Text; via.Visibility = via.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         type.Text = group.Type == "Selector" ? L.T("手动选择") : group.Type == "URLTest" ? L.T("自动选择") : group.Type; count.Text = L.F("{0} 个出口", group.Members.Count);
         var reading = exit?.DelayLabel ?? "—"; if (latency.Text != reading) { latency.Text = reading; ProxyVisuals.Reading(latency); }
         marker.SetResourceReference(Shape.FillProperty, ProxyVisuals.Tone(exit?.Tone ?? "idle")); latency.SetResourceReference(TextBlock.ForegroundProperty, exit?.Failed == true ? "DangerBrush" : "TextSecondaryBrush");
@@ -80,6 +80,23 @@ internal sealed class ProxyGroupCard : Border
         header.ColumnDefinitions[1].Width = compact ? new GridLength(0) : GridLength.Auto;
         Grid.SetRow(meta, compact ? 1 : 0); Grid.SetColumn(meta, compact ? 0 : 1); meta.Margin = compact ? new Thickness(50, 4, 0, 0) : new Thickness(0, 0, 12, 0);
         count.Visibility = compact ? Visibility.Collapsed : Visibility.Visible; well.Padding = new Thickness(compact ? 12 : 16);
+    }
+    // CSS flex:none/max-width:60% keeps the current name at its natural width;
+    // the explanation follows it by 6 px and takes only the remaining space.
+    private sealed class CurrentProxyLine : Panel
+    {
+        protected override Size MeasureOverride(Size available)
+        {
+            var width = available.Width; Children[0].Measure(new Size(width * .6, available.Height));
+            var gap = Children[1].Visibility == Visibility.Collapsed ? 0 : 6;
+            Children[1].Measure(new Size(Math.Max(0, width - Children[0].DesiredSize.Width - gap), available.Height));
+            return new Size(Math.Min(width, Children[0].DesiredSize.Width + gap + Children[1].DesiredSize.Width), Math.Max(Children[0].DesiredSize.Height, Children[1].DesiredSize.Height));
+        }
+        protected override Size ArrangeOverride(Size finalSize)
+        {
+            var width = Math.Min(finalSize.Width * .6, Children[0].DesiredSize.Width); var gap = Children[1].Visibility == Visibility.Collapsed ? 0 : 6;
+            Children[0].Arrange(new Rect(0, 0, width, finalSize.Height)); Children[1].Arrange(new Rect(width + gap, 0, Math.Max(0, finalSize.Width - width - gap), finalSize.Height)); return finalSize;
+        }
     }
     private sealed class SlidingProxyText : Grid
     {
@@ -183,7 +200,7 @@ internal sealed class ProxyMemberGrid : Grid
         }
         internal void Update(ProxyNodeInfo? node, bool selected, bool selectable, bool pending)
         {
-            kind.Text = node?.Type ?? ""; var next = node?.DelayLabel ?? "—";
+            kind.Text = node?.Name is "DIRECT" or "REJECT" or "PASS" ? "" : node?.Type ?? ""; var next = node?.DelayLabel ?? "—";
             if (reading.Text != next) { reading.Text = next; ProxyVisuals.Reading(reading); }
             dot.SetResourceReference(Shape.FillProperty, pending ? "AccentBrush" : ProxyVisuals.Tone(node?.Tone ?? "idle"));
             if (pending && !wasPending && ProxyVisuals.Animate) dot.BeginAnimation(OpacityProperty, new System.Windows.Media.Animation.DoubleAnimation(1, .3, TimeSpan.FromMilliseconds(450)) { AutoReverse = true, RepeatBehavior = System.Windows.Media.Animation.RepeatBehavior.Forever }); else if (!pending) { dot.BeginAnimation(OpacityProperty, null); dot.Opacity = 1; } wasPending = pending;

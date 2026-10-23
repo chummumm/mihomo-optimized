@@ -24,6 +24,8 @@ public partial class MainWindow : Window
     private readonly NativeTitleBar titleBar;
     private readonly DesktopRecovery recovery;
     private readonly DesktopUpdateNotice updateNotice;
+    private readonly FluentBackdropFilter navigationBackdrop = new() { CornerRadius = new CornerRadius(0, 8, 8, 0) };
+    private readonly Grid navigationOverlaySurface = new();
     internal TransientMessageHost Notifications { get; } = new();
     private readonly string shellPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Mihomo Optimized", "native-shell.json");
     private NativePage? activePage;
@@ -48,6 +50,10 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         this.session = session;
+        navigationBackdrop.Id("NavigationBackdrop");
+        navigationBackdrop.SetSources(ContentLayout, NavigationDock, MainContentBorder);
+        navigationOverlaySurface.Children.Add(navigationBackdrop);
+        OverlayPaneHost.Child = navigationOverlaySurface;
         recovery = new DesktopRecovery(session);
         updateNotice = new DesktopUpdateNotice(session);
         UpdateNoticeSlot.Content = updateNotice;
@@ -65,7 +71,7 @@ public partial class MainWindow : Window
             if (e.PropertyName == nameof(AppSession.RuntimeMode)) UpdateTitleSubtitle();
             if (e.PropertyName is nameof(AppSession.Update) or nameof(AppSession.UpdateDismissedVersion)) UpdateUpdateNotice();
         };
-        session.Notification += ShowNotice;
+        session.Notification += (text, kind) => Notifications.Show(text, kind);
         session.NavigateRequested += key => _ = NavigateAsync(key);
         session.NavigateTargetRequested += target => _ = NavigateAsync(target);
         session.ExitRequested += async () => { if (await PrepareExitAsync()) await FinishExitAsync(); };
@@ -206,17 +212,20 @@ public partial class MainWindow : Window
     {
         if (ReferenceEquals(Notifications.Parent, surface)) return;
         if (Notifications.Parent is Panel previous) previous.Children.Remove(Notifications);
-        Grid.SetRowSpan(Notifications, 2); Grid.SetColumnSpan(Notifications, 2); Panel.SetZIndex(Notifications, 60);
+        Grid.SetRowSpan(Notifications, Math.Max(1, (surface as Grid)?.RowDefinitions.Count ?? 1));
+        Grid.SetColumnSpan(Notifications, Math.Max(1, (surface as Grid)?.ColumnDefinitions.Count ?? 1));
+        Panel.SetZIndex(Notifications, 60);
         surface.Children.Add(Notifications);
     }
     internal void RestoreNotifications()
     {
         var dialog = OwnedWindows.OfType<FluentDialog>().LastOrDefault(window => window.IsVisible && !window.IsClosed);
-        AttachNotifications(dialog?.NotificationSurface ?? ClientArea);
+        AttachNotifications(dialog?.NotificationSurface ?? tray?.NotificationSurface ?? ClientArea);
     }
 
     public void ShowMain()
     {
+        if (allowClose || session.IsExiting) return;
         Show(); if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
         Activate(); Focus(); UpdatePageActivity();
     }
@@ -315,9 +324,10 @@ public partial class MainWindow : Window
         double previousWidth = interrupted ? OverlayPaneHost.ActualWidth : 48;
         double previousX = interrupted && OverlayPaneHost.RenderTransform is TranslateTransform previous ? previous.X : -285.6;
         if (NavigationDock.Children.Contains(NavigationPane)) NavigationDock.Children.Remove(NavigationPane);
-        OverlayPaneHost.Child = NavigationPane;
+        if (!navigationOverlaySurface.Children.Contains(NavigationPane)) navigationOverlaySurface.Children.Add(NavigationPane);
+        navigationBackdrop.Visibility = Visibility.Visible;
         OverlayPaneHost.BeginAnimation(WidthProperty, null); OverlayPaneHost.Width = 280;
-        OverlayPaneHost.SetResourceReference(Border.BackgroundProperty, "AcrylicBrush");
+        OverlayPaneHost.Background = Brushes.Transparent;
         bool dark = TryFindResource("AppBackgroundBrush") is SolidColorBrush background && background.Color.R < 128;
         OverlayPaneHost.Effect = new System.Windows.Media.Effects.DropShadowEffect { Color = Colors.Black, BlurRadius = 16, ShadowDepth = 8, Direction = 270, Opacity = dark ? .26 : .14 };
         OverlayPaneHost.Visibility = NavigationScrim.Visibility = Visibility.Visible;
@@ -342,7 +352,7 @@ public partial class MainWindow : Window
             if (animation != overlayAnimation) return;
             overlayClosing = false;
             OverlayPaneHost.BeginAnimation(WidthProperty, null); OverlayPaneHost.Width = 280;
-            OverlayPaneHost.Child = null;
+            navigationOverlaySurface.Children.Remove(NavigationPane);
             if (!NavigationDock.Children.Contains(NavigationPane)) NavigationDock.Children.Add(NavigationPane);
             OverlayPaneHost.Visibility = Visibility.Collapsed; OverlayPaneHost.RenderTransform = Transform.Identity;
             ApplyNavigationContent(); UpdateNavigationIndicator(false);
@@ -351,6 +361,7 @@ public partial class MainWindow : Window
         else if (navigationMode == "compact")
         {
             ApplyNavigationContent(true, false);
+            navigationBackdrop.Visibility = Visibility.Collapsed;
             OverlayPaneHost.Background = Brushes.Transparent; OverlayPaneHost.Effect = null;
             var collapse = new DoubleAnimation(OverlayPaneHost.ActualWidth, 48, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate };
             collapse.Completed += (_, _) => Complete(); OverlayPaneHost.BeginAnimation(WidthProperty, collapse);
@@ -531,7 +542,7 @@ public partial class MainWindow : Window
     {
         if (allowClose) return; allowClose = true;
         foreach (var page in pages.Values) page.Deactivate();
-        L.Changed -= OnLanguageChanged; searchWindow?.Close(); backdrop.Dispose(); titleBar.Dispose(); tray.Dispose();
+        L.Changed -= OnLanguageChanged; searchWindow?.Close(); backdrop.Dispose(); navigationBackdrop.Dispose(); titleBar.Dispose(); tray.Dispose();
         Notifications.Dispose();
         await session.DisposeAsync(); Close(); Application.Current.Shutdown();
     }

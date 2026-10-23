@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Documents;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Effects;
@@ -27,7 +28,7 @@ internal sealed class ConnectionDrawer : Border
     private readonly TranslateTransform slide = new();
     private string layoutStamp = "";
     private ConnectionDetailSnapshot? snapshot;
-    private bool mobile, busy;
+    private bool mobile, busy, lampAnimating;
     private long transition;
     internal bool IsOpen { get; private set; }
     internal event Action? Closed;
@@ -50,7 +51,8 @@ internal sealed class ConnectionDrawer : Border
         closeConnection = new Button { Content = FluentControls.ButtonContent("prohibit", "关闭连接"), Height = 32, HorizontalAlignment = HorizontalAlignment.Right, Padding = new Thickness(12, 0, 12, 0), Style = FluentControls.Style("Button") }.Id("CloseConnection"); L.Bind(closeConnection, AutomationProperties.NameProperty, "关闭连接"); FluentControlState.SetKind(closeConnection, "Danger");
         closeConnection.Click += async (_, _) => { if (busy || snapshot is not { Closed: false }) return; busy = true; closeConnection.IsEnabled = false; try { if (Disconnect is { } disconnect) await disconnect(); } finally { busy = false; closeConnection.IsEnabled = snapshot is { Closed: false }; } };
         var footer = new Border { Child = closeConnection, Padding = new Thickness(18, 12, 18, 12), BorderThickness = new Thickness(0, 1, 0, 0) }; footer.SetResourceReference(BackgroundProperty, "DialogTopBrush"); footer.SetResourceReference(BorderBrushProperty, "DividerBrush"); Grid.SetRow(footer, 2); layout.Children.Add(footer);
-        Loaded += (_, _) => { DesignTokens.Changed += Palette; L.Changed += Relocalize; Palette(); }; Unloaded += (_, _) => { DesignTokens.Changed -= Palette; L.Changed -= Relocalize; lamp.BeginAnimation(OpacityProperty, null); };
+        Loaded += (_, _) => { DesignTokens.Changed += Palette; L.Changed += Relocalize; Palette(); UpdateLamp(); }; Unloaded += (_, _) => { DesignTokens.Changed -= Palette; L.Changed -= Relocalize; lamp.BeginAnimation(OpacityProperty, null); lampAnimating = false; };
+        IsVisibleChanged += (_, _) => UpdateLamp();
     }
     private void Relocalize() { layoutStamp = ""; if (snapshot is { } current) Update(current); }
     private void Palette()
@@ -74,20 +76,16 @@ internal sealed class ConnectionDrawer : Border
     internal void Hide(bool animate = true)
     {
         if (!IsOpen) return; Closing?.Invoke(); IsOpen = false; IsHitTestVisible = false; var generation = ++transition;
-        void Complete() { if (generation != transition) return; Visibility = Visibility.Collapsed; lamp.BeginAnimation(OpacityProperty, null); Closed?.Invoke(); }
+        void Complete() { if (generation != transition) return; Visibility = Visibility.Collapsed; UpdateLamp(); Closed?.Invoke(); }
         if (!animate || !ProxyVisuals.Animate) { Complete(); return; }
         ProxyVisuals.Tween(slide, mobile ? TranslateTransform.YProperty : TranslateTransform.XProperty, mobile ? slide.Y : slide.X, (mobile ? Math.Max(ActualHeight, 300) : Math.Max(ActualWidth, 440)) * 1.1, 250, complete: Complete);
     }
     internal void Update(ConnectionDetailSnapshot value)
     {
-        var changedState = snapshot?.Closed != value.Closed || snapshot?.Id != value.Id; snapshot = value;
+        snapshot = value;
         state.Text = L.T(value.Closed ? "已关闭" : "连接中"); network.Text = value.Network; closeConnection.IsEnabled = !value.Closed && !busy;
         stateBadge.SetResourceReference(BackgroundProperty, value.Closed ? "ControlAltBrush" : "SuccessBackgroundBrush"); state.SetResourceReference(TextBlock.ForegroundProperty, value.Closed ? "TextSecondaryBrush" : "TextPrimaryBrush"); lamp.SetResourceReference(Shape.FillProperty, value.Closed ? "TextSecondaryBrush" : "SuccessBrush");
-        if (changedState)
-        {
-            lamp.BeginAnimation(OpacityProperty, null); lamp.Opacity = 1;
-            if (!value.Closed && ProxyVisuals.Animate && IsOpen) lamp.BeginAnimation(OpacityProperty, new DoubleAnimation(1, .3, TimeSpan.FromMilliseconds(800)) { AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever, EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut } });
-        }
+        UpdateLamp();
         var stamp = string.Join('\n', value.Id, value.Dns.ToString(), value.Source, value.Inbound, value.Rule, value.Chain, value.Host, value.Destination, value.Started, value.Process, value.ProcessPath);
         if (layoutStamp != stamp)
         {
@@ -98,6 +96,17 @@ internal sealed class ConnectionDrawer : Border
             AddFact("destination", "IP", value.Destination); AddPair("上传", value.Upload, "下载", value.Download); AddFact("start", "开始时间", value.Started); AddFact("process", "进程", value.Process); AddFact("path", "路径", value.ProcessPath); AddFact("id", "ID", value.Id);
         }
         if (values.TryGetValue("upload", out var upload)) upload.Text = value.Upload; if (values.TryGetValue("download", out var download)) download.Text = value.Download;
+    }
+    private void UpdateLamp()
+    {
+        var animate = IsLoaded && IsVisible && IsOpen && snapshot is { Closed: false } && ProxyVisuals.Animate;
+        if (lampAnimating == animate) return;
+        lampAnimating = animate; lamp.BeginAnimation(OpacityProperty, null); lamp.Opacity = 1;
+        if (!animate) return;
+        var pulse = new DoubleAnimationUsingKeyFrames { Duration = TimeSpan.FromMilliseconds(1600), RepeatBehavior = RepeatBehavior.Forever };
+        pulse.KeyFrames.Add(new DiscreteDoubleKeyFrame(1, KeyTime.FromTimeSpan(TimeSpan.Zero)));
+        pulse.KeyFrames.Add(new SplineDoubleKeyFrame(.3, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(800)), new KeySpline(.42, 0, .58, 1)));
+        pulse.KeyFrames.Add(new SplineDoubleKeyFrame(1, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(1600)), new KeySpline(.42, 0, .58, 1))); lamp.BeginAnimation(OpacityProperty, pulse);
     }
     private void AddFact(string key, string title, string value)
     {
@@ -145,16 +154,18 @@ internal sealed class ConnectionDrawer : Border
     }
 }
 
-/// <summary>The narrow-screen drawer rises over the page while retaining the same native controls.</summary>
+/// <summary>The narrow-screen drawer rises over the complete client viewport.</summary>
 internal sealed class ConnectionDrawerSheet : Adorner
 {
     private readonly VisualCollection visuals;
     private readonly Grid layer = new();
     private readonly Border smoke = new() { IsHitTestVisible = false };
     private readonly ConnectionDrawer drawer;
-    internal ConnectionDrawerSheet(FrameworkElement page, ConnectionDrawer drawer) : base(page)
+    internal ConnectionDrawerSheet(FrameworkElement viewport, ConnectionDrawer drawer) : base(viewport)
     {
         this.drawer = drawer; visuals = new VisualCollection(this) { layer }; smoke.SetResourceReference(Border.BackgroundProperty, "ScrimBrush"); layer.Children.Add(smoke); layer.Children.Add(drawer); drawer.Margin = new Thickness(8); drawer.VerticalAlignment = VerticalAlignment.Bottom;
+        smoke.Id("ConnectionDrawerSmoke");
+        PreviewKeyDown += (_, e) => { if (e.Key == Key.Escape) { drawer.Hide(); e.Handled = true; } };
         ProxyVisuals.Tween(smoke, OpacityProperty, 0, 1, 250);
     }
     internal void HideSmoke() => ProxyVisuals.Tween(smoke, OpacityProperty, smoke.Opacity, 0, 250);

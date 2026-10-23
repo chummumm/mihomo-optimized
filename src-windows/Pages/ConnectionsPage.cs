@@ -54,6 +54,7 @@ public sealed class ConnectionsPage : NativePage
     private readonly Grid empty = new() { IsHitTestVisible = false, Margin = new Thickness(0, 34, 0, 0) };
     private readonly ConnectionDrawer drawer = new();
     private ConnectionDrawerSheet? sheet;
+    private AdornerDecorator? sheetLayer;
     private ConnectionRow? detailRow;
     private bool paused, applyingSelection, hasSnapshot, suppressFresh;
     private long sampledAt;
@@ -189,14 +190,29 @@ public sealed class ConnectionsPage : NativePage
     }
     private void PlaceDrawer(bool phone)
     {
-        if (phone && sheet is null && AdornerLayer.GetAdornerLayer(this) is { } layer) { tableStage.Children.Remove(drawer); drawer.SetMobile(true); sheet = new ConnectionDrawerSheet(this, drawer); layer.Add(sheet); }
+        if (phone && sheet is null && Window.GetWindow(this)?.Content is Panel clientArea)
+        {
+            // The narrow drawer is fixed to the whole viewport in the source.
+            // Its own client-area layer preserves z-drawer=30 below toast=60;
+            // the Window's outer AdornerLayer would paint above both surfaces.
+            var viewport = new Grid().Id("ConnectionDrawerViewport");
+            sheetLayer = new AdornerDecorator { Child = viewport }.Id("ConnectionDrawerLayer");
+            Grid.SetRowSpan(sheetLayer, Math.Max(1, (clientArea as Grid)?.RowDefinitions.Count ?? 1));
+            Grid.SetColumnSpan(sheetLayer, Math.Max(1, (clientArea as Grid)?.ColumnDefinitions.Count ?? 1));
+            Panel.SetZIndex(sheetLayer, 30); clientArea.Children.Add(sheetLayer);
+            tableStage.Children.Remove(drawer); drawer.SetMobile(true);
+            sheet = new ConnectionDrawerSheet(viewport, drawer); sheetLayer.AdornerLayer.Add(sheet);
+        }
         else if (!phone && sheet is not null) DetachSheet();
         if (sheet is null) { drawer.SetMobile(false); drawer.MaxWidth = Math.Max(0, tableStage.ActualWidth - 20); }
         else drawer.MaxWidth = double.PositiveInfinity;
     }
     private void DetachSheet()
     {
-        if (sheet is null) return; var previous = sheet; sheet = null; previous.Release(); AdornerLayer.GetAdornerLayer(this)?.Remove(previous); drawer.SetMobile(false); if (!tableStage.Children.Contains(drawer)) tableStage.Children.Add(drawer);
+        if (sheet is null) return;
+        var previous = sheet; sheet = null; previous.Release(); sheetLayer?.AdornerLayer.Remove(previous);
+        if (sheetLayer?.Parent is Panel clientArea) clientArea.Children.Remove(sheetLayer);
+        sheetLayer = null; drawer.SetMobile(false); if (!tableStage.Children.Contains(drawer)) tableStage.Children.Add(drawer);
     }
     private void ShowDetails(ConnectionRow row)
     {

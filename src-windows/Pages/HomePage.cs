@@ -63,11 +63,11 @@ public sealed class HomePage : NativePage
     {
         phase.Id("CoreStatus"); chart.Id("TrafficChart"); connectionCount.Id("HomeConnections"); downloadTotal.Id("HomeTrafficTotal");
         description.TextWrapping = TextWrapping.NoWrap; description.TextTrimming = TextTrimming.CharacterEllipsis; description.Margin = new Thickness(0, 2, 0, 0);
-        start = Action("启动", "StartCore", () => ChangeAsync("core", "desktop_start"), true);
-        stop = Action("停止", "StopCore", () => ChangeAsync("core", "desktop_stop"));
-        restart = Action("重启内核", "RestartCore", () => ChangeAsync("core", "desktop_restart"));
+        start = Action("启动内核", "StartCore", () => RunUserActionAsync(() => ChangeAsync("core", "desktop_start")), true);
+        stop = Action("停止内核", "StopCore", () => RunUserActionAsync(() => ChangeAsync("core", "desktop_stop")));
+        restart = Action("重启内核", "RestartCore", () => RunUserActionAsync(() => ChangeAsync("core", "desktop_restart")));
         FluentControls.Primary(start); stop.Style = restart.Style = FluentControls.Style("Button");
-        start.Content = FluentControls.ButtonContent("play", "启动"); stop.Content = FluentControls.ButtonContent("stop", "停止"); restart.Content = new FluentIcon("update", 16);
+        start.Content = FluentControls.ButtonContent("play", "启动内核"); stop.Content = FluentControls.ButtonContent("stop", "停止内核"); restart.Content = new FluentIcon("update", 16);
         restart.Width = restart.Height = 32; restart.Padding = new Thickness(0); L.Bind(restart, ToolTipProperty, "重启内核");
         heroActions = new WrapPanel { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right };
         foreach (var button in new[] { start, stop, restart }) { button.MinHeight = button.Height = 32; button.Margin = new Thickness(0); heroActions.Children.Add(button); }
@@ -79,7 +79,7 @@ public sealed class HomePage : NativePage
         var status = Ui.Column(phase, description); status.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(status, 1); heroMain.Children.Add(status);
         Grid.SetColumn(heroActions, 2); heroMain.Children.Add(heroActions);
         coreError.SetResourceReference(TextBlock.ForegroundProperty, "DangerBrush"); coreError.Margin = new Thickness(0, 12, 0, 0); coreError.Visibility = Visibility.Collapsed; coreError.Id("HomeCoreError");
-        modes.Selected += async value => await RunAsync(() => ChangeAsync("mode", "desktop_patch_config", new { patch = new { mode = value } }));
+        modes.Selected += async value => await RunUserActionAsync(() => ChangeAsync("mode", "desktop_patch_config", new { patch = new { mode = value } }));
         var modeRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center }; var modeLabel = Ui.Hint("出站模式", 14); modeLabel.Margin = new Thickness(0, 0, 12, 0); modeLabel.VerticalAlignment = VerticalAlignment.Center; modeRow.Children.Add(modeLabel); modeRow.Children.Add(modes);
         coreVersion.FontFamily = proxyAddress.FontFamily = new FontFamily("Cascadia Mono, Cascadia Code, Consolas");
         coreVersion.LineHeight = proxyAddress.LineHeight = 18.59;
@@ -96,10 +96,10 @@ public sealed class HomePage : NativePage
         tun = new QuickSettingTile("shield-lock", "TUN 模式", "tun", () => Session.Navigate(new NavigationTarget("settings", "set-tun")));
         lan = new QuickSettingTile("wifi", "局域网连接", "allowLan", () => Session.Navigate(new NavigationTarget("settings", "set-lan")));
         autostart = new QuickSettingTile("power", "开机启动", "autostart");
-        proxy.Changed += async enabled => await RunAsync(() => ChangeAsync("proxy", "desktop_set_system_proxy", new { enabled }));
-        tun.Changed += async enabled => await RunAsync(() => ChangeTunAsync(enabled));
-        autostart.Changed += async enabled => await RunAsync(() => ChangeAsync("autostart", "desktop_set_autostart", new { enabled }));
-        lan.Changed += async enabled => await RunAsync(() => ChangeAsync("lan", "desktop_patch_config", new { patch = new Dictionary<string, object> { ["allow-lan"] = enabled } }));
+        proxy.Changed += async enabled => await RunUserActionAsync(() => ChangeAsync("proxy", "desktop_set_system_proxy", new { enabled }));
+        tun.Changed += async enabled => await RunUserActionAsync(() => ChangeTunAsync(enabled));
+        autostart.Changed += async enabled => await RunUserActionAsync(() => ChangeAsync("autostart", "desktop_set_autostart", new { enabled }));
+        lan.Changed += async enabled => await RunUserActionAsync(() => ChangeAsync("lan", "desktop_patch_config", new { patch = new Dictionary<string, object> { ["allow-lan"] = enabled } }));
         var tiles = new ResponsiveTilePanel { Margin = new Thickness(0, 8, 0, 0) }; foreach (var tile in new[] { proxy, tun, lan, autostart }) tiles.Children.Add(tile);
         var rates = new StackPanel { Orientation = Orientation.Horizontal };
         var downRate = Ui.Column(Legend("下行", "AccentBrush"), down); rates.Children.Add(downRate);
@@ -116,9 +116,11 @@ public sealed class HomePage : NativePage
         var connectionCard = StatCard("nav-connections", "活动连接", connectionCount, processCount); connectionCard.Margin = new Thickness(0, 0, 0, 4);
         var trafficCard = StatCard("down-arrow-o", "本次运行流量", downloadTotal, uploadTotal); trafficCard.Margin = new Thickness(0, 4, 0, 0);
         stats.Children.Add(connectionCard); stats.Children.Add(trafficCard);
-        liveGrid.Margin = new Thickness(0, 8, 0, 0); liveGrid.ColumnDefinitions.Add(new ColumnDefinition()); liveGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(240) });
+        liveGrid.Margin = new Thickness(0, 8, 0, 0); liveGrid.ColumnDefinitions.Add(new ColumnDefinition());
+        // CSS grid keeps the 8px gap outside the fixed 240px statistics column.
+        liveGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(8) }); liveGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(240) });
         liveGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); liveGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        liveGrid.Children.Add(chartCard); Grid.SetColumn(stats, 1); stats.Margin = new Thickness(8, 0, 0, 0); liveGrid.Children.Add(stats);
+        liveGrid.Children.Add(chartCard); Grid.SetColumn(stats, 2); liveGrid.Children.Add(stats);
         exits.Selected += (exit, identity) => { ConnectedNavigation.Prepare(identity, exit.Group); Session.Navigate(new NavigationTarget("proxies", Target: exit.Group, Action: "focus-group")); };
         var exitHeader = new WrapPanel { Margin = new Thickness(0, 28, 0, 8), VerticalAlignment = VerticalAlignment.Center };
         // Preserve the existing accessible navigation command on the section
@@ -157,13 +159,20 @@ public sealed class HomePage : NativePage
         Grid.SetColumn(heroActions, narrow ? 0 : 2); Grid.SetRow(heroActions, narrow ? 1 : 0); Grid.SetColumnSpan(heroActions, narrow ? 3 : 1);
         heroActions.HorizontalAlignment = narrow ? HorizontalAlignment.Left : HorizontalAlignment.Right; heroActions.Margin = narrow ? new Thickness(0, 20, 0, 0) : new Thickness(20, 0, 0, 0);
         facts.Visibility = width <= 480 ? Visibility.Collapsed : Visibility.Visible;
-        liveGrid.ColumnDefinitions[1].Width = narrow ? new GridLength(0) : new GridLength(240);
-        Grid.SetColumn(stats, narrow ? 0 : 1); Grid.SetRow(stats, narrow ? 1 : 0);
-        stats.Columns = narrow ? 2 : 1; stats.Rows = narrow ? 1 : 2; stats.Margin = narrow ? new Thickness(0, 8, 0, 0) : new Thickness(8, 0, 0, 0);
+        liveGrid.ColumnDefinitions[1].Width = new GridLength(narrow ? 0 : 8);
+        liveGrid.ColumnDefinitions[2].Width = new GridLength(narrow ? 0 : 240);
+        Grid.SetColumn(stats, narrow ? 0 : 2); Grid.SetRow(stats, narrow ? 1 : 0);
+        stats.Columns = narrow ? 2 : 1; stats.Rows = narrow ? 1 : 2; stats.Margin = narrow ? new Thickness(0, 8, 0, 0) : new Thickness(0);
         ((Border)stats.Children[0]).Margin = narrow ? new Thickness(0, 0, 4, 0) : new Thickness(0, 0, 0, 4);
         ((Border)stats.Children[1]).Margin = narrow ? new Thickness(4, 0, 0, 0) : new Thickness(0, 4, 0, 0);
         connectionCount.FontSize = downloadTotal.FontSize = width <= 480 ? 20 : 28;
         connectionCount.LineHeight = downloadTotal.LineHeight = width <= 480 ? 28 : 36;
+    }
+    private async Task RunUserActionAsync(Func<Task> operation)
+    {
+        try { await operation(); }
+        catch (OperationCanceledException) { }
+        catch (Exception error) { Session.Notify(error.Message, true); }
     }
     private async Task ChangeAsync(string key, string method, object? args = null)
     {
@@ -177,14 +186,15 @@ public sealed class HomePage : NativePage
         if (pending.Length > 0) { UpdateStatus(); return; }
         if (enabled && !Session.Status.Get("service").Bool("installed") && Window.GetWindow(this) is { } owner)
         {
-            await TunConsentDialog.Run(owner, () => ChangeAsync("tun", "desktop_set_tun", new { enabled }), error => Session.Notify(error, true));
+            await TunConsentDialog.Run(owner, () => ChangeAsync("tun", "desktop_set_tun", new { enabled }), error => Session.Notify(error, true),
+                onSuccess: () => Session.NotifySuccess("TUN 模式已开启"));
             UpdateStatus(); return;
         }
         await ChangeAsync("tun", "desktop_set_tun", new { enabled });
     }
     public override async Task NavigateToAsync(NavigationTarget target)
     {
-        if (target.Action is "toggle-tun" or "toggleTun") await RunAsync(() => ChangeTunAsync(!Session.Status.Bool("tun")));
+        if (target.Action is "toggle-tun" or "toggleTun") await RunUserActionAsync(() => ChangeTunAsync(!Session.Status.Bool("tun")));
     }
     private void UpdateStatus()
     {
@@ -244,7 +254,17 @@ public sealed class HomePage : NativePage
     {
         connectionCount.Text = IsRunning ? connections.ToString("N0", CultureInfo.CurrentCulture) : "—";
         processCount.Text = IsRunning ? L.F("来自 {0} 个进程", processes) : L.T("内核未运行");
-        downloadTotal.Text = IsRunning ? Ui.Bytes(downloaded) : "—"; uploadTotal.Text = L.F("上传 {0}", Ui.Bytes(uploaded));
+        downloadTotal.Text = FormatTraffic(downloaded); uploadTotal.Text = L.F("上传 {0}", FormatTraffic(uploaded));
+    }
+    private static string FormatTraffic(double bytes)
+    {
+        // Home uses helper.formatTraffic: two fractional digits, truncated before formatting.
+        string[] units = ["B", "KiB", "MiB", "GiB", "TiB"];
+        bytes = double.IsFinite(bytes) ? Math.Max(0, bytes) : 0;
+        int exponent = bytes > 0 ? (int)Math.Floor(Math.Log(bytes) / Math.Log(1024)) : 0;
+        double value = Math.Floor(bytes / Math.Pow(1024, exponent) * 100) / 100;
+        string unit = exponent >= 0 && exponent < units.Length ? units[exponent] : "";
+        return value.ToString("F2", CultureInfo.InvariantCulture) + " " + unit;
     }
     protected override void OnStatusChanged() => UpdateStatus();
     protected override void OnLanguageChanged() => UpdateStatus();

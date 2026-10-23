@@ -124,7 +124,7 @@ public sealed class SettingsPage : NativePage
             {
                 if (enabled && !Session.Status.Get("service").Bool("installed"))
                 {
-                    await TunConsentDialog.Run(Window.GetWindow(this), () => ChangeDesktop("desktop_set_tun", new { enabled = true }), error => Session.Notify(error, true));
+                    await TunConsentDialog.Run(Window.GetWindow(this), () => ChangeDesktop("desktop_set_tun", new { enabled = true }), error => Session.Notify(error, true), onSuccess: () => Session.NotifySuccess("TUN 模式已开启"));
                     ApplyStatus(); return;
                 }
                 await ChangeDesktop("desktop_set_tun", new { enabled });
@@ -367,14 +367,14 @@ public sealed class SettingsPage : NativePage
         var grid = new Grid { VerticalAlignment = VerticalAlignment.Center }; grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(36) });
         grid.ColumnDefinitions.Add(new ColumnDefinition()); grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var icon = new FluentIcon(glyph, 20) { VerticalAlignment = VerticalAlignment.Center }; grid.Children.Add(icon);
+        var icon = new FluentIcon(glyph, 20) { HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Center }; grid.Children.Add(icon);
         var label = Ui.Label(title, 14); label.LineHeight = 20; label.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
         var hint = descriptionBlock ?? Ui.Hint(description); hint.Margin = new Thickness(0); hint.LineHeight = 16; hint.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
         hint.Visibility = descriptionBlock is null && description.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         var text = Ui.Column(label, hint); Grid.SetColumn(text, 1); grid.Children.Add(text);
         if (control is not null)
         {
-            control.Margin = new Thickness(16, 0, 0, 0); control.VerticalAlignment = VerticalAlignment.Center;
+            control.Margin = new Thickness(16, 0, 16, 0); control.VerticalAlignment = VerticalAlignment.Center;
             Grid.SetColumn(control, 2); grid.Children.Add(control);
         }
         else Grid.SetColumnSpan(text, 2);
@@ -393,7 +393,9 @@ public sealed class SettingsPage : NativePage
             {
                 Grid.SetRow(control, compact ? 1 : 0); Grid.SetColumn(control, compact ? 1 : 2);
                 Grid.SetColumnSpan(control, compact ? 2 : 1); control.HorizontalAlignment = compact ? HorizontalAlignment.Left : HorizontalAlignment.Right;
-                control.Margin = compact ? new Thickness(0, 4, 0, 0) : new Thickness(16, 0, 0, 0);
+                // The reference keeps its fourth (empty chevron) grid track,
+                // including the 16px gap after the control, at desktop widths.
+                control.Margin = compact ? new Thickness(0, 4, 0, 0) : new Thickness(16, 0, 16, 0);
             }
             if (bottom is not null) bottom.Padding = new Thickness(compact ? 16 : 52, 12, 16, 16);
         }

@@ -15,6 +15,7 @@ const root = process.cwd()
 const source = path.resolve(process.env.REFERENCE_SOURCE || 'artifacts/reference-source')
 const fixtureFile = path.resolve(process.env.REFERENCE_FIXTURE || 'artifacts/verification/visual-fixture.json')
 const output = path.resolve(process.env.REFERENCE_OUTPUT || 'artifacts/verification/reference')
+const partial = process.env.REFERENCE_ALLOW_PARTIAL === '1'
 const dist = path.join(source, 'dist-desktop')
 const targets = [0, 16, 40, 83, 125, 167, 220, 250, 300, 333, 460, 700, 900, 1400, 1800, 2800]
 const requiredScenarios = ['home', 'proxies', 'settings-dark-en', 'search', 'rules', 'profiles',
@@ -23,7 +24,7 @@ const requiredMotions = ['home-to-proxies', 'settings-language', 'search-open', 
     'editor-open', 'narrow-navigation']
 const report = {
     schema: 1, kind: 'unmodified-frontend-reference', source: path.relative(root, source),
-    fixtureSHA256: '', browser: null, scenarios: [], motions: [], errors: [],
+    fixtureSHA256: '', browser: null, scenarios: [], motions: [], errors: [], partial,
     comparison: 'Captured evidence only; no automatic assertion of pixel or motion parity.',
 }
 let browser
@@ -626,7 +627,10 @@ async function main () {
     const fixture = JSON.parse(bytes.toString('utf8'))
     assert.equal(fixture.schema, 1, 'Unsupported reference fixture schema')
     assert.ok(Array.isArray(fixture.scenarios), 'Missing reference scenarios')
-    assert.deepEqual(fixture.scenarios.map(item => item.name).sort(), [...requiredScenarios].sort(), 'The full sixteen-view capture is required')
+    const names = fixture.scenarios.map(item => item.name)
+    assert.equal(new Set(names).size, names.length, 'Duplicate reference scenario')
+    assert.ok(names.length > 0 && names.every(name => requiredScenarios.includes(name)), 'Unknown or empty reference scenarios')
+    if (!partial) assert.deepEqual([...names].sort(), [...requiredScenarios].sort(), 'The full sixteen-view capture is required')
     for (const scenario of [...fixture.scenarios, ...(fixture.motions || [])]) validateScenario(scenario)
     const referenceRequire = createRequire(path.join(source, 'package.json'))
     const { chromium } = referenceRequire('playwright')
@@ -644,10 +648,13 @@ async function main () {
         scenarios: Object.fromEntries(report.scenarios.map(item => [item.name, item.geometry])),
     }, null, 2) + '\n')
     if (process.env.REFERENCE_SKIP_MOTION !== '1') {
-        assert.deepEqual((fixture.motions || []).map(item => item.name).sort(), [...requiredMotions].sort(), 'The full six-interaction motion capture is required')
-        for (const scenario of fixture.motions) await captureMotion(scenario, origin)
+        const motionNames = (fixture.motions || []).map(item => item.name)
+        assert.equal(new Set(motionNames).size, motionNames.length, 'Duplicate reference motion')
+        assert.ok(motionNames.every(name => requiredMotions.includes(name)), 'Unknown reference motion')
+        if (!partial) assert.deepEqual([...motionNames].sort(), [...requiredMotions].sort(), 'The full six-interaction motion capture is required')
+        for (const scenario of fixture.motions || []) await captureMotion(scenario, origin)
     } else report.motionSkipped = 'Explicit REFERENCE_SKIP_MOTION=1; this run is not complete motion evidence.'
-    report.completed = report.scenarios.length === requiredScenarios.length && report.motions.length === requiredMotions.length
+    report.completed = !partial && report.scenarios.length === requiredScenarios.length && report.motions.length === requiredMotions.length
     checkpoint()
     console.log(JSON.stringify({ output: path.relative(root, output), captures: report.scenarios.length,
         motions: report.motions.length, errors: report.errors.length, completed: report.completed }))

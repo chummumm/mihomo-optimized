@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Automation;
+using System.Windows.Media;
 using System.Windows.Threading;
 using Mihomo.Desktop.Services;
 
@@ -9,19 +10,25 @@ namespace Mihomo.Desktop.Controls;
 internal static class TunConsentDialog
 {
     private static readonly HashSet<Window> pending = [];
-    internal static async Task<bool> Run(Window owner, Func<Task> operation, Action<string> reportError, bool enableTun = true)
+    internal static async Task<bool> Run(Window owner, Func<Task> operation, Action<string> reportError, bool enableTun = true, Action? onSuccess = null)
     {
         if (!pending.Add(owner)) return false;
-        try { await Dispatcher.Yield(DispatcherPriority.Background); return Show(owner, operation, reportError, enableTun); }
+        try
+        {
+            await Dispatcher.Yield(DispatcherPriority.Background);
+            bool accepted = Show(owner, operation, reportError, enableTun);
+            if (accepted && enableTun) onSuccess?.Invoke();
+            return accepted;
+        }
         finally { pending.Remove(owner); }
     }
     private static bool Show(Window owner, Func<Task> operation, Action<string> reportError, bool enableTun)
     {
         var description = Ui.Label("TUN 模式通过一个受限的 Windows 服务接管系统流量。安装时需要一次管理员授权，之后开启或关闭 TUN 都不再需要授权。");
         description.Margin = new Thickness(0, 0, 0, 12);
-        var hint = Ui.Hint("服务只接受本应用的请求，卸载应用时会一并移除。仅安装版支持。", 13); hint.LineHeight = 20;
+        var hint = Ui.Hint("服务只接受本应用的请求，卸载应用时会一并移除。仅安装版支持。", 12); hint.LineHeight = 20;
         string label = enableTun ? "安装并开启 TUN" : "安装服务";
-        var install = new Button { Content = FluentControls.ButtonContent("shield-check", label) }.Id("InstallTunConfirmed");
+        var install = new Button { Content = InstallButtonContent(label) }.Id("InstallTunConfirmed");
         FluentControls.Primary(install); L.Bind(install, AutomationProperties.NameProperty, label);
         var cancel = new Button { Content = Ui.Label("取消") }.Id("CancelTunInstall");
         var actions = new Grid { Margin = new Thickness(0, 24, 0, 0) };
@@ -39,9 +46,19 @@ internal static class TunConsentDialog
             var text = Ui.Label(label); text.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); content.Children.Add(progress); content.Children.Add(text); install.Content = content;
             try { await operation(); busy = false; dialog.Complete(true); }
             catch (Exception exception) { reportError(exception.Message); }
-            finally { busy = false; install.IsEnabled = cancel.IsEnabled = true; install.Content = FluentControls.ButtonContent("shield-check", label); }
+            finally { busy = false; install.IsEnabled = cancel.IsEnabled = true; install.Content = InstallButtonContent(label); }
         };
         cancel.Click += (_, _) => dialog.Complete(false);
         dialog.Loaded += (_, _) => cancel.Focus(); return dialog.ShowDialog() == true;
+    }
+    private static FrameworkElement InstallButtonContent(string label)
+    {
+        // The supplied Button's UacShield paths and colours, at its original 16px size.
+        var shield = new Canvas { Width = 16, Height = 16, Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center };
+        shield.Children.Add(new System.Windows.Shapes.Path { Data = Geometry.Parse("M8 1.2 2.6 3.3v4.2c0 3.3 2.3 6 5.4 7.3 3.1-1.3 5.4-4 5.4-7.3V3.3z"), Fill = new SolidColorBrush(Color.FromRgb(0x1e, 0x6f, 0xd9)) });
+        shield.Children.Add(new System.Windows.Shapes.Path { Data = Geometry.Parse("M8 1.2v13.6c3.1-1.3 5.4-4 5.4-7.3V3.3z"), Fill = new SolidColorBrush(Color.FromRgb(0xf2, 0xc1, 0x2e)) });
+        shield.Children.Add(new System.Windows.Shapes.Path { Data = Geometry.Parse("M8 1.2 2.6 3.3V8H8zM8 8v6.8c3.1-1.3 5.4-4 5.4-7.3V8z"), Fill = new SolidColorBrush(Color.FromRgb(0x2b, 0x88, 0xf0)), Opacity = .55 });
+        var content = new StackPanel { Orientation = Orientation.Horizontal };
+        content.Children.Add(shield); content.Children.Add(Ui.Label(label)); return content;
     }
 }

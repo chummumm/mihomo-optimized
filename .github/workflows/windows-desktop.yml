@@ -141,11 +141,19 @@ jobs:
       - name: Test installed native UI, system proxy, TUN forwarding and cleanup
         run: python desktop/tests/windows_smoke.py
       - name: Render original design with the same Windows fixtures and dimensions
+        if: ${{ !cancelled() && (success() || failure()) }}
         env:
           REFERENCE_SOURCE: artifacts/reference-source
           REFERENCE_FIXTURE: artifacts/verification/visual-fixture.json
           REFERENCE_OUTPUT: artifacts/verification/reference
-        run: node desktop/tests/capture-reference.cjs
+          REFERENCE_ALLOW_PARTIAL: ${{ failure() && '1' || '0' }}
+        run: |
+          if (Test-Path artifacts/verification/visual-fixture.json) {
+            node desktop/tests/capture-reference.cjs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } elseif ($env:REFERENCE_ALLOW_PARTIAL -ne '1') {
+            throw 'The successful native acceptance run did not export its visual fixture.'
+          }
       - name: Upload Windows verification evidence
         if: always()
         uses: actions/upload-artifact@v4

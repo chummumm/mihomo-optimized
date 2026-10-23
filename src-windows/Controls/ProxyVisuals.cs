@@ -123,6 +123,19 @@ internal static class ProxyVisuals
                 scale.BeginAnimation(ScaleTransform.ScaleXProperty, Charge(.88));
                 scale.BeginAnimation(ScaleTransform.ScaleYProperty, Charge(.88));
             }
+            else if (icon.Kind == "healthcheck")
+            {
+                scale.BeginAnimation(ScaleTransform.ScaleXProperty, Heartbeat());
+                scale.BeginAnimation(ScaleTransform.ScaleYProperty, Heartbeat());
+            }
+        }
+        private static DoubleAnimationUsingKeyFrames Heartbeat()
+        {
+            var animation = new DoubleAnimationUsingKeyFrames { Duration = TimeSpan.FromMilliseconds(1100), RepeatBehavior = RepeatBehavior.Forever };
+            animation.KeyFrames.Add(new DiscreteDoubleKeyFrame(1, KeyTime.FromTimeSpan(TimeSpan.Zero)));
+            foreach (var (fraction, value) in new[] { (.14, 1.2), (.28, .96), (.42, 1.12), (.6, 1d), (1d, 1d) })
+                animation.KeyFrames.Add(new SplineDoubleKeyFrame(value, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(1100 * fraction)), new KeySpline(0, 0, 0, 1)));
+            return animation;
         }
         private static DoubleAnimationUsingKeyFrames Charge(double midpoint)
         {
@@ -213,13 +226,13 @@ internal static class ProxyVisuals
         animation.Completed += (_, _) => { target.BeginAnimation(property, null); complete?.Invoke(); };
         target.BeginAnimation(property, animation, HandoffBehavior.SnapshotAndReplace);
     }
-    internal static void Tween(UIElement target, DependencyProperty property, double from, double to, int milliseconds, Action? complete = null)
+    internal static void Tween(UIElement target, DependencyProperty property, double from, double to, int milliseconds, Action? complete = null, Point? first = null, Point? second = null)
     {
         target.BeginAnimation(property, null); target.SetValue(property, to);
         if (!Animate || Math.Abs(from - to) < .001) { complete?.Invoke(); return; }
         var animation = new DoubleAnimationUsingKeyFrames { Duration = TimeSpan.FromMilliseconds(milliseconds) };
         animation.KeyFrames.Add(new DiscreteDoubleKeyFrame(from, KeyTime.FromTimeSpan(TimeSpan.Zero)));
-        animation.KeyFrames.Add(new SplineDoubleKeyFrame(to, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(milliseconds)), new KeySpline(0, 0, 0, 1)));
+        animation.KeyFrames.Add(new SplineDoubleKeyFrame(to, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(milliseconds)), new KeySpline(first ?? new Point(0, 0), second ?? new Point(0, 1))));
         animation.Completed += (_, _) => { target.BeginAnimation(property, null); complete?.Invoke(); };
         target.BeginAnimation(property, animation, HandoffBehavior.SnapshotAndReplace);
     }
