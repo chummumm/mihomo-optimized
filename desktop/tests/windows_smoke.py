@@ -1248,6 +1248,7 @@ class Acceptance:
         driver.invoke("native_show")
         # Match the reference browser's neutral pointer position; an arbitrary
         # runner cursor over the topology must not add an unrelated hover state.
+        import win32api
         win32api.SetCursorPos((0, 0))
         driver.invoke("native_resize", {"width": 1180, "height": 780})
         driver.navigate("home")

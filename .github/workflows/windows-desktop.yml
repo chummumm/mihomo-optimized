@@ -66,7 +66,9 @@ jobs:
         run: choco install nsis --version=3.11 --yes --no-progress
       - name: Install Windows acceptance API bindings
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311
+          python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311 pyflakes==3.4.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pyflakes desktop/tests/windows_smoke.py
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
       - name: Verify the unchanged web dashboard
