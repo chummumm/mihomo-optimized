@@ -63,7 +63,25 @@ jobs:
       - name: Exercise native protocol boundaries and cancellation
         run: dotnet run --project desktop/tests/protocol/ProtocolTests.csproj -c Release
       - name: Install native Windows installer compiler
-        run: choco install nsis --version=3.11 --yes --no-progress
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'nsis-3.11.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'mihomo-nsis-3.11'
+          # Published SHA-256: https://sourceforge.net/projects/nsis/files/NSIS%203/3.11/nsis-3.11.zip/download
+          $expectedSha256 = 'C7D27F780DDB6CFFB4730138CD1591E841F4B7EDB155856901CDF5F214394FA1'
+          curl.exe --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --connect-timeout 20 --max-time 60 --retry 2 --retry-delay 2 --retry-all-errors --output $archive 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip'
+          if ($LASTEXITCODE -ne 0) { throw "NSIS 3.11 download failed with exit code $LASTEXITCODE" }
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -cne $expectedSha256) { throw 'NSIS 3.11 archive SHA-256 mismatch' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $nsisDirectory = Join-Path $destination 'nsis-3.11'
+          $compiler = Join-Path $nsisDirectory 'makensis.exe'
+          $version = & $compiler /VERSION
+          if ($LASTEXITCODE -ne 0 -or ([string]$version).Trim() -cne 'v3.11') { throw "Unexpected NSIS compiler version: $version" }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $nsisDirectory -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "NSISDIR=$nsisDirectory" -Encoding utf8
+          Write-Host "Verified NSIS $version ($expectedSha256)"
       - name: Install Windows acceptance API bindings
         run: |
           python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311 pyflakes==3.4.0
