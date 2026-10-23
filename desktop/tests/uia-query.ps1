@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][int]$ApplicationProcessId,
     [Parameter(Mandatory=$true)][string]$AutomationId,
-    [ValidateSet('read', 'invoke', 'set', 'select', 'toggle', 'scroll', 'scroll-horizontal', 'text-start', 'text-end', 'context', 'escape')][string]$Action = 'read',
+    [ValidateSet('read', 'invoke', 'set', 'select', 'toggle', 'scroll', 'scroll-horizontal', 'text-start', 'text-end', 'text-viewport', 'context', 'escape')][string]$Action = 'read',
     [AllowEmptyString()][string]$Value = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -54,9 +54,10 @@ if (-not $element) { @{found=$false} | ConvertTo-Json -Compress; exit 0 }
 $result = @{ found=$true; enabled=$element.Current.IsEnabled; offscreen=$element.Current.IsOffscreen;
     name=$element.Current.Name; focused=$element.Current.HasKeyboardFocus;
     controlType=$element.Current.ControlType.ProgrammaticName }
-if ($AutomationId -eq 'ConfigEditor' -and $Action -eq 'read') {
-    # Keep range comparisons strongly typed across the UIAutomation COM boundary.
-    # Only lengths, endpoint relations and flags leave this helper, never text.
+if ($AutomationId -eq 'ConfigEditor' -and $Action -eq 'text-viewport') {
+    # Only the explicit long-editor gate needs the TextPattern viewport. Ordinary
+    # startup/read checks must not enter range APIs while the editor is opening.
+    # Keep all text in memory; only validated lengths/offsets leave this helper.
     Add-Type -AssemblyName WindowsBase
     Add-Type -ReferencedAssemblies @(
         [System.Windows.Automation.AutomationElement].Assembly.Location,
@@ -69,52 +70,87 @@ using System.Windows.Automation.Text;
 public static class NativeTextViewportProbe
 {
     public static string Stage = "read_text_document";
-    public static Dictionary<string, object> Read(TextPattern pattern)
+
+    private static int[] ReadBounds(TextPatternRange range, string documentText,
+        string stage, out bool valid)
+    {
+        Stage = stage + "_text";
+        string text = range.GetText(-1);
+        // Extend separate clones outwards. Each call receives just its own
+        // range handle, avoiding UIA2's cross-range comparison/move interop.
+        Stage = stage + "_prefix_clone";
+        TextPatternRange prefix = range.Clone();
+        Stage = stage + "_prefix_extend";
+        prefix.MoveEndpointByUnit(TextPatternRangeEndpoint.Start, TextUnit.Document, -1);
+        Stage = stage + "_prefix_text";
+        string prefixText = prefix.GetText(-1);
+        Stage = stage + "_suffix_clone";
+        TextPatternRange suffix = range.Clone();
+        Stage = stage + "_suffix_extend";
+        suffix.MoveEndpointByUnit(TextPatternRangeEndpoint.End, TextUnit.Document, 1);
+        Stage = stage + "_suffix_text";
+        string suffixText = suffix.GetText(-1);
+
+        int start = documentText.Length - suffixText.Length;
+        int end = prefixText.Length;
+        valid = 0 <= start && start <= end && end <= documentText.Length &&
+            documentText.StartsWith(prefixText, StringComparison.Ordinal) &&
+            documentText.EndsWith(suffixText, StringComparison.Ordinal) &&
+            end - start == text.Length &&
+            string.Equals(text, documentText.Substring(start, end - start), StringComparison.Ordinal);
+        return new int[] { start, end, text.Length };
+    }
+
+    public static Dictionary<string, object> Read(TextPattern pattern, string value)
     {
         Stage = "read_text_document";
         TextPatternRange document = pattern.DocumentRange;
         Stage = "read_text_document_length";
-        int textLength = document.GetText(-1).Length;
-        Stage = "read_text_document_endpoints";
-        int documentSpan = document.CompareEndpoints(TextPatternRangeEndpoint.Start,
-            document, TextPatternRangeEndpoint.End);
+        string documentText = document.GetText(-1);
+        int textLength = documentText.Length;
+        bool documentValid;
+        int[] documentOffsets = ReadBounds(document, documentText, "read_text_document", out documentValid);
+        documentValid = documentValid && documentOffsets[0] == 0 && documentOffsets[1] == textLength;
+        bool matchesValue = string.Equals(documentText.Replace("\r\n", "\n"),
+            value.Replace("\r\n", "\n"), StringComparison.Ordinal);
         Stage = "read_text_visible_ranges";
         TextPatternRange[] visible = pattern.GetVisibleRanges();
         bool startsDocument = false, endsDocument = false;
-        var visibleComparisons = new List<int[]>();
-        Stage = "read_text_visible_endpoints";
+        bool visibleValid = true;
+        var visibleOffsets = new List<int[]>();
         foreach (TextPatternRange range in visible)
         {
-            int start = range.CompareEndpoints(TextPatternRangeEndpoint.Start,
-                document, TextPatternRangeEndpoint.Start);
-            int end = range.CompareEndpoints(TextPatternRangeEndpoint.End,
-                document, TextPatternRangeEndpoint.End);
-            startsDocument |= start == 0;
-            endsDocument |= end == 0;
-            visibleComparisons.Add(new int[] { start, end });
+            bool valid;
+            int[] offsets = ReadBounds(range, documentText, "read_text_visible", out valid);
+            visibleValid &= valid;
+            startsDocument |= valid && offsets[0] == 0;
+            endsDocument |= valid && offsets[1] == textLength;
+            visibleOffsets.Add(offsets);
         }
         Stage = "read_text_selection";
         TextPatternRange[] selection = pattern.GetSelection();
         bool caretAtStart = false, caretAtEnd = false;
-        int[] selectionComparisons = null;
-        Stage = "read_text_caret_endpoints";
-        if (selection.Length == 1)
+        bool selectionValid = true;
+        var selectionOffsets = new List<int[]>();
+        foreach (TextPatternRange range in selection)
         {
-            TextPatternRange caret = selection[0];
-            int span = caret.CompareEndpoints(TextPatternRangeEndpoint.Start,
-                caret, TextPatternRangeEndpoint.End);
-            int start = caret.CompareEndpoints(TextPatternRangeEndpoint.Start,
-                document, TextPatternRangeEndpoint.Start);
-            int end = caret.CompareEndpoints(TextPatternRangeEndpoint.End,
-                document, TextPatternRangeEndpoint.End);
-            caretAtStart = span == 0 && start == 0;
-            caretAtEnd = span == 0 && end == 0;
-            selectionComparisons = new int[] { span, start, end };
+            bool valid;
+            int[] offsets = ReadBounds(range, documentText, "read_text_caret", out valid);
+            selectionValid &= valid;
+            selectionOffsets.Add(offsets);
+            bool collapsed = valid && offsets[2] == 0 && offsets[0] == offsets[1];
+            if (selection.Length == 1 && collapsed)
+            {
+                caretAtStart = offsets[0] == 0;
+                caretAtEnd = offsets[1] == textLength;
+            }
         }
         return new Dictionary<string, object> {
-            { "documentTextLength", textLength }, { "documentStartVsEnd", documentSpan },
-            { "ranges", visible.Length }, { "visibleComparisons", visibleComparisons },
-            { "selectionComparisons", selectionComparisons },
+            { "documentTextLength", textLength }, { "documentOffsets", documentOffsets },
+            { "documentRangeValid", documentValid }, { "documentMatchesValue", matchesValue },
+            { "ranges", visible.Length }, { "visibleOffsets", visibleOffsets },
+            { "visibleRangesValid", visibleValid }, { "selectionOffsets", selectionOffsets },
+            { "selectionRangesValid", selectionValid },
             { "startsDocument", startsDocument }, { "endsDocument", endsDocument },
             { "caretAtStart", caretAtStart }, { "caretAtEnd", caretAtEnd }
         };
@@ -300,12 +336,12 @@ public static class NativeEscapeInput {
                 verticalScrollable=$pattern.Current.VerticallyScrollable;
                 verticalPercent=$pattern.Current.VerticalScrollPercent }
         }
-        if ($AutomationId -eq 'ConfigEditor') {
+        if ($AutomationId -eq 'ConfigEditor' -and $Action -eq 'text-viewport') {
             $pattern = $null
             $script:operationStage = 'read_text_pattern'
             if ($element.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$pattern)) {
                 $script:textProbeActive = $true
-                $result.textViewport = [NativeTextViewportProbe]::Read($pattern)
+                $result.textViewport = [NativeTextViewportProbe]::Read($pattern, [string]$result.value)
                 $script:textProbeActive = $false
             }
         }

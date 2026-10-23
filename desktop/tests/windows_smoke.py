@@ -1459,17 +1459,28 @@ class Acceptance:
         require(editor.get("scroll", {}).get("verticalScrollable"), "native_editor_has_no_vertical_scroll_extent")
 
         def editor_view(*, endpoint: str, percent: float | None = None, caret: str | None = None):
-            state = driver.ui("ConfigEditor")
+            state = driver.ui("ConfigEditor", "text-viewport")
             viewport = state.get("textViewport", {})
-            # Retain the numeric probe on failure too. A nonempty long document
-            # cannot have a degenerate document range or a caret at both ends.
+            # Retain numeric positions before asserting. Prefix/suffix reads
+            # validate true offsets without UIA2 cross-range comparisons; no
+            # document text or copied ranges are written to the evidence.
             evidence["editorTextRangeProbe"] = {
                 "valueUtf16Length": len(state.get("value", "").encode("utf-16-le")) // 2,
                 **viewport,
             }
-            require(viewport.get("documentTextLength", 0) > 0
-                    and viewport.get("documentStartVsEnd", 0) < 0,
+            length = viewport.get("documentTextLength", 0)
+            require(length > 0 and viewport.get("documentRangeValid") is True
+                    and viewport.get("documentOffsets") == [0, length, length]
+                    and viewport.get("documentMatchesValue") is True,
                     "native_editor_textpattern_document_degenerate")
+            visible = viewport.get("visibleOffsets", [])
+            require(viewport.get("visibleRangesValid") is True
+                    and len(visible) == viewport.get("ranges", 0)
+                    and any(offsets[2] > 0 for offsets in visible),
+                    "native_editor_textpattern_visible_offsets_invalid")
+            require(viewport.get("selectionRangesValid") is True
+                    and len(viewport.get("selectionOffsets", [])) == 1,
+                    "native_editor_textpattern_selection_offsets_invalid")
             require(not (viewport.get("caretAtStart") and viewport.get("caretAtEnd")),
                     "native_editor_textpattern_caret_at_both_ends")
             opposite = "startsDocument" if endpoint == "endsDocument" else "endsDocument"
