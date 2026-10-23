@@ -32,6 +32,7 @@ public partial class MainWindow : Window
         // grows from 48 to 280. Keep their full rightward sampling path ready.
         MotionOverscan = new Thickness(16, 16, 302, 16)
     };
+    private readonly FluentBackdropFilter searchBackdrop = new() { CornerRadius = new CornerRadius(7) };
     private readonly Grid navigationOverlaySurface = new();
     internal TransientMessageHost Notifications { get; } = new();
     private readonly string shellPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Mihomo Optimized", "native-shell.json");
@@ -49,6 +50,7 @@ public partial class MainWindow : Window
     private bool preferCompact;
     private bool overlayOpen;
     private bool overlayClosing;
+    private bool overlayPreparing;
     private long overlayAnimation;
     private bool shellCommandBusy;
     private double pillTop = double.NaN;
@@ -70,14 +72,22 @@ public partial class MainWindow : Window
         InitializeComponent();
         this.session = session;
         navigationBackdrop.Id("NavigationBackdrop");
-        navigationBackdrop.SetSources(ContentLayout, NavigationDock, MainContentBorder);
+        // The pane is moved out of its dock when opened. Its final backdrop is
+        // the page below it, never the pane itself or the old compact rail.
+        navigationBackdrop.SetSources(ContentLayout, MainContentBorder);
+        navigationBackdrop.ConfigurePreparation(ClientArea, () => new Rect(0, 0, 279, Math.Max(0, ContentLayout.ActualHeight)));
         navigationOverlaySurface.Children.Add(navigationBackdrop);
         OverlayPaneHost.Child = navigationOverlaySurface;
         recovery = new DesktopRecovery(session);
         updateNotice = new DesktopUpdateNotice(session);
         UpdateNoticeSlot.Content = updateNotice;
         AttachNotifications(ClientArea);
+        searchBackdrop.Id("SearchBackdrop");
+        searchBackdrop.SetSources(ClientArea, TitleBar, ContentLayout, PageOverlayHost, ConnectedOverlay, Notifications);
+        searchBackdrop.ConfigurePreparation(ClientArea, () => SearchWindow.PreparationViewport(this, SearchButton, ClientArea));
         SearchButton.OpenRequested += ShowSearch;
+        SearchButton.MouseEnter += (_, _) => PrepareBackdropOnIntent(searchBackdrop);
+        NavigationToggle.MouseEnter += (_, _) => PrepareBackdropOnIntent(navigationBackdrop);
         try { if (File.Exists(shellPath)) { using var saved = JsonDocument.Parse(File.ReadAllText(shellPath)); preferCompact = saved.RootElement.Bool("navigationCollapsed"); } }
         catch (Exception error) when (error is IOException or JsonException or UnauthorizedAccessException) { }
         CoreCardButton.Style = FluentControls.Style("Ghost");
@@ -102,15 +112,29 @@ public partial class MainWindow : Window
         };
         L.Changed += OnLanguageChanged;
         Closing += OnClosing;
-        StateChanged += (_, _) => { UpdateCaption(); UpdatePageActivity(); };
+        StateChanged += (_, _) => { if (WindowState == WindowState.Minimized) CloseOverlay(false); UpdateCaption(); UpdatePageActivity(); UpdateBackdropPreparation(); };
         Activated += (_, _) => UpdateCaptionActivity(true);
         Deactivated += (_, _) => UpdateCaptionActivity(false);
-        IsVisibleChanged += (_, _) => { UpdatePageActivity(); UpdateNavigationIndicator(false); };
+        IsVisibleChanged += (_, _) => { UpdatePageActivity(); UpdateNavigationIndicator(false); UpdateBackdropPreparation(); };
         SizeChanged += (_, _) => { ConnectedNavigation.Cancel(this); ApplyNavigationSize(); };
         MainContentBorder.SizeChanged += (_, _) => UpdateNoticeMetrics();
         PreviewKeyDown += OnKey;
         NavigationList.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler((_, _) => UpdateNavigationIndicator(false)));
         Loaded += async (_, _) => { ApplyNavigationSize(); UpdateStatus(); if (activePage is null) await NavigateAsync("home"); };
+    }
+
+    private void UpdateBackdropPreparation()
+    {
+        bool available = IsLoaded && IsVisible && WindowState != WindowState.Minimized && !allowClose && !EditorOpen;
+        searchBackdrop.SetPreparationEnabled(available && !overlayOpen && !overlayClosing);
+        navigationBackdrop.SetPreparationEnabled(available && navigationMode != "expanded");
+        searchBackdrop.RefreshPreparation(); navigationBackdrop.RefreshPreparation();
+    }
+
+    private async void PrepareBackdropOnIntent(FluentBackdropFilter filter)
+    {
+        if (allowClose || !IsVisible || WindowState == WindowState.Minimized || EditorOpen) return;
+        await filter.PrepareAsync();
     }
 
     public Task<bool> NavigateAsync(string key) => NavigateAsync(new NavigationTarget(key));
@@ -283,7 +307,13 @@ public partial class MainWindow : Window
         bool recovering = RecoveryRequired;
         bool resumed = !navigating && ReferenceEquals(PageContent.Content, recovery) && !recovering;
         var shown = recovering ? recovery : activePage;
-        if (!ReferenceEquals(PageContent.Content, shown)) PageContent.Content = shown;
+        if (!ReferenceEquals(PageContent.Content, shown))
+        {
+            PageContent.Content = shown;
+            // The next page can occupy identical bounds. Its content identity,
+            // unlike an animated sample on the same page, invalidates readiness.
+            searchBackdrop.InvalidatePreparation(); navigationBackdrop.InvalidatePreparation();
+        }
         if (IsVisible && WindowState != WindowState.Minimized && !recovering) activePage?.Activate();
         else activePage?.Deactivate();
         if (resumed && activePage is { } page) _ = ResumePageTargetAsync(page, location);
@@ -364,11 +394,15 @@ public partial class MainWindow : Window
         if (animate && FluentMotion.Enabled)
             label.BeginAnimation(OpacityProperty, new DoubleAnimation(from, label.Opacity, TimeSpan.FromMilliseconds(167)));
     }
-    private void OpenOverlay()
+    private async void OpenOverlay()
     {
-        if (overlayOpen) return;
-        ++overlayAnimation;
+        if (overlayOpen || allowClose || EditorOpen) return;
+        long animation = ++overlayAnimation;
         bool interrupted = overlayClosing; overlayClosing = false; overlayOpen = true;
+        overlayPreparing = true; UpdateBackdropPreparation();
+        await navigationBackdrop.PrepareAsync();
+        if (animation != overlayAnimation || !overlayOpen || allowClose || !IsVisible || WindowState == WindowState.Minimized) return;
+        overlayPreparing = false;
         double previousWidth = interrupted ? OverlayPaneHost.ActualWidth : 48;
         double previousX = interrupted && OverlayPaneHost.RenderTransform is TranslateTransform previous ? previous.X : -285.6;
         if (NavigationDock.Children.Contains(NavigationPane)) NavigationDock.Children.Remove(NavigationPane);
@@ -379,6 +413,7 @@ public partial class MainWindow : Window
         bool dark = TryFindResource("AppBackgroundBrush") is SolidColorBrush background && background.Color.R < 128;
         OverlayPaneHost.Effect = new System.Windows.Media.Effects.DropShadowEffect { Color = Colors.Black, BlurRadius = 16, ShadowDepth = 8, Direction = 270, Opacity = dark ? .26 : .14 };
         OverlayPaneHost.Visibility = NavigationScrim.Visibility = Visibility.Visible;
+        navigationBackdrop.BeginPresentation();
         ApplyNavigationContent(navigationMode == "compact");
         OverlayPaneHost.RenderTransform = Transform.Identity;
         if (FluentMotion.Enabled && navigationMode == "compact")
@@ -388,12 +423,13 @@ public partial class MainWindow : Window
             var shift = new TranslateTransform(previousX, 0); OverlayPaneHost.RenderTransform = shift;
             shift.BeginAnimation(TranslateTransform.XProperty, new DoubleAnimation(0, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate });
         }
-        Dispatcher.InvokeAsync(() => UpdateNavigationIndicator(false), System.Windows.Threading.DispatcherPriority.Loaded);
+        _ = Dispatcher.InvokeAsync(() => UpdateNavigationIndicator(false), System.Windows.Threading.DispatcherPriority.Loaded);
     }
     private void CloseOverlay(bool animate, bool restoreFocus = false)
     {
         if (!overlayOpen && !overlayClosing) return;
         long animation = ++overlayAnimation;
+        bool wasPreparing = overlayPreparing; overlayPreparing = false;
         overlayOpen = false; overlayClosing = true; NavigationScrim.Visibility = Visibility.Collapsed;
         void Complete()
         {
@@ -403,9 +439,11 @@ public partial class MainWindow : Window
             navigationOverlaySurface.Children.Remove(NavigationPane);
             if (!NavigationDock.Children.Contains(NavigationPane)) NavigationDock.Children.Add(NavigationPane);
             OverlayPaneHost.Visibility = Visibility.Collapsed; OverlayPaneHost.RenderTransform = Transform.Identity;
+            navigationBackdrop.EndPresentation();
             ApplyNavigationContent(); UpdateNavigationIndicator(false);
+            UpdateBackdropPreparation();
         }
-        if (!animate || !FluentMotion.Enabled) Complete();
+        if (wasPreparing || !animate || !FluentMotion.Enabled) Complete();
         else if (navigationMode == "compact")
         {
             ApplyNavigationContent(true, false);
@@ -483,11 +521,13 @@ public partial class MainWindow : Window
         KeyboardNavigation.SetTabNavigation(NavigationPane, editing ? KeyboardNavigationMode.None : KeyboardNavigationMode.Continue);
         KeyboardNavigation.SetTabNavigation(SearchButton, editing ? KeyboardNavigationMode.None : KeyboardNavigationMode.Continue);
         KeyboardNavigation.SetTabNavigation(UpdateNoticeSlot, editing ? KeyboardNavigationMode.None : KeyboardNavigationMode.Continue);
+        if (editing) CloseOverlay(false);
         if (editing && searchWindow is { IsVisible: true }) searchWindow.Close();
         if (activePage is ProfilesPage profiles) profiles.SetOverlayHost(full ? PageOverlayHost : ContentPageOverlayHost);
         System.Windows.Shell.WindowChrome.SetIsHitTestVisibleInChrome(PageOverlayHost, full);
         MainContentBorder.CornerRadius = navigationMode == "minimal" ? new CornerRadius(0) : new CornerRadius(8, 0, 0, 0);
         MainContentBorder.BorderThickness = navigationMode == "minimal" ? new Thickness(0, 1, 0, 0) : new Thickness(1, 1, 0, 0);
+        UpdateBackdropPreparation();
     }
     private async Task GoBackAsync()
     {
@@ -512,7 +552,7 @@ public partial class MainWindow : Window
         if (EditorOpen) return;
         CloseOverlay(false);
         if (searchWindow is { IsVisible: true }) { searchWindow.FocusInput(); return; }
-        var dialog = new SearchWindow(session, SearchButton) { Owner = this }; searchWindow = dialog;
+        var dialog = new SearchWindow(session, SearchButton, searchBackdrop) { Owner = this }; searchWindow = dialog;
         dialog.Closed += (_, _) => { if (ReferenceEquals(searchWindow, dialog)) searchWindow = null; };
         dialog.Show(); dialog.FocusInput();
     }
@@ -589,7 +629,7 @@ public partial class MainWindow : Window
     {
         if (allowClose) return; allowClose = true;
         foreach (var page in pages.Values) page.Deactivate();
-        L.Changed -= OnLanguageChanged; searchWindow?.Close(); backdrop.Dispose(); navigationBackdrop.Dispose(); titleBar.Dispose(); tray.Dispose();
+        L.Changed -= OnLanguageChanged; searchWindow?.Close(); backdrop.Dispose(); navigationBackdrop.Dispose(); searchBackdrop.Dispose(); titleBar.Dispose(); tray.Dispose();
         Notifications.Dispose();
         await session.DisposeAsync(); Close(); Application.Current.Shutdown();
     }
@@ -602,6 +642,7 @@ public partial class MainWindow : Window
         navigation = navigationTiming?.Describe(),
         preparation = pages.TryGetValue("proxies", out var page) && page is ProxiesPage proxies ? proxies.DescribeNavigationPreparation() : null,
         search = searchWindow?.Describe(),
+        navigationBackdrop = navigationBackdrop.Describe(),
         backdrop = FluentBackdropFilter.DescribeCompilation()
     };
 

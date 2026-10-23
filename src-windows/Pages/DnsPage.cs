@@ -42,7 +42,9 @@ public sealed class DnsPage : NativePage
     private readonly DnsTabs tabs = new();
     private readonly TextBlock overviewUpdated = DnsVisuals.Caption("", false), queryUpdated = DnsVisuals.Caption("", false), upstreamUpdated = DnsVisuals.Caption("", false);
     private readonly TextBlock trendUnit = DnsVisuals.Caption("", false), trendEmpty = DnsVisuals.Caption("暂时没有 DNS 查询。"), rangeEmpty = DnsVisuals.Caption("此时间范围内没有查询。"), queryEmpty = DnsVisuals.Caption("暂时没有 DNS 查询。"), upstreamEmpty = DnsVisuals.Caption("暂时没有记录到上游交换。");
-    private readonly DnsFlowPanel trendHeading = new() { Gap = 12, RowGap = 8, SpaceBetween = true, AlignTop = true, Margin = new Thickness(0, 0, 0, 8) };
+    // The reference's adjacent 8px block margins collapse into one gap.
+    // StackPanel margins add, so the trend alone supplies that spacing.
+    private readonly DnsFlowPanel trendHeading = new() { Gap = 12, RowGap = 8, SpaceBetween = true, AlignTop = true };
     private readonly DnsPagingActions pageActions = new() { Gap = 8, RowGap = 8 };
     private Border? jumpFrame, paginationFrame;
     private readonly DnsFlowPanel legend = new() { Gap = 20, RowGap = 8, Margin = new Thickness(0, 8, 0, 0) };
@@ -416,7 +418,7 @@ public sealed class DnsPage : NativePage
             position.Inlines.Add(new Run(location[offset..match.Index])); var reading = new Run(match.Value) { FontWeight = FontWeights.Medium }; reading.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); position.Inlines.Add(reading); offset = match.Index + match.Length;
         }
         position.Inlines.Add(new Run(location[offset..])); pageRows.Text = L.F("本页 {0} 条", DnsVisuals.Number(queries.Items.Count));
-        queryNote.Text = (!total.HasValue ? L.T("更新内核后可显示总数并直接跳页。") + "\n" : "") + L.T("仅统计仍保留的查询明细，不包含已过期或被淘汰的记录。") + "\n" + L.F("保留明细: {0} · 已淘汰: {1}", DnsVisuals.Number(latestQueries.Number("retained")), DnsVisuals.Number(latestQueries.Number("evicted")));
+        queryNote.Text = (!total.HasValue ? L.T("更新内核后可显示总数并直接跳页。") + "\n" : "") + L.T("仅统计仍保留的查询明细，不包含已过期或被淘汰的记录。") + " · " + L.F("保留明细: {0} · 已淘汰: {1}", DnsVisuals.Number(latestQueries.Number("retained")), DnsVisuals.Number(latestQueries.Number("evicted")));
         queryUpdated.Text = Updated(queriesAt); queryEmpty.Text = L.T("保留的明细中没有符合条件的查询。"); queryEmpty.Visibility = queries.Items.Count > 0 ? Visibility.Collapsed : Visibility.Visible; queries.MinHeight = queries.Items.Count > 0 ? 0 : DnsVisuals.EmptyTableHeight; FitQueryColumns(); UpdatePaging();
     }
     private void FitQueryColumns()

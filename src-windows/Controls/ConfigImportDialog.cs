@@ -28,11 +28,13 @@ internal sealed class ConfigImportDialog
     // The original grid stretches the track; its three options keep their
     // natural widths (SettingsSegments.Stretch would instead divide the row).
     private readonly SettingsSegments modes = new() { HorizontalAlignment = HorizontalAlignment.Stretch };
-    private readonly TextBox preview = new()
+    private readonly TextBox preview = new TextAreaTextBox()
     {
         AcceptsReturn = true, AcceptsTab = false, TextWrapping = TextWrapping.NoWrap,
         Height = 260, MinHeight = 260, FontSize = 12, FontFamily = new FontFamily("Cascadia Mono, Consolas"),
-        Padding = new Thickness(12, 10, 12, 10), VerticalContentAlignment = VerticalAlignment.Top,
+        // TextBoxView adds 2-DIP bidi margins and places this font's ink 2 DIP
+        // below the CSS line box. Preserve the original total vertical inset.
+        Padding = new Thickness(10, 8, 10, 12), VerticalContentAlignment = VerticalAlignment.Top,
         VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
         UndoLimit = 50,
     };

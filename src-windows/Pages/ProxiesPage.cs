@@ -74,6 +74,8 @@ public sealed class ProxiesPage : NativePage
     private long preparationGeneration;
     private bool? preparationCacheHit;
     private double? preparationElapsedMs;
+    private double? preparationSnapshotMs, preparationGroupMs, preparationLayoutMs, preparationLayoutWaitMs;
+    private int unchangedReadbacks;
     private bool preparationPending;
     private NavigationTarget? preparedNavigation;
     private string preparedController = "";
@@ -88,6 +90,7 @@ public sealed class ProxiesPage : NativePage
     private double down;
     private bool applyingPreferences;
     private bool shownProviders;
+    private string renderedLanguage = "";
 
     public ProxiesPage(AppSession session) : base(session, "proxies", "代理", "策略组、代理节点与实时流量路径")
     {
@@ -185,6 +188,22 @@ public sealed class ProxiesPage : NativePage
     }
     private void PresentRuntimeData(JsonElement proxies, JsonElement providers, JsonElement configs)
     {
+        // Activation still requests authoritative data. A new JSON document
+        // with identical content need not rebuild the just-realized controls
+        // while their connected entrance is running. Preference/language
+        // changes on a cached, inactive page still require a fresh rendering.
+        if (presentedProxies.ValueKind != JsonValueKind.Undefined &&
+            shownProviders == Session.ShowProxyProvider &&
+            breakConnections.IsChecked == Session.CloseConnectionsOnSwitch &&
+            renderedLanguage == L.ResolvedLanguage &&
+            JsonElement.DeepEquals(proxies, presentedProxies) &&
+            JsonElement.DeepEquals(providers, presentedProviders) &&
+            JsonElement.DeepEquals(configs, presentedConfigs))
+        {
+            presentedProxies = proxies; presentedProviders = providers; presentedConfigs = configs;
+            unchangedReadbacks++;
+            Message(""); return;
+        }
         var all = proxies.Get("proxies"); providerData = providers.Get("providers"); mode = configs.Text("mode").ToLowerInvariant();
         nodes.Clear();
         foreach (var item in all.Fields()) nodes[item.Name] = ProxyNodeInfo.From(item.Name, item.Value);
@@ -211,6 +230,7 @@ public sealed class ProxiesPage : NativePage
     {
         applyingPreferences = true; breakConnections.IsChecked = Session.CloseConnectionsOnSwitch; applyingPreferences = false;
         shownProviders = Session.ShowProxyProvider;
+        renderedLanguage = L.ResolvedLanguage;
         var stage = System.Diagnostics.Stopwatch.GetTimestamp();
         RenderGroups(); var groupsMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
         stage = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -438,19 +458,43 @@ public sealed class ProxiesPage : NativePage
         var generation = ++preparationGeneration;
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         preparationCacheHit = null; preparationElapsedMs = null; preparationPending = true;
+        preparationSnapshotMs = preparationGroupMs = preparationLayoutMs = preparationLayoutWaitMs = null;
+        double? snapshotMs = null, groupMs = null, layoutMs = null, layoutWaitMs = null;
         preparedNavigation = null;
         try
         {
-            preparationCacheHit = TryPresentRuntimeSnapshot();
-            if (preparationCacheHit != true) await RefreshAsync();
-            if (target.Action == "focus-group" && target.Target is { Length: > 0 } name && IsActive && IsRunning && lastController == ControllerIdentity)
+            var stage = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool cacheHit = TryPresentRuntimeSnapshot();
+            preparationCacheHit = cacheHit;
+            snapshotMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+            if (!cacheHit) await RefreshAsync();
+            if (generation == preparationGeneration && target.Action == "focus-group" && target.Target is { Length: > 0 } name && IsActive && IsRunning && lastController == ControllerIdentity)
             {
                 var controller = ControllerIdentity;
+                stage = System.Diagnostics.Stopwatch.GetTimestamp();
                 OpenNavigationGroup(name);
+                groupMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
                 // Realize the target before Main starts its entrance clock.
-                // NavigateToAsync then measures that first animated frame without
-                // another Render or dispatcher wait consuming the entrance offset.
-                await Dispatcher.InvokeAsync(scroll.UpdateLayout, DispatcherPriority.Loaded);
+                // A cache hit is already attached to the live window: waiting
+                // at Loaded priority unnecessarily lets normal-priority network
+                // continuations rebuild it before this preparation can resume.
+                void RealizeTarget()
+                {
+                    if (generation != preparationGeneration || !IsActive || !IsRunning || controller != ControllerIdentity) return;
+                    var layoutStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                    scroll.UpdateLayout();
+                    layoutMs = System.Diagnostics.Stopwatch.GetElapsedTime(layoutStarted).TotalMilliseconds;
+                }
+                if (cacheHit) { layoutWaitMs = 0; RealizeTarget(); }
+                else
+                {
+                    var queued = System.Diagnostics.Stopwatch.GetTimestamp();
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        layoutWaitMs = System.Diagnostics.Stopwatch.GetElapsedTime(queued).TotalMilliseconds;
+                        RealizeTarget();
+                    }, DispatcherPriority.Loaded);
+                }
                 if (generation == preparationGeneration && IsActive && IsRunning && controller == ControllerIdentity && groupCards.ContainsKey(name))
                 {
                     preparedNavigation = target;
@@ -463,6 +507,8 @@ public sealed class ProxiesPage : NativePage
             if (generation == preparationGeneration)
             {
                 preparationElapsedMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                preparationSnapshotMs = snapshotMs; preparationGroupMs = groupMs;
+                preparationLayoutMs = layoutMs; preparationLayoutWaitMs = layoutWaitMs;
                 preparationPending = false;
             }
         }
@@ -472,6 +518,11 @@ public sealed class ProxiesPage : NativePage
     {
         cacheHit = preparationCacheHit,
         elapsedMs = preparationElapsedMs,
+        snapshotMs = preparationSnapshotMs,
+        openGroupMs = preparationGroupMs,
+        layoutMs = preparationLayoutMs,
+        layoutWaitMs = preparationLayoutWaitMs,
+        unchangedReadbacks,
         pending = preparationPending,
         construction = new { fieldsMs = constructionFieldsMs, controlsMs = constructionControlsMs, topologyMs = constructionTopologyMs, snapshotMs = constructionSnapshotMs, totalMs = constructionTotalMs, templateLoadMs = ProxyVisuals.TemplateLoadMilliseconds, render = constructionRenderTiming },
         geometry = lastNavigationGeometry

@@ -107,7 +107,9 @@ internal sealed class SearchWindow : Window
     private ResultAppearance[] renderedResults = [];
     private string renderedQuery = "";
     private readonly CancellationTokenSource lifetime = new();
-    private readonly FluentBackdropFilter backdropFilter = new FluentBackdropFilter { CornerRadius = new CornerRadius(7) }.Id("SearchBackdrop");
+    private readonly FluentBackdropFilter backdropFilter;
+    private readonly bool ownsBackdrop;
+    private readonly Grid suggestionContent;
     private readonly Grid flyoutSurface;
     private Window? anchorOwner;
     private bool positioning;
@@ -130,10 +132,12 @@ internal sealed class SearchWindow : Window
     private string CommandState => string.Join("|", session.Ready, session.IsUpdating, session.IsDirty, session.Status.Text("phase"), session.Status.Bool("systemProxy"), session.Status.Bool("tun"),
         session.Status.Get("capabilities").ToString());
 
-    public SearchWindow(AppSession session, GlobalSearchBox inputBox)
+    public SearchWindow(AppSession session, GlobalSearchBox inputBox, FluentBackdropFilter? preparedBackdrop = null)
     {
         constructorStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         this.session = session; this.inputBox = inputBox; search = inputBox.Input;
+        ownsBackdrop = preparedBackdrop is null;
+        backdropFilter = preparedBackdrop ?? new FluentBackdropFilter { CornerRadius = new CornerRadius(7) }.Id("SearchBackdrop");
         instance = inputBox.PaletteCreated();
         L.Bind(this, TitleProperty, "搜索"); this.Id("GlobalSearchWindow");
         Width = 380; Height = 330; MinWidth = 0; MinHeight = 0;
@@ -153,8 +157,8 @@ internal sealed class SearchWindow : Window
         // Status remains available to assistive technology; the original palette has no persistent footer.
         state.Visibility = Visibility.Collapsed; suggestions.Children.Add(state);
         suggestionScroll = new ScrollViewer { Content = suggestions, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Padding = new Thickness(4), CanContentScroll = false };
-        var content = new Grid(); content.Children.Add(backdropFilter); content.Children.Add(suggestionScroll);
-        suggestionBorder = new Border { Child = content, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), MaxHeight = 380, Margin = new Thickness(ShadowInset) };
+        suggestionContent = new Grid(); suggestionContent.Children.Add(backdropFilter); suggestionContent.Children.Add(suggestionScroll);
+        suggestionBorder = new Border { Child = suggestionContent, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), MaxHeight = 380, Margin = new Thickness(ShadowInset) };
         if (FluentMotion.Enabled) { suggestionBorder.Opacity = 0; suggestionBorder.RenderTransform = new TranslateTransform(0, -12); }
         suggestionBorder.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush");
         suggestionBorder.Effect = new DropShadowEffect { Direction = 270, ShadowDepth = 8, BlurRadius = 16, Color = Colors.Black, Opacity = IsDark ? .26 : .14 };
@@ -182,6 +186,7 @@ internal sealed class SearchWindow : Window
             AttachOwner();
             attachOwnerCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
             PositionFlyout(); FocusInput();
+            backdropFilter.BeginPresentation();
             CompositionTarget.Rendering += FirstRendering;
             var coreLoad = LoadInitialEntries();
             await backdropFilter.PrepareAsync();
@@ -204,7 +209,8 @@ internal sealed class SearchWindow : Window
                 anchorOwner.StateChanged -= CloseForOwnerChange; anchorOwner.IsVisibleChanged -= CloseForOwnerVisibility;
                 anchorOwner.PreviewMouseDown -= OwnerPointerDown;
             }
-            backdropFilter.Dispose();
+            if (ownsBackdrop) backdropFilter.Dispose();
+            else { backdropFilter.EndPresentation(); suggestionContent.Children.Remove(backdropFilter); }
         };
         session.StatusChanged += OnStatusChanged; session.ThemeChanged += OnThemeChanged; L.Changed += OnLanguageChanged;
         RebuildEntries();
@@ -276,7 +282,7 @@ internal sealed class SearchWindow : Window
     {
         if (Owner is null || anchorOwner is not null) return;
         anchorOwner = Owner;
-        if (anchorOwner.Content is FrameworkElement content) backdropFilter.SetSources(content, content);
+        if (ownsBackdrop && anchorOwner.Content is FrameworkElement content) backdropFilter.SetSources(content, content);
         anchorOwner.LocationChanged += CloseForOwnerChange; anchorOwner.SizeChanged += CloseForOwnerSize;
         anchorOwner.StateChanged += CloseForOwnerChange; anchorOwner.IsVisibleChanged += CloseForOwnerVisibility;
         // The supplied AutoSuggestBox closes for an outside pointer, resize or
@@ -305,6 +311,33 @@ internal sealed class SearchWindow : Window
             PositionFlyout();
         }));
     }
+    private readonly record struct Placement(double Left, double Top, double Width, double MaxHeight, DpiScale Dpi);
+    private static Placement Locate(Window owner, GlobalSearchBox anchor)
+    {
+        Point origin = anchor.PointToScreen(new Point(0, anchor.ActualHeight));
+        Point ownerOrigin = owner.PointToScreen(new Point());
+        var dpi = VisualTreeHelper.GetDpi(anchor);
+        double scale = dpi.DpiScaleX, verticalScale = dpi.DpiScaleY;
+        var work = System.Windows.Forms.Screen.FromPoint(new System.Drawing.Point((int)origin.X, (int)origin.Y)).WorkingArea;
+        double availableWidth = Math.Max(1, Math.Min(owner.ActualWidth, work.Width / scale) - 16);
+        double width = Math.Min(Math.Max(anchor.ActualWidth, 320), availableWidth);
+        double minimumLeft = Math.Max(ownerOrigin.X, work.Left) + 8 * scale;
+        double maximumRight = Math.Min(ownerOrigin.X + owner.ActualWidth * scale, work.Right) - 8 * scale;
+        double left = Math.Clamp(origin.X, minimumLeft, Math.Max(minimumLeft, maximumRight - width * scale));
+        double top = origin.Y + 4 * verticalScale;
+        double maxHeight = Math.Min(380, Math.Max(40, (work.Bottom - top) / verticalScale - 8));
+        return new(left, top, width, maxHeight, dpi);
+    }
+    internal static Rect PreparationViewport(Window owner, GlobalSearchBox anchor, FrameworkElement root)
+    {
+        if (anchor.ActualWidth <= 0 || anchor.ActualHeight <= 0) return Rect.Empty;
+        var placement = Locate(owner, anchor); var origin = root.PointToScreen(new Point());
+        // This is the real inside-border viewport. Reserving the legal maximum
+        // height also covers later query results without rebuilding during entry.
+        return new Rect((placement.Left - origin.X) / placement.Dpi.DpiScaleX + 1,
+            (placement.Top - origin.Y) / placement.Dpi.DpiScaleY + 1,
+            Math.Max(1, placement.Width - 2), Math.Max(1, placement.MaxHeight - 2));
+    }
     private void PositionFlyout()
     {
         if (closing || closed || positioning || Owner is null) return;
@@ -314,18 +347,9 @@ internal sealed class SearchWindow : Window
         positioning = true;
         try
         {
-            var anchor = inputBox;
-            Point origin = anchor.PointToScreen(new Point(0, anchor.ActualHeight));
-            Point ownerOrigin = Owner.PointToScreen(new Point());
-            var dpi = VisualTreeHelper.GetDpi(anchor);
-            double scale = dpi.DpiScaleX, verticalScale = dpi.DpiScaleY;
-            var work = System.Windows.Forms.Screen.FromPoint(new System.Drawing.Point((int)origin.X, (int)origin.Y)).WorkingArea;
-            double availableWidth = Math.Max(1, Math.Min(Owner.ActualWidth, work.Width / scale) - 16);
-            double width = Math.Min(Math.Max(anchor.ActualWidth, 320), availableWidth);
-            double minimumLeft = Math.Max(ownerOrigin.X, work.Left) + 8 * scale;
-            double maximumRight = Math.Min(ownerOrigin.X + Owner.ActualWidth * scale, work.Right) - 8 * scale;
-            double left = Math.Clamp(origin.X, minimumLeft, Math.Max(minimumLeft, maximumRight - width * scale));
-            double top = origin.Y + 4 * verticalScale;
+            var placement = Locate(Owner, inputBox);
+            double width = placement.Width, left = placement.Left, top = placement.Top;
+            double scale = placement.Dpi.DpiScaleX, verticalScale = placement.Dpi.DpiScaleY;
             var measure = new Size(Math.Max(1, width - 10), double.PositiveInfinity);
             // The reference renders at most eight ordinary rows. Measure those
             // actual containers directly so an earlier list/scroll extent can
@@ -343,7 +367,7 @@ internal sealed class SearchWindow : Window
                 contentHeight += item.DesiredSize.Height;
             }
             results.InvalidateMeasure(); suggestions.InvalidateMeasure();
-            double maxHeight = Math.Min(380, Math.Max(40, (work.Bottom - top) / verticalScale - 8));
+            double maxHeight = placement.MaxHeight;
             double panelHeight = Math.Min(maxHeight, contentHeight + 10);
             suggestionBorder.MaxHeight = maxHeight; suggestionBorder.Height = panelHeight;
             Width = width + 2 * ShadowInset; Height = panelHeight + 2 * ShadowInset;

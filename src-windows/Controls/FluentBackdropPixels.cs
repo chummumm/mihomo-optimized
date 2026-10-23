@@ -12,6 +12,8 @@ internal static class FluentBackdropPixels
     private sealed record Warmup(bool Completed, double ElapsedMs);
     private static Warmup warmup = new(false, 0);
     private static int warmupStarted;
+    internal sealed record Result(byte[] Pixels, double QueueMilliseconds, double SchedulingMilliseconds,
+        double ConvolutionMilliseconds, long CompletedAt);
 
     internal static void Prewarm()
     {
@@ -33,9 +35,25 @@ internal static class FluentBackdropPixels
     }
 
     internal static async Task<byte[]> ApplyAsync(byte[] pixels, int width, int height, double sigmaX, double sigmaY, double saturation, CancellationToken cancellation)
+        => (await ApplyMeasuredAsync(pixels, width, height, sigmaX, sigmaY, saturation, cancellation).ConfigureAwait(false)).Pixels;
+
+    internal static async Task<Result> ApplyMeasuredAsync(byte[] pixels, int width, int height, double sigmaX, double sigmaY, double saturation, CancellationToken cancellation)
     {
+        long requested = Stopwatch.GetTimestamp();
         await work.WaitAsync(cancellation).ConfigureAwait(false);
-        try { return await Task.Run(() => Apply(pixels, width, height, sigmaX, sigmaY, saturation, cancellation), cancellation).ConfigureAwait(false); }
+        long admitted = Stopwatch.GetTimestamp();
+        try
+        {
+            return await Task.Run(() =>
+            {
+                long started = Stopwatch.GetTimestamp();
+                byte[] result = Apply(pixels, width, height, sigmaX, sigmaY, saturation, cancellation);
+                long completed = Stopwatch.GetTimestamp();
+                return new Result(result, Stopwatch.GetElapsedTime(requested, admitted).TotalMilliseconds,
+                    Stopwatch.GetElapsedTime(admitted, started).TotalMilliseconds,
+                    Stopwatch.GetElapsedTime(started, completed).TotalMilliseconds, completed);
+            }, cancellation).ConfigureAwait(false);
+        }
         finally { work.Release(); }
     }
 

@@ -17,7 +17,7 @@ namespace Mihomo.Desktop.Controls;
 /// <summary>A native, plain-text YAML surface with a virtual line-number gutter.</summary>
 internal sealed class ConfigCodeEditor : UserControl
 {
-    public TextBox Editor { get; } = new()
+    public TextBox Editor { get; } = new TextAreaTextBox()
     {
         AcceptsReturn = true, AcceptsTab = false, TextWrapping = TextWrapping.NoWrap,
         VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
@@ -104,22 +104,20 @@ internal sealed class ConfigCodeEditor : UserControl
         Editor.ApplyTemplate();
         if (Editor.Template.FindName("PART_ContentHost", Editor) is not ScrollViewer viewer) return;
         viewer.ApplyTemplate();
-        Bind("PART_VerticalScrollBar", nameof(ScrollViewer.ViewportHeight), false);
-        Bind("PART_HorizontalScrollBar", nameof(ScrollViewer.ViewportWidth), true);
-        void Bind(string name, string viewport, bool horizontal)
+        Bind("PART_HorizontalScrollBar", nameof(ScrollViewer.ViewportWidth));
+        void Bind(string name, string viewport)
         {
             if (viewer.Template.FindName(name, viewer) is not ScrollBar bar) return;
-            var binding = new MultiBinding { Mode = BindingMode.OneWay, Converter = new PaddedViewport(horizontal) };
+            var binding = new MultiBinding { Mode = BindingMode.OneWay, Converter = new HorizontalViewport() };
             binding.Bindings.Add(new Binding(viewport) { Source = viewer });
             binding.Bindings.Add(new Binding(nameof(Control.Padding)) { Source = Editor });
-            // CSS clientHeight includes padding. WPF's TextBoxView viewport
-            // excludes it; add it back only for the thumb ratio. Maximum,
-            // Value, line/page commands and the actual scrolling stay intact.
+            // TextAreaViewport already exposes the full real vertical viewport.
+            // Horizontal padding still follows WPF's native TextBoxView layout.
             BindingOperations.SetBinding(bar, ScrollBar.ViewportSizeProperty, binding);
         }
     }
 
-    private sealed class PaddedViewport(bool horizontal) : IMultiValueConverter
+    private sealed class HorizontalViewport : IMultiValueConverter
     {
         public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
         {
@@ -127,7 +125,7 @@ internal sealed class ConfigCodeEditor : UserControl
                 return Binding.DoNothing;
             // Horizontal content also excludes TextBoxView's two 2-DIP bidi
             // caret margins. All measurements remain DIPs at every monitor DPI.
-            return viewport + (horizontal ? padding.Left + padding.Right + 4 : padding.Top + padding.Bottom);
+            return viewport + padding.Left + padding.Right + 4;
         }
         public object[] ConvertBack(object value, Type[] targetTypes, object parameter, CultureInfo culture) => throw new NotSupportedException();
     }
@@ -273,8 +271,15 @@ internal sealed class ConfigCodeEditor : UserControl
             drawing.DrawLine(new Pen(border, 1), new Point(ActualWidth - .5, 0), new Point(ActualWidth - .5, ActualHeight));
             var text = owner.Editor;
             if (!text.IsVisible || text.ActualHeight <= 0) return;
-            firstLine = Math.Max(0, text.GetFirstVisibleLineIndex()); lastLine = Math.Min(owner.lineStarts.Length - 1, Math.Max(firstLine, text.GetLastVisibleLineIndex()));
+            if (text is not TextAreaTextBox area || !area.TryGetTextViewport(out var offset, out var viewport)) return;
+            // TextBox's visible-line helpers divide its public scroll offset
+            // by font metrics. Our public offset includes document padding;
+            // use the actual text view and this editor's fixed line advance.
+            var lineHeight = TextBlock.GetLineHeight(text);
+            firstLine = Math.Clamp((int)Math.Floor(offset / lineHeight + .0001), 0, owner.lineStarts.Length - 1);
+            lastLine = Math.Clamp((int)Math.Ceiling((offset + viewport.Height) / lineHeight) - 1, firstLine, owner.lineStarts.Length - 1);
             var foreground = (Brush?)TryFindResource("TextTertiaryBrush") ?? Brushes.Gray;
+            drawing.PushClip(new RectangleGeometry(new Rect(0, viewport.Top, ActualWidth, viewport.Height)));
             for (var line = firstLine; line <= lastLine; line++)
             {
                 var rect = text.GetRectFromCharacterIndex(owner.lineStarts[line]);
@@ -282,6 +287,7 @@ internal sealed class ConfigCodeEditor : UserControl
                 var number = new FormattedText((line + 1).ToString(CultureInfo.InvariantCulture), CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, new Typeface(text.FontFamily, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal), text.FontSize, foreground, VisualTreeHelper.GetDpi(this).PixelsPerDip);
                 drawing.DrawText(number, new Point(ActualWidth - 11 - number.Width, rect.Y + Math.Max(0, (rect.Height - number.Height) / 2)));
             }
+            drawing.Pop();
             AutomationProperties.SetName(this, L.F("行号 {0}–{1}", firstLine + 1, lastLine + 1));
         }
         protected override AutomationPeer OnCreateAutomationPeer() => new GutterPeer(this);

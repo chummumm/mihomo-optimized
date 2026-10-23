@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -11,6 +12,12 @@ namespace Mihomo.Desktop.Controls;
 /// <summary>A full-resolution backdrop sampled only from explicitly supplied lower visual layers.</summary>
 internal sealed class FluentBackdropFilter : Grid, IDisposable
 {
+    private sealed class ObserverScope
+    {
+        internal readonly List<WeakReference<FluentBackdropFilter>> Filters = [];
+        internal bool Rearming;
+    }
+    private static readonly ConditionalWeakTable<Dispatcher, ObserverScope> ObserverScopes = new();
     internal static void PrewarmRendering() { if (FluentMotion.Enabled) FluentBackdropPixels.Prewarm(); }
     // Keep the diagnostic entry point used by the opt-in motion recorder; the
     // implementation has no shader/compiler or software-rendering STA anymore.
@@ -49,6 +56,19 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         protected override void OnRender(DrawingContext context) { if (Drawing is not null) context.DrawDrawing(Drawing); }
     }
 
+    // These zero-opacity observation resources have no rendered pixels. They
+    // must not become another filter's lower layer (for example a modal toast
+    // enumerating the owner's direct children), which would make a brush cycle.
+    private sealed class PreparationPlane : Canvas
+    {
+        internal PreparationPlane()
+        {
+            Width = Height = 0; IsHitTestVisible = false;
+            HorizontalAlignment = HorizontalAlignment.Left; VerticalAlignment = VerticalAlignment.Top;
+            SetZIndex(this, int.MaxValue);
+        }
+    }
+
     private readonly Canvas sampling = new() { IsHitTestVisible = false, ClipToBounds = false };
     private readonly TranslateTransform sampleOffset = new();
     private readonly Image raster = new() { IsHitTestVisible = false, Stretch = Stretch.Fill };
@@ -61,22 +81,35 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private readonly DrawingVisual captureVisual = new();
     private readonly List<Layer> layers = [];
     private readonly Stopwatch clock = Stopwatch.StartNew();
+    private readonly ObserverScope observerScope;
+    private readonly PreparationPlane preparationObserverHost = new();
+    private readonly DispatcherTimer preparationTimer;
+    private Panel? preparationHost;
+    private Func<Rect>? preparationViewport;
+    private bool preparationEnabled, presentationEnabled = true, renderingSubscribed, demanding;
     private FrameworkElement? coordinateRoot;
     private bool listening, disposed, geometryDirty = true, sourceDirty = true, captureQueued, capturing, updatingGeometry;
     private double dpiX = 1, dpiY = 1, padding;
     private Rect clipBounds = Rect.Empty, sampleWindow = Rect.Empty;
     private Size sourceSize, clipSize;
     private long generation;
+    private long sourceRevision, publishedSourceRevision = -1, readyRevision;
     private byte[]? baseline, scratch;
     private CancellationTokenSource? processing;
     private TaskCompletionSource<bool> firstReady = NewReady();
-    private int drawingRevision, sourceInvalidations, captures, identicalCaptures, filteredFrames, cancelledFrames;
+    private int drawingRevision, sourceInvalidations, captures, identicalCaptures, filteredFrames, cancelledFrames, observerRearms;
     private double captureMilliseconds, compareMilliseconds, filterMilliseconds, retryAfterMilliseconds;
+    private double queueMilliseconds, schedulingMilliseconds, convolutionMilliseconds, publishDispatchMilliseconds;
+    private double lastCaptureAt = double.NegativeInfinity, preparationStartedAt, preparationReadyMilliseconds;
     private double? firstBitmapMilliseconds;
     private static TaskCompletionSource<bool> NewReady() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     internal FluentBackdropFilter()
     {
+        observerScope = ObserverScopes.GetValue(Dispatcher, _ => new ObserverScope());
+        observerScope.Filters.Add(new(this));
+        preparationTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher);
+        preparationTimer.Tick += PreparationDue;
         IsHitTestVisible = false; Focusable = false; ClipToBounds = true;
         sampling.RenderTransform = sampleOffset;
         sampling.Children.Add(observer); sampling.Children.Add(raster);
@@ -87,6 +120,49 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         IsVisibleChanged += OnVisibilityChanged; SizeChanged += OnSizeChanged;
     }
 
+    private bool Presenting => presentationEnabled && IsLoaded && IsVisible;
+    private bool Preparing => preparationEnabled && preparationHost is { IsLoaded: true, IsVisible: true };
+    private bool CanProcess => Presenting || Preparing;
+
+    /// <summary>Prepare the real future viewport without constructing or displaying a popup HWND.</summary>
+    internal void ConfigurePreparation(Panel host, Func<Rect> viewport)
+    {
+        Dispatcher.VerifyAccess(); ObjectDisposedException.ThrowIf(disposed, this);
+        ArgumentNullException.ThrowIfNull(host); ArgumentNullException.ThrowIfNull(viewport);
+        if (!ReferenceEquals(host.Dispatcher, Dispatcher) || layers.Any(layer => ReferenceEquals(layer.Source, host) || layer.Source.IsAncestorOf(host)))
+            throw new ArgumentException("The preparation observer must be outside every sampled layer.", nameof(host));
+        if (preparationHost is not null) throw new InvalidOperationException("Backdrop preparation is already configured.");
+        preparationHost = host; preparationViewport = viewport; presentationEnabled = false;
+        sampling.Children.Remove(observer); preparationObserverHost.Children.Add(observer); host.Children.Add(preparationObserverHost);
+        host.Loaded += PreparationHostChanged; host.Unloaded += PreparationHostChanged;
+        host.IsVisibleChanged += PreparationVisibilityChanged; host.SizeChanged += PreparationSizeChanged;
+        host.LayoutUpdated += PreparationLayoutChanged;
+    }
+
+    internal void SetPreparationEnabled(bool enabled)
+    {
+        if (disposed || preparationEnabled == enabled) return;
+        preparationEnabled = enabled;
+        if (enabled) { preparationStartedAt = clock.Elapsed.TotalMilliseconds; preparationReadyMilliseconds = 0; }
+        UpdateSubscription();
+    }
+
+    internal void BeginPresentation() { presentationEnabled = true; UpdateSubscription(); }
+    internal void EndPresentation() { if (preparationHost is not null) { presentationEnabled = false; UpdateSubscription(); } }
+    internal void RefreshPreparation() { if (Preparing) UpdateGeometry(); }
+    internal void InvalidatePreparation()
+    {
+        if (disposed) return;
+        InvalidateRaster(clear: true);
+        if (CanProcess) { UpdateGeometry(); QueueCapture(); }
+    }
+
+    private void PreparationDue(object? sender, EventArgs args) { preparationTimer.Stop(); QueueCapture(); }
+    private void PreparationHostChanged(object sender, RoutedEventArgs args) => UpdateSubscription();
+    private void PreparationVisibilityChanged(object sender, DependencyPropertyChangedEventArgs args) => UpdateSubscription();
+    private void PreparationSizeChanged(object sender, SizeChangedEventArgs args) { if (Preparing) UpdateGeometry(); }
+    private void PreparationLayoutChanged(object? sender, EventArgs args) { if (Preparing && !Presenting) UpdateGeometry(); }
+
     /// <summary>The viewport is never implicitly sampled; every lower layer must be explicit and non-recursive.</summary>
     internal void SetSources(FrameworkElement root, params FrameworkElement[] sources)
     {
@@ -96,12 +172,13 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         foreach (var source in sources)
         {
             ArgumentNullException.ThrowIfNull(source);
+            if (source is PreparationPlane) continue;
             if (!ReferenceEquals(source.Dispatcher, Dispatcher)) throw new ArgumentException("Backdrop layers must use this dispatcher.", nameof(sources));
-            if (ReferenceEquals(source, this) || source.IsAncestorOf(this) || IsAncestorOf(source))
+            if (ReferenceEquals(source, this) || source.IsAncestorOf(this) || IsAncestorOf(source) || source.IsAncestorOf(observer))
                 throw new ArgumentException("A backdrop source cannot contain or belong to the filter.", nameof(sources));
         }
         ReleaseLayers(); coordinateRoot = root; sampleWindow = Rect.Empty; geometryDirty = true;
-        foreach (var source in sources.Distinct())
+        foreach (var source in sources.Where(source => source is not PreparationPlane).Distinct())
         {
             var layer = new Layer(source); layer.Brush.Changed += SourceChanged; layers.Add(layer);
         }
@@ -112,10 +189,20 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     internal async Task<bool> PrepareAsync()
     {
         Dispatcher.VerifyAccess();
-        if (disposed || !IsLoaded || !IsVisible) return false;
+        if (disposed || !CanProcess) return false;
+        bool verifySource = !demanding;
+        demanding = true; preparationTimer.Stop();
         UpdateGeometry();
-        if (raster.Source is not null) return true;
-        if (coordinateRoot is null || layers.Count == 0 || SystemParameters.HighContrast) return false;
+        if (FilterDiagnostic is not ("preparing-full-resolution-backdrop" or "live-full-resolution-gaussian-srgb")) { demanding = false; return false; }
+        // Verify the actual lower pixels at presentation demand. A source can
+        // have changed while its owner was hidden, or while another WPF RTB
+        // temporarily removed the cyclic-root marker. Reusing the prepared
+        // convolution is safe only after this inexpensive pixel comparison.
+        if (verifySource) { RearmObservers(); sourceDirty = true; sourceRevision++; }
+        if (raster.Source is not null && !sourceDirty && processing is null && publishedSourceRevision >= sourceRevision) { demanding = false; return true; }
+        if (coordinateRoot is null || layers.Count == 0 || SystemParameters.HighContrast) { demanding = false; return false; }
+        readyRevision = sourceRevision;
+        if (firstReady.Task.IsCompleted) firstReady = NewReady();
         QueueCapture();
         return await firstReady.Task;
     }
@@ -130,8 +217,11 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         sampleWidth = sourceSize.Width, sampleHeight = sourceSize.Height,
         rasterWidth = raster.Source is BitmapSource bitmap ? bitmap.PixelWidth : 0,
         rasterHeight = raster.Source is BitmapSource bitmap2 ? bitmap2.PixelHeight : 0,
-        sourceInvalidations, captures, identicalCaptures, filteredFrames, cancelledFrames,
+        sourceInvalidations, captures, identicalCaptures, filteredFrames, cancelledFrames, observerRearms,
         captureMilliseconds, compareMilliseconds, filterMilliseconds, firstBitmapMilliseconds,
+        queueMilliseconds, schedulingMilliseconds, convolutionMilliseconds, publishDispatchMilliseconds,
+        preparationEnabled, presenting = Presenting, preparationReadyMilliseconds,
+        sourceRevision, publishedSourceRevision,
         processing = processing is not null, pendingSourceChange = sourceDirty,
     };
 
@@ -149,74 +239,98 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         filter.UpdateGeometry();
     }
     private void OnLoaded(object sender, RoutedEventArgs args) => UpdateSubscription();
-    private void OnUnloaded(object sender, RoutedEventArgs args) => StopListening();
+    // A prepared filter is transferred to/from the flyout HWND. The owner-side
+    // observer remains loaded, so that transfer must not discard the bitmap.
+    private void OnUnloaded(object sender, RoutedEventArgs args) => UpdateSubscription();
     private void OnVisibilityChanged(object sender, DependencyPropertyChangedEventArgs args) => UpdateSubscription();
     private void OnSizeChanged(object sender, SizeChangedEventArgs args) => UpdateGeometry();
     private void SourceChanged(object? sender, EventArgs args)
     {
-        if (disposed || updatingGeometry || capturing) return;
-        sourceInvalidations++; sourceDirty = true; retryAfterMilliseconds = 0; QueueCapture();
+        if (disposed || updatingGeometry || capturing || observerScope.Rearming) return;
+        sourceInvalidations++; sourceRevision++; sourceDirty = true; retryAfterMilliseconds = 0; QueueCapture();
     }
     private void UpdateSubscription()
     {
-        if (disposed || !IsLoaded || !IsVisible || coordinateRoot is null) { StopListening(); return; }
-        if (!listening) { listening = true; CompositionTarget.Rendering += Rendering; }
+        if (disposed || !CanProcess || coordinateRoot is null) { StopListening(); return; }
+        listening = true;
+        if (Presenting && !renderingSubscribed) { renderingSubscribed = true; CompositionTarget.Rendering += Rendering; }
+        else if (!Presenting && renderingSubscribed) { renderingSubscribed = false; CompositionTarget.Rendering -= Rendering; }
         if (firstReady.Task.IsCompleted && raster.Source is null) firstReady = NewReady();
-        sourceDirty = true; UpdateGeometry();
+        UpdateGeometry();
     }
     private void StopListening()
     {
-        if (listening) { listening = false; CompositionTarget.Rendering -= Rendering; }
+        listening = false; demanding = false; preparationTimer.Stop();
+        if (renderingSubscribed) { renderingSubscribed = false; CompositionTarget.Rendering -= Rendering; }
         InvalidateRaster(clear: true); firstReady.TrySetResult(false);
         sampling.Visibility = Visibility.Collapsed;
     }
     private void Rendering(object? sender, EventArgs args) => UpdateGeometry();
     private void InvalidateRaster(bool clear)
     {
-        generation++; processing?.Cancel(); baseline = scratch = null; sourceDirty = true;
+        generation++; sourceRevision++; processing?.Cancel(); baseline = scratch = null; sourceDirty = true;
+        if (demanding) readyRevision = sourceRevision;
         if (clear)
         {
-            raster.Source = null; FilterAvailable = false;
+            raster.Source = null; publishedSourceRevision = -1; FilterAvailable = false;
             if (firstReady.Task.IsCompleted) firstReady = NewReady();
         }
     }
     private void Fallback(string reason)
     {
-        InvalidateRaster(clear: true);
+        if (raster.Source is not null || processing is not null || baseline is not null || FilterDiagnostic != reason)
+            InvalidateRaster(clear: true);
+        else sourceDirty = true;
         FilterAvailable = false; FilterDiagnostic = reason;
         sampling.Visibility = Visibility.Collapsed; Background = BaseBrush ?? SystemColors.WindowBrush;
         if (reason.StartsWith("capture-unavailable-", StringComparison.Ordinal) || reason.StartsWith("filter-unavailable-", StringComparison.Ordinal))
             retryAfterMilliseconds = clock.Elapsed.TotalMilliseconds + 500;
-        firstReady.TrySetResult(false);
+        demanding = false; firstReady.TrySetResult(false);
     }
 
     private void UpdateGeometry()
     {
-        if (disposed || !IsLoaded || !IsVisible || updatingGeometry) return;
+        if (disposed || !CanProcess || updatingGeometry) return;
         tint.Background = TintBrush;
         var actual = new Size(ActualWidth, ActualHeight);
         if (actual != clipSize && actual.Width > 0 && actual.Height > 0) { Clip = Rounded(actual, CornerRadius); clipSize = actual; }
-        if (coordinateRoot is null || layers.Count == 0 || PresentationSource.FromVisual(coordinateRoot) is null || PresentationSource.FromVisual(this) is null)
+        if (coordinateRoot is null || layers.Count == 0 || PresentationSource.FromVisual(coordinateRoot) is null)
         { Fallback("source-not-attached"); return; }
-        if (actual.Width <= 0 || actual.Height <= 0) { Fallback("surface-not-arranged"); return; }
+        bool arrangedPresentation = Presenting && actual.Width > 0 && actual.Height > 0 && PresentationSource.FromVisual(this) is not null;
+        if (!arrangedPresentation && !Preparing) { Fallback("surface-not-arranged"); return; }
         if (SystemParameters.HighContrast) { Fallback("high-contrast"); return; }
         updatingGeometry = true;
         try
         {
-            var scale = VisualTreeHelper.GetDpi(this);
+            var scale = VisualTreeHelper.GetDpi(arrangedPresentation ? this : preparationHost!);
             bool dpiChanged = dpiX != scale.DpiScaleX || dpiY != scale.DpiScaleY;
             dpiX = scale.DpiScaleX; dpiY = scale.DpiScaleY;
             if (!double.IsFinite(dpiX) || !double.IsFinite(dpiY) || dpiX is <= 0 or > 4 || dpiY is <= 0 or > 4) { Fallback("dpi-not-supported"); return; }
             double padX = Math.Ceiling(3 * Sigma * dpiX) / dpiX, padY = Math.Ceiling(3 * Sigma * dpiY) / dpiY;
             padding = Math.Max(padX, padY);
-            var origin = PointToScreen(new Point()); var rootOrigin = coordinateRoot.PointToScreen(new Point());
-            var viewport = new Rect((origin.X - rootOrigin.X) / dpiX, (origin.Y - rootOrigin.Y) / dpiY, ActualWidth, ActualHeight);
-            var required = viewport; required.Inflate(padX, padY);
+            var rootOrigin = coordinateRoot.PointToScreen(new Point());
+            Rect viewport;
+            if (arrangedPresentation)
+            {
+                var origin = PointToScreen(new Point());
+                viewport = new Rect((origin.X - rootOrigin.X) / dpiX, (origin.Y - rootOrigin.Y) / dpiY, ActualWidth, ActualHeight);
+            }
+            else viewport = preparationViewport?.Invoke() ?? Rect.Empty;
+            if (viewport.IsEmpty || viewport.Width <= 0 || viewport.Height <= 0) { Fallback("surface-not-arranged"); return; }
+            var rootEnd = coordinateRoot.PointToScreen(new Point(coordinateRoot.ActualWidth, coordinateRoot.ActualHeight));
+            var rootBounds = new Rect(0, 0, Math.Max(0, (rootEnd.X - rootOrigin.X) / dpiX), Math.Max(0, (rootEnd.Y - rootOrigin.Y) / dpiY));
+            var required = Rect.Intersect(viewport, rootBounds);
+            // Pixels wholly outside the owner's viewport are never presented.
+            // Reserve the final visible navigation region instead of filtering
+            // an additional full pane width while it slides in from off-screen.
+            if (required.IsEmpty && Preparing) required = Rect.Intersect(preparationViewport!(), rootBounds);
+            if (required.IsEmpty) { Fallback("surface-outside-source"); return; }
+            required.Inflate(padX, padY);
             if (sampleWindow.IsEmpty || !sampleWindow.Contains(required) || dpiChanged)
             {
                 // Reserve the complete Gaussian support plus the entrance path.
                 // Align to physical pixels without shrinking or downsampling.
-                var margin = MotionOverscan;
+                var margin = Preparing ? new Thickness(16) : MotionOverscan;
                 double left = Math.Floor((required.Left - Math.Max(0, margin.Left)) * dpiX) / dpiX;
                 double top = Math.Floor((required.Top - Math.Max(0, margin.Top)) * dpiY) / dpiY;
                 double right = Math.Ceiling((required.Right + Math.Max(0, margin.Right)) * dpiX) / dpiX;
@@ -237,7 +351,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
             bool changed = geometryDirty || sourceSize != size || clipBounds != bounds || dpiChanged;
             foreach (var layer in layers)
             {
-                if (ReferenceEquals(layer.Source, this) || layer.Source.IsAncestorOf(this) || IsAncestorOf(layer.Source)) { Fallback("recursive-source-rejected"); return; }
+                if (ReferenceEquals(layer.Source, this) || layer.Source.IsAncestorOf(this) || IsAncestorOf(layer.Source) || layer.Source.IsAncestorOf(observer)) { Fallback("recursive-source-rejected"); return; }
                 var full = layer.Source.IsVisible ? ToLocal(layer.Source) : Rect.Empty;
                 var port = Rect.Intersect(Rect.Intersect(full, area), bounds); var view = Rect.Empty;
                 if (!port.IsEmpty && port.Width > 0 && port.Height > 0 && full.Width > 0 && full.Height > 0)
@@ -281,36 +395,49 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
 
     private void QueueCapture()
     {
-        if (disposed || !listening || !IsLoaded || !IsVisible || capturing || updatingGeometry || captureQueued || processing is not null || observer.Drawing is null || clock.Elapsed.TotalMilliseconds < retryAfterMilliseconds) return;
+        if (disposed || !listening || !CanProcess || capturing || updatingGeometry || captureQueued || processing is not null || observer.Drawing is null || clock.Elapsed.TotalMilliseconds < retryAfterMilliseconds) return;
+        if (!Presenting && !demanding)
+        {
+            // Hidden preparation is not a second render loop. Source changes
+            // coalesce into at most one capture per second; real input intent
+            // bypasses this budget and waits for a current source revision.
+            double delay = Math.Max(0, lastCaptureAt + 1000 - clock.Elapsed.TotalMilliseconds);
+            if (delay > 0)
+            {
+                preparationTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(1, delay)); preparationTimer.Start(); return;
+            }
+        }
         captureQueued = true;
-        _ = Dispatcher.BeginInvoke(DispatcherPriority.Render, new Action(() =>
+        _ = Dispatcher.BeginInvoke(Presenting || demanding ? DispatcherPriority.Render : DispatcherPriority.Background, new Action(() =>
         {
             captureQueued = false;
-            if (disposed || !listening || !IsVisible || processing is not null || !sourceDirty) return;
+            if (disposed || !listening || !CanProcess || processing is not null || !sourceDirty) return;
             capturing = true;
             try
             {
                 UpdateGeometry();
                 if (FilterDiagnostic is not ("preparing-full-resolution-backdrop" or "live-full-resolution-gaussian-srgb")) return;
                 sourceDirty = false;
+                long revision = sourceRevision;
                 int width = checked((int)Math.Round(sourceSize.Width * dpiX)), height = checked((int)Math.Round(sourceSize.Height * dpiY));
                 int stride = checked(width * 4), length = checked(stride * height);
                 if (width <= 0 || height <= 0) return;
-                long captureStarted = Stopwatch.GetTimestamp();
+                long captureStarted = Stopwatch.GetTimestamp(); lastCaptureAt = clock.Elapsed.TotalMilliseconds;
                 var snapshot = new RenderTargetBitmap(width, height, dpiX * 96, dpiY * 96, PixelFormats.Pbgra32);
-                snapshot.Render(captureVisual);
+                try { snapshot.Render(captureVisual); }
+                finally { RearmObservers(); }
                 if (scratch?.Length != length) scratch = new byte[length];
                 snapshot.CopyPixels(scratch, stride, 0); captures++;
                 captureMilliseconds = Stopwatch.GetElapsedTime(captureStarted).TotalMilliseconds;
                 long compareStarted = Stopwatch.GetTimestamp();
                 bool identical = baseline is not null && baseline.AsSpan().SequenceEqual(scratch);
                 compareMilliseconds = Stopwatch.GetElapsedTime(compareStarted).TotalMilliseconds;
-                if (identical) { identicalCaptures++; return; }
+                if (identical) { identicalCaptures++; CompleteReady(revision); return; }
                 // Only these two byte buffers are retained. While one is being
                 // processed no second capture can mutate it or build a queue.
                 (baseline, scratch) = (scratch, baseline);
                 var cancellation = new CancellationTokenSource(); processing = cancellation;
-                _ = PublishAsync(baseline!, width, height, dpiX, dpiY, Sigma, Saturation, generation, cancellation);
+                _ = PublishAsync(baseline!, width, height, dpiX, dpiY, Sigma, Saturation, generation, revision, cancellation);
             }
             catch (Exception error) when (error is COMException or NotSupportedException or InvalidOperationException or ArgumentException or OverflowException)
             { Fallback("capture-unavailable-" + error.GetType().Name); }
@@ -318,19 +445,22 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         }));
     }
 
-    private async Task PublishAsync(byte[] pixels, int width, int height, double scaleX, double scaleY, double sigma, double saturation, long version, CancellationTokenSource cancellation)
+    private async Task PublishAsync(byte[] pixels, int width, int height, double scaleX, double scaleY, double sigma, double saturation, long version, long revision, CancellationTokenSource cancellation)
     {
         try
         {
             long started = Stopwatch.GetTimestamp();
-            byte[] filtered = await FluentBackdropPixels.ApplyAsync(pixels, width, height, sigma * scaleX, sigma * scaleY, saturation, cancellation.Token);
+            var result = await FluentBackdropPixels.ApplyMeasuredAsync(pixels, width, height, sigma * scaleX, sigma * scaleY, saturation, cancellation.Token);
             filterMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-            if (disposed || !listening || !IsVisible || version != generation || cancellation.IsCancellationRequested) { cancelledFrames++; return; }
-            var bitmap = BitmapSource.Create(width, height, scaleX * 96, scaleY * 96, PixelFormats.Pbgra32, null, filtered, width * 4);
+            queueMilliseconds = result.QueueMilliseconds; schedulingMilliseconds = result.SchedulingMilliseconds;
+            convolutionMilliseconds = result.ConvolutionMilliseconds;
+            publishDispatchMilliseconds = Stopwatch.GetElapsedTime(result.CompletedAt).TotalMilliseconds;
+            if (disposed || !listening || !CanProcess || version != generation || cancellation.IsCancellationRequested) { cancelledFrames++; return; }
+            var bitmap = BitmapSource.Create(width, height, scaleX * 96, scaleY * 96, PixelFormats.Pbgra32, null, result.Pixels, width * 4);
             bitmap.Freeze(); raster.Source = bitmap; filteredFrames++;
             firstBitmapMilliseconds ??= clock.Elapsed.TotalMilliseconds;
             Background = Brushes.Transparent; FilterAvailable = true; FilterDiagnostic = "live-full-resolution-gaussian-srgb";
-            firstReady.TrySetResult(true);
+            CompleteReady(revision);
         }
         catch (OperationCanceledException) { cancelledFrames++; }
         catch (Exception error) when (error is COMException or NotSupportedException or InvalidOperationException or ArgumentException or OverflowException)
@@ -341,6 +471,49 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
             cancellation.Dispose();
             if (!disposed && sourceDirty) QueueCapture();
         }
+    }
+
+    private void CompleteReady(long revision)
+    {
+        publishedSourceRevision = revision;
+        if (preparationEnabled) preparationReadyMilliseconds = clock.Elapsed.TotalMilliseconds - preparationStartedAt;
+        // Readiness means a real sample captured after the current request (or
+        // a newer page/geometry invalidation). It must not wait for a live chart
+        // to stop changing: later dirty frames continue through the live queue.
+        if (revision >= readyRevision) { demanding = false; firstReady.TrySetResult(true); }
+    }
+
+    private void RearmObservers()
+    {
+        // RenderTargetBitmap releases its synchronous WPF channel. WPF clears
+        // NodeIsCyclicBrushRoot when that channel reaches zero, even if a visual
+        // still has observers on the normal presentation channel. Rebind all our
+        // observers together so the last old reference is released before the
+        // first new one restores the marker. These property changes are not
+        // source changes and must never schedule another capture themselves.
+        var active = new List<FluentBackdropFilter>();
+        observerScope.Filters.RemoveAll(reference => !reference.TryGetTarget(out var filter) || filter.disposed);
+        foreach (var reference in observerScope.Filters)
+            if (reference.TryGetTarget(out var filter)) active.Add(filter);
+        var watched = active.SelectMany(filter => filter.layers).ToArray();
+        observerScope.Rearming = true;
+        try
+        {
+            foreach (var layer in watched) layer.Brush.Visual = null;
+        }
+        finally
+        {
+            try { foreach (var layer in watched) layer.Brush.Visual = layer.Source; }
+            finally { observerScope.Rearming = false; }
+        }
+        observerRearms++;
+    }
+
+    internal static void RestoreLiveObservers()
+    {
+        if (!ObserverScopes.TryGetValue(Dispatcher.CurrentDispatcher, out var scope)) return;
+        foreach (var reference in scope.Filters)
+            if (reference.TryGetTarget(out var filter) && !filter.disposed) { filter.RearmObservers(); return; }
     }
 
     private static Geometry Rounded(Size size, CornerRadius corners)
@@ -378,6 +551,14 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         if (disposed) return;
         Dispatcher.VerifyAccess(); disposed = true; StopListening();
         Loaded -= OnLoaded; Unloaded -= OnUnloaded; IsVisibleChanged -= OnVisibilityChanged; SizeChanged -= OnSizeChanged;
+        preparationTimer.Tick -= PreparationDue;
+        if (preparationHost is not null)
+        {
+            preparationHost.Loaded -= PreparationHostChanged; preparationHost.Unloaded -= PreparationHostChanged;
+            preparationHost.IsVisibleChanged -= PreparationVisibilityChanged; preparationHost.SizeChanged -= PreparationSizeChanged;
+            preparationHost.LayoutUpdated -= PreparationLayoutChanged;
+            preparationHost.Children.Remove(preparationObserverHost); preparationObserverHost.Children.Clear(); preparationHost = null;
+        }
         ReleaseLayers(); coordinateRoot = null; sampling.Children.Clear();
         FilterAvailable = false; FilterDiagnostic = "disposed";
     }

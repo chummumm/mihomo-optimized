@@ -2,6 +2,8 @@ namespace Mihomo.Desktop.Services;
 
 public static partial class L
 {
+    internal static string SettingsThemeSystem => T(new ContextualText("跟随系统", "settings-theme"));
+
     static partial void RegisterSearchSettings(Dictionary<string, string> catalog)
     {
         (string Source, string Translation)[] entries =
@@ -34,6 +36,7 @@ public static partial class L
             ("外观", "Appearance"), ("应用主题", "App theme"),
             ("外观与行为", "Appearance & behavior"), ("版本与更新", "Version & updates"), ("TUN 与系统服务", "TUN & system service"),
             ("settings-section\u0004代理", "Proxy"),
+            ("settings-theme\u0004跟随系统", "Use system setting"),
             ("选择窗口使用的颜色模式", "Choose the color mode of the window"),
             ("语言", "Language"), ("开机时启动", "Start at login"),
             ("在通知区域启动，并恢复上次的内核运行状态", "Starts in the notification area and restores the last core state"),

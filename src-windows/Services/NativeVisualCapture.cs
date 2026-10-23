@@ -105,7 +105,11 @@ internal static class NativeVisualCapture
         int width = (int)Math.Ceiling(target.ActualWidth * dpi.DpiScaleX), height = (int)Math.Ceiling(target.ActualHeight * dpi.DpiScaleY);
         if (width is < 1 or > 4000 || height is < 1 or > 3000) throw new InvalidOperationException("Capture bounds are invalid.");
         var bitmap = new RenderTargetBitmap(width, height, dpi.PixelsPerInchX, dpi.PixelsPerInchY, PixelFormats.Pbgra32);
-        bitmap.Render(target);
+        // RTB releases a synchronous WPF channel, including the owner's
+        // transparent live observers. Preserve their normal presentation-channel
+        // subscription after taking evidence, without another capture or filter.
+        try { bitmap.Render(target); }
+        finally { FluentBackdropFilter.RestoreLiveObservers(); }
         var overlays = owner.OwnedWindows.OfType<FluentDialog>().Where(window => window.IsVisible).Cast<Window>().ToList();
         if (surface == "search") overlays.Add(Find("GlobalSearchWindow") ?? throw new InvalidOperationException("Open the real search flyout before capturing it."));
         if (surface == "tray") overlays.Clear();
@@ -115,7 +119,8 @@ internal static class NativeVisualCapture
             content.UpdateLayout();
             var popupDpi = VisualTreeHelper.GetDpi(content);
             var popup = new RenderTargetBitmap(Math.Max(1, (int)Math.Ceiling(content.ActualWidth * popupDpi.DpiScaleX)), Math.Max(1, (int)Math.Ceiling(content.ActualHeight * popupDpi.DpiScaleY)), popupDpi.PixelsPerInchX, popupDpi.PixelsPerInchY, PixelFormats.Pbgra32);
-            popup.Render(content);
+            try { popup.Render(content); }
+            finally { FluentBackdropFilter.RestoreLiveObservers(); }
             var origin = target.PointToScreen(new Point());
             var position = content.PointToScreen(new Point());
             var drawing = new DrawingVisual();

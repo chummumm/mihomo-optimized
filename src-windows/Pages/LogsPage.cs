@@ -27,13 +27,13 @@ public sealed class LogsPage : NativePage
             <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBoxItem"><ContentPresenter HorizontalAlignment="Stretch"/></ControlTemplate></Setter.Value></Setter>
           </Style>
           <Style x:Key="Pause" TargetType="ToggleButton">
-            <Setter Property="Height" Value="32"/><Setter Property="Padding" Value="11,0"/><Setter Property="FontSize" Value="14"/>
+            <Setter Property="Height" Value="32"/><Setter Property="Padding" Value="12,0"/><Setter Property="FontSize" Value="14"/>
             <Setter Property="FontFamily" Value="{DynamicResource BodyFont}"/><Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
             <Setter Property="Background" Value="{DynamicResource ControlBrush}"/><Setter Property="BorderBrush" Value="{DynamicResource ControlStrokeBrush}"/>
             <Setter Property="FocusVisualStyle" Value="{DynamicResource FluentFocus}"/>
             <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ToggleButton">
               <Border x:Name="Frame" CornerRadius="4" BorderThickness="1" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" Padding="{TemplateBinding Padding}">
-                <Grid><Border Height="1" Background="{DynamicResource ControlElevationBrush}" VerticalAlignment="Bottom" Margin="-11,0,-11,0"/><ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Center"/></Grid>
+                <Grid><Border Height="1" Background="{DynamicResource ControlElevationBrush}" VerticalAlignment="Bottom" Margin="-12,0,-12,0"/><ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Center"/></Grid>
               </Border>
               <ControlTemplate.Triggers>
                 <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Frame" Property="Background" Value="{DynamicResource ControlHoverBrush}"/></Trigger>

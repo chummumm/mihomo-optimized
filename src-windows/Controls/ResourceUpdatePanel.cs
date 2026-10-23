@@ -182,7 +182,7 @@ internal sealed class ResourceUpdatePanel : UserControl
         sources.Visibility = Visibility.Visible;
         var current = snapshot.Get("items").Items().ToArray(); var displayed = restarted ? previous.Get("items").Items().Concat(current.Where(item => !previous.Get("items").Items().Any(old => old.Text("id") == item.Text("id")))).ToArray() : current;
         AddGroup("geodata", "GeoData", displayed.Where(item => item.Text("kind") == "geodata").ToArray(), current);
-        AddGroup("rule-provider", "规则集合", displayed.Where(item => item.Text("kind") == "rule-provider").ToArray(), current);
+        AddGroup("rule-provider", "规则集", displayed.Where(item => item.Text("kind") == "rule-provider").ToArray(), current);
         // Desktop-managed tasks stay inspectable from the context menu without adding a third resource section.
         managedDetails.Items.Clear(); foreach (var item in displayed.Where(item => item.Text("kind") is "kernel" or "ui"))
         {
@@ -238,7 +238,7 @@ internal sealed class ResourceUpdatePanel : UserControl
         }
         var count = items.Count(item => item.Text("reason") != "not_configured");
         var header = new Grid(); header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30, GridUnitType.Star) }); header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(55, GridUnitType.Star) }); header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); header.Children.Add(Ui.Label(label));
-        var meta = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(12, 0, 12, 0) }; meta.Children.Add(Ui.Muted(L.F("{0} 项", count) + (items.Any(item => item.Text("status") == "error") ? " · " + L.T("有更新失败") : ""), 12));
+        var meta = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 0, 12, 0) }; meta.Children.Add(Ui.Muted(L.F("{0} 项", count) + (items.Any(item => item.Text("status") == "error") ? " · " + L.T("有更新失败") : ""), 12));
         var enabled = schedules.Where(item => items.Any(candidate => candidate.Text("id") == item.Text("id")) && item.Bool("auto_update")).OrderBy(item => item.Get("next_check_in_ms").ValueKind == JsonValueKind.Number ? item.Number("next_check_in_ms") : double.MaxValue).ToArray();
         if (enabled.Length > 0) { var next = Schedule(enabled[0]); if (next.Length > 0) { var text = Ui.Muted(next, 12); text.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); text.Margin = new Thickness(0, 2, 0, 0); meta.Children.Add(text); } }
         Grid.SetColumn(meta, 1); header.Children.Add(meta); var caret = new FluentIcon("chevron-down", 14); caret.SetResourceReference(Control.ForegroundProperty, "TextSecondaryBrush"); Grid.SetColumn(caret, 2); header.Children.Add(caret);

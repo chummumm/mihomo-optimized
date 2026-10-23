@@ -223,7 +223,7 @@ internal sealed class TrayWindow : Window
         FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Microsoft YaHei"); FontSize = 14;
         ClientArea.SetResourceReference(Panel.BackgroundProperty, "DialogBottomBrush");
         ClientArea.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); ClientArea.RowDefinitions.Add(new RowDefinition()); ClientArea.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var frame = new Border { BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Child = ClientArea }; frame.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush"); Content = frame;
+        var frame = new RoundedContentBorder { BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Child = ClientArea, ClipToBounds = false }; frame.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush"); Content = frame;
         var header = new Grid { Margin = new Thickness(16, 16, 12, 12) };
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); header.ColumnDefinitions.Add(new ColumnDefinition()); header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         var logo = new Image { Source = new BitmapImage(new Uri("pack://application:,,,/Assets/logo.png")), Width = 32, Height = 32, Clip = new RectangleGeometry(new Rect(0, 0, 32, 32), 8, 8) };

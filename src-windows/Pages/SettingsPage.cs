@@ -22,6 +22,20 @@ public sealed class SettingsPage : NativePage
         // WPF item peers read Content.ToString(), independently of DisplayMemberPath.
         public override string ToString() => Label;
     }
+    private sealed class ThemeChoiceBox : ComboBox
+    {
+        public ThemeChoiceBox() => SetResourceReference(StyleProperty, typeof(ComboBox));
+
+        public override void OnApplyTemplate()
+        {
+            base.OnApplyTemplate();
+            // Match this Select's 11px/10px content padding; retain the shared
+            // 12px caret gap, minimum width and native selection/automation.
+            if (GetTemplateChild("PART_Frame") is Border { Child: Grid chrome } &&
+                chrome.Children.OfType<Grid>().FirstOrDefault() is { } content)
+                content.Margin = new Thickness(11, 0, 10, 0);
+        }
+    }
     private sealed record Destination(SettingCard Card, Control? Control);
     private sealed class SettingCard : Grid
     {
@@ -216,7 +230,7 @@ public sealed class SettingsPage : NativePage
 
     private static ComboBox Selection(string id, string title)
     {
-        var input = new ComboBox { MinWidth = 120, Height = 32, DisplayMemberPath = nameof(Choice.Label), SelectedValuePath = nameof(Choice.Value), VerticalAlignment = VerticalAlignment.Center }.Id(id);
+        var input = new ThemeChoiceBox { MinWidth = 120, Height = 32, DisplayMemberPath = nameof(Choice.Label), SelectedValuePath = nameof(Choice.Value), VerticalAlignment = VerticalAlignment.Center }.Id(id);
         L.Bind(input, AutomationProperties.NameProperty, title); return input;
     }
     private static SettingsSegments Segments(string id, string title)
@@ -412,7 +426,7 @@ public sealed class SettingsPage : NativePage
     private void PopulateChoices()
     {
         applying = true;
-        theme.ItemsSource = new[] { new Choice(L.T("跟随系统"), "system"), new Choice(L.T("浅色"), "light"), new Choice(L.T("深色"), "dark") };
+        theme.ItemsSource = new[] { new Choice(L.SettingsThemeSystem, "system"), new Choice(L.T("浅色"), "light"), new Choice(L.T("深色"), "dark") };
         // These labels do not change with the selected language. Keep the same
         // containers so the selection indicator can finish its 167ms slide.
         language.ItemsSource ??= new[] { new Choice("中文", "zh-CN"), new Choice("English", "en-US") };
@@ -481,7 +495,6 @@ public sealed class SettingsPage : NativePage
         L.Bind(uninstallService, ToolTipProperty, status.Bool("tun") ? "请先关闭 TUN 模式，再卸载服务。" : "卸载本机 TUN 服务");
         openConfig.IsEnabled = openLogs.IsEnabled = openProject.IsEnabled = Session.Ready && !Session.IsUpdating;
         runtimeStatus.Text = Session.IsDirty ? L.T("配置编辑器中有未保存的修改，请先保存或放弃后再修改网络设置。")
-            : DesktopBusy ? L.T("正在应用操作，请稍候。")
             : !IsRunning ? L.T("启动内核后可修改代理模式、局域网访问和端口。") : "";
         runtimeStatus.Visibility = runtimeStatus.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         if (status.Text("lastError").Length > 0) Message(status.Text("lastError"), true);

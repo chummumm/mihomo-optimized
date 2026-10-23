@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][int]$ApplicationProcessId,
     [Parameter(Mandatory=$true)][string]$AutomationId,
-    [ValidateSet('read', 'invoke', 'set', 'select', 'toggle', 'scroll', 'scroll-horizontal', 'context', 'escape')][string]$Action = 'read',
+    [ValidateSet('read', 'invoke', 'set', 'select', 'toggle', 'scroll', 'scroll-horizontal', 'text-start', 'text-end', 'context', 'escape')][string]$Action = 'read',
     [AllowEmptyString()][string]$Value = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -188,6 +188,21 @@ public static class NativeEscapeInput {
         $pattern.SetScrollPercent($percent, [System.Windows.Automation.ScrollPattern]::NoScroll)
         $result.scrolled = $true
     }
+    { $_ -eq 'text-start' -or $_ -eq 'text-end' } {
+        $element.SetFocus()
+        $pattern = $element.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+        $document = $pattern.DocumentRange
+        $range = $document.Clone()
+        $start = [System.Windows.Automation.Text.TextPatternRangeEndpoint]::Start
+        $end = [System.Windows.Automation.Text.TextPatternRangeEndpoint]::End
+        if ($Action -eq 'text-start') { $range.MoveEndpointByRange($end, $document, $start) }
+        else { $range.MoveEndpointByRange($start, $document, $end) }
+        # This enters the native caret/BringIntoView path independently of the
+        # ScrollPattern. A caret need not expose all trailing document padding.
+        $range.Select()
+        $range.ScrollIntoView(($Action -eq 'text-start'))
+        $result.selected = $true
+    }
     default {
         $pattern = $null
         if ($element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
@@ -209,6 +224,29 @@ public static class NativeEscapeInput {
                 horizontalViewSize=$pattern.Current.HorizontalViewSize;
                 verticalScrollable=$pattern.Current.VerticallyScrollable;
                 verticalPercent=$pattern.Current.VerticalScrollPercent }
+        }
+        if ($AutomationId -eq 'ConfigEditor') {
+            $pattern = $null
+            if ($element.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$pattern)) {
+                $document = $pattern.DocumentRange
+                $start = [System.Windows.Automation.Text.TextPatternRangeEndpoint]::Start
+                $end = [System.Windows.Automation.Text.TextPatternRangeEndpoint]::End
+                $visible = @($pattern.GetVisibleRanges())
+                $startsDocument = $false; $endsDocument = $false
+                foreach ($range in $visible) {
+                    $startsDocument = $startsDocument -or ($range.CompareEndpoints($start, $document, $start) -eq 0)
+                    $endsDocument = $endsDocument -or ($range.CompareEndpoints($end, $document, $end) -eq 0)
+                }
+                $selection = @($pattern.GetSelection())
+                $caretAtStart = $false; $caretAtEnd = $false
+                if ($selection.Count -eq 1 -and $selection[0].CompareEndpoints($start, $selection[0], $end) -eq 0) {
+                    $caretAtStart = $selection[0].CompareEndpoints($start, $document, $start) -eq 0
+                    $caretAtEnd = $selection[0].CompareEndpoints($end, $document, $end) -eq 0
+                }
+                # Export endpoint relationships, never document text or ranges.
+                $result.textViewport = @{ ranges=$visible.Count; startsDocument=$startsDocument;
+                    endsDocument=$endsDocument; caretAtStart=$caretAtStart; caretAtEnd=$caretAtEnd }
+            }
         }
         if ($element.Current.ControlType -eq [System.Windows.Automation.ControlType]::DataGrid) {
             $bounds = $element.Current.BoundingRectangle

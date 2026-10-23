@@ -1242,9 +1242,48 @@ class Acceptance:
             else:
                 driver.ui("GlobalSearch", "invoke")
             found("SearchInput", enabled=True)
+
+            def ready_backdrop():
+                window = driver.snapshot().get("search", {}).get("window") or {}
+                state = window.get("backdrop") or {}
+                return window if state.get("available") and state.get("cachedAtNativeResolution") else None
+
+            before = wait_until(ready_backdrop, "native_search_backdrop_not_ready", 10) if screenshot else None
             driver.ui("SearchInput", "set", query)
             found(result_id, enabled=True)
             if screenshot:
+                previous = before["backdrop"]
+                required_revision = None
+
+                def refreshed_backdrop():
+                    nonlocal required_revision
+                    window = ready_backdrop()
+                    if not window or window.get("instance") != before.get("instance"):
+                        return None
+                    state = window["backdrop"]
+                    # Typing updates the real title-bar source. A live observer
+                    # must capture it again; an identical cropped raster may
+                    # legitimately avoid a second convolution.
+                    if state.get("sourceInvalidations", 0) <= previous.get("sourceInvalidations", 0):
+                        return None
+                    # Fix the observed post-input revision once. A continuously
+                    # animated lower layer need not become idle to prove that
+                    # this real update has been sampled and published.
+                    if required_revision is None:
+                        required_revision = state["sourceRevision"]
+                    if state.get("captures", 0) <= previous.get("captures", 0) or \
+                            state.get("publishedSourceRevision", -1) < required_revision:
+                        return None
+                    completed = state.get("filteredFrames", 0) + state.get("identicalCaptures", 0)
+                    prior_completed = previous.get("filteredFrames", 0) + previous.get("identicalCaptures", 0)
+                    return state if completed > prior_completed else None
+
+                refreshed = wait_until(refreshed_backdrop, "native_search_backdrop_did_not_refresh", 10)
+                fields = ("sourceInvalidations", "captures", "identicalCaptures", "filteredFrames", "available", "cachedAtNativeResolution", "sourceRevision", "publishedSourceRevision")
+                evidence["searchBackdropRefresh"] = {
+                    "requiredRevision": required_revision,
+                    "before": {key: previous[key] for key in fields},
+                    "after": {key: refreshed[key] for key in fields}}
                 capture("windows-search.png", surface="search")
             driver.ui(result_id, "invoke")
             last_snapshot = {}
@@ -1404,6 +1443,46 @@ class Acceptance:
         require("Smoke Primary" in original, "native_editor_wrong_document")
         marker = "# native UIA save acceptance"
         driver.ui("ConfigEditor", "set", original.rstrip("\r\n") + "\n" + marker + "\n")
+        editor = found("ConfigEditor", enabled=True)
+        draft = editor["value"]
+        require(editor.get("scroll", {}).get("verticalScrollable"), "native_editor_has_no_vertical_scroll_extent")
+
+        def editor_view(*, endpoint: str, percent: float | None = None, caret: str | None = None):
+            state = driver.ui("ConfigEditor")
+            viewport = state.get("textViewport", {})
+            if not viewport.get(endpoint) or caret and not viewport.get(caret):
+                return None
+            if percent is not None and abs(state.get("scroll", {}).get("verticalPercent", -1) - percent) > .01:
+                return None
+            return state
+
+        def editor_scroll_evidence(state: dict) -> dict:
+            return {"verticalPercent": state["scroll"]["verticalPercent"], **state["textViewport"]}
+
+        try:
+            # The padding is part of the real scrolling document. Exercise both
+            # ScrollPattern and WPF's independent caret/BringIntoView path, which
+            # may scroll the underlying TextBoxView directly.
+            driver.ui("ConfigEditor", "scroll", "100")
+            bottom = wait_until(lambda: editor_view(endpoint="endsDocument", percent=100),
+                                "native_editor_bottom_not_visible", 10)
+            driver.ui("ConfigEditor", "text-start")
+            start = wait_until(lambda: editor_view(endpoint="startsDocument", caret="caretAtStart"),
+                               "native_editor_caret_start_not_visible", 10)
+            driver.ui("ConfigEditor", "text-end")
+            end = wait_until(lambda: editor_view(endpoint="endsDocument", caret="caretAtEnd"),
+                             "native_editor_caret_end_not_visible", 10)
+            require(all(state.get("value") == draft for state in (bottom, start, end)),
+                    "native_editor_scrolling_changed_document")
+            evidence["editorVerticalScroll"] = {"bottom": editor_scroll_evidence(bottom),
+                "caretStart": editor_scroll_evidence(start), "caretEnd": editor_scroll_evidence(end)}
+        finally:
+            driver.ui("ConfigEditor", "text-start")
+            driver.ui("ConfigEditor", "scroll", "0")
+        restored = wait_until(lambda: editor_view(endpoint="startsDocument", percent=0, caret="caretAtStart"),
+                              "native_editor_vertical_scroll_did_not_restore", 10)
+        require(restored.get("value") == draft, "native_editor_scroll_restore_changed_document")
+        evidence["editorVerticalScroll"]["restored"] = editor_scroll_evidence(restored)
         capture("windows-config-editor.png")
         driver.ui("CloseEditor", "invoke")
         found("ConfigKeepEditing", enabled=True)
