@@ -1470,6 +1470,11 @@ class Acceptance:
                                      timeout=45, creationflags=subprocess.CREATE_NO_WINDOW)
         require(quit_result.returncode == 0, "elevated_installer_quit_failed")
         evidence["elevatedInstallerQuit"] = True
+        # A terminating process can disappear from image-path enumeration before
+        # its original process handle is signaled. Confirm normal exit on that
+        # exact handle before close(), whose fallback terminates live fixtures.
+        require(self.driver.process.wait(timeout=20) == 0, "automatic_startup_gui_exit_code_nonzero")
+        evidence["normalGuiExitConfirmed"] = True
         wait_until(lambda: not self.processes.at_paths([self.app, self.host, self.core, self.helper]),
                    "automatic_startup_gui_did_not_exit", 20)
         self.driver.close()
@@ -2160,7 +2165,22 @@ def main() -> int:
         code = safe_code(str(error)) if isinstance(error, SmokeFailure) else "unexpected_" + type(error).__name__
         print("FAIL: " + code, file=sys.stderr, flush=True)
         if acceptance:
-            acceptance.report["diagnostics"].append({"stage": acceptance.stage, "code": code})
+            diagnostic = {"stage": acceptance.stage, "code": code}
+            if not isinstance(error, SmokeFailure):
+                # Retain locations and numeric Win32 failures, never exception
+                # text or locals (which may contain configuration credentials).
+                import traceback
+                diagnostic["frames"] = [{"function": safe_code(frame.name), "line": frame.lineno}
+                    for frame in traceback.extract_tb(error.__traceback__)
+                    if Path(frame.filename).name == Path(__file__).name][-8:]
+                for key in ("winerror", "errno"):
+                    number = getattr(error, key, None)
+                    if isinstance(number, int):
+                        diagnostic[key] = number
+                function = getattr(error, "funcname", None)
+                if isinstance(function, str):
+                    diagnostic["function"] = safe_code(function)
+            acceptance.report["diagnostics"].append(diagnostic)
             if acceptance.stage == "native_redesign_ui" and acceptance.driver:
                 try:
                     acceptance.driver.screenshot(artifacts / "windows-ui-failure.png", acceptance.secrets, page=None)
