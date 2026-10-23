@@ -181,7 +181,8 @@ public sealed class HomePage : NativePage
             _ => L.T("已保存的配置") + (Path.GetFileName(status.Text("configPath")) is { Length: > 0 } name ? " · " + name : "")
         };
         description.ToolTip = description.Text;
-        coreVersion.Text = status.Text("coreVersion", fallback: "—"); coreVersion.ToolTip = coreVersion.Text;
+        string version = status.Text("coreVersion", fallback: "—");
+        coreVersion.Text = ShortVersion(version); coreVersion.ToolTip = version;
         coreVersion.TextTrimming = TextTrimming.CharacterEllipsis; coreVersion.MaxWidth = 180; coreVersion.TextWrapping = TextWrapping.NoWrap;
         proxyAddress.Text = port > 0 ? "127.0.0.1:" + port : "—";
         coreError.Text = status.Text("lastError"); coreError.Visibility = coreError.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -199,6 +200,12 @@ public sealed class HomePage : NativePage
         throughputHint.Text = L.T(running ? "最近 60 秒 · 每秒采样" : "内核未运行");
         exits.SetEmptyText(running ? "配置中没有策略组。" : state is "starting" or "stopping" ? description.Text : "启动内核后，这里会显示实时数据。");
         UpdateStatistics(); exits.Update(running ? exitSnapshot.Summaries.Take(4) : Array.Empty<ProxyExit>());
+    }
+    private static string ShortVersion(string value)
+    {
+        if (value.StartsWith("mihomo-optimized-", StringComparison.Ordinal)) return value["mihomo-optimized-".Length..];
+        var words = value.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        return words.FirstOrDefault(word => char.IsDigit(word[0]) || word[0] == 'v' && word.Length > 1 && char.IsDigit(word[1])) ?? value;
     }
     private void UpdateStatistics()
     {

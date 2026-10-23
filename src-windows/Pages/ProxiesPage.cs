@@ -21,7 +21,7 @@ public sealed class ProxiesPage : NativePage
     private readonly ProxyTopologyControl topology = new();
     private readonly ProxyTopologyModelBuilder topologyModel = new();
     private readonly ProxyPreferences preferences = new();
-    private readonly TextBox search = Ui.SearchBox("筛选策略组、节点或类型", "ProxySearch");
+    private readonly TextBox search = Ui.SearchBox("筛选策略组、节点或类型", "ProxySearch", "filter");
     private readonly TextBlock summary = Ui.Muted("");
     private readonly TextBlock flow = Ui.Muted("");
     private readonly TextBlock idleMap = Ui.Hint("暂无活动连接，显示当前策略组出口");

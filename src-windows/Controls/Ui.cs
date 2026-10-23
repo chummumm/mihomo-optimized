@@ -76,11 +76,12 @@ internal static class Ui
         }
         return table;
     }
-    public static TextBox SearchBox(string label, string id)
+    public static TextBox SearchBox(string label, string id, string? icon = null)
     {
         var input = new TextBox { MinWidth = 180, Height = 34, VerticalContentAlignment = VerticalAlignment.Center, ToolTip = label }.Id(id);
         L.Bind(input, FrameworkElement.ToolTipProperty, label);
-        L.Bind(input, AutomationProperties.NameProperty, label); return input;
+        L.Bind(input, AutomationProperties.NameProperty, label);
+        InputHint.Attach(input, icon); return input;
     }
     public static string Bytes(double value)
     {
