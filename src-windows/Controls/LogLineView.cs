@@ -73,7 +73,7 @@ public sealed class LogLineView : UserControl
             payload.Foreground = new SolidColorBrush(Mix(warning.Color, text.Color, .3));
         else payload.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush");
         if (TryFindResource("AccentBrush") is SolidColorBrush accent)
-            lamp.Effect = new DropShadowEffect { Color = accent.Color, BlurRadius = 8, ShadowDepth = 0, Opacity = 1 };
+            lamp.Effect = new DropShadowEffect { Color = accent.Color, BlurRadius = 12, ShadowDepth = 0, Opacity = 1 };
     }
     private void Adapt(bool force = false)
     {

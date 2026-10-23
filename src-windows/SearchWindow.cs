@@ -85,7 +85,9 @@ internal sealed class SearchWindow : Window
     private sealed record ResultAppearance(string Key, string Category, string Icon, string Title, string Detail, bool Enabled, bool IsEnglish);
 
     private const int MaximumVisibleResults = 8;
-    private const double ShadowInset = 16;
+    // CSS's 16 px box-shadow blur is sigma 8 (WPF radius 24). Reserve its
+    // complete support, including the 8 px drop and the 12 px entrance offset.
+    private const double ShadowInset = 32;
     private readonly long timingSession = NativeMotionCapture.TimingSession;
     private readonly Stopwatch openClock = StartOpenClock();
     private static Stopwatch StartOpenClock()
@@ -100,6 +102,9 @@ internal sealed class SearchWindow : Window
         coreResponsesReadyMilliseconds, coreEntriesCompletedMilliseconds, backdropReadyMilliseconds, firstRenderingMilliseconds, contentRenderedMilliseconds,
         entranceFirstTickMilliseconds, entranceClockCompletedMilliseconds, entranceFirstRenderingMilliseconds;
     private double? entranceFirstRenderedOpacity;
+    private double? initialBackdropMilliseconds, backdropVerificationCompletedMilliseconds;
+    private bool initialBackdropFromCache;
+    private bool? backdropVerificationSucceeded;
     private readonly AppSession session;
     private readonly GlobalSearchBox inputBox;
     private readonly int instance;
@@ -172,7 +177,7 @@ internal sealed class SearchWindow : Window
         suggestionBorder = new Border { Child = suggestionContent, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), MaxHeight = 380, Margin = new Thickness(ShadowInset) };
         if (FluentMotion.Enabled) { suggestionBorder.Opacity = 0; suggestionBorder.RenderTransform = new TranslateTransform(0, -12); }
         suggestionBorder.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush");
-        suggestionBorder.Effect = new DropShadowEffect { Direction = 270, ShadowDepth = 8, BlurRadius = 16, Color = Colors.Black, Opacity = IsDark ? .26 : .14 };
+        suggestionBorder.Effect = new DropShadowEffect { Direction = 270, ShadowDepth = 8, BlurRadius = 24, Color = Colors.Black, Opacity = IsDark ? .26 : .14 };
         flyoutSurface = new Grid { Background = Brushes.Transparent }; flyoutSurface.Children.Add(suggestionBorder);
         Content = flyoutSurface;
         ScrollViewer.SetHorizontalScrollBarVisibility(results, ScrollBarVisibility.Disabled);
@@ -203,13 +208,33 @@ internal sealed class SearchWindow : Window
             backdropFilter.BeginPresentation();
             CompositionTarget.Rendering += FirstRendering;
             var coreLoad = LoadInitialEntries();
+            var verification = preparedPixels ?? backdropFilter.PrepareAsync();
+            initialBackdropFromCache = backdropFilter.TryPresentPreparedFrame();
+            if (initialBackdropFromCache)
+            {
+                initialBackdropMilliseconds = openClock.Elapsed.TotalMilliseconds;
+                NativeMotionCapture.Mark(timingSession, "search-backdrop-initial-cache");
+                EnterSuggestions();
+            }
             NativeMotionCapture.Mark(timingSession, "search-await-backdrop");
-            if (preparedPixels is null) await backdropFilter.PrepareAsync();
-            else await backdropFilter.CompletePreparationAsync(preparedPixels);
-            backdropReadyMilliseconds = openClock.Elapsed.TotalMilliseconds;
-            NativeMotionCapture.Mark(timingSession, "search-backdrop-ready");
+            bool verified = await backdropFilter.CompletePreparationAsync(verification);
+            backdropVerificationSucceeded = verified;
+            backdropVerificationCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            if (verified)
+            {
+                backdropReadyMilliseconds = backdropVerificationCompletedMilliseconds;
+                NativeMotionCapture.Mark(timingSession, "search-backdrop-ready");
+            }
+            else NativeMotionCapture.Mark(timingSession, "search-backdrop-unavailable");
             if (closing || closed) return;
-            EnterSuggestions();
+            if (!initialBackdropFromCache)
+            {
+                // Search remains usable with the existing solid fallback when
+                // capture is unavailable. Its failed verification and filter
+                // diagnostic stay explicit; it is not reported as ready blur.
+                initialBackdropMilliseconds = openClock.Elapsed.TotalMilliseconds;
+                EnterSuggestions();
+            }
             await coreLoad;
         };
         ContentRendered += (_, _) => contentRenderedMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
@@ -246,7 +271,12 @@ internal sealed class SearchWindow : Window
         NativeMotionCapture.Mark(timingSession, "search-animation-start");
         suggestionsStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         suggestionBorder.Opacity = 1;
-        if (!FluentMotion.Enabled) { suggestionBorder.RenderTransform = Transform.Identity; return; }
+        if (!FluentMotion.Enabled)
+        {
+            suggestionBorder.RenderTransform = Transform.Identity;
+            if (initialBackdropFromCache) CompositionTarget.Rendering += EntranceRendering;
+            return;
+        }
         var movement = new TranslateTransform(); suggestionBorder.RenderTransform = movement;
         SettingsSegments.Animate(movement, TranslateTransform.YProperty, -12, 0, 250);
         // The same CSS keyframes as SettingsSegments.Animate. These callbacks
@@ -281,9 +311,18 @@ internal sealed class SearchWindow : Window
     }
     private void EntranceRendering(object? sender, EventArgs args)
     {
-        entranceFirstRenderingMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
-        entranceFirstRenderedOpacity ??= suggestionBorder.Opacity;
-        NativeMotionCapture.Mark(timingSession, "search-animation-first-rendering");
+        if (entranceFirstRenderingMilliseconds is null)
+        {
+            entranceFirstRenderingMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            entranceFirstRenderedOpacity = suggestionBorder.Opacity;
+            NativeMotionCapture.Mark(timingSession, "search-animation-first-rendering");
+        }
+        if (initialBackdropFromCache)
+        {
+            if (suggestionBorder.Opacity <= 0) return;
+            backdropFilter.FirstPresentationFrameSubmitted();
+            NativeMotionCapture.Mark(timingSession, "search-initial-cache-nonzero-rendering");
+        }
         CompositionTarget.Rendering -= EntranceRendering;
     }
 
@@ -296,6 +335,7 @@ internal sealed class SearchWindow : Window
     {
         instance, visible = IsVisible, closing, closed, choosing, resultCount = results.Items.Count,
         renderingTier = RenderCapability.Tier >> 16, positionCount, positionMilliseconds, backdrop = backdropFilter.Describe(),
+        initialBackdropFromCache, backdropVerificationSucceeded,
         // Relative timings only: no search text, entry names or controller data.
         lifecycleMilliseconds = new { templates = templatesMilliseconds, constructorStarted = constructorStartedMilliseconds,
             constructorCompleted = constructorCompletedMilliseconds, sourceInitialized = sourceInitializedMilliseconds,
@@ -303,6 +343,7 @@ internal sealed class SearchWindow : Window
             attachOwnerCompleted = attachOwnerCompletedMilliseconds, suggestionsStarted = suggestionsStartedMilliseconds,
             coreRequestsStarted = coreRequestsStartedMilliseconds, coreResponsesReady = coreResponsesReadyMilliseconds,
             coreEntriesCompleted = coreEntriesCompletedMilliseconds, backdropReady = backdropReadyMilliseconds, firstRendering = firstRenderingMilliseconds,
+            initialBackdrop = initialBackdropMilliseconds, backdropVerificationCompleted = backdropVerificationCompletedMilliseconds,
             contentRendered = contentRenderedMilliseconds, entranceFirstTick = entranceFirstTickMilliseconds,
             entranceClockCompleted = entranceClockCompletedMilliseconds, entranceFirstRendering = entranceFirstRenderingMilliseconds,
             entranceFirstRenderedOpacity }

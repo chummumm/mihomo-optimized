@@ -58,7 +58,7 @@ internal sealed class ConnectionDrawer : Border
     private void Palette()
     {
         var dark = TryFindResource("SolidBaseBrush") is SolidColorBrush background && background.Color.R < 128;
-        Effect = SystemParameters.HighContrast ? null : new DropShadowEffect { Color = Colors.Black, BlurRadius = 16, ShadowDepth = 8, Opacity = dark ? .26 : .14 };
+        Effect = SystemParameters.HighContrast ? null : new DropShadowEffect { Color = Colors.Black, BlurRadius = 24, ShadowDepth = 8, Direction = 270, Opacity = dark ? .26 : .14 };
     }
     internal void SetMobile(bool value)
     {

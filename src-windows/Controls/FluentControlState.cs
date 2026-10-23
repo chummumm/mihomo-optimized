@@ -255,9 +255,9 @@ public static class FluentControlState
         {
             var (viewportWidth, anchorLeft) = PopupViewport(combo);
             double left = Math.Max(8, Math.Min(anchorLeft - 4, viewportWidth - Math.Max(combo.ActualWidth + 8, 160) - 8));
-            // Popup includes 16px of transparent room for the shadow; CSS left is the frame edge.
-            double shadowInset = Part("PART_PopupFrame")?.Margin.Left ?? 16;
-            return [new CustomPopupPlacement(new Point(left - anchorLeft - shadowInset, -21 - Math.Min(Math.Max(0, combo.SelectedIndex), 8) * 34), PopupPrimaryAxis.Vertical)];
+            // Position the visible frame, excluding the transparent shadow room.
+            var shadowRoom = Part("PART_PopupFrame")?.Margin ?? new Thickness(32);
+            return [new CustomPopupPlacement(new Point(left - anchorLeft - shadowRoom.Left, -5 - shadowRoom.Top - Math.Min(Math.Max(0, combo.SelectedIndex), 8) * 34), PopupPrimaryAxis.Vertical)];
         }
         private void PopupOpened(object? sender, EventArgs e)
         {
@@ -298,10 +298,23 @@ public static class FluentControlState
             menuOpen = true; PrepareMenuItems(menu);
             var owner = menu.PlacementTarget is FrameworkElement anchor ? PopupBackdrop.Owner(anchor) : null;
             if (owner?.Content is FrameworkElement viewport) { frame.MaxWidth = Math.Min(360, Math.Max(0, viewport.ActualWidth - 16)); frame.MinWidth = Math.Min(200, frame.MaxWidth); }
-            // The outer 16 px is shadow room, not part of the CSS menu box.
+            // Shadow and entrance-animation room is outside the CSS menu box.
             menuX = menu.HorizontalOffset; menuY = menu.VerticalOffset;
-            menu.SetCurrentValue(ContextMenu.HorizontalOffsetProperty, menuX - 16 + (menu.Placement == PlacementMode.Right ? 4 : 0));
-            menu.SetCurrentValue(ContextMenu.VerticalOffsetProperty, menuY - 16 + (menu.Placement == PlacementMode.Bottom ? 4 : menu.Placement == PlacementMode.Top ? -4 : 0));
+            // Top/Left align the popup's far edge, so compensate with the far margin.
+            double offsetX = menu.Placement switch
+            {
+                PlacementMode.Left => frame.Margin.Right - 4,
+                PlacementMode.Right => -frame.Margin.Left + 4,
+                _ => -frame.Margin.Left,
+            };
+            double offsetY = menu.Placement switch
+            {
+                PlacementMode.Top => frame.Margin.Bottom - 4,
+                PlacementMode.Bottom => -frame.Margin.Top + 4,
+                _ => -frame.Margin.Top,
+            };
+            menu.SetCurrentValue(ContextMenu.HorizontalOffsetProperty, menuX + offsetX);
+            menu.SetCurrentValue(ContextMenu.VerticalOffsetProperty, menuY + offsetY);
             ReleaseBackdrop(); if (menu.PlacementTarget is FrameworkElement target) backdrop = PopupBackdrop.Attach(frame, target, "MenuBackdrop");
             UpdatePopupShadow(); AnimateMenu(frame, menu.Placement);
         }

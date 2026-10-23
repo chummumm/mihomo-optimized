@@ -161,8 +161,9 @@
           <ToggleButton.Style><Style TargetType="ToggleButton"><Setter Property="Template"><Setter.Value><ControlTemplate><Border Background="Transparent"/></ControlTemplate></Setter.Value></Setter></Style></ToggleButton.Style>
         </ToggleButton>
         <Popup x:Name="PART_Popup" Placement="Custom" AllowsTransparency="True" Focusable="False" PopupAnimation="None">
-          <Border x:Name="PART_PopupFrame" Margin="16" MaxWidth="360" MaxHeight="320" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource AcrylicStrokeBrush}" Background="{DynamicResource AcrylicBrush}" Padding="4">
-            <Border.Effect><DropShadowEffect BlurRadius="16" ShadowDepth="8" Direction="270" Opacity="0.14"/></Border.Effect>
+          <!-- CSS blur 16 is sigma 8: WPF radius 24, plus 8 below the frame. -->
+          <Border x:Name="PART_PopupFrame" Margin="32" MaxWidth="360" MaxHeight="320" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource AcrylicStrokeBrush}" Background="{DynamicResource AcrylicBrush}" Padding="4">
+            <Border.Effect><DropShadowEffect BlurRadius="24" ShadowDepth="8" Direction="270" Opacity="0.14"/></Border.Effect>
             <ScrollViewer CanContentScroll="True" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"><ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/></ScrollViewer>
           </Border>
         </Popup>
@@ -180,8 +181,9 @@
     <Setter Property="c:FluentControlState.Kind" Value="Menu"/>
     <Setter Property="KeyboardNavigation.DirectionalNavigation" Value="Cycle"/>
     <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ContextMenu">
-      <Border x:Name="PART_PopupFrame" Margin="16" MinWidth="200" MaxWidth="360" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource AcrylicStrokeBrush}" Background="{DynamicResource AcrylicBrush}" Padding="4">
-        <Border.Effect><DropShadowEffect BlurRadius="16" ShadowDepth="8" Direction="270" Opacity="0.14"/></Border.Effect>
+      <!-- Shadow room also includes the original menu-right/down/up 12px entrance. -->
+      <Border x:Name="PART_PopupFrame" Margin="36,28,24,44" MinWidth="200" MaxWidth="360" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource AcrylicStrokeBrush}" Background="{DynamicResource AcrylicBrush}" Padding="4">
+        <Border.Effect><DropShadowEffect BlurRadius="24" ShadowDepth="8" Direction="270" Opacity="0.14"/></Border.Effect>
         <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Cycle"/>
       </Border>
     </ControlTemplate></Setter.Value></Setter>
@@ -208,9 +210,9 @@
             <c:FluentIcon x:Name="SubmenuArrow" Grid.Column="3" Kind="chevron-right" Width="12" Height="12" Margin="12,0,0,0" Foreground="{TemplateBinding Foreground}" Visibility="Collapsed"/>
           </Grid>
         </Border>
-        <Popup x:Name="PART_Popup" Placement="Right" HorizontalOffset="-12" VerticalOffset="-16" AllowsTransparency="True" Focusable="False" PopupAnimation="None" IsOpen="{Binding IsSubmenuOpen,RelativeSource={RelativeSource TemplatedParent},Mode=TwoWay}">
-          <Border x:Name="PART_PopupFrame" Margin="16" MinWidth="200" MaxWidth="360" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource AcrylicStrokeBrush}" Background="{DynamicResource AcrylicBrush}" Padding="4">
-            <Border.Effect><DropShadowEffect BlurRadius="16" ShadowDepth="8" Direction="270" Opacity="0.14"/></Border.Effect>
+        <Popup x:Name="PART_Popup" Placement="Right" HorizontalOffset="-32" VerticalOffset="-28" AllowsTransparency="True" Focusable="False" PopupAnimation="None" IsOpen="{Binding IsSubmenuOpen,RelativeSource={RelativeSource TemplatedParent},Mode=TwoWay}">
+          <Border x:Name="PART_PopupFrame" Margin="36,28,24,44" MinWidth="200" MaxWidth="360" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource AcrylicStrokeBrush}" Background="{DynamicResource AcrylicBrush}" Padding="4">
+            <Border.Effect><DropShadowEffect BlurRadius="24" ShadowDepth="8" Direction="270" Opacity="0.14"/></Border.Effect>
             <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Cycle"/>
           </Border>
         </Popup>

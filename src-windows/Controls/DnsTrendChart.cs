@@ -17,6 +17,7 @@ namespace Mihomo.Desktop.Controls;
 public sealed class DnsTrendChart : FrameworkElement
 {
     private const double PlotHeight = 228, LeftPad = 46, RightPad = 16, TopPad = 14, Base = 198;
+    private const double ReadoutShadowInset = 32;
     private readonly long origin = Stopwatch.GetTimestamp();
     private readonly DispatcherTimer timer;
     private readonly Canvas readoutShadow = new() { Background = Brushes.Transparent };
@@ -36,7 +37,7 @@ public sealed class DnsTrendChart : FrameworkElement
     public DnsTrendChart()
     {
         Height = PlotHeight; Focusable = true; Cursor = Cursors.Cross; ClipToBounds = false;
-        readoutShadow.Children.Add(shadowShape); Canvas.SetLeft(shadowShape, 24); Canvas.SetTop(shadowShape, 24);
+        readoutShadow.Children.Add(shadowShape); Canvas.SetLeft(shadowShape, ReadoutShadowInset); Canvas.SetTop(shadowShape, ReadoutShadowInset);
         timer = new DispatcherTimer(DispatcherPriority.Render, Dispatcher) { Interval = TimeSpan.FromMilliseconds(1000d / 60) };
         timer.Tick += (_, _) => { timer.Stop(); InvalidateVisual(); };
         Loaded += (_, _) => { L.Changed += LocaleChanged; DesignTokens.Changed += InvalidateVisual; entryStarted = Now; Rebuild(false); InvalidateVisual(); };
@@ -239,11 +240,11 @@ public sealed class DnsTrendChart : FrameworkElement
     {
         var surface = Resource("DialogTopBrush"); bool dark = surface is SolidColorBrush color && color.Color.R < 128;
         shadowShape.Background = surface; shadowShape.Width = bounds.Width; shadowShape.Height = bounds.Height;
-        if (shadowShape.Effect is not DropShadowEffect effect) { effect = new DropShadowEffect { Color = Colors.Black, BlurRadius = 16, ShadowDepth = 8, Direction = 270, RenderingBias = RenderingBias.Quality }; shadowShape.Effect = effect; }
+        if (shadowShape.Effect is not DropShadowEffect effect) { effect = new DropShadowEffect { Color = Colors.Black, BlurRadius = 24, ShadowDepth = 8, Direction = 270, RenderingBias = RenderingBias.Quality }; shadowShape.Effect = effect; }
         effect.Opacity = dark ? .26 : .14;
-        readoutShadow.Width = bounds.Width + 48; readoutShadow.Height = bounds.Height + 48;
+        readoutShadow.Width = bounds.Width + 2 * ReadoutShadowInset; readoutShadow.Height = bounds.Height + 2 * ReadoutShadowInset;
         readoutShadow.Measure(new Size(readoutShadow.Width, readoutShadow.Height)); readoutShadow.Arrange(new Rect(0, 0, readoutShadow.Width, readoutShadow.Height));
-        context.DrawRectangle(new VisualBrush(readoutShadow), null, new Rect(bounds.X - 24, bounds.Y - 24, readoutShadow.Width, readoutShadow.Height));
+        context.DrawRectangle(new VisualBrush(readoutShadow), null, new Rect(bounds.X - ReadoutShadowInset, bounds.Y - ReadoutShadowInset, readoutShadow.Width, readoutShadow.Height));
         context.DrawRoundedRectangle(surface, new Pen(Resource("DividerBrush"), 1), bounds, 4, 4);
     }
     private (FormattedText Label, FormattedText Value, string? Key)[] Readings(DnsTrendPoint sample)

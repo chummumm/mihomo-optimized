@@ -179,9 +179,10 @@ public sealed class LogsPage : NativePage
     private void ApplyTheme()
     {
         pausedNotice.BorderBrush = Tint("WarningBrush", .4); pausedNotice.Background = Tint("PanelSolidBrush", .92);
-        pausedNotice.Effect = new DropShadowEffect { Color = Colors.Black, BlurRadius = 16, ShadowDepth = 8, Direction = 270, Opacity = Color("AppBackgroundBrush").R < 128 ? .26 : .14 };
-        pausedLamp.Effect = new DropShadowEffect { Color = Color("WarningBrush"), BlurRadius = 8, ShadowDepth = 0, Opacity = 1 };
-        pausedGlow.Effect = new BlurEffect { Radius = 40 };
+        pausedNotice.Effect = new DropShadowEffect { Color = Colors.Black, BlurRadius = 24, ShadowDepth = 8, Direction = 270, Opacity = Color("AppBackgroundBrush").R < 128 ? .26 : .14 };
+        pausedLamp.Effect = new DropShadowEffect { Color = Color("WarningBrush"), BlurRadius = 12, ShadowDepth = 0, Opacity = 1 };
+        // CSS blur 40 means sigma 20; the caster keeps the original -18px spread.
+        pausedGlow.Effect = new BlurEffect { Radius = 60 };
         UpdateResumeFill(false); UpdateCardEdge(false);
         for (int index = 0; index < table.Items.Count; index++)
             if (table.ItemContainerGenerator.ContainerFromIndex(index) is DependencyObject container) FindVisual<LogLineView>(container)?.RefreshColors();

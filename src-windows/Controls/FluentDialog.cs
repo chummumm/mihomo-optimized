@@ -18,8 +18,9 @@ internal sealed class FluentDialog : Window
     private readonly Grid mask = new();
     private readonly Grid notificationSurface = new();
     private readonly Border surface;
-    private readonly DropShadowEffect ambientShadow = new() { Color = Colors.Black, BlurRadius = 64, ShadowDepth = 32, Direction = 270, RenderingBias = RenderingBias.Quality };
-    private readonly DropShadowEffect contactShadow = new() { Color = Colors.Black, BlurRadius = 21, ShadowDepth = 2, Direction = 270, RenderingBias = RenderingBias.Quality };
+    private readonly DropShadowEffect ambientShadow = new() { Color = Colors.Black, BlurRadius = 96, ShadowDepth = 32, Direction = 270, RenderingBias = RenderingBias.Quality };
+    // CSS blur 21 means sigma 10.5. WPF truncates the nominal radius 31.5 to 31 at 96 DPI.
+    private readonly DropShadowEffect contactShadow = new() { Color = Colors.Black, BlurRadius = 31.5, ShadowDepth = 2, Direction = 270, RenderingBias = RenderingBias.Quality };
     private readonly ScaleTransform scale = new(1, 1);
     private readonly DialogDismissal dismissal;
     private bool completing, closed;

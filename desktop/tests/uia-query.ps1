@@ -34,25 +34,50 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $processCondition = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $ApplicationProcessId)
+if ($AutomationId -eq '*') { $script:operationStage = 'visible_list_windows' }
 $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
     [System.Windows.Automation.TreeScope]::Children, $processCondition)
 if ($windows.Count -eq 0) { @{found=$false} | ConvertTo-Json -Compress; exit 0 }
 if ($AutomationId -eq '*') {
-    $visible = @()
+    # Fetch the complete raw subtree with its read-only properties in one
+    # UIA cache request per window. Walking live peers and reading Current
+    # separately lets a refreshed WPF child disappear between those calls.
+    # None makes accidental follow-up remote reads impossible; actors below
+    # still use their original live elements and execute only once.
+    $cache = [System.Windows.Automation.CacheRequest]::new()
+    $cache.TreeScope = [System.Windows.Automation.TreeScope]::Element
+    $cache.TreeFilter = [System.Windows.Automation.Automation]::RawViewCondition
+    $cache.AutomationElementMode = [System.Windows.Automation.AutomationElementMode]::None
+    $cache.Add([System.Windows.Automation.AutomationElement]::AutomationIdProperty)
+    $cache.Add([System.Windows.Automation.AutomationElement]::NameProperty)
+    $cache.Add([System.Windows.Automation.AutomationElement]::IsOffscreenProperty)
+    $cache.Add([System.Windows.Automation.AutomationElement]::IsValuePatternAvailableProperty)
+    $cache.Add([System.Windows.Automation.ValuePattern]::ValueProperty)
+    $visible = [System.Collections.Generic.List[object]]::new()
     foreach ($window in $windows) {
-        $elements = $window.FindAll([System.Windows.Automation.TreeScope]::Subtree,
-            [System.Windows.Automation.Condition]::TrueCondition)
+        $script:operationStage = 'visible_snapshot'
+        $activeCache = $cache.Activate()
+        try {
+            $elements = $window.FindAll([System.Windows.Automation.TreeScope]::Subtree,
+                [System.Windows.Automation.Condition]::TrueCondition)
+        } finally { $activeCache.Dispose() }
+        $script:operationStage = 'visible_materialize'
         foreach ($item in $elements) {
-            if ($item.Current.IsOffscreen) { continue }
-            $row = @{id=$item.Current.AutomationId; name=$item.Current.Name}
-            $pattern = $null
-            if ($item.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
-                $row.value = $pattern.Current.Value
+            $properties = $item.Cached
+            if ($properties.IsOffscreen) { continue }
+            $row = @{id=$properties.AutomationId; name=$properties.Name}
+            $hasValue = $item.GetCachedPropertyValue(
+                [System.Windows.Automation.AutomationElement]::IsValuePatternAvailableProperty)
+            if ($hasValue -isnot [bool]) { throw 'The visible element has no cached value-pattern availability.' }
+            if ($hasValue) {
+                $cachedValue = $item.GetCachedPropertyValue([System.Windows.Automation.ValuePattern]::ValueProperty, $true)
+                if ($cachedValue -isnot [string]) { throw 'The visible value control has no cached string value.' }
+                $row.value = $cachedValue
             }
-            $visible += $row
+            $visible.Add($row)
         }
     }
-    @{found=$true; elements=$visible} | ConvertTo-Json -Compress -Depth 4
+    @{found=$true; elements=$visible.ToArray()} | ConvertTo-Json -Compress -Depth 4
     exit 0
 }
 $idCondition = [System.Windows.Automation.PropertyCondition]::new(

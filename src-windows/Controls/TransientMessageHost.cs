@@ -190,7 +190,7 @@ public sealed class TransientMessageHost : Grid, IDisposable
         private readonly FluentBackdropFilter backdrop = new() { CornerRadius = new CornerRadius(8), Sigma = 30, Saturation = 1.5 };
         private readonly DropShadowEffect shadow = new()
         {
-            Color = Colors.Black, BlurRadius = 16, ShadowDepth = 8, Direction = 270,
+            Color = Colors.Black, BlurRadius = 24, ShadowDepth = 8, Direction = 270,
             RenderingBias = RenderingBias.Quality,
         };
         private readonly TranslateTransform movement = new();

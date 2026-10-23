@@ -130,8 +130,9 @@ internal sealed class ProxyTopologyControl : Grid
         {
             var hot = view.Node.Id == hovered; view.Button.Opacity = view.Alpha * (Related(view.Node.Id) ? 1 : .45);
             view.Button.SetResourceReference(Control.BorderBrushProperty, hot ? "AccentBrush" : "HairStrongBrush");
-            view.Button.Effect = hot && Dark && !SystemParameters.HighContrast && TryFindResource("AccentBrush") is SolidColorBrush accent ? new DropShadowEffect { Color = accent.Color, BlurRadius = 16, ShadowDepth = 0, Opacity = .65 } : null;
-            view.Marker.Effect = Dark && view.Node.Kind != "group" && !SystemParameters.HighContrast && view.Marker.Fill is SolidColorBrush color ? new DropShadowEffect { Color = color.Color, BlurRadius = 8, ShadowDepth = 0, Opacity = .7 } : null;
+            // Canvas shadowBlur 16/8 denotes sigma 8/4; WPF uses a three-sigma radius.
+            view.Button.Effect = hot && Dark && !SystemParameters.HighContrast && TryFindResource("AccentBrush") is SolidColorBrush accent ? new DropShadowEffect { Color = accent.Color, BlurRadius = 24, ShadowDepth = 0, Opacity = .65 } : null;
+            view.Marker.Effect = Dark && view.Node.Kind != "group" && !SystemParameters.HighContrast && view.Marker.Fill is SolidColorBrush color ? new DropShadowEffect { Color = color.Color, BlurRadius = 12, ShadowDepth = 0, Opacity = .7 } : null;
         }
     }
     private void Wake()

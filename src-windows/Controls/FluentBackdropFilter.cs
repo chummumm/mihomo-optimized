@@ -88,6 +88,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private readonly ObserverScope observerScope;
     private readonly PreparationPlane preparationObserverHost = new();
     private readonly DispatcherTimer preparationTimer;
+    private readonly DispatcherTimer firstPresentationTimer;
     private Panel? preparationHost;
     private Func<Rect>? preparationViewport;
     private bool preparationEnabled, presentationEnabled = true, renderingSubscribed, demanding;
@@ -112,6 +113,11 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private int demandCacheHits, captureQueuePromotions;
     private int preparedFrameReuses;
     private object? lastPreparationUse;
+    private int initialCachePresentations;
+    private object? lastInitialPresentation;
+    private long firstPresentationGeneration = -1;
+    private double firstPresentationCaptureAfter;
+    private bool awaitingFirstPresentationFrame;
     private double? firstBitmapMilliseconds;
     private static TaskCompletionSource<bool> NewReady() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -121,6 +127,8 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         observerScope.Filters.Add(new(this));
         preparationTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher);
         preparationTimer.Tick += PreparationDue;
+        firstPresentationTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher);
+        firstPresentationTimer.Tick += FirstPresentationDue;
         IsHitTestVisible = false; Focusable = false; ClipToBounds = true;
         sampling.RenderTransform = sampleOffset;
         sampling.Children.Add(observer); sampling.Children.Add(raster);
@@ -159,7 +167,11 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     }
 
     internal void BeginPresentation() { presentationEnabled = true; UpdateSubscription(); }
-    internal void EndPresentation() { if (preparationHost is not null) { presentationEnabled = false; UpdateSubscription(); } }
+    internal void EndPresentation()
+    {
+        CancelFirstPresentationDelay();
+        if (preparationHost is not null) { presentationEnabled = false; UpdateSubscription(); }
+    }
     internal void RefreshPreparation() { if (Preparing) UpdateGeometry(); }
     internal void InvalidatePreparation()
     {
@@ -198,6 +210,76 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     }
 
     internal Task<PreparationTicket?> PrepareAsync() => PrepareCoreAsync(verifyPixels: true);
+
+    // A prepared, full-resolution frame can be shown while this presentation's
+    // real pixel verification continues. This is explicitly an initial cache,
+    // not a claim that a dirty source has already been verified. UpdateGeometry
+    // validates the actual HWND/DPI, viewport and all current lower layers;
+    // any such invalidation gives the frame a different generation.
+    internal bool TryPresentPreparedFrame()
+    {
+        Dispatcher.VerifyAccess();
+        if (disposed || !Presenting) return false;
+        UpdateGeometry();
+        double now = clock.Elapsed.TotalMilliseconds;
+        double age = now - publishedCaptureCompletedAtMilliseconds;
+        if (raster.Source is null || !FilterAvailable || publishedGeneration != generation
+            || FilterDiagnostic != "live-full-resolution-gaussian-srgb" || age is < 0 or > 1000)
+            return false;
+
+        initialCachePresentations++;
+        lastInitialPresentation = new
+        {
+            generation, frameRevision = publishedSourceRevision, currentSourceRevision = sourceRevision,
+            sampleAgeAtUseMilliseconds = age, maximumAgeMilliseconds = 1000,
+            pendingSourceChange = sourceDirty, verificationInProgress = demanding || processing is not null,
+        };
+        // Let the first nonzero animation frame reach composition before the
+        // synchronous RTB verification. Source revisions remain dirty, and the
+        // existing preparation task is neither completed nor cancelled here.
+        // This opportunity ends one 16 ms interval after that frame, or after
+        // 100 ms even if rendering never arrives; it does not freeze entrance.
+        CancelFirstPresentationDelay();
+        firstPresentationGeneration = generation;
+        awaitingFirstPresentationFrame = true;
+        firstPresentationCaptureAfter = now + 100;
+        if (captureOperation is { Status: DispatcherOperationStatus.Pending })
+        {
+            captureOperation.Abort(); captureOperation = null;
+        }
+        preparationTimer.Stop();
+        ScheduleFirstPresentationDelay();
+        return true;
+    }
+
+    internal void FirstPresentationFrameSubmitted()
+    {
+        Dispatcher.VerifyAccess();
+        if (!awaitingFirstPresentationFrame || firstPresentationGeneration != generation) return;
+        awaitingFirstPresentationFrame = false;
+        firstPresentationCaptureAfter = Math.Min(firstPresentationCaptureAfter, clock.Elapsed.TotalMilliseconds + 16);
+        ScheduleFirstPresentationDelay();
+    }
+
+    private void ScheduleFirstPresentationDelay()
+    {
+        firstPresentationTimer.Stop();
+        firstPresentationTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(1, firstPresentationCaptureAfter - clock.Elapsed.TotalMilliseconds));
+        firstPresentationTimer.Start();
+    }
+
+    private void FirstPresentationDue(object? sender, EventArgs args)
+    {
+        CancelFirstPresentationDelay();
+        QueueCapture();
+    }
+
+    private void CancelFirstPresentationDelay()
+    {
+        firstPresentationTimer.Stop();
+        firstPresentationGeneration = -1;
+        awaitingFirstPresentationFrame = false;
+    }
 
     // A popup can construct its HWND/layout while this same real-source
     // verification runs. Loaded validates that same request's frame against the
@@ -272,7 +354,8 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         queueMilliseconds, schedulingMilliseconds, convolutionMilliseconds, publishDispatchMilliseconds,
         preparationEnabled, presenting = Presenting, preparationReadyMilliseconds,
         demandMilliseconds, demandCacheHits, captureQueueMilliseconds, captureQueuePromotions,
-        preparedFrameReuses, lastPreparationUse,
+        preparedFrameReuses, lastPreparationUse, initialCachePresentations, lastInitialPresentation,
+        firstPresentationCaptureDeferred = firstPresentationGeneration == generation,
         sourceRevision, publishedSourceRevision,
         processing = processing is not null, pendingSourceChange = sourceDirty,
     };
@@ -313,6 +396,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private void StopListening()
     {
         listening = false; demanding = false; preparationTimer.Stop();
+        CancelFirstPresentationDelay();
         captureOperation?.Abort(); captureOperation = null;
         if (renderingSubscribed) { renderingSubscribed = false; CompositionTarget.Rendering -= Rendering; }
         InvalidateRaster(clear: true); firstReady.TrySetResult(false);
@@ -321,6 +405,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private void Rendering(object? sender, EventArgs args) => UpdateGeometry();
     private void InvalidateRaster(bool clear)
     {
+        CancelFirstPresentationDelay();
         generation++; sourceRevision++; processing?.Cancel(); baseline = scratch = null; sourceDirty = true;
         if (demanding) readyRevision = sourceRevision;
         if (clear)
@@ -331,6 +416,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     }
     private void Fallback(string reason)
     {
+        CancelFirstPresentationDelay();
         if (raster.Source is not null || processing is not null || baseline is not null || FilterDiagnostic != reason)
             InvalidateRaster(clear: true);
         else sourceDirty = true;
@@ -449,6 +535,11 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private void QueueCapture()
     {
         if (disposed || !listening || !CanProcess || capturing || updatingGeometry || processing is not null || observer.Drawing is null || clock.Elapsed.TotalMilliseconds < retryAfterMilliseconds) return;
+        if (firstPresentationGeneration == generation)
+        {
+            if (clock.Elapsed.TotalMilliseconds < firstPresentationCaptureAfter) return;
+            CancelFirstPresentationDelay();
+        }
         // Initial presentation is urgent. Subsequent live sampling runs after
         // normal WPF presentation, so an RTB does not preempt the menu's next
         // animation frame. There is still only one queued/in-flight capture.
@@ -639,6 +730,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         Dispatcher.VerifyAccess(); disposed = true; StopListening();
         Loaded -= OnLoaded; Unloaded -= OnUnloaded; IsVisibleChanged -= OnVisibilityChanged; SizeChanged -= OnSizeChanged;
         preparationTimer.Tick -= PreparationDue;
+        firstPresentationTimer.Tick -= FirstPresentationDue;
         if (preparationHost is not null)
         {
             preparationHost.Loaded -= PreparationHostChanged; preparationHost.Unloaded -= PreparationHostChanged;
