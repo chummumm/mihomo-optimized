@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][int]$ApplicationProcessId,
     [Parameter(Mandatory=$true)][string]$AutomationId,
-    [ValidateSet('read', 'invoke', 'set', 'select', 'toggle', 'scroll')][string]$Action = 'read',
+    [ValidateSet('read', 'invoke', 'set', 'select', 'toggle', 'scroll', 'context', 'escape')][string]$Action = 'read',
     [AllowEmptyString()][string]$Value = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -110,6 +110,38 @@ switch ($Action) {
             }
         }
         $result.selected = $true
+    }
+    'context' {
+        $element.SetFocus()
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class NativeMenuInput {
+    [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+}
+'@
+        $ancestor = $element
+        while ($ancestor -and -not $ancestor.Current.NativeWindowHandle) { $ancestor = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($ancestor) }
+        if (-not $ancestor -or $ancestor.Current.ProcessId -ne $ApplicationProcessId) { throw 'The focused element has no owned window.' }
+        $handle = [IntPtr]$ancestor.Current.NativeWindowHandle
+        if (-not [NativeMenuInput]::PostMessage($handle, 0x007B, $handle, [IntPtr](-1))) { throw 'Context menu input failed.' }
+        $result.opened = $true
+    }
+    'escape' {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class NativeEscapeInput {
+    [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+}
+'@
+        $ancestor = $element
+        while ($ancestor -and -not $ancestor.Current.NativeWindowHandle) { $ancestor = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($ancestor) }
+        if (-not $ancestor -or $ancestor.Current.ProcessId -ne $ApplicationProcessId) { throw 'The focused element has no owned window.' }
+        $handle = [IntPtr]$ancestor.Current.NativeWindowHandle
+        [void][NativeEscapeInput]::PostMessage($handle, 0x0100, [IntPtr]0x1B, [IntPtr]0)
+        [void][NativeEscapeInput]::PostMessage($handle, 0x0101, [IntPtr]0x1B, [IntPtr]0xC0000001L)
+        $result.sent = $true
     }
     'scroll' {
         $pattern = $element.GetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern)

@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using Mihomo.Desktop.Services;
 
 namespace Mihomo.Desktop.Controls;
 
@@ -7,18 +8,15 @@ internal static class InputDialog
 {
     public static string? Show(FrameworkElement owner, string title, string label, bool multiline = false)
     {
-        var dialog = new Window { Title = title, Owner = Window.GetWindow(owner), Width = 620, Height = multiline ? 440 : 230, MinWidth = 420, MinHeight = 200, WindowStartupLocation = WindowStartupLocation.CenterOwner, ResizeMode = multiline ? ResizeMode.CanResize : ResizeMode.NoResize };
-        dialog.SetResourceReference(Control.BackgroundProperty, "AppBackgroundBrush");
-        var layout = new DockPanel { Margin = new Thickness(24) };
-        var text = Ui.Text(label); text.Margin = new Thickness(0, 0, 0, 12); DockPanel.SetDock(text, Dock.Top); layout.Children.Add(text);
-        var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 16, 0, 0) };
-        var accept = new Button { Content = "导入", IsDefault = true, Padding = new Thickness(20, 6, 20, 6), Margin = new Thickness(0, 0, 8, 0), IsEnabled = false };
-        var cancel = new Button { Content = "取消", IsCancel = true, Padding = new Thickness(20, 6, 20, 6) };
-        actions.Children.Add(accept); actions.Children.Add(cancel); DockPanel.SetDock(actions, Dock.Bottom); layout.Children.Add(actions);
-        var input = new TextBox { AcceptsReturn = multiline, AcceptsTab = multiline, TextWrapping = multiline ? TextWrapping.NoWrap : TextWrapping.Wrap, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = multiline ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled, Padding = new Thickness(8), MaxLength = multiline ? 4 * 1024 * 1024 : 8192 };
+        var input = new TextBox { AcceptsReturn = multiline, AcceptsTab = multiline, TextWrapping = multiline ? TextWrapping.NoWrap : TextWrapping.Wrap, VerticalScrollBarVisibility = multiline ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled, HorizontalScrollBarVisibility = multiline ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled, MaxLength = multiline ? 4 * 1024 * 1024 : 8192 };
+        if (multiline) { input.Height = 260; input.Padding = new Thickness(11, 8, 11, 8); input.SetResourceReference(Control.FontFamilyProperty, "MonoFont"); input.FontSize = 12; }
+        var hint = Ui.Text(label); hint.Margin = new Thickness(0, 0, 0, 12);
+        var accept = new Button { Content = Ui.Label("导入"), IsDefault = true, IsEnabled = false }; FluentControls.Primary(accept);
+        var cancel = new Button { Content = Ui.Label("取消") };
+        var dialog = new FluentDialog(Window.GetWindow(owner), title, Ui.Column(hint, input), [accept, cancel], multiline);
         input.TextChanged += (_, _) => accept.IsEnabled = !string.IsNullOrWhiteSpace(input.Text);
-        accept.Click += (_, _) => dialog.DialogResult = true;
-        layout.Children.Add(input); dialog.Content = layout; dialog.Loaded += (_, _) => input.Focus();
+        accept.Click += (_, _) => dialog.Complete(true); cancel.Click += (_, _) => dialog.Complete(false);
+        dialog.Loaded += (_, _) => input.Focus();
         return dialog.ShowDialog() == true ? input.Text : null;
     }
 }

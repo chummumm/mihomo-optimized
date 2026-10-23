@@ -4,36 +4,10 @@
              ShutdownMode="OnExplicitShutdown" ThemeMode="System">
   <Application.Resources>
     <ResourceDictionary>
-      <SolidColorBrush x:Key="AppBackgroundBrush" Color="#F3F3F3" />
-      <SolidColorBrush x:Key="SurfaceBrush" Color="#FFFFFF" />
-      <SolidColorBrush x:Key="SubtleSurfaceBrush" Color="#F8F8F8" />
-      <SolidColorBrush x:Key="TextPrimaryBrush" Color="#1B1B1B" />
-      <SolidColorBrush x:Key="TextSecondaryBrush" Color="#616161" />
-      <SolidColorBrush x:Key="BorderBrush" Color="#E2E2E2" />
-      <SolidColorBrush x:Key="AccentBrush" Color="#005FB8" />
-      <SolidColorBrush x:Key="AccentTextBrush" Color="#FFFFFF" />
-      <SolidColorBrush x:Key="SuccessBrush" Color="#0F7B0F" />
-      <SolidColorBrush x:Key="DangerBrush" Color="#C42B1C" />
-      <SolidColorBrush x:Key="WarningBrush" Color="#9D5D00" />
-      <SolidColorBrush x:Key="ChartUpBrush" Color="#8A8A8A" />
-      <SolidColorBrush x:Key="Line0Brush" Color="#0063B1" />
-      <SolidColorBrush x:Key="Line1Brush" Color="#6B4FAC" />
-      <SolidColorBrush x:Key="Line2Brush" Color="#B0297A" />
-      <SolidColorBrush x:Key="Line3Brush" Color="#00755E" />
-      <SolidColorBrush x:Key="Line4Brush" Color="#A65200" />
-      <SolidColorBrush x:Key="Line5Brush" Color="#1F5BD6" />
-      <SolidColorBrush x:Key="Line6Brush" Color="#8A3FC2" />
-      <SolidColorBrush x:Key="Line7Brush" Color="#00727A" />
-      <SolidColorBrush x:Key="Line8Brush" Color="#B33A3A" />
-      <Style TargetType="ToolTip"><Setter Property="MaxWidth" Value="440" /></Style>
-      <Style x:Key="NavigationItem" TargetType="ListBoxItem">
-        <Setter Property="Padding" Value="12,11" /><Setter Property="Margin" Value="6,2" />
-        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-        <Setter Property="MinHeight" Value="42" /><Setter Property="FontSize" Value="14" />
-      </Style>
-      <Style x:Key="CompactButton" TargetType="Button">
-        <Setter Property="Padding" Value="12,6" /><Setter Property="MinHeight" Value="32" />
-      </Style>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceDictionary Source="Themes/Tokens.xaml" />
+        <ResourceDictionary Source="Themes/Controls.xaml" />
+      </ResourceDictionary.MergedDictionaries>
     </ResourceDictionary>
   </Application.Resources>
 </Application>

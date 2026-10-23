@@ -1120,6 +1120,7 @@ class Acceptance:
         self.secrets: set[str] = set()
         self.mutations_started = False
         self.service_owned = False
+        self.animation_before: bool | None = None
         self.stage = "preflight"
         self.report = {"passed": False, "platform": "windows", "tests": {}, "diagnostics": []}
 
@@ -1157,6 +1158,59 @@ class Acceptance:
         evidence = {"checks": [], "captures": [], "framework": "WPF", "browserRuntime": False}
         self.report["nativeRedesign"] = evidence
         driver = self.driver
+        visual_fixture = {"schema": 1, "scenarios": [], "motions": []}
+        fixture_path = self.artifacts / "visual-fixture.json"
+
+        def reference_state(name: str, result: dict) -> dict:
+            """Only acceptance-owned, credential-free data is exported to the reference renderer."""
+            snapshot = driver.snapshot()
+            status = self.status()
+            status = {key: status[key] for key in ("appVersion", "phase", "systemProxy", "tun", "autostart", "coreVersion", "configPath", "logPath", "service", "capabilities") if key in status}
+            config = self.runtime_json("configs")
+            config = {key: config[key] for key in ("port", "socks-port", "mixed-port", "redir-port", "tproxy-port", "mode", "log-level", "allow-lan", "ipv6", "bind-address", "find-process-mode") if key in config}
+            proxies = self.runtime_json("proxies")
+            allowed_proxy = ("name", "type", "now", "all", "history", "udp", "alive", "hidden", "icon")
+            proxies = {"proxies": {key: {field: value[field] for field in allowed_proxy if field in value} for key, value in proxies.get("proxies", {}).items()}}
+            api = {"/configs": config, "/proxies": proxies}
+            for endpoint in ("version", "rules", "connections", "upgrade/check", "dns/observability", "dns/observability/stats", "dns/observability/upstreams"):
+                api["/" + endpoint] = self.runtime_json(endpoint)
+            api["/dns/observability/queries"] = self.runtime_json("dns/observability/queries?limit=" + ("100" if name == "dns-queries" else "50"))
+            for endpoint in ("providers/proxies", "providers/rules"):
+                providers = self.runtime_json(endpoint).get("providers", {})
+                fields = ("name", "type", "vehicleType", "behavior", "ruleCount", "updatedAt", "subscriptionInfo", "proxies")
+                api["/" + endpoint] = {"providers": {key: {field: value[field] for field in fields if field in value} for key, value in providers.items()}}
+            dpi = result.get("dpi", 96)
+            row = {"name": name, "page": snapshot.get("page", "home"), "width": round(result["width"] * 96 / dpi), "height": round(result["height"] * 96 / dpi), "dpi": dpi,
+                "theme": snapshot.get("theme", "light"), "language": snapshot.get("language", "zh-CN"), "appearance": result.get("appearance"), "capturedAt": result.get("capturedAt"),
+                "status": status, "api": api, "streams": result.get("streams", {}), "update": result.get("update", {}),
+                "config": {"path": status.get("configPath", "config.yaml"), "content": base, "revision": "fixture", "max_size": 4194304, "writable": True}}
+            if name == "search": row["searchQuery"] = "theme"
+            if name == "rules": row["ruleQuery"] = driver.ui("RuleSearch").get("value", "")
+            if name == "home-narrow": row["navigationOverlay"] = True
+            if name in ("config-editor", "config-unsaved"): row["editor"] = {"content": base.rstrip("\r\n") + "\n# native UIA save acceptance\n"}
+            if name == "import-config": row["import"] = {"mode": "text", "content": base}
+            serialized = json.dumps(row, ensure_ascii=False)
+            require(all(value not in serialized for value in self.secrets), "visual_fixture_would_expose_secret")
+            return row
+
+        def save_reference_fixture() -> None:
+            fixture_path.write_text(json.dumps(visual_fixture, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        def record_motion(name: str, identifier: str, action: str = "invoke", value: str = "", surface: str = "main") -> None:
+            directory = self.artifacts / "motion"
+            directory.mkdir(exist_ok=True)
+            # Capture and inspect the actual pre-action surface before arming.
+            before = driver.screenshot(directory / (name + "-before.png"), self.secrets, page=None)
+            state = reference_state(name, before)
+            state["action"] = {"automationId": identifier, "kind": action, "value": value, "surface": surface}
+            visual_fixture["motions"].append(state)
+            save_reference_fixture()
+            armed = driver.invoke("native_arm_motion", {"directory": str(directory.resolve()), "name": name, "trigger": identifier, "surface": surface})
+            require(armed.get("armed") and not armed.get("reducedMotion"), "native_motion_animation_not_enabled")
+            driver.ui(identifier, action, value)
+            result = wait_until(lambda: (current if (current := driver.invoke("native_motion_status")).get("finished") else None), "native_motion_capture_timeout", 25)
+            require(not result.get("error") and result.get("frames", 0) >= 10, "native_motion_capture_failed")
+            evidence.setdefault("motions", []).append({"name": name, "manifest": "motion/" + name + ".json", "frames": result["frames"]})
 
         def found(identifier: str, *, enabled: bool = False) -> dict:
             def probe():
@@ -1171,9 +1225,17 @@ class Acceptance:
         def capture(name: str, page: str | None = None, surface: str = "main") -> None:
             result = driver.screenshot(self.artifacts / name, self.secrets, page, surface)
             evidence["captures"].append({"file": name, "surface": result.get("surface"), "kind": result.get("captureKind"), "material": result.get("material")})
+            scenario = name.removeprefix("windows-").removesuffix(".png")
+            visual_fixture["scenarios"].append(reference_state(scenario, result))
+            metadata = {key: value for key, value in result.items() if key not in ("path", "streams")}
+            (self.artifacts / ("windows-" + scenario + ".json")).write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+            save_reference_fixture()
 
         def search(query: str, result_id: str, page: str, *, screenshot: bool = False) -> None:
-            driver.ui("GlobalSearch", "invoke")
+            if screenshot:
+                record_motion("search-open", "GlobalSearch", surface="search")
+            else:
+                driver.ui("GlobalSearch", "invoke")
             found("SearchInput", enabled=True)
             driver.ui("SearchInput", "set", query)
             found(result_id, enabled=True)
@@ -1191,7 +1253,15 @@ class Acceptance:
             found("HomeExitSummary_" + group)
         require(driver.snapshot().get("customTitleBar") is True, "native_custom_titlebar_missing")
         capture("windows-home.png")
-        driver.ui("HomeExitSummary_Smoke Primary", "invoke")
+        require(not self.status().get("service", {}).get("installed"), "native_tun_consent_prerequisite_missing")
+        driver.ui("tun", "toggle")
+        found("TunConsentDialog")
+        found("CancelTunInstall", enabled=True)
+        capture("windows-tun-consent.png")
+        driver.ui("CancelTunInstall", "invoke")
+        wait_until(lambda: not driver.ui("TunConsentDialog").get("found"), "native_tun_consent_did_not_close")
+        require(not self.status().get("tun") and not service_installed(), "native_cancelled_tun_installed_service")
+        record_motion("home-to-proxies", "HomeExitSummary_Smoke Primary")
         wait_until(lambda: driver.snapshot().get("page") == "proxies", "native_home_exit_navigation_failed", 15)
         found("ProxyGroup_Smoke Primary")
         checked("home_four_exits_and_group_navigation")
@@ -1212,7 +1282,7 @@ class Acceptance:
 
         driver.navigate("settings")
         found("AppLanguage", enabled=True)
-        driver.ui("AppLanguage", "select", "English")
+        record_motion("settings-language", "AppLanguage", "select", "English")
         wait_until(lambda: driver.snapshot().get("language") == "en-US", "native_language_not_applied")
         require("Settings" in found("NavSettings").get("name", ""), "native_navigation_not_translated")
         driver.ui("AppTheme", "select", "Dark")
@@ -1235,7 +1305,7 @@ class Acceptance:
 
         driver.navigate("settings")
         found("SettingsAllowLan", enabled=True)
-        driver.ui("SettingsAllowLan", "toggle")
+        record_motion("settings-switch", "SettingsAllowLan", "toggle")
         wait_until(lambda: self.runtime_json("configs").get("allow-lan") is True, "native_lan_toggle_not_applied")
         found("SettingsAllowLan", enabled=True)
         driver.ui("SettingsAllowLan", "toggle")
@@ -1271,7 +1341,16 @@ class Acceptance:
         driver.navigate("profiles")
         found("EditConfig", enabled=True)
         capture("windows-profiles.png")
-        driver.ui("EditConfig", "invoke")
+        driver.ui("PasteConfig", "invoke")
+        found("ConfigImportText", enabled=True)
+        driver.ui("ConfigImportText", "set", base)
+        capture("windows-import-config.png")
+        driver.ui("CancelConfigImport", "invoke")
+        found("ConfigImportDiscard", enabled=True)
+        driver.ui("ConfigImportDiscard", "invoke")
+        wait_until(lambda: not driver.ui("ConfigImportDialog").get("found"), "native_import_preview_did_not_close")
+        require(self.driver.invoke("desktop_read_config").get("content") == base, "native_cancelled_import_changed_config")
+        record_motion("editor-open", "EditConfig")
         editor = found("ConfigEditor", enabled=True)
         require(editor.get("readOnly") is False, "native_config_editor_readonly")
         found("ConfigLineNumbers")
@@ -1279,8 +1358,14 @@ class Acceptance:
         require("Smoke Primary" in original, "native_editor_wrong_document")
         marker = "# native UIA save acceptance"
         driver.ui("ConfigEditor", "set", original.rstrip("\r\n") + "\n" + marker + "\n")
-        found("SaveOnlyConfig", enabled=True)
         capture("windows-config-editor.png")
+        driver.ui("CloseEditor", "invoke")
+        found("ConfigKeepEditing", enabled=True)
+        capture("windows-config-unsaved.png")
+        driver.ui("ConfigKeepEditing", "invoke")
+        require(marker in found("ConfigEditor").get("value", ""), "native_keep_editing_lost_draft")
+        driver.ui("SaveConfig", "context")
+        found("SaveOnlyConfig", enabled=True)
         driver.ui("SaveOnlyConfig", "invoke")
         wait_until(lambda: marker in (self.directory / "config.yaml").read_text(encoding="utf-8"), "native_editor_save_not_written")
         found("CloseEditor", enabled=True)
@@ -1319,15 +1404,18 @@ class Acceptance:
         driver.navigate("connections")
         found("ConnectionTable")
         found("ConnectionSource_all")
+        driver.ui("ConnectionTable", "context")
         driver.ui("PauseConnections", "toggle")
+        driver.ui("ConnectionTable", "context")
         driver.ui("PauseConnections", "toggle")
+        driver.ui("ConnectionTable", "escape")
         capture("windows-connections.png")
         checked("logs_pause_resume_and_connections")
 
         driver.navigate("home")
         narrow = driver.invoke("native_resize", {"width": 640, "height": 700})
         require(narrow.get("navigationMode") in ("minimal", "compact"), "native_narrow_navigation_mode_missing")
-        driver.ui("NavigationToggle", "invoke")
+        record_motion("narrow-navigation", "NavigationToggle")
         wait_until(lambda: driver.snapshot().get("navigationOverlay") is True, "native_navigation_overlay_did_not_open")
         capture("windows-home-narrow.png")
         driver.ui("NavigationToggle", "invoke")
@@ -1833,6 +1921,12 @@ class Acceptance:
             self.original_files[path] = path.read_bytes() if path.exists() else None
         require(not (self.directory / "system-proxy-recovery.json").exists(), "preexisting_proxy_recovery")
         self.mutations_started = True
+        animation = wintypes.BOOL()
+        require(ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(animation), 0), "client_animation_read_failed")
+        self.animation_before = bool(animation.value)
+        # The disposable runner must exercise the real animation branch. Restore
+        # the original accessibility preference in cleanup, like proxy settings.
+        require(ctypes.windll.user32.SystemParametersInfoW(0x1043, 0, ctypes.c_void_p(1), 2), "client_animation_enable_failed")
         # Make the negative prerequisite explicit, including PAC/autodetection.
         # The runner's original per-user settings are restored in cleanup.
         self.wininet.restore({"flags": 1, "server": "", "bypass": "", "pac": ""})
@@ -2126,6 +2220,8 @@ class Acceptance:
             attempt("update_cache_fixture_cleanup", self.update_cache.close)
         attempt("proxy_restore", lambda: self.wininet.restore(self.proxy_before))
         attempt("autostart_restore", lambda: restore_autostart(self.autostart_before))
+        if self.animation_before is not None:
+            attempt("client_animation_restore", lambda: require(ctypes.windll.user32.SystemParametersInfoW(0x1043, 0, ctypes.c_void_p(int(self.animation_before)), 2), "client_animation_restore_failed"))
         for path, original in self.original_files.items():
             def restore_file(path=path, original=original):
                 if original is None:

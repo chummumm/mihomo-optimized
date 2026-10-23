@@ -24,12 +24,14 @@ public static partial class L
         RegisterShell(catalog);
         RegisterProxyEditor(catalog);
         RegisterSearchSettings(catalog);
+        RegisterDns(catalog);
         return catalog;
     }
     static partial void RegisterCommon(Dictionary<string, string> catalog);
     static partial void RegisterShell(Dictionary<string, string> catalog);
     static partial void RegisterProxyEditor(Dictionary<string, string> catalog);
     static partial void RegisterSearchSettings(Dictionary<string, string> catalog);
+    static partial void RegisterDns(Dictionary<string, string> catalog);
 
     public static string T(string text) => IsEnglish && english.TryGetValue(text, out var translated) ? translated : text;
     public static string F(string template, params object?[] arguments) => string.Format(CultureInfo.CurrentCulture, T(template), arguments);

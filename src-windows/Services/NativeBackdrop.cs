@@ -54,14 +54,14 @@ internal sealed class NativeBackdrop : IDisposable
             if (HwndSource.FromHwnd(handle)?.CompositionTarget is { } target) target.BackgroundColor = Colors.Transparent;
             window.Background = Brushes.Transparent;
             // DWM supplies the material; only transient windows need the design's tint.
-            surface.Background = transient ? new SolidColorBrush(dark ? Color.FromArgb(84, 32, 32, 32) : Color.FromArgb(56, 243, 243, 243)) : Brushes.Transparent;
+            surface.Background = transient ? new SolidColorBrush(dark ? Color.FromArgb(153, 32, 32, 32) : Color.FromArgb(153, 243, 243, 243)) : Brushes.Transparent;
         }
         else
         {
             var margins = new Margins();
             _ = DwmExtendFrameIntoClientArea(handle, ref margins);
-            window.SetResourceReference(Window.BackgroundProperty, "AppBackgroundBrush");
-            surface.SetResourceReference(System.Windows.Controls.Panel.BackgroundProperty, "AppBackgroundBrush");
+            window.SetResourceReference(Window.BackgroundProperty, transient ? "DialogBottomBrush" : "AppBackgroundBrush");
+            surface.SetResourceReference(System.Windows.Controls.Panel.BackgroundProperty, transient ? "DialogBottomBrush" : "AppBackgroundBrush");
         }
     }
     public void Dispose()

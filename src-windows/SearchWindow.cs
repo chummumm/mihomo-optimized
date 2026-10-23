@@ -10,7 +10,10 @@ using System.Windows.Controls;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
+using System.Windows.Markup;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Effects;
 using System.Windows.Threading;
 using Mihomo.Desktop.Controls;
 using Mihomo.Desktop.Services;
@@ -19,6 +22,31 @@ namespace Mihomo.Desktop;
 
 internal sealed class SearchWindow : Window
 {
+    private static readonly ResourceDictionary templates = (ResourceDictionary)XamlReader.Parse("""
+        <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+          <Style x:Key="Results" TargetType="ListBox">
+            <Setter Property="BorderThickness" Value="0"/><Setter Property="Padding" Value="0"/>
+            <Setter Property="Background" Value="Transparent"/><Setter Property="Focusable" Value="False"/>
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBox"><ItemsPresenter/></ControlTemplate></Setter.Value></Setter>
+          </Style>
+          <Style x:Key="Result" TargetType="ListBoxItem">
+            <Setter Property="MinHeight" Value="40"/><Setter Property="Padding" Value="11,4"/><Setter Property="Margin" Value="0"/>
+            <Setter Property="Focusable" Value="False"/><Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBoxItem">
+              <Grid>
+                <Border x:Name="Frame" CornerRadius="4" Background="Transparent" Padding="{TemplateBinding Padding}">
+                  <ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Stretch"/>
+                </Border>
+                <Border x:Name="Marker" Width="3" Height="16" CornerRadius="2" HorizontalAlignment="Left" VerticalAlignment="Center" Background="{DynamicResource AccentBrush}" Visibility="Collapsed"/>
+              </Grid>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsSelected" Value="True"><Setter TargetName="Frame" Property="Background" Value="{DynamicResource SubtleHoverBrush}"/><Setter TargetName="Marker" Property="Visibility" Value="Visible"/></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate></Setter.Value></Setter>
+          </Style>
+        </ResourceDictionary>
+        """);
     private sealed class ResultItem : ListBoxItem
     {
         internal required Func<Task> Execute { get; init; }
@@ -53,15 +81,18 @@ internal sealed class SearchWindow : Window
 
     private const int MaximumVisibleResults = 8;
     private readonly AppSession session;
-    private readonly TextBox search = new() { MinHeight = 32, VerticalContentAlignment = VerticalAlignment.Center, Padding = new Thickness(12, 3, 12, 3), MaxLength = 2048, FontSize = 12 };
+    private readonly GlobalSearchBox inputBox;
+    private readonly TextBox search;
     private readonly ResultList results = new() { BorderThickness = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Stretch, Background = Brushes.Transparent };
-    private readonly TextBlock resultCount = Ui.Muted("");
+    private readonly TextBlock resultCount = Ui.Hint("试试这些");
     private readonly TextBlock state = Ui.Muted("");
-    private readonly TextBlock empty = Ui.Text("", 14);
+    private readonly TextBlock empty = Ui.Muted("", 13);
+    private readonly StackPanel suggestions;
+    private readonly ScrollViewer suggestionScroll;
+    private readonly Border suggestionBorder;
     private readonly List<Entry> entries = new();
     private readonly List<Entry> coreEntries = new();
     private readonly CancellationTokenSource lifetime = new();
-    private readonly DispatcherTimer searchDelay = new() { Interval = TimeSpan.FromMilliseconds(80) };
     private readonly NativeBackdrop backdrop;
     private readonly Grid flyoutSurface;
     private Window? anchorOwner;
@@ -81,71 +112,85 @@ internal sealed class SearchWindow : Window
     private string CommandState => string.Join("|", session.Ready, session.IsUpdating, session.IsDirty, session.Status.Text("phase"), session.Status.Bool("systemProxy"), session.Status.Bool("tun"),
         session.Status.Get("capabilities").ToString());
 
-    public SearchWindow(AppSession session)
+    public SearchWindow(AppSession session, GlobalSearchBox inputBox)
     {
-        this.session = session;
+        this.session = session; this.inputBox = inputBox; search = inputBox.Input;
         L.Bind(this, TitleProperty, "搜索"); this.Id("GlobalSearchWindow");
-        Width = 380; Height = 420; MinWidth = 200; MinHeight = 160;
+        Width = 380; Height = 330; MinWidth = 0; MinHeight = 0;
         WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize;
-        WindowStartupLocation = WindowStartupLocation.Manual; ShowInTaskbar = false;
-        FontFamily = new FontFamily("Segoe UI Variable, Segoe UI, Microsoft YaHei UI"); FontSize = 14;
+        WindowStartupLocation = WindowStartupLocation.Manual; ShowInTaskbar = false; ShowActivated = false; Focusable = false;
+        FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Microsoft YaHei"); FontSize = 14;
         SetResourceReference(BackgroundProperty, "AppBackgroundBrush"); SetResourceReference(ForegroundProperty, "TextPrimaryBrush");
-        search.Id("SearchInput"); results.Id("SearchResults"); resultCount.Id("SearchResultCount");
+        results.Id("SearchResults"); resultCount.Id("SearchResultCount");
         state.Id("SearchStatus"); empty.Id("SearchEmpty");
-        L.Bind(search, AutomationProperties.NameProperty, "搜索页面、策略组、节点、设置、规则或命令");
-        L.Bind(search, ToolTipProperty, "搜索页面、策略组、节点、设置、规则或命令");
         AutomationProperties.SetLiveSetting(resultCount, AutomationLiveSetting.Polite);
         AutomationProperties.SetLiveSetting(state, AutomationLiveSetting.Polite);
-        var layout = new Grid { Margin = new Thickness(8) };
-        layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        layout.RowDefinitions.Add(new RowDefinition());
-        layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        resultCount.Margin = new Thickness(4, 2, 4, 6); layout.Children.Add(resultCount);
-        var resultsArea = new Grid(); resultsArea.Children.Add(results);
-        empty.HorizontalAlignment = HorizontalAlignment.Center; empty.VerticalAlignment = VerticalAlignment.Center;
-        empty.Margin = new Thickness(24); resultsArea.Children.Add(empty);
-        Grid.SetRow(resultsArea, 1); layout.Children.Add(resultsArea);
-        state.Margin = new Thickness(4, 8, 4, 4); state.MaxHeight = 54; state.TextTrimming = TextTrimming.CharacterEllipsis; Grid.SetRow(state, 2); layout.Children.Add(state);
-        var keys = Ui.Hint("↑ ↓ 选择    Enter 打开    Esc 关闭    Ctrl+T 全部测速", 11);
-        keys.Margin = new Thickness(4, 8, 4, 0); Grid.SetRow(keys, 3); layout.Children.Add(keys);
-        var border = new Border { Child = layout, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Margin = new Thickness(0, 4, 0, 0) };
-        border.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
-        flyoutSurface = new Grid(); flyoutSurface.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); flyoutSurface.RowDefinitions.Add(new RowDefinition());
-        flyoutSurface.Children.Add(search); Grid.SetRow(border, 1); flyoutSurface.Children.Add(border);
+        results.Style = (Style)templates["Results"];
+        suggestions = new StackPanel();
+        resultCount.Margin = new Thickness(11, 8, 11, 4); resultCount.FontWeight = FontWeights.SemiBold; resultCount.LineHeight = 16; resultCount.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
+        suggestions.Children.Add(resultCount); suggestions.Children.Add(results);
+        empty.Margin = new Thickness(12); empty.HorizontalAlignment = HorizontalAlignment.Left; suggestions.Children.Add(empty);
+        // Status remains available to assistive technology; the original palette has no persistent footer.
+        state.Visibility = Visibility.Collapsed; suggestions.Children.Add(state);
+        suggestionScroll = new ScrollViewer { Content = suggestions, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Padding = new Thickness(4), CanContentScroll = false };
+        suggestionBorder = new Border { Child = suggestionScroll, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), MaxHeight = 380 };
+        suggestionBorder.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush"); suggestionBorder.SetResourceReference(Border.BackgroundProperty, "AcrylicBrush");
+        suggestionBorder.Effect = new DropShadowEffect { Direction = 270, ShadowDepth = 8, BlurRadius = 16, Color = Colors.Black, Opacity = IsDark ? .26 : .14 };
+        flyoutSurface = new Grid(); flyoutSurface.Children.Add(suggestionBorder);
         Content = flyoutSurface;
         backdrop = new NativeBackdrop(this, flyoutSurface, session, transient: true);
         ScrollViewer.SetHorizontalScrollBarVisibility(results, ScrollBarVisibility.Disabled);
         ScrollViewer.SetVerticalScrollBarVisibility(results, ScrollBarVisibility.Auto);
-        search.TextChanged += (_, _) => { searchDelay.Stop(); searchDelay.Start(); };
-        searchDelay.Tick += (_, _) => { searchDelay.Stop(); Filter(); };
-        PreviewKeyDown += OnKeyDown;
-        SourceInitialized += (_, _) => PositionFlyout();
+        search.TextChanged += QueryChanged;
+        search.LostKeyboardFocus += InputLostFocus;
+        SourceInitialized += (_, _) =>
+        {
+            var handle = new WindowInteropHelper(this).Handle;
+            // The title-bar input owns keyboard focus even while the pointer is over suggestions.
+            _ = SetWindowLongPtr(handle, -20, new IntPtr(GetWindowLongPtr(handle, -20).ToInt64() | 0x08000000));
+            HwndSource.FromHwnd(handle)?.AddHook(WindowMessage);
+            PositionFlyout();
+        };
         Loaded += async (_, _) =>
         {
-            AttachOwner(); PositionFlyout(); FocusInput(); FluentMotion.Enter(layout);
+            AttachOwner(); PositionFlyout(); FocusInput(); EnterSuggestions();
             await LoadCoreEntries();
         };
-        Deactivated += (_, _) => { if (IsLoaded) ClosePalette(); };
         Closed += (_, _) =>
         {
-            closed = true; searchDelay.Stop(); lifetime.Cancel(); lifetime.Dispose();
-            session.StatusChanged -= OnStatusChanged; L.Changed -= OnLanguageChanged;
+            closed = true; lifetime.Cancel(); lifetime.Dispose();
+            search.TextChanged -= QueryChanged; search.LostKeyboardFocus -= InputLostFocus;
+            AutomationProperties.SetHelpText(search, "");
+            session.StatusChanged -= OnStatusChanged; session.ThemeChanged -= OnThemeChanged; L.Changed -= OnLanguageChanged;
             if (anchorOwner is not null)
             {
                 anchorOwner.LocationChanged -= CloseForOwnerChange; anchorOwner.SizeChanged -= CloseForOwnerSize;
                 anchorOwner.StateChanged -= CloseForOwnerChange; anchorOwner.IsVisibleChanged -= CloseForOwnerVisibility;
+                anchorOwner.Deactivated -= CloseForOwnerChange; anchorOwner.PreviewMouseDown -= OwnerPointerDown;
             }
             backdrop.Dispose();
         };
-        session.StatusChanged += OnStatusChanged; L.Changed += OnLanguageChanged;
+        session.StatusChanged += OnStatusChanged; session.ThemeChanged += OnThemeChanged; L.Changed += OnLanguageChanged;
         RebuildEntries();
+    }
+
+    private bool IsDark => TryFindResource("AppBackgroundBrush") is SolidColorBrush brush && brush.Color.R < 128;
+    private void OnThemeChanged()
+    {
+        if (suggestionBorder.Effect is DropShadowEffect shadow) shadow.Opacity = IsDark ? .26 : .14;
+    }
+    private void EnterSuggestions()
+    {
+        if (!FluentMotion.Enabled) return;
+        var movement = new TranslateTransform(); suggestionBorder.RenderTransform = movement;
+        SettingsSegments.Animate(movement, TranslateTransform.YProperty, -12, 0, 250);
+        SettingsSegments.Animate(suggestionBorder, OpacityProperty, 0, 1, 250);
     }
 
     public void FocusInput()
     {
         if (closing || closed) return;
-        Activate(); search.Focus(); search.SelectAll();
+        inputBox.FocusInput();
     }
     protected override void OnClosing(CancelEventArgs e)
     {
@@ -155,11 +200,16 @@ internal sealed class SearchWindow : Window
         base.OnClosing(e);
         if (e.Cancel) closing = false;
     }
-    private void ClosePalette()
+    private void ClosePalette(bool clearQuery = false, bool blur = false)
     {
         if (closing || closed) return;
         closing = true;
-        try { Close(); }
+        try
+        {
+            if (clearQuery) inputBox.ClearQuery();
+            if (blur) inputBox.BlurInput();
+            Close();
+        }
         finally { if (!closed) closing = false; }
     }
     private void AttachOwner()
@@ -168,6 +218,14 @@ internal sealed class SearchWindow : Window
         anchorOwner = Owner;
         anchorOwner.LocationChanged += CloseForOwnerChange; anchorOwner.SizeChanged += CloseForOwnerSize;
         anchorOwner.StateChanged += CloseForOwnerChange; anchorOwner.IsVisibleChanged += CloseForOwnerVisibility;
+        anchorOwner.Deactivated += CloseForOwnerChange; anchorOwner.PreviewMouseDown += OwnerPointerDown;
+    }
+    private void QueryChanged(object sender, TextChangedEventArgs e) { if (!closing && !closed) Filter(); }
+    private void InputLostFocus(object sender, KeyboardFocusChangedEventArgs e) => ClosePalette();
+    private void OwnerPointerDown(object sender, MouseButtonEventArgs e)
+    {
+        if (new Rect(inputBox.RenderSize).Contains(e.GetPosition(inputBox))) return;
+        ClosePalette();
     }
     private void CloseForOwnerChange(object? sender, EventArgs e) => ClosePalette();
     private void CloseForOwnerSize(object sender, SizeChangedEventArgs e) => ClosePalette();
@@ -180,30 +238,40 @@ internal sealed class SearchWindow : Window
         positioning = true;
         try
         {
-            var anchor = Owner.FindName("SearchButton") as FrameworkElement ?? Owner;
-            Point origin = anchor.PointToScreen(new Point());
+            var anchor = inputBox;
+            Point origin = anchor.PointToScreen(new Point(0, anchor.ActualHeight));
+            Point ownerOrigin = Owner.PointToScreen(new Point());
             var dpi = VisualTreeHelper.GetDpi(anchor);
             double scale = dpi.DpiScaleX, verticalScale = dpi.DpiScaleY;
             var work = System.Windows.Forms.Screen.FromPoint(new System.Drawing.Point((int)origin.X, (int)origin.Y)).WorkingArea;
-            double availableWidth = Math.Max(200, work.Width / scale - 16);
-            double width = Math.Min(Math.Clamp(anchor.ActualWidth, 320, 680), availableWidth);
-            double inputHeight = Math.Max(32, Math.Min(40, anchor.ActualHeight));
-            double left = Math.Clamp(origin.X, work.Left + 8 * scale, Math.Max(work.Left + 8 * scale, work.Right - (width + 8) * scale));
-            double top = Math.Clamp(origin.Y, work.Top + 8 * verticalScale, Math.Max(work.Top + 8 * verticalScale, work.Bottom - 168 * verticalScale));
-            double wantedHeight = inputHeight + 4 + 32 + Math.Max(1, results.Items.Count) * 54 + 32 + 18 + (state.Visibility == Visibility.Visible ? 54 : 0);
-            double height = Math.Min(wantedHeight, Math.Max(160, (work.Bottom - top) / verticalScale - 8));
-            search.Width = Math.Min(width, anchor.ActualWidth > 0 ? anchor.ActualWidth : width);
-            search.Height = inputHeight; search.HorizontalAlignment = HorizontalAlignment.Left;
-            search.Margin = new Thickness(Math.Clamp((origin.X - left) / scale, 0, Math.Max(0, width - search.Width)), 0, 0, 0);
-            Width = width; Height = height;
+            double availableWidth = Math.Max(1, Math.Min(Owner.ActualWidth, work.Width / scale) - 16);
+            double width = Math.Min(Math.Max(anchor.ActualWidth, 320), availableWidth);
+            double minimumLeft = Math.Max(ownerOrigin.X, work.Left) + 8 * scale;
+            double maximumRight = Math.Min(ownerOrigin.X + Owner.ActualWidth * scale, work.Right) - 8 * scale;
+            double left = Math.Clamp(origin.X, minimumLeft, Math.Max(minimumLeft, maximumRight - width * scale));
+            double top = origin.Y + 4 * verticalScale;
+            suggestions.Measure(new Size(Math.Max(1, width - 10), double.PositiveInfinity));
+            double maxHeight = Math.Min(380, Math.Max(40, (work.Bottom - top) / verticalScale - 8));
+            double panelHeight = Math.Min(maxHeight, suggestions.DesiredSize.Height + 10);
+            suggestionBorder.MaxHeight = maxHeight; suggestionBorder.Height = panelHeight;
+            Width = width; Height = panelHeight;
             // Physical coordinates keep the flyout on the owner's monitor at mixed DPI settings.
-            _ = SetWindowPos(handle, IntPtr.Zero, (int)Math.Round(left), (int)Math.Round(top), (int)Math.Round(width * scale), (int)Math.Round(height * verticalScale), 0x0014);
+            _ = SetWindowPos(handle, IntPtr.Zero, (int)Math.Round(left), (int)Math.Round(top), (int)Math.Round(width * scale), (int)Math.Round(panelHeight * verticalScale), 0x0014);
         }
         finally { positioning = false; }
     }
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+    private static extern IntPtr GetWindowLongPtr(IntPtr window, int index);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
+    private static extern IntPtr SetWindowLongPtr(IntPtr window, int index, IntPtr value);
+    private IntPtr WindowMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (message == 0x0021) { handled = true; return new IntPtr(3); } // WM_MOUSEACTIVATE: MA_NOACTIVATE
+        return IntPtr.Zero;
+    }
 
     private void RebuildEntries()
     {
@@ -213,19 +281,19 @@ internal sealed class SearchWindow : Window
         AddCommand(running ? "cmd-stop" : "cmd-start", running ? "停止内核" : "启动内核", running ? "stop" : "play",
             running ? "desktop_stop" : "desktop_start", "core start stop 内核 启动 停止", () => DesktopReady,
             L.T(running ? "运行中" : "已停止"));
-        entries.Add(new Entry("cmd-proxy", "command", "nav-proxies", L.T(session.Status.Bool("systemProxy") ? "关闭系统代理" : "开启系统代理"), "Windows",
+        entries.Add(new Entry("cmd-proxy", "command", "nav-proxies", L.T(session.Status.Bool("systemProxy") ? "关闭系统代理" : "开启系统代理"), "",
             "system proxy 系统代理", async () => await session.CommandAsync("desktop_set_system_proxy", new { enabled = !session.Status.Bool("systemProxy") }),
             () => DesktopReady && session.Status.Get("capabilities").Bool("systemProxy")));
         AddNavigation("cmd-tun", "command", "shield-lock", session.Status.Bool("tun") ? "关闭 TUN 模式" : "开启 TUN 模式", "TUN",
             "tun virtual adapter 虚拟网卡", new("home", Action: "toggle-tun"), () => DesktopReady && !session.IsDirty && session.Status.Get("capabilities").Bool("tun"));
         AddNavigation("cmd-import", "command", "arrow-import", "导入配置", "", "import yaml subscription 导入 订阅 配置", new("profiles", Action: "import"), () => DesktopReady && session.Status.Get("capabilities").Bool("configImport"));
         AddNavigation("cmd-test", "command", "speed", "全部测速", "Ctrl+T", "latency speed test 测速 延迟", new("proxies", Action: "test-all"), () => RuntimeReady);
-        AddNavigation("cmd-edit", "command", "edit", "编辑配置", "YAML", "yaml config editor 编辑 配置", new("profiles", Action: "edit"), () => session.Ready && !session.IsUpdating);
+        AddNavigation("cmd-edit", "command", "edit", "编辑配置文件", "", "yaml config editor 编辑 配置", new("profiles", Action: "edit"), () => session.Ready && !session.IsUpdating);
         AddCommand("cmd-restart", "重启内核", "arrow-sync", "desktop_restart", "core restart 重启 内核", () => DesktopReady && !session.IsDirty);
         foreach (string mode in new[] { "rule", "global", "direct" })
         {
-            string title = mode switch { "rule" => "切换规则模式", "global" => "切换全局模式", _ => "切换直连模式" };
-            string detail = runtimeMode == mode ? L.T("当前模式") : L.T(mode switch { "rule" => "规则", "global" => "全局", _ => "直连" });
+            string title = mode switch { "rule" => "切换到规则模式", "global" => "切换到全局模式", _ => "切换到直连模式" };
+            string detail = runtimeMode == mode ? L.T("当前模式") : L.ShortMode(mode);
             entries.Add(new Entry("mode-" + mode, "command", "arrow-swap", L.T(title), detail, "mode " + mode + " " + title,
                 async () => await session.CommandAsync("desktop_patch_config", new { patch = new Dictionary<string, object> { ["mode"] = mode } }),
                 () => RuntimeReady && !session.IsDirty));
@@ -240,7 +308,7 @@ internal sealed class SearchWindow : Window
             ("connections", "连接", "nav-connections", "connections traffic 连接 流量"), ("dns", "DNS", "nav-dns", "dns lookup domain 域名 查询"),
             ("rules", "规则", "nav-rules", "rules match 规则 匹配"), ("logs", "日志", "nav-logs", "logs errors 日志 错误"),
             ("profiles", "配置", "nav-profiles", "profiles config subscription yaml 配置 订阅"), ("settings", "设置", "nav-settings", "settings preferences 设置 偏好")
-        }) AddNavigation("page-" + page, "page", icon, title, L.T("页面"), keywords, new(page));
+        }) AddNavigation("page-" + page, "page", icon, title, page == "home" ? "/" : "/" + page, keywords, new(page));
         entries.AddRange(coreEntries);
         foreach (var target in SearchTargets.Settings)
             AddNavigation("setting-" + target.Id, "setting", "setting", target.Title, L.T(target.Page == "profiles" ? "配置" : "设置"), target.Keywords,
@@ -268,37 +336,44 @@ internal sealed class SearchWindow : Window
             for (int index = 0; index < results.Items.Count; index++)
                 if (((ListBoxItem)results.Items[index]).Tag is Entry entry && entry.Key == selectedKey) { selected = index; break; }
         if (results.Items.Count > 0) results.SelectedIndex = selected;
-        resultCount.Text = query.Length == 0 ? L.T("快捷命令 · 输入关键词搜索全部内容")
-            : candidates.Length > MaximumVisibleResults ? L.F("{0} 个结果，显示前 {1} 项；请细化关键词", candidates.Length, MaximumVisibleResults)
+        resultCount.Text = L.T("试试这些"); resultCount.Visibility = query.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        string countDescription = candidates.Length > MaximumVisibleResults ? L.F("{0} 个结果，显示前 {1} 项；请细化关键词", candidates.Length, MaximumVisibleResults)
             : L.F("{0} 个结果", candidates.Length);
-        empty.Text = L.F("未找到与“{0}”匹配的内容", query);
+        AutomationProperties.SetItemStatus(results, countDescription);
+        empty.Text = L.F("没有找到“{0}”。可以搜索节点、策略组、规则、设置项或命令。", query);
         empty.Visibility = candidates.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
         state.Text = loading ? L.T("正在读取策略组、节点和规则…")
             : loadError is not null ? L.F("部分内容未能读取：{0}。按 F5 重试。", loadError)
             : !RuntimeReady ? L.T("启动内核后，可搜索策略组、节点和规则。页面与设置始终可搜索。")
             : L.T("选择结果可定位到页面、控件或规则；节点结果会定位到节点。");
-        state.Visibility = loading || loadError is not null || !RuntimeReady ? Visibility.Visible : Visibility.Collapsed;
+        AutomationProperties.SetHelpText(search, state.Text);
         if (IsLoaded) PositionFlyout();
     }
 
     private ListBoxItem RenderResult(Entry entry, string query)
     {
-        var row = new Grid(); row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(34) });
+        var row = new Grid(); row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(28) });
         row.ColumnDefinitions.Add(new ColumnDefinition()); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        row.Children.Add(new FluentIcon(entry.Icon, 16) { VerticalAlignment = VerticalAlignment.Center });
-        var title = Ui.Text("", 14, true); title.TextTrimming = TextTrimming.CharacterEllipsis; title.TextWrapping = TextWrapping.NoWrap;
+        var glyph = new FluentIcon(entry.Icon, 16) { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Left };
+        glyph.SetResourceReference(Control.ForegroundProperty, "TextSecondaryBrush"); row.Children.Add(glyph);
+        var title = Ui.Text("", 14); title.TextTrimming = TextTrimming.CharacterEllipsis; title.TextWrapping = TextWrapping.NoWrap;
+        title.LineHeight = 20; title.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
         AppendHighlight(title, entry.Title, query);
         var detail = Ui.Muted(entry.Detail); detail.TextWrapping = TextWrapping.NoWrap; detail.TextTrimming = TextTrimming.CharacterEllipsis;
-        detail.Margin = new Thickness(0, 4, 0, 0); detail.Visibility = entry.Detail.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+        detail.LineHeight = 16; detail.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
+        detail.Visibility = entry.Detail.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         var text = Ui.Column(title, detail); Grid.SetColumn(text, 1); row.Children.Add(text);
-        string category = L.T(entry.Category switch { "command" => "命令", "page" => "页面", "group" => "策略组", "node" => "节点", "setting" => "设置", _ => "规则" });
-        var label = Ui.Muted(category, 11); label.Margin = new Thickness(16, 0, 0, 0); Grid.SetColumn(label, 2); row.Children.Add(label);
+        string category = L.IsEnglish ? entry.Category switch { "command" => "Command", "page" => "Page", "group" => "Group", "node" => "Node", "setting" => "Setting", _ => "Rule" }
+            : entry.Category switch { "command" => "命令", "page" => "页面", "group" => "策略组", "node" => "节点", "setting" => "设置", _ => "规则" };
+        var label = Ui.Muted(category, 12); label.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush");
+        label.TextWrapping = TextWrapping.NoWrap; label.Margin = new Thickness(12, 0, 0, 0); Grid.SetColumn(label, 2); row.Children.Add(label);
         var item = new ResultItem { Execute = () => RunEntry(entry), CanExecute = () => entry.IsEnabled && !closing && !closed && !choosing,
-            Content = row, Tag = entry, Padding = new Thickness(12, 10, 12, 10), Margin = new Thickness(0, 2, 0, 2), HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            Content = row, Tag = entry, Style = (Style)templates["Result"],
             Opacity = entry.IsEnabled ? 1 : 0.5, ToolTip = entry.IsEnabled ? null : L.T("当前状态无法执行此命令，请等待正在进行的操作完成。") }.Id("SearchResult_" + entry.Key);
         AutomationProperties.SetName(item, entry.Title + " · " + category + (entry.Detail.Length > 0 ? " · " + entry.Detail : ""));
         AutomationProperties.SetHelpText(item, entry.IsEnabled ? "" : L.T("当前状态无法执行此命令，请等待正在进行的操作完成。"));
         item.MouseEnter += (_, _) => { results.SelectedItem = item; };
+        item.PreviewMouseLeftButtonDown += (_, e) => { e.Handled = true; results.SelectedItem = item; };
         item.PreviewMouseLeftButtonUp += async (_, e) => { e.Handled = true; await RunEntry(entry); };
         return item;
     }
@@ -309,8 +384,8 @@ internal sealed class SearchWindow : Window
         if (start < 0) { text.Inlines.Add(new Run(title)); return; }
         text.Inlines.Add(new Run(title[..start]));
         var highlight = new Run(title.Substring(start, query.Length));
-        highlight.SetResourceReference(TextElement.BackgroundProperty, "AccentBrush");
-        highlight.SetResourceReference(TextElement.ForegroundProperty, "AccentTextBrush");
+        highlight.FontWeight = FontWeights.SemiBold;
+        highlight.SetResourceReference(TextElement.ForegroundProperty, "AccentLinkBrush");
         text.Inlines.Add(highlight); text.Inlines.Add(new Run(title[(start + query.Length)..]));
     }
 
@@ -380,43 +455,45 @@ internal sealed class SearchWindow : Window
     }
     private void OnLanguageChanged() => RebuildEntries();
 
-    private async void OnKeyDown(object sender, KeyEventArgs e)
+    internal bool HandleKey(KeyEventArgs e)
     {
-        if (e.Key == Key.Escape) { e.Handled = true; ClosePalette(); return; }
-        if (e.Key == Key.K && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; search.Focus(); search.SelectAll(); return; }
+        if (closing || closed) return false;
+        if (e.Key == Key.Escape) { e.Handled = true; ClosePalette(clearQuery: true, blur: true); return true; }
+        if (e.Key == Key.K && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; FocusInput(); return true; }
         if (e.Key == Key.T && Keyboard.Modifiers == ModifierKeys.Control)
         {
             e.Handled = true;
-            if (entries.FirstOrDefault(entry => entry.Key == "cmd-test") is { } test) await RunEntry(test);
-            return;
+            if (entries.FirstOrDefault(entry => entry.Key == "cmd-test") is { } test) _ = RunEntry(test);
+            return true;
         }
-        if (e.Key == Key.F5) { e.Handled = true; await LoadCoreEntries(); return; }
+        if (e.Key == Key.F5) { e.Handled = true; _ = LoadCoreEntries(); return true; }
         if (e.Key is Key.Up or Key.Down)
         {
             e.Handled = true;
-            if (searchDelay.IsEnabled) { searchDelay.Stop(); Filter(); }
-            if (results.Items.Count == 0) return;
+            if (results.Items.Count == 0) return true;
             int step = e.Key == Key.Down ? 1 : -1;
             results.SelectedIndex = (results.SelectedIndex + step + results.Items.Count) % results.Items.Count;
-            results.ScrollIntoView(results.SelectedItem); return;
+            if (results.SelectedItem is ListBoxItem selected) selected.BringIntoView();
+            return true;
         }
         if (e.Key == Key.Enter)
         {
             e.Handled = true;
-            if (searchDelay.IsEnabled) { searchDelay.Stop(); Filter(); }
-            if (results.SelectedItem is ListBoxItem { Tag: Entry entry }) await RunEntry(entry);
+            if (results.SelectedItem is ListBoxItem { Tag: Entry entry }) _ = RunEntry(entry);
+            return true;
         }
+        return false;
     }
 
     private async Task RunEntry(Entry entry)
     {
         if (choosing || closing || closed) return;
-        if (!entry.IsEnabled) { state.Text = L.T("当前状态无法执行此命令，请等待正在进行的操作完成。"); return; }
+        if (!entry.IsEnabled) { state.Text = L.T("当前状态无法执行此命令，请等待正在进行的操作完成。"); session.Notify(state.Text, true); return; }
         choosing = true;
         try
         {
             // Close the palette before navigation so the destination receives keyboard focus.
-            ClosePalette();
+            ClosePalette(clearQuery: true, blur: true);
             await entry.Run();
         }
         catch (Exception error) { session.Notify(error.Message, true); }

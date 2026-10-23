@@ -6,7 +6,7 @@
         xmlns:services="clr-namespace:Mihomo.Desktop.Services"
         Title="Mihomo Optimized" Width="1180" Height="780" MinWidth="360" MinHeight="420"
         WindowStartupLocation="CenterScreen" WindowStyle="None" ResizeMode="CanResize"
-        FontFamily="Segoe UI Variable, Segoe UI, Microsoft YaHei UI" FontSize="14"
+        FontFamily="Segoe UI Variable Text, Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Microsoft YaHei" FontSize="14"
         Background="{DynamicResource AppBackgroundBrush}" Foreground="{DynamicResource TextPrimaryBrush}"
         Icon="Assets/icon.ico" AutomationProperties.AutomationId="MainWindow"
         AllowDrop="True" PreviewDragOver="OnDragOver" PreviewDragLeave="OnDragLeave" PreviewDrop="OnDrop">
@@ -20,42 +20,61 @@
       <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
       <Setter Property="shell:WindowChrome.IsHitTestVisibleInChrome" Value="True"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
-        <Border x:Name="Frame" Background="{TemplateBinding Background}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+        <Border x:Name="Frame" controls:ShellVisuals.Background="{TemplateBinding Background}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
         <ControlTemplate.Triggers>
-          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Frame" Property="Background" Value="{DynamicResource SubtleSurfaceBrush}"/></Trigger>
-          <Trigger Property="Tag" Value="hover"><Setter TargetName="Frame" Property="Background" Value="{DynamicResource SubtleSurfaceBrush}"/></Trigger>
-          <Trigger Property="IsPressed" Value="True"><Setter TargetName="Frame" Property="Opacity" Value="0.6"/></Trigger>
-          <Trigger Property="Tag" Value="pressed"><Setter TargetName="Frame" Property="Background" Value="{DynamicResource BorderBrush}"/></Trigger>
-          <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Frame" Property="Background" Value="{DynamicResource BorderBrush}"/></Trigger>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="{DynamicResource SubtleHoverBrush}"/></Trigger>
+          <Trigger Property="Tag" Value="hover"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="{DynamicResource SubtleHoverBrush}"/></Trigger>
+          <Trigger Property="IsPressed" Value="True"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="{DynamicResource SubtlePressedBrush}"/><Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/></Trigger>
+          <Trigger Property="Tag" Value="pressed"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="{DynamicResource SubtlePressedBrush}"/><Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/></Trigger>
         </ControlTemplate.Triggers>
       </ControlTemplate></Setter.Value></Setter>
+      <Style.Triggers><DataTrigger Binding="{Binding IsActive, RelativeSource={RelativeSource AncestorType=Window}}" Value="False"><Setter Property="Foreground" Value="{DynamicResource TextDisabledBrush}"/></DataTrigger></Style.Triggers>
     </Style>
     <Style x:Key="CaptionCloseButton" TargetType="Button" BasedOn="{StaticResource CaptionButton}">
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
-        <Border x:Name="Frame" Background="Transparent"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+        <Border x:Name="Frame" controls:ShellVisuals.Background="Transparent"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
         <ControlTemplate.Triggers>
-          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Frame" Property="Background" Value="#C42B1C"/><Setter Property="Foreground" Value="White"/></Trigger>
-          <Trigger Property="IsPressed" Value="True"><Setter TargetName="Frame" Property="Background" Value="#A32317"/><Setter Property="Foreground" Value="White"/></Trigger>
-          <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Frame" Property="Background" Value="{DynamicResource BorderBrush}"/></Trigger>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="#C42B1C"/><Setter Property="Foreground" Value="White"/></Trigger>
+          <Trigger Property="IsPressed" Value="True"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="#E6C42B1C"/><Setter Property="Foreground" Value="#B3FFFFFF"/></Trigger>
         </ControlTemplate.Triggers>
       </ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style x:Key="TitleButton" TargetType="Button" BasedOn="{StaticResource CaptionButton}">
       <Setter Property="Width" Value="40"/><Setter Property="Height" Value="36"/><Setter Property="VerticalAlignment" Value="Center"/>
-      <Style.Triggers><Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.35"/></Trigger></Style.Triggers>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+        <Border x:Name="Frame" CornerRadius="4" controls:ShellVisuals.Background="Transparent"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="{DynamicResource SubtleHoverBrush}"/></Trigger>
+          <Trigger Property="IsPressed" Value="True"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="{DynamicResource SubtlePressedBrush}"/><Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/></Trigger>
+          <Trigger Property="IsEnabled" Value="False"><Setter Property="Foreground" Value="{DynamicResource TextDisabledBrush}"/></Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+    <Style x:Key="TitleSearch" TargetType="Button">
+      <Setter Property="Background" Value="{DynamicResource ControlBrush}"/><Setter Property="BorderBrush" Value="{DynamicResource ControlStrokeBrush}"/><Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+        <Grid><Border x:Name="Frame" controls:ShellVisuals.Background="{TemplateBinding Background}" BorderThickness="1" BorderBrush="{TemplateBinding BorderBrush}" CornerRadius="4"><ContentPresenter HorizontalAlignment="Stretch" VerticalAlignment="Center"/></Border>
+          <Border x:Name="Underline" Height="1" Margin="1,0,1,0" VerticalAlignment="Bottom" CornerRadius="0,0,4,4" Background="{DynamicResource ControlStrongBrush}"/>
+        </Grid>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="{DynamicResource ControlHoverBrush}"/></Trigger>
+          <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Underline" Property="Background" Value="{DynamicResource AccentBrush}"/><Setter TargetName="Underline" Property="Height" Value="2"/></Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style x:Key="ShellNavItem" TargetType="ListBoxItem">
-      <Setter Property="Height" Value="36"/><Setter Property="Margin" Value="4,2"/><Setter Property="Padding" Value="12,0"/>
+      <Setter Property="controls:ShellVisuals.TrackPress" Value="True"/>
+      <Setter Property="Height" Value="36"/><Setter Property="Margin" Value="4,0,4,4"/><Setter Property="Padding" Value="12,0"/>
       <Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="VerticalContentAlignment" Value="Center"/>
       <Setter Property="Background" Value="Transparent"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBoxItem">
-        <Border x:Name="Frame" CornerRadius="4" Padding="{TemplateBinding Padding}" Background="{TemplateBinding Background}" BorderThickness="1" BorderBrush="Transparent">
+        <Border x:Name="Frame" CornerRadius="4" Padding="{TemplateBinding Padding}" controls:ShellVisuals.Background="{TemplateBinding Background}">
           <ContentPresenter HorizontalAlignment="Stretch" VerticalAlignment="Center"/>
         </Border>
         <ControlTemplate.Triggers>
-          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Frame" Property="Background" Value="{DynamicResource SubtleSurfaceBrush}"/></Trigger>
-          <Trigger Property="IsSelected" Value="True"><Setter TargetName="Frame" Property="Background" Value="{DynamicResource SubtleSurfaceBrush}"/></Trigger>
-          <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Frame" Property="BorderBrush" Value="{DynamicResource AccentBrush}"/></Trigger>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="{DynamicResource SubtleHoverBrush}"/></Trigger>
+          <Trigger Property="IsSelected" Value="True"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="{DynamicResource SubtleHoverBrush}"/></Trigger>
+          <Trigger Property="controls:ShellVisuals.Pressed" Value="True"><Setter TargetName="Frame" Property="controls:ShellVisuals.Background" Value="{DynamicResource SubtlePressedBrush}"/><Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/></Trigger>
         </ControlTemplate.Triggers>
       </ControlTemplate></Setter.Value></Setter>
     </Style>
@@ -64,26 +83,22 @@
     <Grid.RowDefinitions><RowDefinition Height="48"/><RowDefinition Height="*"/></Grid.RowDefinitions>
     <Grid x:Name="TitleBar" AutomationProperties.AutomationId="NativeTitleBar">
       <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-      <StackPanel Orientation="Horizontal" Margin="4,0,12,0">
+      <StackPanel Orientation="Horizontal" Margin="4,0,4,0">
         <Button x:Name="BackButton" Style="{StaticResource TitleButton}" Click="GoBack" IsEnabled="False"
                 ToolTip="{services:Tr 返回}" AutomationProperties.Name="{services:Tr 返回}" AutomationProperties.AutomationId="TitleBarBack"><controls:FluentIcon Kind="arrow-left"/></Button>
-        <Button x:Name="NavigationToggle" Style="{StaticResource TitleButton}" Click="ToggleNavigation"
+        <Button x:Name="NavigationToggle" Style="{StaticResource TitleButton}" Click="ToggleNavigation" Margin="2,0,0,0"
                 ToolTip="{services:Tr 展开或收起导航}" AutomationProperties.Name="{services:Tr 展开或收起导航}" AutomationProperties.AutomationId="NavigationToggle"><controls:FluentIcon Kind="navigation"/></Button>
-        <StackPanel x:Name="TitleIdentity" Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0" IsHitTestVisible="False">
-          <Image x:Name="TitleLogo" Source="Assets/icon.ico" Width="16" Height="16"/>
-          <TextBlock x:Name="TitleName" Text="Mihomo Optimized" FontSize="12" Margin="8,0,0,0" VerticalAlignment="Center"/>
+        <StackPanel x:Name="TitleIdentity" Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,8,0" IsHitTestVisible="False">
+          <Image x:Name="TitleLogo" Source="Assets/logo.png" Width="16" Height="16"/>
+          <TextBlock x:Name="TitleName" Text="Mihomo Optimized" FontSize="12" LineHeight="16" Margin="12,0,0,0" VerticalAlignment="Center" controls:ShellVisuals.Duration="167"/>
+          <TextBlock x:Name="TitleSubtitle" FontSize="12" LineHeight="16" Margin="12,0,0,0" VerticalAlignment="Center"
+                     TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextTertiaryBrush}"
+                     Visibility="Collapsed" controls:ShellVisuals.Duration="167"/>
         </StackPanel>
       </StackPanel>
-      <Button x:Name="SearchButton" Grid.Column="1" MaxWidth="380" Height="32" Margin="0,0,12,0" Padding="12,3" HorizontalContentAlignment="Stretch"
-              shell:WindowChrome.IsHitTestVisibleInChrome="True" Click="OpenSearch" AutomationProperties.AutomationId="GlobalSearch"
-              ToolTip="{services:Tr 搜索页面、节点或命令}" AutomationProperties.Name="{services:Tr 搜索页面、节点或命令}">
-        <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-          <controls:FluentIcon Kind="search" Foreground="{DynamicResource TextSecondaryBrush}"/>
-          <TextBlock x:Name="SearchLabel" Grid.Column="1" Text="{services:Tr 搜索页面、节点或命令}" Margin="8,0,0,0" FontSize="12" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondaryBrush}"/>
-          <TextBlock x:Name="SearchShortcut" Grid.Column="2" Text="Ctrl+K" Margin="16,0,0,0" FontSize="12" VerticalAlignment="Center" Foreground="{DynamicResource TextSecondaryBrush}"/>
-        </Grid>
-      </Button>
-      <StackPanel Grid.Column="2" Orientation="Horizontal">
+      <controls:GlobalSearchBox x:Name="SearchButton" Grid.Column="1" MaxWidth="380" Height="32" Margin="12,0"
+                               shell:WindowChrome.IsHitTestVisibleInChrome="True"/>
+      <StackPanel x:Name="CaptionButtons" Grid.Column="2" Orientation="Horizontal" Margin="4,0,0,0">
         <Button Style="{StaticResource CaptionButton}" Click="MinimizeWindow" ToolTip="{services:Tr 最小化}" AutomationProperties.Name="{services:Tr 最小化}" AutomationProperties.AutomationId="TitleBarMinimize"><controls:FluentIcon Kind="minimize"/></Button>
         <Button x:Name="MaximizeButton" Style="{StaticResource CaptionButton}" Click="MaximizeWindow" ToolTip="{services:Tr 最大化}" AutomationProperties.Name="{services:Tr 最大化}" AutomationProperties.AutomationId="TitleBarMaximize"><controls:FluentIcon x:Name="MaximizeIcon" Kind="maximize"/></Button>
         <Button Style="{StaticResource CaptionCloseButton}" Click="CloseToTray" ToolTip="{services:Tr 关闭}" AutomationProperties.Name="{services:Tr 关闭}" AutomationProperties.AutomationId="TitleBarClose"><controls:FluentIcon Kind="dismiss"/></Button>
@@ -92,44 +107,43 @@
     <Grid x:Name="ContentLayout" Grid.Row="1">
       <Grid.ColumnDefinitions><ColumnDefinition x:Name="NavigationColumn" Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
       <Grid x:Name="NavigationDock" Width="280" ClipToBounds="True">
-        <Grid x:Name="NavigationPane" Width="280" Margin="0,0,0,4">
+        <Grid x:Name="NavigationPane" Width="280" Margin="0,4,0,6" ClipToBounds="True">
           <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-          <Button x:Name="CoreCardButton" Margin="4,6,4,12" Height="64" Padding="8" HorizontalContentAlignment="Stretch" Click="OpenCoreMenu" AutomationProperties.AutomationId="CoreCard" AutomationProperties.Name="{services:Tr 本地内核}">
-            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+          <Button x:Name="CoreCardButton" Margin="4,2,4,8" Height="56" Padding="8" HorizontalContentAlignment="Stretch" Click="OpenCoreMenu" AutomationProperties.AutomationId="CoreCard" AutomationProperties.Name="{services:Tr 本地内核}">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
               <Grid x:Name="CoreAvatar" Width="40" Height="40" VerticalAlignment="Center">
-                <Border x:Name="CoreAvatarBackground" CornerRadius="20" Background="{DynamicResource SubtleSurfaceBrush}"><controls:FluentIcon x:Name="CoreGlyph" Kind="power" Width="20" Height="20"/></Border>
-                <Border x:Name="CoreStatusDot" Width="12" Height="12" CornerRadius="6" BorderThickness="2" BorderBrush="{DynamicResource AppBackgroundBrush}" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="{DynamicResource TextSecondaryBrush}"/>
+                <Border x:Name="CoreAvatarBackground" CornerRadius="20" controls:ShellVisuals.Duration="250" controls:ShellVisuals.Background="{DynamicResource ControlAltBrush}"><controls:FluentIcon x:Name="CoreGlyph" Kind="power" Width="20" Height="20"/></Border>
+                <Border x:Name="CoreStatusDot" Width="16" Height="16" Margin="0,0,-2,-2" CornerRadius="8" BorderThickness="2" BorderBrush="{DynamicResource DialogBottomBrush}" HorizontalAlignment="Right" VerticalAlignment="Bottom" controls:ShellVisuals.Duration="250" controls:ShellVisuals.Background="{DynamicResource TextTertiaryBrush}"/>
                 <controls:FluentProgressRing x:Name="CoreProgress" Width="48" Height="48" Margin="-4"/>
               </Grid>
-              <StackPanel x:Name="CoreText" Grid.Column="1" Margin="12,0,6,0" VerticalAlignment="Center">
-                <TextBlock x:Name="PhaseText" Text="{services:Tr 正在连接…}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" AutomationProperties.AutomationId="CorePhase"/>
-                <TextBlock x:Name="VersionText" FontSize="12" Margin="0,2,0,0" Foreground="{DynamicResource TextSecondaryBrush}" TextTrimming="CharacterEllipsis"/>
+              <StackPanel x:Name="CoreText" Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
+                <TextBlock x:Name="PhaseText" Text="{services:Tr 正在连接…}" FontWeight="SemiBold" FontSize="14" LineHeight="20" TextTrimming="CharacterEllipsis" AutomationProperties.AutomationId="CorePhase"/>
+                <TextBlock x:Name="VersionText" FontSize="12" LineHeight="16" Foreground="{DynamicResource TextSecondaryBrush}" TextTrimming="CharacterEllipsis"/>
               </StackPanel>
-              <controls:FluentIcon x:Name="CoreChevron" Grid.Column="2" Kind="chevron-down" Foreground="{DynamicResource TextSecondaryBrush}"/>
             </Grid>
           </Button>
           <ListBox x:Name="NavigationList" Grid.Row="1" Background="Transparent" BorderThickness="0" Padding="0" ItemContainerStyle="{StaticResource ShellNavItem}"
-                   SelectionChanged="NavigationChanged" ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.VerticalScrollBarVisibility="Auto" AutomationProperties.AutomationId="Navigation">
+                   SelectionChanged="NavigationChanged" ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.VerticalScrollBarVisibility="Hidden" AutomationProperties.AutomationId="Navigation">
             <ListBoxItem Tag="home" AutomationProperties.AutomationId="NavHome"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-home"/><TextBlock Text="{services:Tr 主页}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
             <ListBoxItem Tag="proxies" AutomationProperties.AutomationId="NavProxies"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-proxies"/><TextBlock Text="{services:Tr 代理}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
             <ListBoxItem Tag="connections" AutomationProperties.AutomationId="NavConnections"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-connections"/><TextBlock Text="{services:Tr 连接}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
             <ListBoxItem Tag="dns" AutomationProperties.AutomationId="NavDns"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-dns"/><TextBlock Text="DNS" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
             <ListBoxItem Tag="rules" AutomationProperties.AutomationId="NavRules"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-rules"/><TextBlock Text="{services:Tr 规则}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
             <ListBoxItem Tag="logs" AutomationProperties.AutomationId="NavLogs"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-logs"/><TextBlock Text="{services:Tr 日志}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
-            <ListBoxItem Tag="profiles" AutomationProperties.AutomationId="NavProfiles"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-profiles"/><TextBlock Text="{services:Tr 配置}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
           </ListBox>
-          <Border Grid.Row="2" BorderThickness="0,1,0,0" BorderBrush="{DynamicResource BorderBrush}" Padding="0,4,0,4" Margin="0,4,0,0">
+          <Border Grid.Row="2" BorderThickness="0,1,0,0" BorderBrush="{DynamicResource DividerBrush}" Padding="0,6,0,0" Margin="0,12,0,0">
             <ListBox x:Name="SettingsNavigation" Background="Transparent" BorderThickness="0" Padding="0" ItemContainerStyle="{StaticResource ShellNavItem}" SelectionChanged="NavigationChanged" ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.VerticalScrollBarVisibility="Disabled">
-              <ListBoxItem Tag="settings" AutomationProperties.AutomationId="NavSettings"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <ListBoxItem Tag="profiles" Margin="4,0,4,4" AutomationProperties.AutomationId="NavProfiles"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-profiles"/><TextBlock x:Name="ProfilesLabel" Text="{services:Tr 配置}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
+              <ListBoxItem Tag="settings" Margin="4,0" AutomationProperties.AutomationId="NavSettings"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                 <controls:FluentIcon Kind="nav-settings"/><TextBlock x:Name="SettingsLabel" Grid.Column="1" Text="{services:Tr 设置}" Margin="16,0,0,0"/>
-                <Border x:Name="UpdateBadge" Grid.Column="2" Width="8" Height="8" Margin="8,0,4,0" CornerRadius="4" Background="{DynamicResource AccentBrush}" Visibility="Collapsed"/>
+                <Border x:Name="UpdateBadge" Grid.Column="2" Width="6" Height="6" CornerRadius="3" Background="{DynamicResource AccentBrush}" Visibility="Collapsed"/>
               </Grid></ListBoxItem>
             </ListBox>
           </Border>
           <Canvas x:Name="SelectionCanvas" Grid.RowSpan="3" IsHitTestVisible="False"><Border x:Name="SelectionPill" Width="3" Height="16" CornerRadius="2" Background="{DynamicResource AccentBrush}" Canvas.Left="4" Visibility="Collapsed"/></Canvas>
         </Grid>
       </Grid>
-      <Border x:Name="MainContentBorder" Grid.Column="1" Margin="0,0,8,8" CornerRadius="8" Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" ClipToBounds="True">
+      <Border x:Name="MainContentBorder" Grid.Column="1" CornerRadius="8,0,0,0" Background="{DynamicResource LayerBrush}" BorderBrush="{DynamicResource LayerStrokeBrush}" BorderThickness="1,1,0,0" ClipToBounds="True">
         <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
           <Border x:Name="NoticeBorder" Visibility="Collapsed" Padding="14,10" Margin="20,16,20,0" CornerRadius="4" Background="{DynamicResource SubtleSurfaceBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1">
             <DockPanel><Button DockPanel.Dock="Right" Width="28" Height="28" Padding="4" Content="×" ToolTip="{services:Tr 关闭提示}" AutomationProperties.Name="{services:Tr 关闭提示}" Click="DismissNotice" Margin="12,0,0,0"/>
@@ -139,8 +153,10 @@
           <ContentControl x:Name="PageContent" Grid.Row="1" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch"/>
         </Grid>
       </Border>
-      <Border x:Name="NavigationScrim" Grid.ColumnSpan="2" Background="#55000000" Visibility="Collapsed" MouseLeftButtonDown="CloseNavigationOverlay" Panel.ZIndex="5"/>
-      <Border x:Name="OverlayPaneHost" Grid.ColumnSpan="2" Width="280" HorizontalAlignment="Left" Background="{DynamicResource AppBackgroundBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,1,0" Visibility="Collapsed" Panel.ZIndex="6"/>
+      <Border x:Name="NavigationScrim" Grid.ColumnSpan="2" Background="Transparent" Visibility="Collapsed" MouseLeftButtonDown="CloseNavigationOverlay" Panel.ZIndex="5"/>
+      <Border x:Name="OverlayPaneHost" Grid.ColumnSpan="2" Width="280" HorizontalAlignment="Left" CornerRadius="0,8,8,0" Background="{DynamicResource AcrylicBrush}" BorderBrush="{DynamicResource AcrylicStrokeBrush}" BorderThickness="0,0,1,0" Visibility="Collapsed" Panel.ZIndex="6" ClipToBounds="True">
+        <Border.Effect><DropShadowEffect Color="Black" BlurRadius="16" ShadowDepth="8" Direction="270" Opacity="0.14"/></Border.Effect>
+      </Border>
       <Border x:Name="DropOverlay" Grid.ColumnSpan="2" Margin="16" CornerRadius="8" Background="{DynamicResource SurfaceBrush}" BorderThickness="2" BorderBrush="{DynamicResource AccentBrush}" Visibility="Collapsed" IsHitTestVisible="False" Panel.ZIndex="10">
         <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center"><controls:FluentIcon Kind="arrow-import" Width="36" Height="36" Foreground="{DynamicResource AccentBrush}" HorizontalAlignment="Center" Margin="0,0,0,16"/>
           <TextBlock Text="{services:Tr 松开以导入配置}" FontSize="20" FontWeight="SemiBold" TextWrapping="Wrap" TextAlignment="Center" Margin="24,0"/>

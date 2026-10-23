@@ -38,6 +38,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public string TestUrl { get; private set; } = "https://www.gstatic.com/generate_204";
     public bool CloseConnectionsOnSwitch { get; private set; }
     public bool ShowProxyProvider { get; private set; } = true;
+    public string RuntimeMode { get; private set; } = "";
     public bool Ready { get; private set; }
     public bool IsExiting => exiting;
     public bool IsUpdating { get; private set; }
@@ -200,6 +201,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             if (identity != controllerIdentity)
             {
                 controllerIdentity = identity;
+                RuntimeMode = "";
                 var previous = controllerLifetime;
                 controllerLifetime = new CancellationTokenSource();
                 previous.Cancel();
@@ -319,6 +321,16 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             }
             if (data.Length == 0) return JsonSerializer.SerializeToElement(new { });
             using var parsed = JsonDocument.Parse(data.ToArray());
+            if (method == HttpMethod.Get && uri.AbsolutePath == "/configs")
+            {
+                var mode = HostChannel.Text(parsed.RootElement, "mode");
+                if (mode is "rule" or "global" or "direct" or "script") Dispatch(() =>
+                {
+                    if (controllerToken.IsCancellationRequested || RuntimeMode == mode) return;
+                    RuntimeMode = mode;
+                    PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(RuntimeMode)));
+                });
+            }
             return parsed.RootElement.Clone();
         }
         catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && !cancellationToken.IsCancellationRequested && !controllerToken.IsCancellationRequested)
@@ -412,33 +424,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         var app = Application.Current;
         app.ThemeMode = Theme switch { "dark" => ThemeMode.Dark, "light" => ThemeMode.Light, _ => ThemeMode.System };
         bool dark = Theme == "dark" || (Theme == "system" && Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme", 1) is int setting && setting == 0);
-        var palette = new Dictionary<string, string>
-        {
-            ["AppBackgroundBrush"] = dark ? "#202020" : "#F3F3F3",
-            ["SurfaceBrush"] = dark ? "#2B2B2B" : "#FBFBFB",
-            ["SubtleSurfaceBrush"] = dark ? "#272727" : "#F8F8F8",
-            ["TextPrimaryBrush"] = dark ? "#FFFFFF" : "#1B1B1B",
-            ["TextSecondaryBrush"] = dark ? "#C5C5C5" : "#616161",
-            ["BorderBrush"] = dark ? "#454545" : "#E2E2E2",
-            ["SuccessBrush"] = dark ? "#6CCB5F" : "#0F7B0F",
-            ["DangerBrush"] = dark ? "#FF99A4" : "#C42B1C",
-            ["WarningBrush"] = dark ? "#FCE100" : "#9D5D00",
-            ["ChartUpBrush"] = dark ? "#9E9E9E" : "#8A8A8A"
-        };
-        string[] lines = dark ? ["#60CDFF", "#C3A6F2", "#FF8FD0", "#4FD8B4", "#FFB36B", "#82A8FF", "#D6A3FF", "#5DD3D6", "#FF9A9A"] : ["#0063B1", "#6B4FAC", "#B0297A", "#00755E", "#A65200", "#1F5BD6", "#8A3FC2", "#00727A", "#B33A3A"];
-        for (int index = 0; index < lines.Length; index++) palette["Line" + index + "Brush"] = lines[index];
-        foreach (var item in palette) app.Resources[item.Key] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(item.Value));
-        app.Resources["AccentBrush"] = dark ? SystemColors.AccentColorLight2Brush : SystemColors.AccentColorDark1Brush;
-        app.Resources["AccentTextBrush"] = dark ? Brushes.Black : Brushes.White;
-        if (SystemParameters.HighContrast)
-        {
-            app.Resources["AppBackgroundBrush"] = app.Resources["SurfaceBrush"] = app.Resources["SubtleSurfaceBrush"] = SystemColors.WindowBrush;
-            app.Resources["TextPrimaryBrush"] = app.Resources["TextSecondaryBrush"] = app.Resources["SuccessBrush"] = app.Resources["DangerBrush"] = app.Resources["WarningBrush"] = app.Resources["ChartUpBrush"] = SystemColors.WindowTextBrush;
-            for (int index = 0; index < lines.Length; index++) app.Resources["Line" + index + "Brush"] = SystemColors.HighlightBrush;
-            app.Resources["BorderBrush"] = SystemColors.WindowTextBrush;
-            app.Resources["AccentBrush"] = SystemColors.HighlightBrush;
-            app.Resources["AccentTextBrush"] = SystemColors.HighlightTextBrush;
-        }
+        Controls.DesignTokens.Apply(dark);
         ThemeChanged?.Invoke();
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Theme)));
     }

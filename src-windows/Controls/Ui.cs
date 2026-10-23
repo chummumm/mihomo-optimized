@@ -32,7 +32,7 @@ internal static class Ui
     public static T Id<T>(this T element, string id) where T : DependencyObject { AutomationProperties.SetAutomationId(element, id); return element; }
     public static TextBlock Text(string value, double size = 14, bool strong = false) => new()
     {
-        Text = value, FontSize = size, FontWeight = strong ? FontWeights.SemiBold : FontWeights.Normal,
+        Text = value, FontSize = size, LineHeight = size == 12 ? 16 : size == 28 ? 36 : Math.Round(size * 1.43), FontWeight = strong ? FontWeights.SemiBold : FontWeights.Normal,
         TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center
     };
     public static TextBlock Muted(string value, double size = 12)
@@ -57,14 +57,16 @@ internal static class Ui
         border.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
         border.SetResourceReference(Border.BorderBrushProperty, "BorderBrush"); return border;
     }
-    public static ScrollViewer Scroll(UIElement content) => new() { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Padding = new Thickness(0, 0, 12, 12) };
+    public static ScrollViewer Scroll(UIElement content) => new() { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Padding = new Thickness(0) };
     public static DataGrid Table(params (string Header, string Path, double Width)[] columns)
     {
         var table = new DataGrid { AutoGenerateColumns = false, IsReadOnly = true, CanUserAddRows = false, CanUserDeleteRows = false,
             SelectionMode = DataGridSelectionMode.Single, SelectionUnit = DataGridSelectionUnit.FullRow, EnableRowVirtualization = true,
             EnableColumnVirtualization = true, HeadersVisibility = DataGridHeadersVisibility.Column, GridLinesVisibility = DataGridGridLinesVisibility.Horizontal,
-            RowHeight = 38, MinRowHeight = 32, BorderThickness = new Thickness(1), FontSize = 13 };
-        table.SetResourceReference(Control.BackgroundProperty, "SurfaceBrush");
+            RowHeight = 40, MinRowHeight = 32, BorderThickness = new Thickness(1), FontSize = 14 };
+        table.SetResourceReference(Control.BackgroundProperty, "SolidCardBrush");
+        table.SetResourceReference(DataGrid.HorizontalGridLinesBrushProperty, "DividerBrush");
+        table.SetResourceReference(Control.ForegroundProperty, "TextPrimaryBrush");
         table.SetResourceReference(Control.BorderBrushProperty, "BorderBrush");
         VirtualizingPanel.SetIsVirtualizing(table, true); VirtualizingPanel.SetVirtualizationMode(table, VirtualizationMode.Recycling);
         ScrollViewer.SetCanContentScroll(table, true);
@@ -76,12 +78,12 @@ internal static class Ui
         }
         return table;
     }
-    public static TextBox SearchBox(string label, string id, string? icon = null)
+    public static TextBox SearchBox(string label, string id, string? icon = null, bool rightIcon = false)
     {
-        var input = new TextBox { MinWidth = 180, Height = 34, VerticalContentAlignment = VerticalAlignment.Center, ToolTip = label }.Id(id);
+        var input = new TextBox { MinWidth = 180, Height = 32, VerticalContentAlignment = VerticalAlignment.Center, ToolTip = label }.Id(id);
         L.Bind(input, FrameworkElement.ToolTipProperty, label);
         L.Bind(input, AutomationProperties.NameProperty, label);
-        InputHint.Attach(input, icon); return input;
+        InputHint.Attach(input, icon, rightIcon); return input;
     }
     public static string Bytes(double value)
     {

@@ -31,14 +31,13 @@ internal sealed class TrayController : IDisposable
     private readonly Forms.ToolStripMenuItem tunItem = new();
     private readonly Forms.ToolStripMenuItem restoreItem = new();
     private readonly Forms.ToolStripMenuItem exitItem = new();
-    private readonly Forms.Timer clickTimer = new();
     private TrayWindow? flyout;
     private bool commandBusy;
     private bool wasOpenAtMouseDown;
     private DateTime lastHidden;
     private DateTime suppressClicksUntil;
     public bool IsFlyoutVisible => flyout?.IsVisible == true;
-    public FrameworkElement? VisibleSurface => flyout?.IsVisible == true ? flyout.ClientArea : null;
+    public FrameworkElement? VisibleSurface => flyout?.IsVisible == true ? flyout : null;
     public string Material => flyout?.Material ?? "solid";
 
     public TrayController(MainWindow main, AppSession session)
@@ -55,26 +54,24 @@ internal sealed class TrayController : IDisposable
         tunItem.Click += async (_, _) => await ChangeTun(!session.Status.Bool("tun"));
         restoreItem.Click += async (_, _) => await Run("desktop_stop");
         exitItem.Click += async (_, _) => { if (await main.PrepareExitAsync()) await main.FinishExitAsync(); };
-        clickTimer.Interval = Forms.SystemInformation.DoubleClickTime;
-        clickTimer.Tick += (_, _) => { clickTimer.Stop(); ShowFlyout(); };
         icon.MouseDown += (_, e) =>
         {
             if (e.Button == Forms.MouseButtons.Left)
-                wasOpenAtMouseDown = IsFlyoutVisible || DateTime.UtcNow - lastHidden < TimeSpan.FromMilliseconds(150);
+                wasOpenAtMouseDown = IsFlyoutVisible || DateTime.UtcNow - lastHidden < TimeSpan.FromMilliseconds(250);
         };
         icon.MouseClick += (_, e) =>
         {
             if (e.Button != Forms.MouseButtons.Left || DateTime.UtcNow < suppressClicksUntil) return;
-            if (IsFlyoutVisible || wasOpenAtMouseDown) { clickTimer.Stop(); flyout?.HideFlyout(); return; }
-            clickTimer.Stop(); clickTimer.Start();
+            if (IsFlyoutVisible || wasOpenAtMouseDown) { flyout?.HideFlyout(); return; }
+            ShowFlyout();
         };
         icon.MouseDoubleClick += (_, e) =>
         {
             if (e.Button != Forms.MouseButtons.Left) return;
             suppressClicksUntil = DateTime.UtcNow.AddMilliseconds(Forms.SystemInformation.DoubleClickTime);
-            clickTimer.Stop(); flyout?.HideFlyout(); main.ShowMain();
+            flyout?.HideFlyout(); main.ShowMain();
         };
-        menu.Opening += (_, _) => { clickTimer.Stop(); flyout?.HideFlyout(); Refresh(); };
+        menu.Opening += (_, _) => { flyout?.HideFlyout(); Refresh(); };
         L.Changed += Refresh; Refresh();
     }
     private bool IsRunning => session.Status.Text("phase") == "running";
@@ -92,7 +89,10 @@ internal sealed class TrayController : IDisposable
         if (enabled && !session.Status.Get("service").Bool("installed"))
         {
             flyout?.HideFlyout(); main.ShowMain();
-            if (!TunConsentDialog.Confirm(main)) { Refresh(); return; }
+            commandBusy = true; Refresh();
+            try { await TunConsentDialog.Run(main, async () => { await session.CommandAsync("desktop_set_tun", new { enabled }); }, error => session.Notify(error, true)); }
+            finally { commandBusy = false; Refresh(); }
+            return;
         }
         await Run("desktop_set_tun", new { enabled });
     }
@@ -112,28 +112,28 @@ internal sealed class TrayController : IDisposable
     }
     internal void ShowFlyout()
     {
-        clickTimer.Stop();
         if (flyout is null)
         {
             flyout = new TrayWindow(main, session, Run, ChangeTun);
             flyout.IsVisibleChanged += (_, _) => { if (!flyout.IsVisible) lastHidden = DateTime.UtcNow; };
         }
         if (flyout.IsVisible) { flyout.Activate(); return; }
-        flyout.Refresh(commandBusy); flyout.Show();
-        PositionFlyout(); flyout.Activate();
-        FluentMotion.Enter(flyout.ClientArea);
+        flyout.Refresh(commandBusy); PositionFlyout();
+        flyout.Show(); flyout.Activate();
+        // The supplied host shows/hides this native flyout immediately. Page
+        // navigation motion must not be applied to the entire tray window.
     }
     private void PositionFlyout()
     {
         if (flyout is null) return;
         var point = Forms.Cursor.Position; var area = Forms.Screen.FromPoint(point).WorkingArea;
-        var handle = new WindowInteropHelper(flyout).Handle;
+        var handle = new WindowInteropHelper(flyout).EnsureHandle();
         // Move the HWND to the target monitor before reading its per-monitor DPI.
         // WPF processes WM_DPICHANGED during this call; all final coordinates below
         // are physical pixels, including work-area clamps on vertical taskbars.
-        _ = SetWindowPos(handle, new IntPtr(-1), area.Left + 8, area.Top + 8, 0, 0, 0x0001 | 0x0010);
+        _ = SetWindowPos(handle, new IntPtr(-1), area.Left + 12, area.Top + 12, 0, 0, 0x0001 | 0x0010);
         double scale = Math.Max(1, GetDpiForWindow(handle)) / 96d;
-        int margin = (int)Math.Round(8 * scale);
+        int margin = (int)Math.Round(12 * scale);
         int width = Math.Max(1, Math.Min((int)Math.Round(360 * scale), area.Width - margin * 2));
         int height = Math.Max(1, Math.Min((int)Math.Round(492 * scale), area.Height - margin * 2));
         flyout.Width = width / scale; flyout.Height = height / scale; flyout.UpdateLayout();
@@ -152,7 +152,7 @@ internal sealed class TrayController : IDisposable
     [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr window);
     public void Dispose()
     {
-        L.Changed -= Refresh; clickTimer.Stop(); clickTimer.Dispose(); flyout?.Close();
+        L.Changed -= Refresh; flyout?.Close();
         icon.Visible = false; var image = icon.Icon; icon.Dispose(); image?.Dispose(); menu.Dispose();
     }
 }
@@ -165,22 +165,22 @@ internal sealed class TrayWindow : Window
     private readonly Func<bool, Task> changeTun;
     private readonly NativeBackdrop backdrop;
     private readonly TextBlock state = Ui.Muted("");
-    private readonly Ellipse stateDot = new() { Width = 7, Height = 7, Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center };
-    private readonly ModeSelector mode = new("TrayOutboundMode");
+    private readonly Ellipse stateDot = new() { Width = 8, Height = 8, Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center };
+    private readonly ModeSelector mode = new("TrayOutboundMode") { Stretch = true, HorizontalAlignment = HorizontalAlignment.Stretch };
     private readonly ToggleButton proxy;
     private readonly ToggleButton tun;
     private readonly ToggleButton lan;
     private readonly ExitSummaryList exits = new("TrayExitSummary", compact: true);
     private readonly StackPanel stopped;
-    private readonly TextBlock stoppedTitle = Ui.Text("", 16, true);
-    private readonly TextBlock stoppedHint = Ui.Muted("", 12);
+    private readonly TextBlock stoppedTitle = Ui.Text("", 14, true);
+    private readonly TextBlock stoppedHint = Ui.Muted("", 13);
     private readonly TextBlock notice = Ui.Text("", 12);
-    private readonly FluentIcon stoppedIcon = new("plug-disconnected", 28);
+    private readonly FluentIcon stoppedIcon = new("plug-disconnected", 24);
     private readonly FluentProgressRing stoppedProgress = new() { Width = 28, Height = 28 };
     private readonly FluentProgressRing powerProgress = new() { Width = 16, Height = 16 };
     private readonly TextBlock down = Ui.Text("0 B/s", 12);
     private readonly TextBlock up = Ui.Text("0 B/s", 12);
-    private readonly TrafficChart sparkline = new() { Height = 28, Compact = true, Margin = new Thickness(12, 0, 12, 0), MinWidth = 20 };
+    private readonly TrafficChart sparkline = new() { Height = 28, Compact = true, Margin = new Thickness(12, 0, 12, 0), MinWidth = 0, VerticalAlignment = VerticalAlignment.Center };
     private readonly Button power;
     private readonly FluentIcon powerIcon = new("power", 16);
     private ProxyExitSnapshot exitSnapshot = ProxyExitSnapshot.Empty;
@@ -206,17 +206,19 @@ internal sealed class TrayWindow : Window
         Width = 360; Height = 492; WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize; ShowInTaskbar = false; Topmost = true; ShowActivated = false;
         L.Bind(this, TitleProperty, "Mihomo Optimized 快捷面板"); this.Id("TrayFlyout");
         SetResourceReference(BackgroundProperty, "AppBackgroundBrush"); SetResourceReference(ForegroundProperty, "TextPrimaryBrush");
-        FontFamily = new FontFamily("Segoe UI Variable, Segoe UI, Microsoft YaHei UI"); FontSize = 14;
-        ClientArea.SetResourceReference(Panel.BackgroundProperty, "AppBackgroundBrush");
+        FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Microsoft YaHei"); FontSize = 14;
+        ClientArea.SetResourceReference(Panel.BackgroundProperty, "DialogBottomBrush");
         ClientArea.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); ClientArea.RowDefinitions.Add(new RowDefinition()); ClientArea.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var frame = new Border { BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Child = ClientArea }; frame.SetResourceReference(Border.BorderBrushProperty, "BorderBrush"); Content = frame;
+        var frame = new Border { BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Child = ClientArea }; frame.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush"); Content = frame;
         var header = new Grid { Margin = new Thickness(16, 16, 12, 12) };
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); header.ColumnDefinitions.Add(new ColumnDefinition()); header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        header.Children.Add(new Image { Source = new BitmapImage(new Uri("pack://application:,,,/Assets/icon.ico")), Width = 32, Height = 32, Margin = new Thickness(0, 0, 12, 0) });
+        var logo = new Image { Source = new BitmapImage(new Uri("pack://application:,,,/Assets/logo.png")), Width = 32, Height = 32, Clip = new RectangleGeometry(new Rect(0, 0, 32, 32), 8, 8) };
+        header.Children.Add(new Border { Child = logo, Margin = new Thickness(0, 0, 12, 0), VerticalAlignment = VerticalAlignment.Center });
         var statusRow = new StackPanel { Orientation = Orientation.Horizontal }; state.TextWrapping = TextWrapping.NoWrap; state.TextTrimming = TextTrimming.CharacterEllipsis; state.Id("TrayCoreStatus"); statusRow.Children.Add(stateDot); statusRow.Children.Add(state);
-        var identity = Ui.Column(Ui.Text("Mihomo Optimized", 14, true), statusRow); Grid.SetColumn(identity, 1); header.Children.Add(identity);
-        var settings = FluentControls.IconButton("nav-settings", "设置", "TrayOpenSettings"); settings.Click += async (_, _) => { HideFlyout(); main.ShowMain(); await main.NavigateAsync("settings"); }; Grid.SetColumn(settings, 2); header.Children.Add(settings);
-        var open = FluentControls.IconButton("window-new", "打开主界面", "TrayOpenMain"); open.Click += (_, _) => { HideFlyout(); main.ShowMain(); }; Grid.SetColumn(open, 3); header.Children.Add(open); ClientArea.Children.Add(header);
+        var name = Ui.Text("Mihomo Optimized", 14, true); name.LineHeight = 20; state.LineHeight = 16;
+        var identity = Ui.Column(name, statusRow); identity.Margin = new Thickness(0, 0, 12, 0); identity.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(identity, 1); header.Children.Add(identity);
+        var settings = FluentControls.IconButton("nav-settings", "设置", "TrayOpenSettings"); settings.VerticalAlignment = VerticalAlignment.Center; settings.Margin = new Thickness(0, 0, 12, 0); settings.Click += async (_, _) => { HideFlyout(); main.ShowMain(); await main.NavigateAsync("settings"); }; Grid.SetColumn(settings, 2); header.Children.Add(settings);
+        var open = FluentControls.IconButton("window-new", "打开主界面", "TrayOpenMain"); open.VerticalAlignment = VerticalAlignment.Center; open.Click += (_, _) => { HideFlyout(); main.ShowMain(); }; Grid.SetColumn(open, 3); header.Children.Add(open); ClientArea.Children.Add(header);
         mode.Margin = new Thickness(0, 0, 0, 12); mode.Selected += async value => await Run("desktop_patch_config", new { patch = new { mode = value } });
         var tiles = new UniformGrid { Columns = 3, Margin = new Thickness(-4, 0, -4, 12) };
         (proxy, var proxyTile) = MakeTile("nav-proxies", "系统代理", "TraySystemProxy");
@@ -226,21 +228,29 @@ internal sealed class TrayWindow : Window
         tun.Checked += TunChanged; tun.Unchecked += TunChanged;
         lan.Checked += LanChanged; lan.Unchecked += LanChanged;
         exits.Selected += async (exit, _) => { HideFlyout(); main.ShowMain(); await main.NavigateAsync(new NavigationTarget("proxies", Target: exit.Group, Action: "focus-group")); };
-        var emptyGlyph = new Grid { Width = 40, Height = 40, Margin = new Thickness(0, 0, 0, 12) }; emptyGlyph.Children.Add(stoppedIcon); emptyGlyph.Children.Add(stoppedProgress);
-        stopped = Ui.Column(emptyGlyph, stoppedTitle, stoppedHint); stopped.MinHeight = 174; stopped.VerticalAlignment = VerticalAlignment.Center; stopped.Margin = new Thickness(12, 12, 12, 0);
+        var emptyGlyph = new Grid { Width = 48, Height = 48 }; emptyGlyph.Children.Add(stoppedIcon); emptyGlyph.Children.Add(stoppedProgress);
+        var emptyCircle = new Border { CornerRadius = new CornerRadius(24), Child = emptyGlyph, Margin = new Thickness(0, 0, 0, 6) }; emptyCircle.SetResourceReference(Border.BackgroundProperty, "ControlAltBrush");
+        stopped = Ui.Column(emptyCircle, stoppedTitle, stoppedHint); stopped.VerticalAlignment = VerticalAlignment.Center; stopped.Margin = new Thickness(12);
         foreach (FrameworkElement item in stopped.Children) item.HorizontalAlignment = HorizontalAlignment.Center;
-        stoppedHint.TextAlignment = TextAlignment.Center; stoppedHint.Margin = new Thickness(0, 8, 0, 0); stoppedHint.MaxWidth = 280;
-        notice.SetResourceReference(TextBlock.ForegroundProperty, "DangerBrush"); notice.Visibility = Visibility.Collapsed; notice.Margin = new Thickness(0, 0, 0, 8); notice.Id("TrayError");
-        var body = Ui.Column(mode, tiles, notice, exits, stopped);
+        stoppedHint.TextAlignment = TextAlignment.Center; stoppedHint.Margin = new Thickness(0, 6, 0, 0); stoppedHint.MaxWidth = 280;
+        stoppedIcon.SetResourceReference(Control.ForegroundProperty, "TextSecondaryBrush");
+        notice.SetResourceReference(TextBlock.ForegroundProperty, "DangerBrush"); notice.Visibility = Visibility.Collapsed; notice.Margin = new Thickness(0, 0, 0, 12); notice.Id("TrayError");
+        var body = new Grid();
+        for (int row = 0; row < 4; row++) body.RowDefinitions.Add(new RowDefinition { Height = row < 3 ? GridLength.Auto : new GridLength(1, GridUnitType.Star) });
+        body.Children.Add(mode); Grid.SetRow(tiles, 1); body.Children.Add(tiles); Grid.SetRow(notice, 2); body.Children.Add(notice);
+        exits.VerticalAlignment = VerticalAlignment.Top; Grid.SetRow(exits, 3); body.Children.Add(exits); Grid.SetRow(stopped, 3); body.Children.Add(stopped);
         var scroll = new ScrollViewer { Content = body, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Padding = new Thickness(16, 4, 16, 12) };
         Grid.SetRow(scroll, 1); ClientArea.Children.Add(scroll);
+        scroll.ScrollChanged += (_, e) => { if (e.ViewportHeightChange != 0) body.MinHeight = Math.Max(0, e.ViewportHeight); };
         var footerGrid = new Grid(); footerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); footerGrid.ColumnDefinitions.Add(new ColumnDefinition()); footerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        down.FontFamily = up.FontFamily = new FontFamily("Cascadia Mono, Consolas");
-        var rates = Ui.Column(Rate("arrow-down", down), Rate("arrow-up", up)); footerGrid.Children.Add(rates); Grid.SetColumn(sparkline, 1); footerGrid.Children.Add(sparkline);
+        down.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); up.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
+        ByteReading.SetRate(down, 0); ByteReading.SetRate(up, 0);
+        var uploadRate = Rate("arrow-up", up); uploadRate.Margin = new Thickness(0, 2, 0, 0);
+        var rates = Ui.Column(Rate("arrow-down", down), uploadRate); rates.MinWidth = 92; rates.VerticalAlignment = VerticalAlignment.Center; footerGrid.Children.Add(rates); Grid.SetColumn(sparkline, 1); footerGrid.Children.Add(sparkline);
         var powerContents = new Grid(); powerContents.Children.Add(powerIcon); powerContents.Children.Add(powerProgress);
-        power = FluentControls.IconButton("power", "启动内核", "TrayPower", 36); power.Content = powerContents;
+        power = FluentControls.IconButton("power", "启动内核", "TrayPower", 36); power.Content = powerContents; power.Style = FluentControls.Style("Button"); power.VerticalAlignment = VerticalAlignment.Center;
         power.Click += async (_, _) => await Run(Running ? "desktop_stop" : "desktop_start"); Grid.SetColumn(power, 2); footerGrid.Children.Add(power);
-        var footer = new Border { Child = footerGrid, Padding = new Thickness(16, 12, 12, 12), BorderThickness = new Thickness(0, 1, 0, 0) }; footer.SetResourceReference(Border.BorderBrushProperty, "BorderBrush"); Grid.SetRow(footer, 2); ClientArea.Children.Add(footer);
+        var footer = new Border { Child = footerGrid, Padding = new Thickness(16, 12, 12, 12), BorderThickness = new Thickness(0, 1, 0, 0) }; footer.SetResourceReference(Border.BorderBrushProperty, "DividerBrush"); footer.SetResourceReference(Border.BackgroundProperty, "DialogTopBrush"); Grid.SetRow(footer, 2); ClientArea.Children.Add(footer);
         backdrop = new NativeBackdrop(this, ClientArea, session, transient: true);
         IsVisibleChanged += (_, _) =>
         {
@@ -270,15 +280,16 @@ internal sealed class TrayWindow : Window
     }
     private static (ToggleButton Button, FrameworkElement Tile) MakeTile(string icon, string label, string id)
     {
-        var button = new ToggleButton { Content = new FluentIcon(icon, 20), Style = FluentControls.Style("QuickToggle") }.Id(id);
+        var button = new ToggleButton { Content = new FluentIcon(icon, 16), Style = FluentControls.Style("QuickToggle") }.Id(id);
         L.Bind(button, AutomationProperties.NameProperty, label);
-        var caption = Ui.Hint(label); caption.HorizontalAlignment = HorizontalAlignment.Center; caption.TextAlignment = TextAlignment.Center; caption.Margin = new Thickness(0, 6, 0, 0);
+        var caption = Ui.Label(label, 12); caption.LineHeight = 16; caption.TextWrapping = TextWrapping.NoWrap; caption.TextTrimming = TextTrimming.CharacterEllipsis; caption.HorizontalAlignment = HorizontalAlignment.Center; caption.TextAlignment = TextAlignment.Center; caption.Margin = new Thickness(0, 6, 0, 0);
         var tile = Ui.Column(button, caption); tile.Margin = new Thickness(4, 0, 4, 0); return (button, tile);
     }
     private static FrameworkElement Rate(string name, TextBlock value)
     {
         var row = new StackPanel { Orientation = Orientation.Horizontal };
-        row.Children.Add(new FluentIcon(name, 12) { Margin = new Thickness(0, 0, 6, 0) }); row.Children.Add(value); return row;
+        var glyph = new FluentIcon(name, 12) { Margin = new Thickness(0, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }; glyph.SetResourceReference(Control.ForegroundProperty, "TextSecondaryBrush");
+        row.Children.Add(glyph); row.Children.Add(value); return row;
     }
     private async void ProxyChanged(object sender, RoutedEventArgs e) { if (!applying && proxy.IsEnabled) await Run("desktop_set_system_proxy", new { enabled = proxy.IsChecked == true }); }
     private async void LanChanged(object sender, RoutedEventArgs e) { if (!applying && lan.IsEnabled) await Run("desktop_patch_config", new { patch = new Dictionary<string, object> { ["allow-lan"] = lan.IsChecked == true } }); }
@@ -301,11 +312,11 @@ internal sealed class TrayWindow : Window
             if (controller != Controller || !running && runtimeReady)
             {
                 controller = Controller; runtimeReady = false; allowLan = false; exitSnapshot = ProxyExitSnapshot.Empty;
-                sparkline.Clear(); down.Text = up.Text = "0 B/s";
+                sparkline.Clear(); ByteReading.SetRate(down, 0); ByteReading.SetRate(up, 0);
             }
             string label = L.T(phase switch { "running" => "运行中", "starting" => "正在启动…", "stopping" => "正在停止…", "error" => "需要处理", "stopped" => "已停止", _ => "正在连接…" });
-            string modeLabel = L.ShortMode(mode.Mode); state.Text = label + (running ? " · " + modeLabel : "");
-            stateDot.SetResourceReference(Shape.FillProperty, running ? "SuccessBrush" : busy ? "WarningBrush" : phase == "error" ? "DangerBrush" : "TextSecondaryBrush");
+            string modeLabel = L.T(mode.Mode switch { "global" => "全局模式", "direct" => "直连模式", _ => "规则模式" }); state.Text = label + (running ? " · " + modeLabel : "");
+            stateDot.SetResourceReference(Shape.FillProperty, running ? "SuccessBrush" : busy ? "WarningBrush" : phase == "error" ? "DangerBrush" : "TextTertiaryBrush");
             bool interactive = session.Ready && !busy && !outerBusy && !changing && !session.IsUpdating;
             proxy.IsChecked = session.Status.Bool("systemProxy"); tun.IsChecked = session.Status.Bool("tun"); lan.IsChecked = allowLan;
             power.IsEnabled = interactive; proxy.IsEnabled = interactive && session.Status.Get("capabilities").Bool("systemProxy"); tun.IsEnabled = interactive && session.Status.Get("capabilities").Bool("tun"); lan.IsEnabled = mode.IsEnabled = interactive && running && runtimeReady && !session.IsDirty;
@@ -314,7 +325,11 @@ internal sealed class TrayWindow : Window
             stoppedTitle.Text = busy ? label : L.T("内核未运行"); stoppedHint.Text = session.Status.Text("lastError", fallback: busy ? L.T("首次启动可能需要更长时间，请稍候。") : L.T("启动后即可切换模式、出口与快捷开关。"));
             stoppedIcon.Visibility = busy ? Visibility.Collapsed : Visibility.Visible; stoppedProgress.IsActive = busy;
             powerProgress.IsActive = busy || outerBusy || changing; powerIcon.Visibility = powerProgress.IsActive ? Visibility.Collapsed : Visibility.Visible;
-            powerIcon.Filled = running; powerIcon.SetResourceReference(Control.ForegroundProperty, running ? "AccentBrush" : "TextPrimaryBrush");
+            powerIcon.Filled = running;
+            power.SetResourceReference(Control.BackgroundProperty, running ? "AccentBrush" : "ControlBrush");
+            power.SetResourceReference(Control.ForegroundProperty, running ? "AccentTextBrush" : "TextPrimaryBrush");
+            power.SetResourceReference(Control.BorderBrushProperty, running ? "AccentBrush" : "ControlStrokeBrush");
+            powerProgress.SetResourceReference(FluentProgressRing.ForegroundProperty, running ? "AccentTextBrush" : "AccentBrush");
             L.Bind(power, AutomationProperties.NameProperty, running ? "停止内核" : "启动内核"); L.Bind(power, ToolTipProperty, running ? "停止内核" : "启动内核");
         }
         finally { applying = false; }
@@ -371,7 +386,7 @@ internal sealed class TrayWindow : Window
                         if (token.IsCancellationRequested) return;
                         if (source != Controller || !Running) break;
                         double upload = sample.Number("up"), download = sample.Number("down");
-                        up.Text = Ui.Bytes(upload) + "/s"; down.Text = Ui.Bytes(download) + "/s"; sparkline.Add(upload, download);
+                        ByteReading.SetRate(up, upload); ByteReading.SetRate(down, download); sparkline.Add(upload, download);
                     }
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }

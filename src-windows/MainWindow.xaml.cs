@@ -35,6 +35,8 @@ public partial class MainWindow : Window
     private bool preparedExit;
     private bool preferCompact;
     private bool overlayOpen;
+    private bool overlayClosing;
+    private long overlayAnimation;
     private bool shellCommandBusy;
     private double pillTop = double.NaN;
     private string lastCoreError = "";
@@ -43,13 +45,15 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         this.session = session;
+        SearchButton.OpenRequested += ShowSearch;
         try { if (File.Exists(shellPath)) { using var saved = JsonDocument.Parse(File.ReadAllText(shellPath)); preferCompact = saved.RootElement.Bool("navigationCollapsed"); } }
         catch (Exception error) when (error is IOException or JsonException or UnauthorizedAccessException) { }
-        SearchButton.Style = FluentControls.Style("Button"); CoreCardButton.Style = FluentControls.Style("Ghost");
+        CoreCardButton.Style = FluentControls.Style("Ghost");
         backdrop = new NativeBackdrop(this, ClientArea, session);
         titleBar = new NativeTitleBar(this, MaximizeButton, ToggleMaximize);
         tray = new TrayController(this, session);
         session.StatusChanged += (_, _) => UpdateStatus();
+        session.PropertyChanged += (_, e) => { if (e.PropertyName == nameof(AppSession.RuntimeMode)) UpdateTitleSubtitle(); };
         session.Notification += ShowNotice;
         session.NavigateRequested += key => _ = NavigateAsync(key);
         session.NavigateTargetRequested += target => _ = NavigateAsync(target);
@@ -63,8 +67,8 @@ public partial class MainWindow : Window
         L.Changed += OnLanguageChanged;
         Closing += OnClosing;
         StateChanged += (_, _) => { UpdateCaption(); UpdatePageActivity(); };
-        Activated += (_, _) => TitleIdentity.Opacity = 1;
-        Deactivated += (_, _) => TitleIdentity.Opacity = .6;
+        Activated += (_, _) => UpdateCaptionActivity(true);
+        Deactivated += (_, _) => UpdateCaptionActivity(false);
         IsVisibleChanged += (_, _) => { UpdatePageActivity(); UpdateNavigationIndicator(false); };
         SizeChanged += (_, _) => ApplyNavigationSize();
         PreviewKeyDown += OnKey;
@@ -79,6 +83,7 @@ public partial class MainWindow : Window
         if (navigating || target.Page is not ("home" or "proxies" or "connections" or "dns" or "rules" or "logs" or "profiles" or "settings")) return false;
         NativePage page;
         bool changed = activePage is null || target.Page != currentPage;
+        if (changed && EditorOpen) return false;
         navigating = true;
         try
         {
@@ -91,11 +96,11 @@ public partial class MainWindow : Window
                 if (!pages.TryGetValue(target.Page, out page!)) { page = PageFactory.Create(target.Page, session); pages.Add(target.Page, page); }
                 currentPage = target.Page; activePage = page; PageContent.Content = page;
                 if (page is IPageBackNavigation nextBack) nextBack.BackStateChanged += UpdateBackButton;
-                SelectNavigation(target.Page); CloseOverlay(false); UpdatePageActivity();
+                SelectNavigation(target.Page); CloseOverlay(true); UpdatePageActivity();
                 if (ConnectedNavigation.HasPending(this, target.Target)) { page.BeginAnimation(OpacityProperty, null); page.Opacity = 1; page.RenderTransform = Transform.Identity; }
                 else FluentMotion.Enter(page, back);
             }
-            else { page = activePage!; CloseOverlay(false); }
+            else { page = activePage!; CloseOverlay(true); }
             location = target with { Action = null }; UpdateBackButton();
         }
         catch (Exception error) { ShowNotice(error.Message, true); return false; }
@@ -118,7 +123,7 @@ public partial class MainWindow : Window
         try
         {
             NavigationList.SelectedItem = NavigationList.Items.Cast<ListBoxItem>().FirstOrDefault(item => item.Tag as string == key);
-            SettingsNavigation.SelectedItem = key == "settings" ? SettingsNavigation.Items[0] : null;
+            SettingsNavigation.SelectedItem = SettingsNavigation.Items.Cast<ListBoxItem>().FirstOrDefault(item => item.Tag as string == key);
             foreach (var item in NavigationItems)
                 if (item.Content is Panel panel && panel.Children.OfType<FluentIcon>().FirstOrDefault() is { } icon) icon.Filled = item.Tag as string == key;
         }
@@ -129,6 +134,7 @@ public partial class MainWindow : Window
     private async void NavigationChanged(object sender, SelectionChangedEventArgs e)
     {
         if (session is null || navigating || selecting) return;
+        if (EditorOpen) { SelectNavigation(currentPage); return; }
         if (sender is ListBox list && list.SelectedItem is ListBoxItem item && item.Tag is string key) await NavigateAsync(key);
     }
 
@@ -138,8 +144,8 @@ public partial class MainWindow : Window
         string label = phase switch { "running" => "运行中", "starting" => "正在启动…", "stopping" => "正在停止…", "stopped" => "已停止", "error" => "需要处理", _ => "正在连接…" };
         PhaseText.Text = L.T(label);
         PhaseText.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush");
-        CoreStatusDot.SetResourceReference(Border.BackgroundProperty, phase == "running" ? "SuccessBrush" : phase == "error" ? "DangerBrush" : phase is "starting" or "stopping" ? "WarningBrush" : "TextSecondaryBrush");
-        CoreAvatarBackground.SetResourceReference(Border.BackgroundProperty, phase == "running" ? "AccentBrush" : "SubtleSurfaceBrush");
+        CoreStatusDot.SetResourceReference(ShellVisuals.BackgroundProperty, phase == "running" ? "SuccessBrush" : phase == "error" ? "DangerBrush" : phase is "starting" or "stopping" ? "WarningBrush" : "TextTertiaryBrush");
+        CoreAvatarBackground.SetResourceReference(ShellVisuals.BackgroundProperty, phase == "running" ? "AccentBrush" : "ControlAltBrush");
         CoreGlyph.Kind = phase == "running" ? "globe-shield" : "power"; CoreGlyph.Filled = phase == "running";
         CoreGlyph.SetResourceReference(Control.ForegroundProperty, phase == "running" ? "AccentTextBrush" : "TextSecondaryBrush");
         CoreProgress.IsActive = phase is "starting" or "stopping";
@@ -147,6 +153,7 @@ public partial class MainWindow : Window
         AutomationProperties.SetName(CoreCardButton, L.T("本地内核") + " · " + PhaseText.Text);
         CoreCardButton.ToolTip = PhaseText.Text + " · " + VersionText.Text;
         UpdateBadge.Visibility = session.Update.Bool("available") ? Visibility.Visible : Visibility.Collapsed;
+        UpdateTitleSubtitle();
         string error = session.Status.Text("lastError");
         if (error.Length > 0 && error != lastCoreError) ShowNotice(error, true);
         if (lastCoreError.Length > 0 && error.Length == 0 && NoticeText.Text == lastCoreError) NoticeBorder.Visibility = Visibility.Collapsed;
@@ -160,6 +167,17 @@ public partial class MainWindow : Window
         return words.FirstOrDefault(word => char.IsDigit(word[0]) || word[0] == 'v' && word.Length > 1 && char.IsDigit(word[1])) ?? value;
     }
     private void OnLanguageChanged() { UpdateStatus(); ApplyNavigationContent(); UpdateCaption(); UpdateBackButton(); }
+    private void UpdateCaptionActivity(bool active)
+    {
+        TitleName.SetResourceReference(ShellVisuals.ForegroundProperty, active ? "TextPrimaryBrush" : "TextDisabledBrush");
+        TitleSubtitle.SetResourceReference(ShellVisuals.ForegroundProperty, active ? "TextTertiaryBrush" : "TextDisabledBrush");
+    }
+    private void UpdateTitleSubtitle()
+    {
+        string mode = session.RuntimeMode switch { "rule" => "规则模式", "global" => "全局模式", "direct" => "直连模式", "script" => "脚本模式", _ => "" };
+        TitleSubtitle.Text = mode.Length > 0 ? "· " + L.T(mode) : "";
+        TitleSubtitle.Visibility = ActualWidth > 640 && session.Status.Text("phase") == "running" && mode.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
     private void ShowNotice(string text, bool error)
     {
         NoticeText.Text = L.T(text);
@@ -185,7 +203,7 @@ public partial class MainWindow : Window
         {
             preferCompact = !preferCompact; CloseOverlay(false); ApplyNavigationSize(true); SaveShellPreference();
         }
-        else if (overlayOpen) CloseOverlay(true);
+        else if (overlayOpen) CloseOverlay(true, restoreFocus: true);
         else OpenOverlay();
     }
     private void SaveShellPreference()
@@ -198,65 +216,110 @@ public partial class MainWindow : Window
         if (session is null) return;
         string next = ActualWidth <= 640 ? "minimal" : ActualWidth < 1008 || preferCompact ? "compact" : "expanded";
         bool modeChanged = next != navigationMode;
-        if (modeChanged && overlayOpen) CloseOverlay(false);
+        if (modeChanged && (overlayOpen || overlayClosing)) CloseOverlay(false);
         navigationMode = next;
         double width = next == "expanded" ? 280 : next == "compact" ? 48 : 0;
         double previous = NavigationDock.ActualWidth;
         NavigationDock.BeginAnimation(WidthProperty, null); NavigationDock.Width = width;
         if (animate && FluentMotion.Enabled && previous > 0) NavigationDock.BeginAnimation(WidthProperty, new DoubleAnimation(previous, width, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate });
-        ApplyNavigationContent();
-        TitleName.Visibility = ActualWidth >= 880 ? Visibility.Visible : Visibility.Collapsed;
-        TitleIdentity.Visibility = ActualWidth >= 440 ? Visibility.Visible : Visibility.Collapsed;
-        SearchLabel.Visibility = ActualWidth >= 700 ? Visibility.Visible : Visibility.Collapsed;
-        SearchShortcut.Visibility = ActualWidth >= 1008 ? Visibility.Visible : Visibility.Collapsed;
-        SearchButton.HorizontalAlignment = ActualWidth < 700 ? HorizontalAlignment.Left : HorizontalAlignment.Stretch;
-        SearchButton.Width = ActualWidth < 700 ? 34 : double.NaN;
-        SearchButton.Padding = ActualWidth < 700 ? new Thickness(8, 3, 8, 3) : new Thickness(12, 3, 12, 3);
-        MainContentBorder.Margin = next == "minimal" ? new Thickness(4, 0, 4, 4) : new Thickness(0, 0, 8, 8);
+        ApplyNavigationContent(animate);
+        TitleName.Visibility = ActualWidth > 640 ? Visibility.Visible : Visibility.Collapsed;
+        UpdateTitleSubtitle();
+        TitleIdentity.Visibility = ActualWidth > 440 ? Visibility.Visible : Visibility.Collapsed;
+        SearchButton.ShowShortcut = ActualWidth > 640;
+        SearchButton.Margin = new Thickness(ActualWidth > 440 ? 12 : 4, 0, ActualWidth > 440 ? 12 : 4, 0);
+        MainContentBorder.CornerRadius = next == "minimal" ? new CornerRadius(0) : new CornerRadius(8, 0, 0, 0);
+        MainContentBorder.BorderThickness = next == "minimal" ? new Thickness(0, 1, 0, 0) : new Thickness(1, 1, 0, 0);
+        ApplySubpageState();
         Dispatcher.InvokeAsync(() => UpdateNavigationIndicator(false), System.Windows.Threading.DispatcherPriority.Loaded);
     }
-    private void ApplyNavigationContent()
+    private void ApplyNavigationContent(bool animate = false, bool? showLabels = null)
     {
-        bool expanded = overlayOpen || navigationMode == "expanded";
-        NavigationPane.Width = expanded ? 280 : 48;
+        bool expanded = showLabels ?? (overlayOpen || overlayClosing || navigationMode == "expanded");
+        double previous = NavigationPane.ActualWidth;
+        NavigationPane.BeginAnimation(WidthProperty, null); NavigationPane.Width = expanded ? 280 : 48;
+        if (animate && FluentMotion.Enabled && previous > 0)
+            NavigationPane.BeginAnimation(WidthProperty, new DoubleAnimation(previous, NavigationPane.Width, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate });
         foreach (var item in NavigationItems)
         {
             if (item.Content is not Panel row) continue;
             var label = row.Children.OfType<TextBlock>().FirstOrDefault();
             if (label is null) continue;
-            label.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
+            FadeLabel(label, expanded, animate);
             item.ToolTip = expanded ? null : label.Text; AutomationProperties.SetName(item, label.Text);
-            item.Padding = expanded ? new Thickness(12, 0, 12, 0) : new Thickness(11, 0, 0, 0);
+            item.Padding = new Thickness(12, 0, 12, 0);
         }
-        CoreText.Visibility = CoreChevron.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
+        FadeLabel(CoreText, expanded, animate);
         CoreCardButton.Padding = expanded ? new Thickness(8) : new Thickness(0);
-        CoreCardButton.Margin = expanded ? new Thickness(4, 6, 4, 12) : new Thickness(4, 6, 4, 12);
+        CoreCardButton.Height = expanded ? 56 : 40;
         CoreAvatar.Width = CoreAvatar.Height = 40;
         CoreProgress.Width = CoreProgress.Height = 48; CoreCardButton.BorderThickness = new Thickness(0);
-        UpdateBadge.Margin = expanded ? new Thickness(8, 0, 4, 0) : new Thickness(-7, -14, 0, 0);
+        UpdateBadge.Margin = expanded ? new Thickness(16, 0, 0, 0) : new Thickness(-10, -18, 0, 0);
+    }
+    private static void FadeLabel(FrameworkElement label, bool shown, bool animate)
+    {
+        double from = label.Opacity;
+        label.BeginAnimation(OpacityProperty, null); label.Opacity = shown ? 1 : 0;
+        label.IsHitTestVisible = shown;
+        if (animate && FluentMotion.Enabled)
+            label.BeginAnimation(OpacityProperty, new DoubleAnimation(from, label.Opacity, TimeSpan.FromMilliseconds(167)));
     }
     private void OpenOverlay()
     {
-        overlayOpen = true; NavigationDock.Children.Remove(NavigationPane); OverlayPaneHost.Child = NavigationPane;
-        OverlayPaneHost.Visibility = NavigationScrim.Visibility = Visibility.Visible; ApplyNavigationContent();
-        if (FluentMotion.Enabled)
+        if (overlayOpen) return;
+        ++overlayAnimation;
+        bool interrupted = overlayClosing; overlayClosing = false; overlayOpen = true;
+        double previousWidth = interrupted ? OverlayPaneHost.ActualWidth : 48;
+        double previousX = interrupted && OverlayPaneHost.RenderTransform is TranslateTransform previous ? previous.X : -285.6;
+        if (NavigationDock.Children.Contains(NavigationPane)) NavigationDock.Children.Remove(NavigationPane);
+        OverlayPaneHost.Child = NavigationPane;
+        OverlayPaneHost.BeginAnimation(WidthProperty, null); OverlayPaneHost.Width = 280;
+        OverlayPaneHost.SetResourceReference(Border.BackgroundProperty, "AcrylicBrush");
+        bool dark = TryFindResource("AppBackgroundBrush") is SolidColorBrush background && background.Color.R < 128;
+        OverlayPaneHost.Effect = new System.Windows.Media.Effects.DropShadowEffect { Color = Colors.Black, BlurRadius = 16, ShadowDepth = 8, Direction = 270, Opacity = dark ? .26 : .14 };
+        OverlayPaneHost.Visibility = NavigationScrim.Visibility = Visibility.Visible;
+        ApplyNavigationContent(navigationMode == "compact");
+        OverlayPaneHost.RenderTransform = Transform.Identity;
+        if (FluentMotion.Enabled && navigationMode == "compact")
+            OverlayPaneHost.BeginAnimation(WidthProperty, new DoubleAnimation(previousWidth, 280, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate });
+        else if (FluentMotion.Enabled)
         {
-            var shift = new TranslateTransform(-280, 0); OverlayPaneHost.RenderTransform = shift;
+            var shift = new TranslateTransform(previousX, 0); OverlayPaneHost.RenderTransform = shift;
             shift.BeginAnimation(TranslateTransform.XProperty, new DoubleAnimation(0, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate });
-            NavigationScrim.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(167)));
         }
-        Dispatcher.InvokeAsync(() => { UpdateNavigationIndicator(false); (NavigationList.SelectedItem as ListBoxItem)?.Focus(); }, System.Windows.Threading.DispatcherPriority.Loaded);
+        Dispatcher.InvokeAsync(() => UpdateNavigationIndicator(false), System.Windows.Threading.DispatcherPriority.Loaded);
     }
-    private void CloseOverlay(bool animate)
+    private void CloseOverlay(bool animate, bool restoreFocus = false)
     {
-        if (!overlayOpen) return;
-        overlayOpen = false; OverlayPaneHost.BeginAnimation(OpacityProperty, null); NavigationScrim.BeginAnimation(OpacityProperty, null);
-        // Restore the same native controls immediately. No duplicate navigation
-        // tree is exposed to UI Automation while the compact pane is in use.
-        OverlayPaneHost.Child = null; NavigationDock.Children.Add(NavigationPane);
-        OverlayPaneHost.Visibility = NavigationScrim.Visibility = Visibility.Collapsed;
-        OverlayPaneHost.RenderTransform = Transform.Identity; ApplyNavigationContent(); UpdateNavigationIndicator(false);
-        if (animate) NavigationToggle.Focus();
+        if (!overlayOpen && !overlayClosing) return;
+        long animation = ++overlayAnimation;
+        overlayOpen = false; overlayClosing = true; NavigationScrim.Visibility = Visibility.Collapsed;
+        void Complete()
+        {
+            if (animation != overlayAnimation) return;
+            overlayClosing = false;
+            OverlayPaneHost.BeginAnimation(WidthProperty, null); OverlayPaneHost.Width = 280;
+            OverlayPaneHost.Child = null;
+            if (!NavigationDock.Children.Contains(NavigationPane)) NavigationDock.Children.Add(NavigationPane);
+            OverlayPaneHost.Visibility = Visibility.Collapsed; OverlayPaneHost.RenderTransform = Transform.Identity;
+            ApplyNavigationContent(); UpdateNavigationIndicator(false);
+        }
+        if (!animate || !FluentMotion.Enabled) Complete();
+        else if (navigationMode == "compact")
+        {
+            ApplyNavigationContent(true, false);
+            OverlayPaneHost.Background = Brushes.Transparent; OverlayPaneHost.Effect = null;
+            var collapse = new DoubleAnimation(OverlayPaneHost.ActualWidth, 48, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate };
+            collapse.Completed += (_, _) => Complete(); OverlayPaneHost.BeginAnimation(WidthProperty, collapse);
+        }
+        else
+        {
+            var shift = OverlayPaneHost.RenderTransform as TranslateTransform ?? new TranslateTransform();
+            OverlayPaneHost.RenderTransform = shift;
+            var slide = new DoubleAnimation(shift.X, -285.6, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate };
+            slide.Completed += (_, _) => Complete(); shift.BeginAnimation(TranslateTransform.XProperty, slide);
+        }
+        if (restoreFocus) NavigationToggle.Focus();
     }
     private void CloseNavigationOverlay(object sender, MouseButtonEventArgs e) { CloseOverlay(true); e.Handled = true; }
     private void UpdateNavigationIndicator(bool animate)
@@ -274,17 +337,18 @@ public partial class MainWindow : Window
         var duration = TimeSpan.FromMilliseconds(460); var midpoint = KeyTime.FromPercent(.42);
         var move = new DoubleAnimationUsingKeyFrames { Duration = duration };
         move.KeyFrames.Add(new DiscreteDoubleKeyFrame(old, KeyTime.FromTimeSpan(TimeSpan.Zero)));
-        move.KeyFrames.Add(new EasingDoubleKeyFrame(Math.Min(old, top), midpoint, FluentMotion.Decelerate));
-        move.KeyFrames.Add(new EasingDoubleKeyFrame(top, KeyTime.FromPercent(1), FluentMotion.Decelerate));
+        move.KeyFrames.Add(new SplineDoubleKeyFrame(Math.Min(old, top), midpoint, new KeySpline(.7, 0, 1, .5)));
+        move.KeyFrames.Add(new SplineDoubleKeyFrame(top, KeyTime.FromPercent(1), new KeySpline(0, 0, 0, 1)));
         var stretch = new DoubleAnimationUsingKeyFrames { Duration = duration };
         stretch.KeyFrames.Add(new DiscreteDoubleKeyFrame(16, KeyTime.FromTimeSpan(TimeSpan.Zero)));
-        stretch.KeyFrames.Add(new EasingDoubleKeyFrame(Math.Abs(top - old) + 16, midpoint, FluentMotion.Decelerate));
-        stretch.KeyFrames.Add(new EasingDoubleKeyFrame(16, KeyTime.FromPercent(1), FluentMotion.Decelerate));
+        stretch.KeyFrames.Add(new SplineDoubleKeyFrame(Math.Abs(top - old) + 16, midpoint, new KeySpline(.7, 0, 1, .5)));
+        stretch.KeyFrames.Add(new SplineDoubleKeyFrame(16, KeyTime.FromPercent(1), new KeySpline(0, 0, 0, 1)));
         SelectionPill.BeginAnimation(Canvas.TopProperty, move); SelectionPill.BeginAnimation(HeightProperty, stretch);
     }
 
     private void OpenCoreMenu(object sender, RoutedEventArgs e)
     {
+        if (EditorOpen) return;
         var menu = new ContextMenu { PlacementTarget = CoreCardButton, Placement = navigationMode == "expanded" || overlayOpen ? PlacementMode.Bottom : PlacementMode.Right };
         menu.Items.Add(new MenuItem { Header = PhaseText.Text + " · " + VersionText.Text, IsEnabled = false }); menu.Items.Add(new Separator());
         bool running = session.Status.Text("phase") == "running";
@@ -302,7 +366,28 @@ public partial class MainWindow : Window
         CoreCardButton.ContextMenu = menu; menu.IsOpen = true;
     }
 
-    private void UpdateBackButton() => BackButton.IsEnabled = !navigating && (activePage is IPageBackNavigation { CanGoBack: true } || history.Count > 0);
+    private bool EditorOpen => activePage is ProfilesPage { CanGoBack: true };
+    private void UpdateBackButton()
+    {
+        BackButton.IsEnabled = !navigating && (activePage is IPageBackNavigation { CanGoBack: true } || history.Count > 0);
+        ApplySubpageState();
+    }
+    private void ApplySubpageState()
+    {
+        bool editing = EditorOpen, full = editing && ActualWidth <= 768;
+        // HTML inert leaves the navigation's appearance intact. Block pointer
+        // and keyboard entry while retaining those original colors and metrics.
+        NavigationPane.IsHitTestVisible = SearchButton.IsHitTestVisible = !editing;
+        KeyboardNavigation.SetTabNavigation(NavigationPane, editing ? KeyboardNavigationMode.None : KeyboardNavigationMode.Continue);
+        KeyboardNavigation.SetTabNavigation(SearchButton, editing ? KeyboardNavigationMode.None : KeyboardNavigationMode.Continue);
+        if (editing && searchWindow is { IsVisible: true }) searchWindow.Close();
+        TitleBar.Visibility = full ? Visibility.Hidden : Visibility.Visible;
+        Grid.SetRow(ContentLayout, full ? 0 : 1); Grid.SetRowSpan(ContentLayout, full ? 2 : 1);
+        NavigationDock.Visibility = full ? Visibility.Collapsed : Visibility.Visible;
+        System.Windows.Shell.WindowChrome.SetIsHitTestVisibleInChrome(ContentLayout, full);
+        MainContentBorder.CornerRadius = full || navigationMode == "minimal" ? new CornerRadius(0) : new CornerRadius(8, 0, 0, 0);
+        MainContentBorder.BorderThickness = full ? new Thickness(0) : navigationMode == "minimal" ? new Thickness(0, 1, 0, 0) : new Thickness(1, 1, 0, 0);
+    }
     private async Task GoBackAsync()
     {
         if (navigating) return;
@@ -321,17 +406,18 @@ public partial class MainWindow : Window
         L.Bind(MaximizeButton, ToolTipProperty, maximized ? "还原" : "最大化"); L.Bind(MaximizeButton, AutomationProperties.NameProperty, maximized ? "还原" : "最大化");
         ClientArea.Margin = maximized ? SystemParameters.WindowResizeBorderThickness : new Thickness(0);
     }
-    private void OpenSearch(object sender, RoutedEventArgs e) => ShowSearch();
     private void ShowSearch()
     {
+        if (EditorOpen) return;
         CloseOverlay(false);
         if (searchWindow is { IsVisible: true }) { searchWindow.FocusInput(); return; }
-        var dialog = new SearchWindow(session) { Owner = this }; searchWindow = dialog;
+        var dialog = new SearchWindow(session, SearchButton) { Owner = this }; searchWindow = dialog;
         dialog.Closed += (_, _) => { if (ReferenceEquals(searchWindow, dialog)) searchWindow = null; };
         dialog.Show(); dialog.FocusInput();
     }
     private async void OnKey(object sender, KeyEventArgs e)
     {
+        if (SearchButton.InputFocused && searchWindow is { IsVisible: true } palette && palette.HandleKey(e)) return;
         Key key = e.Key == Key.System ? e.SystemKey : e.Key;
         if (key == Key.K && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; ShowSearch(); }
         else if (key == Key.T && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; await NavigateAsync(new NavigationTarget("proxies", Action: "test-all")); }
@@ -375,7 +461,7 @@ public partial class MainWindow : Window
             if (session.IsDirty)
             {
                 ShowMain();
-                if (pages.TryGetValue("profiles", out var editor) && !await editor.CanLeaveAsync()) return false;
+                if (pages.TryGetValue("profiles", out var editor) && editor is ProfilesPage profiles && !await profiles.CanExitAsync()) return false;
                 if (session.IsDirty) return false;
             }
             if (session.Ready)
@@ -410,6 +496,8 @@ public partial class MainWindow : Window
     {
         switch (method)
         {
+            case "native_arm_motion": return NativeMotionCapture.Arm(this, args);
+            case "native_motion_status": return NativeMotionCapture.Status();
             case "native_snapshot":
                 return new { ready = session.Ready, visible = IsVisible, phase = session.Status.Text("phase"), page = currentPage, error = NoticeBorder.Visibility == Visibility.Visible ? NoticeText.Text : "", busy = preparingExit || session.Status.Text("phase") is "starting" or "stopping", navigationMode, navigationOverlay = overlayOpen, material = backdrop.Material, customTitleBar = true, canGoBack = BackButton.IsEnabled, language = session.Language, theme = session.Theme, captureKind = "wpf-visual-tree", trayVisible = tray.IsFlyoutVisible, searchVisible = searchWindow?.IsVisible == true };
             case "native_navigate":
@@ -424,37 +512,8 @@ public partial class MainWindow : Window
             case "native_show_tray": tray.ShowFlyout(); return new { visible = tray.IsFlyoutVisible };
             case "native_finish_exit": preparedExit = true; _ = FinishExitAsync(); return new { exiting = true };
             case "native_screenshot":
-                string path = Path.GetFullPath(args.Text("path"));
-                if (!path.EndsWith(".png", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("Screenshot must be a PNG file");
-                string surfaceName = args.Text("surface", fallback: "main"); bool traySurface = surfaceName == "tray";
-                FrameworkElement surface;
-                if (traySurface) surface = tray.VisibleSurface ?? throw new InvalidOperationException("Open the real tray flyout before capturing it.");
-                else if (surfaceName == "search") surface = searchWindow is { IsVisible: true, Content: FrameworkElement content } ? content : throw new InvalidOperationException("Open the real search flyout before capturing it.");
-                // Include the Window template's AdornerLayer, which contains
-                // native input hints and focus adorners outside ClientArea.
-                else { ShowMain(); surface = this; }
-                surface.UpdateLayout();
-                var dpi = VisualTreeHelper.GetDpi(surface);
-                int pixelsWide = Math.Max(1, (int)Math.Ceiling(surface.ActualWidth * dpi.DpiScaleX));
-                int pixelsHigh = Math.Max(1, (int)Math.Ceiling(surface.ActualHeight * dpi.DpiScaleY));
-                string captureKind = args.Text("capture") == "screen" ? "screen-pixels" : "wpf-visual-tree";
-                if (captureKind == "screen-pixels")
-                {
-                    var origin = surface.PointToScreen(new Point());
-                    using var bitmap = new System.Drawing.Bitmap(pixelsWide, pixelsHigh, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-                    using var graphics = System.Drawing.Graphics.FromImage(bitmap);
-                    graphics.CopyFromScreen((int)Math.Round(origin.X), (int)Math.Round(origin.Y), 0, 0, new System.Drawing.Size(pixelsWide, pixelsHigh), System.Drawing.CopyPixelOperation.SourceCopy);
-                    bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
-                }
-                else
-                {
-                    // A real visual-tree capture works in headless Windows CI.
-                    // DWM's Mica/Acrylic is composed outside this tree; opt in to
-                    // screen pixels on an interactive desktop to include it.
-                    var bitmap = new RenderTargetBitmap(pixelsWide, pixelsHigh, dpi.PixelsPerInchX, dpi.PixelsPerInchY, PixelFormats.Pbgra32); bitmap.Render(surface);
-                    var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(bitmap)); using var file = File.Create(path); png.Save(file);
-                }
-                return new { path, captureKind, surface = surfaceName, material = traySurface ? tray.Material : surfaceName == "search" ? "system-flyout" : backdrop.Material };
+                if (args.Text("surface", fallback: "main") == "main") ShowMain();
+                return NativeVisualCapture.Save(this, args, args.Text("surface") == "tray" ? tray.Material : args.Text("surface") == "search" ? "system-flyout" : backdrop.Material, session.Update);
             default: throw new ArgumentException("Unknown native automation method");
         }
     }

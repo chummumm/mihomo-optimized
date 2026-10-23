@@ -1,0 +1,2 @@
+# The visual reference is verified byte-for-byte before git apply on Windows.
+/desktop/tests/visual-reference.patch -text

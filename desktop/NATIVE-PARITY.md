@@ -2,6 +2,16 @@
 
 设计依据是用户提供的 `mihomo-fluent-redesign(1).zip` 中 `files/` 的最终源文件及 patch。本表记录原生实现入口和验收路径；网页端文件仍作为设计依据，不参与 Windows 运行。Windows 使用 C# WPF，系统集成保留现有 Rust host 和固定 Go 内核。
 
+## 0.2.1 视觉校准
+
+原稿的完整前端通过 `visual-reference.json` 固定到基础提交和补丁 SHA-256，包含压缩包没有重复携带的 Logs 等基础页面。Windows 验收在同一 runner 上分别渲染原稿和安装后的 WPF 程序，使用同样的窗口尺寸、DPI、语言、主题强调色和无凭据测试数据。原稿仅作为测试基准，不进入安装包或便携包。
+
+这一轮按原稿恢复透明色叠加、文字和行高、控件边框、卡片尺寸、页面留白、内容宽度断点，以及每页的标题、默认操作和滚动范围。全局搜索输入属于主标题栏，结果列表是独立的原生浮层；连接详情在表格内部展开，配置编辑器使用原稿的独立子页面结构。
+
+导入配置使用原稿的文件/粘贴/URL 三模式预览，成功后重新加载；编辑器未保存提示保持在原稿内联区域。首次开启 TUN 的说明使用原稿内容对话框。16 个静态场景包含这些操作后的界面，6 个交互动效另行保存实际时间与连续帧。
+
+共享动画使用原稿的 cubic-bezier 曲线及 83/167/250ms 时长；页面进入为 300ms，导航指示条、节点数值、折线和定位高亮保留各自的时序。界面仍遵从系统减少动画设置。验收临时开启一次性 runner 的客户端动画，并在清理时恢复原值。
+
 | 原稿 | 原生入口 | 对应行为 |
 | --- | --- | --- |
 | Shell/TitleBar、Sidebar、Shell/nav-mode | MainWindow、NativeTitleBar | 48px 标题栏、返回、窗口按钮、拖动/缩放/贴靠、展开/紧凑/覆盖式导航、Escape 关闭覆盖导航 |
@@ -23,7 +33,9 @@
 
 - `desktop/tests/protocol`：stdio 边界、取消/并发、退出、Windows 单实例身份校验，以及 DNS 原子分页索引的稀疏 ID、UInt64 边界、空页、非法/旧版元数据。
 - `desktop/tests/windows_smoke.py` 与 `uia-query.ps1`：实际安装程序、普通权限 WPF 界面、原生 UIA 控件操作及截图；同时保留系统代理、TUN、服务身份、资源引导和异常退出恢复检查。
+- `desktop/tests/prepare-visual-reference.py` 与 `capture-reference.cjs`：恢复并渲染固定原稿，使用安装验收导出的安全数据；输出实际尺寸、DPI、主题、字体及关键元素几何信息。测试浏览器禁止访问本地夹具以外的网络目标。
+- `NativeMotionCapture`：由独立 Windows UIA 操作触发真实控件事件，保存页面、选中项、开关、搜索、编辑器和窄窗导航的连续帧及实际采样时间；它只录制，不替代或驱动控件行为。静态图与动画帧是人工对照证据，生成图片本身不等于逐像素一致性判定。
 - `desktop/tests/upgrade_smoke.py`：真实旧发行升级、卸载残留修复、配置和所有者保留、安装/便携逐文件一致性。
-- `.github/workflows/windows-desktop.yml`：通过全部 Windows 检查后，由 `clash-dashboard` 受信工作流生成构建证明并发布 `mihomo-desktop-v0.2.0`。PR 构建不发布正式 Release。
+- `.github/workflows/windows-desktop.yml`：通过全部 Windows 检查后，由 `clash-dashboard` 受信工作流生成构建证明并发布 `mihomo-desktop-v0.2.1`。PR 构建不发布正式 Release。
 
 WPF 视觉树截图来自实际运行的控件。系统合成的 Mica/Acrylic 需在支持透明效果的 Windows 11 桌面观察；不支持材料的系统使用原稿规定的实色回退。YAML 编辑器依照原稿的纯文本编辑模型实现，不将原稿没有的代码补全列作已实现功能。

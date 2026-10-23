@@ -1,0 +1,77 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <!-- Exact palette from the supplied Fluent tokens.css. Alpha is retained when layers compose. -->
+  <SolidColorBrush x:Key="AppBackgroundBrush" Color="#F3F3F3" />
+  <SolidColorBrush x:Key="SolidBaseBrush" Color="#F3F3F3" />
+  <SolidColorBrush x:Key="SolidCardBrush" Color="#FBFBFB" />
+  <SolidColorBrush x:Key="LayerBrush" Color="#7FFFFFFF" />
+  <SolidColorBrush x:Key="LayerStrokeBrush" Color="#0F000000" />
+  <SolidColorBrush x:Key="CardBrush" Color="#B2FFFFFF" />
+  <SolidColorBrush x:Key="CardSecondaryBrush" Color="#7FF6F6F6" />
+  <SolidColorBrush x:Key="CardHoverBrush" Color="#9EF9F9F9" />
+  <SolidColorBrush x:Key="CardStrokeBrush" Color="#0F000000" />
+  <SolidColorBrush x:Key="ControlBrush" Color="#B2FFFFFF" />
+  <SolidColorBrush x:Key="ControlHoverBrush" Color="#7FF9F9F9" />
+  <SolidColorBrush x:Key="ControlPressedBrush" Color="#4CF9F9F9" />
+  <SolidColorBrush x:Key="ControlDisabledBrush" Color="#4CF9F9F9" />
+  <SolidColorBrush x:Key="ControlAltBrush" Color="#06000000" />
+  <SolidColorBrush x:Key="ControlAltHoverBrush" Color="#0F000000" />
+  <SolidColorBrush x:Key="ControlStrokeBrush" Color="#0F000000" />
+  <SolidColorBrush x:Key="ControlElevationBrush" Color="#29000000" />
+  <SolidColorBrush x:Key="ControlElevationTopBrush" Color="#0F000000" />
+  <SolidColorBrush x:Key="ControlStrongBrush" Color="#72000000" />
+  <SolidColorBrush x:Key="ControlFocusBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="SubtleHoverBrush" Color="#0A000000" />
+  <SolidColorBrush x:Key="SubtlePressedBrush" Color="#06000000" />
+  <SolidColorBrush x:Key="DividerBrush" Color="#14000000" />
+  <SolidColorBrush x:Key="AcrylicBrush" Color="#F0F9F9F9" />
+  <SolidColorBrush x:Key="AcrylicStrokeBrush" Color="#0F000000" />
+  <SolidColorBrush x:Key="ToolTipBrush" Color="#F9F9F9" />
+  <SolidColorBrush x:Key="DialogTopBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="DialogBottomBrush" Color="#F3F3F3" />
+  <SolidColorBrush x:Key="TextDisabledBrush" Color="#5C000000" />
+  <SolidColorBrush x:Key="DisabledTextBrush" Color="#5C000000" />
+  <SolidColorBrush x:Key="FocusOuterBrush" Color="#E4000000" />
+  <SolidColorBrush x:Key="FocusInnerBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="TextPrimaryBrush" Color="#E4000000" />
+  <SolidColorBrush x:Key="TextSecondaryBrush" Color="#9B000000" />
+  <SolidColorBrush x:Key="TextTertiaryBrush" Color="#72000000" />
+  <SolidColorBrush x:Key="FaintBrush" Color="#5C000000" />
+  <SolidColorBrush x:Key="AccentBrush" Color="#005FB8" />
+  <SolidColorBrush x:Key="AccentLinkBrush" Color="#003E92" />
+  <SolidColorBrush x:Key="AccentTextBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="AccentTextSecondaryBrush" Color="#B2FFFFFF" />
+  <SolidColorBrush x:Key="SuccessBrush" Color="#0F7B0F" />
+  <SolidColorBrush x:Key="WarningBrush" Color="#9D5D00" />
+  <SolidColorBrush x:Key="DangerBrush" Color="#C42B1C" />
+  <SolidColorBrush x:Key="SuccessBackgroundBrush" Color="#DFF6DD" />
+  <SolidColorBrush x:Key="WarningBackgroundBrush" Color="#FFF4CE" />
+  <SolidColorBrush x:Key="CriticalBackgroundBrush" Color="#FDE7E9" />
+  <SolidColorBrush x:Key="InfoBackgroundBrush" Color="#BFF6F6F6" />
+  <SolidColorBrush x:Key="ChartUpBrush" Color="#8A8A8A" />
+  <SolidColorBrush x:Key="ScrimBrush" Color="#4C000000" />
+  <SolidColorBrush x:Key="SurfaceBrush" Color="#B2FFFFFF" />
+  <SolidColorBrush x:Key="SubtleSurfaceBrush" Color="#7FF6F6F6" />
+  <SolidColorBrush x:Key="BorderBrush" Color="#0F000000" />
+  <SolidColorBrush x:Key="LineSystemBrush" Color="#9B000000" />
+  <SolidColorBrush x:Key="OnLineBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="Line0Brush" Color="#0063B1" />
+  <SolidColorBrush x:Key="Line1Brush" Color="#6B4FAC" />
+  <SolidColorBrush x:Key="Line2Brush" Color="#B0297A" />
+  <SolidColorBrush x:Key="Line3Brush" Color="#00755E" />
+  <SolidColorBrush x:Key="Line4Brush" Color="#A65200" />
+  <SolidColorBrush x:Key="Line5Brush" Color="#1F5BD6" />
+  <SolidColorBrush x:Key="Line6Brush" Color="#8A3FC2" />
+  <SolidColorBrush x:Key="Line7Brush" Color="#00727A" />
+  <SolidColorBrush x:Key="Line8Brush" Color="#B33A3A" />
+  <FontFamily x:Key="BodyFont">Segoe UI Variable Text, Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Microsoft YaHei</FontFamily>
+  <FontFamily x:Key="DisplayFont">Segoe UI Variable Display, Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Microsoft YaHei</FontFamily>
+  <FontFamily x:Key="MonoFont">Cascadia Mono, Cascadia Code, Consolas, Microsoft YaHei UI</FontFamily>
+  <SolidColorBrush x:Key="PanelSolidBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="HairStrongBrush" Color="#72000000" />
+  <SolidColorBrush x:Key="OnAccentHoverBrush" Color="#14FFFFFF" />
+  <SolidColorBrush x:Key="OnAccentDividerBrush" Color="#33FFFFFF" />
+  <SolidColorBrush x:Key="AccentStrokeBrush" Color="#14FFFFFF" />
+  <SolidColorBrush x:Key="AccentElevationBrush" Color="#52000000" />
+  <SolidColorBrush x:Key="AccentHoverBrush" Color="#E6005FB8" />
+  <SolidColorBrush x:Key="AccentPressedBrush" Color="#CC005FB8" />
+</ResourceDictionary>
