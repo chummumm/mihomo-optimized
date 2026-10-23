@@ -4,7 +4,7 @@
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         xmlns:controls="clr-namespace:Mihomo.Desktop.Controls"
         xmlns:services="clr-namespace:Mihomo.Desktop.Services"
-        Title="Mihomo Optimized" Width="1180" Height="780" MinWidth="360" MinHeight="420"
+        Title="Mihomo Optimized" Width="1240" Height="820" MinWidth="500" MinHeight="560"
         WindowStartupLocation="CenterScreen" WindowStyle="None" ResizeMode="CanResize"
         FontFamily="Segoe UI Variable Text, Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Microsoft YaHei" FontSize="14"
         Background="{DynamicResource AppBackgroundBrush}" Foreground="{DynamicResource TextPrimaryBrush}"

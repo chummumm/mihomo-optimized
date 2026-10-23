@@ -3,8 +3,10 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Media;
+using System.Windows.Threading;
 using Mihomo.Desktop.Services;
 
 namespace Mihomo.Desktop.Controls;
@@ -77,6 +79,64 @@ internal static class Ui
             table.Columns.Add(column);
         }
         return table;
+    }
+    // Call after configuring the columns. The native rows presenter reports no
+    // horizontal extent without rows, although the separate headers still have
+    // their full width. Physical scrolling of that real width fixes the empty
+    // case; populated tables keep the original virtualizing scroll presenter.
+    public static void KeepHeadersScrollableWhenEmpty(DataGrid table)
+    {
+        var width = new MultiBinding { Converter = new EmptyHeaderWidthConverter() };
+        width.Bindings.Add(new Binding(nameof(ItemsControl.HasItems)) { Source = table });
+        foreach (var column in table.Columns)
+        {
+            width.Bindings.Add(new Binding(nameof(DataGridColumn.ActualWidth)) { Source = column });
+            width.Bindings.Add(new Binding(nameof(DataGridColumn.Visibility)) { Source = column });
+        }
+        var panel = new FrameworkElementFactory(typeof(DataGridRowsPresenter));
+        panel.SetBinding(FrameworkElement.MinWidthProperty, width);
+        table.ItemsPanel = new ItemsPanelTemplate(panel);
+        bool hasItems = table.Items.Count > 0;
+        long revision = 0;
+        ScrollViewer.SetCanContentScroll(table, hasItems);
+        ScrollViewer? Scroll() => table.Template?.FindName("DG_ScrollViewer", table) as ScrollViewer;
+        table.ItemContainerGenerator.ItemsChanged += (_, _) =>
+        {
+            bool next = table.Items.Count > 0;
+            if (next == hasItems) return;
+            hasItems = next;
+            var offset = Scroll()?.HorizontalOffset ?? 0;
+            var current = ++revision;
+            ScrollViewer.SetCanContentScroll(table, next);
+            // Switching between the physical and virtualizing IScrollInfo can
+            // replace its offset. Restore only after the new extent is measured.
+            _ = table.Dispatcher.InvokeAsync(() =>
+            {
+                if (current == revision && table.IsLoaded) Scroll()?.ScrollToHorizontalOffset(offset);
+            }, DispatcherPriority.Loaded);
+        };
+        table.Loaded += (_, _) =>
+        {
+            if (Scroll() is not { } viewer || viewer.Template?.FindName("PART_HorizontalScrollBar", viewer) is not ScrollBar bar) return;
+            // Keep the real native scrollbar, including its range and commands,
+            // across the whole table rather than indenting it by frozen columns.
+            if (bar.Parent is Grid grid && grid.ColumnDefinitions.Count > 1)
+            {
+                Grid.SetColumn(bar, 0); Grid.SetColumnSpan(bar, grid.ColumnDefinitions.Count);
+            }
+        };
+    }
+    private sealed class EmptyHeaderWidthConverter : IMultiValueConverter
+    {
+        public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (values.Length == 0 || values[0] is true) return 0d;
+            double width = 0;
+            for (int index = 1; index + 1 < values.Length; index += 2)
+                if (values[index] is double value && double.IsFinite(value) && values[index + 1] is Visibility.Visible) width += Math.Max(0, value);
+            return width;
+        }
+        public object[] ConvertBack(object value, Type[] targetTypes, object parameter, CultureInfo culture) => throw new NotSupportedException();
     }
     public static TextBox SearchBox(string label, string id, string? icon = null, bool rightIcon = false)
     {

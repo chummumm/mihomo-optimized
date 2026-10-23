@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][int]$ApplicationProcessId,
     [Parameter(Mandatory=$true)][string]$AutomationId,
-    [ValidateSet('read', 'invoke', 'set', 'select', 'toggle', 'scroll', 'context', 'escape')][string]$Action = 'read',
+    [ValidateSet('read', 'invoke', 'set', 'select', 'toggle', 'scroll', 'scroll-horizontal', 'context', 'escape')][string]$Action = 'read',
     [AllowEmptyString()][string]$Value = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -181,6 +181,13 @@ public static class NativeEscapeInput {
         $pattern.SetScrollPercent([System.Windows.Automation.ScrollPattern]::NoScroll, $percent)
         $result.scrolled = $true
     }
+    'scroll-horizontal' {
+        $pattern = $element.GetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern)
+        $percent = [double]::Parse($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+        if ($percent -lt 0 -or $percent -gt 100) { throw 'Scroll percent is out of range.' }
+        $pattern.SetScrollPercent($percent, [System.Windows.Automation.ScrollPattern]::NoScroll)
+        $result.scrolled = $true
+    }
     default {
         $pattern = $null
         if ($element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
@@ -194,6 +201,32 @@ public static class NativeEscapeInput {
         $pattern = $null
         if ($element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
             $result.toggleState = $pattern.Current.ToggleState.ToString()
+        }
+        $pattern = $null
+        if ($element.TryGetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern, [ref]$pattern)) {
+            $result.scroll = @{ horizontalScrollable=$pattern.Current.HorizontallyScrollable;
+                horizontalPercent=$pattern.Current.HorizontalScrollPercent;
+                horizontalViewSize=$pattern.Current.HorizontalViewSize;
+                verticalScrollable=$pattern.Current.VerticallyScrollable;
+                verticalPercent=$pattern.Current.VerticalScrollPercent }
+        }
+        if ($element.Current.ControlType -eq [System.Windows.Automation.ControlType]::DataGrid) {
+            $bounds = $element.Current.BoundingRectangle
+            $result.bounds = @{ x=$bounds.X; y=$bounds.Y; width=$bounds.Width; height=$bounds.Height }
+            $pattern = $null
+            if ($element.TryGetCurrentPattern([System.Windows.Automation.GridPattern]::Pattern, [ref]$pattern)) {
+                $result.rowCount = $pattern.Current.RowCount
+            }
+            $headerCondition = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::HeaderItem)
+            $headers = @()
+            foreach ($header in $element.FindAll([System.Windows.Automation.TreeScope]::Descendants, $headerCondition)) {
+                $rect = $header.Current.BoundingRectangle
+                if ($rect.IsEmpty) { continue }
+                $headers += @{ name=$header.Current.Name; offscreen=$header.Current.IsOffscreen;
+                    x=$rect.X; y=$rect.Y; width=$rect.Width; height=$rect.Height }
+            }
+            $result.headers = $headers
         }
     }
 }

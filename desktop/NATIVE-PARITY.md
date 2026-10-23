@@ -12,11 +12,11 @@
 
 共享动画使用原稿的 cubic-bezier 曲线及 83/167/250ms 时长；页面进入为 300ms，导航指示条、节点数值、折线和定位高亮保留各自的时序。界面仍遵从系统减少动画设置。验收临时开启一次性 runner 的客户端动画，并在清理时恢复原值。
 
-局部浮层使用显式的下层视觉内容进行 Gaussian 模糊和 sRGB 饱和度处理，再叠加原稿的半透明颜色、边框和前景。采样不包含浮层自身，不临时隐藏控件，也不重新渲染整个窗口来制造背景。截图元数据记录实际滤镜状态、DPI、采样半径与降级原因；WPF 的整数半径量化及系统合成材料仍须按实际机器核对。
+局部浮层仅采样明确指定的下层视觉，按实际 DPI 保留原始分辨率，在后台进行 Gaussian 模糊和预乘 alpha 的 sRGB 饱和度处理，再叠加原稿的半透明颜色、边框和前景。像素没有变化时复用结果；真实内容变化触发更新，尺寸、来源或 DPI 改变时取消过期计算。缓存保留进入动效的完整采样范围，背景保持世界坐标，不随前景一起滑动。首次搜索等待实际滤镜图像后开始原有 250ms 过渡。截图元数据记录实际滤镜状态、DPI、采样范围和计算耗时，系统合成材料仍须按实际机器核对。
 
 | 原稿 | 原生入口 | 对应行为 |
 | --- | --- | --- |
-| Shell/TitleBar、Sidebar、Shell/nav-mode | MainWindow、NativeTitleBar | 48px 标题栏、返回、窗口按钮、拖动/缩放/贴靠、展开/紧凑/覆盖式导航、Escape 关闭覆盖导航 |
+| Shell/TitleBar、Sidebar、Shell/nav-mode | MainWindow、NativeTitleBar | 默认 1240×820、最小 500×560，48px 标题栏、返回、窗口按钮、拖动/缩放/贴靠、展开/紧凑/覆盖式导航、Escape 关闭覆盖导航 |
 | Shell/appearance、styles/tokens、components/Icon/Motion | AppSession、NativeBackdrop、FluentIcon、FluentMotion | 系统主题与强调色、Mica/Acrylic、原稿 Fluent 图标、状态和页面过渡、减少动画/高对比度/透明效果回退 |
 | Shell/CoreCard | MainWindow CoreCard | 内核状态、版本、启停/重启/日志/配置快捷入口 |
 | Shell/GlobalSearch、search-targets、Settings/focus-target | SearchWindow、SearchTargets、NavigationTarget | 命令/页面/组/节点/设置/规则检索、匹配高亮、键盘操作、设置定位和短暂高亮、代理定位、规则筛选 |
@@ -34,8 +34,8 @@
 ## 验收
 
 - `desktop/tests/protocol`：stdio 边界、取消/并发、退出、Windows 单实例身份校验，以及 DNS 原子分页索引的稀疏 ID、UInt64 边界、空页、非法/旧版元数据。
-- `desktop/tests/windows_smoke.py` 与 `uia-query.ps1`：实际安装程序、普通权限 WPF 界面、原生 UIA 控件操作及截图；同时保留系统代理、TUN、服务身份、资源引导和异常退出恢复检查。
-- `desktop/tests/prepare-visual-reference.py` 与 `capture-reference.cjs`：恢复并渲染固定原稿，使用安装验收导出的安全数据；输出实际尺寸、DPI、主题、字体及关键元素几何信息。测试浏览器禁止访问本地夹具以外的网络目标。
+- `desktop/tests/windows_smoke.py` 与 `uia-query.ps1`：实际安装程序、普通权限 WPF 界面、原生 UIA 控件操作及截图；验证空连接表能实际横向滚到末列、首列保持冻结并恢复起点，同时保留系统代理、TUN、服务身份、资源引导和异常退出恢复检查。
+- `desktop/tests/prepare-visual-reference.py` 与 `capture-reference.cjs`：恢复并渲染固定原稿，使用安装验收导出的安全数据和实际页面滚动位置；输出实际尺寸、DPI、主题、字体及关键元素几何信息。测试浏览器禁止访问本地夹具以外的网络目标。
 - `NativeMotionCapture`：由独立 Windows UIA 操作触发真实控件事件，后台读取实际桌面像素，保存页面、选中项、开关、搜索、编辑器和窄窗导航的连续帧、实际采样时间、采集耗时与屏幕可见区域。录制不调用 WPF 布局或渲染，PNG 编码延后到交互结束；它只录制，不替代或驱动控件行为。静态图与动画帧是人工对照证据，生成图片本身不等于逐像素一致性判定。
 - `desktop/tests/upgrade_smoke.py`：真实旧发行升级、卸载残留修复、配置和所有者保留、安装/便携逐文件一致性。
 - `.github/workflows/windows-desktop.yml`：通过全部 Windows 检查后，由 `clash-dashboard` 受信工作流生成构建证明并发布 `mihomo-desktop-v0.2.1`。PR 构建不发布正式 Release。

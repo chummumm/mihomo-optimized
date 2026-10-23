@@ -225,20 +225,24 @@ internal sealed class ProxyMemberGrid : Grid
             IsHitTestVisible = selectable; Focusable = selectable; IsTabStop = selected; AutomationProperties.SetHelpText(this, selected ? L.T("当前节点") : node?.DelayLabel ?? "");
         }
     }
-    private static readonly (string Pattern, string Code)[] regions =
-    [
+    // These fixed alternatives have no unbounded repetition. Reuse their
+    // ordinary matchers: 21 static IsMatch calls exceed Regex's 15-entry cache
+    // and repeatedly rebuild the symbolic automata for unlabelled node names.
+    private static readonly (Regex Pattern, string Code)[] regions =
+    new (string Pattern, string Code)[]
+    {
         (@"香港|港[区節节]|\bHK\b|Hong\s?Kong", "HK"), (@"台湾|台灣|台北|\bTW\b|Taiwan", "TW"), (@"日本|东京|東京|大阪|\bJP\b|Japan|Tokyo|Osaka", "JP"),
         (@"新加坡|狮城|獅城|\bSG\b|Singapore", "SG"), (@"美国|美國|洛杉矶|圣何塞|硅谷|西雅图|\bUS\b|\bUSA\b|United\s?States|America|Los\s?Angeles|San\s?Jose|Seattle", "US"),
         (@"韩国|韓國|首尔|首爾|\bKR\b|Korea|Seoul", "KR"), (@"英国|英國|伦敦|\bUK\b|\bGB\b|Britain|London", "UK"), (@"德国|德國|法兰克福|\bDE\b|Germany|Frankfurt", "DE"),
         (@"法国|法國|巴黎|\bFR\b|France|Paris", "FR"), (@"荷兰|荷蘭|阿姆斯特丹|\bNL\b|Netherlands|Amsterdam", "NL"), (@"加拿大|\bCA\b|Canada", "CA"), (@"澳大利亚|澳洲|悉尼|\bAU\b|Australia|Sydney", "AU"),
         (@"俄罗斯|俄羅斯|莫斯科|\bRU\b|Russia|Moscow", "RU"), (@"印度|India|Mumbai", "IN"), (@"土耳其|\bTR\b|Turkey|Türkiye|Istanbul", "TR"), (@"马来西亚|馬來西亞|\bMY\b|Malaysia", "MY"),
         (@"泰国|泰國|\bTH\b|Thailand", "TH"), (@"越南|\bVN\b|Vietnam", "VN"), (@"菲律宾|\bPH\b|Philippines", "PH"), (@"阿根廷|\bAR\b|Argentina", "AR"), (@"巴西|\bBR\b|Brazil", "BR")
-    ];
+    }.Select(item => (new Regex(item.Pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), item.Code)).ToArray();
     private static string? Region(string name)
     {
         var runes = name.EnumerateRunes().Select(rune => rune.Value).ToArray();
         for (var index = 1; index < runes.Length; index++) if (runes[index - 1] is >= 0x1F1E6 and <= 0x1F1FF && runes[index] is >= 0x1F1E6 and <= 0x1F1FF)
         { var value = new string([(char)(runes[index - 1] - 0x1F1E6 + 65), (char)(runes[index] - 0x1F1E6 + 65)]); return value == "GB" ? "UK" : value; }
-        return regions.FirstOrDefault(item => Regex.IsMatch(name, item.Pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking)).Code;
+        return regions.FirstOrDefault(item => item.Pattern.IsMatch(name)).Code;
     }
 }

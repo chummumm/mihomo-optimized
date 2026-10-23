@@ -139,7 +139,23 @@ internal sealed class ConnectionRateReading : TextBlock
     internal void SetMetrics(bool phone)
     {
         FontSize = phone ? 20 : 28; LineHeight = 36;
-        if (unitLabel is not null) unitLabel.LineHeight = LineHeight;
+        if (unitLabel is not null)
+        {
+            unitLabel.LineHeight = LineHeight;
+            // CSS gives each inline run its own 36-DIP line box, then unions
+            // those boxes at a common baseline. WPF MaxHeight only accounts for
+            // the glyph box of a Run, so it under-measures this mixed-size line.
+            // Keep its correctly aligned glyphs and reserve the missing leading
+            // using the actual fallback fonts rather than a fixed pixel inset.
+            double Baseline(TextBlock text)
+            {
+                var metrics = new FormattedText("0", CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
+                    new Typeface(text.FontFamily, text.FontStyle, text.FontWeight, text.FontStretch),
+                    text.FontSize, Brushes.Black, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+                return metrics.Baseline + (LineHeight - metrics.Height) / 2;
+            }
+            MinHeight = LineHeight + Math.Abs(Baseline(this) - Baseline(unitLabel));
+        }
     }
     internal void Set(double value)
     {

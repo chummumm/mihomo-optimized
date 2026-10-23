@@ -23,6 +23,7 @@ import hashlib
 import http.client
 import http.server
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -1165,6 +1166,9 @@ class Acceptance:
         def reference_state(name: str, result: dict) -> dict:
             """Only acceptance-owned, credential-free data is exported to the reference renderer."""
             snapshot = driver.snapshot()
+            scroll_offset = snapshot.get("routeScrollOffset")
+            require(type(scroll_offset) in (int, float) and math.isfinite(scroll_offset) and scroll_offset >= 0,
+                    "native_ui_scroll_observation_invalid")
             status = self.status()
             status = {key: status[key] for key in ("appVersion", "phase", "systemProxy", "tun", "autostart", "coreVersion", "configPath", "logPath", "service", "capabilities") if key in status}
             config = self.runtime_json("configs")
@@ -1182,7 +1186,7 @@ class Acceptance:
                 api["/" + endpoint] = {"providers": {key: {field: value[field] for field in fields if field in value} for key, value in providers.items()}}
             dpi = result.get("dpi", 96)
             row = {"name": name, "page": snapshot.get("page", "home"), "width": round(result["width"] * 96 / dpi), "height": round(result["height"] * 96 / dpi), "dpi": dpi,
-                "theme": snapshot.get("theme", "light"), "language": snapshot.get("language", "zh-CN"), "appearance": result.get("appearance"), "capturedAt": result.get("capturedAt"), "canGoBack": snapshot.get("canGoBack", False),
+                "theme": snapshot.get("theme", "light"), "language": snapshot.get("language", "zh-CN"), "appearance": result.get("appearance"), "capturedAt": result.get("capturedAt"), "canGoBack": snapshot.get("canGoBack", False), "routeScrollOffset": scroll_offset,
                 "status": status, "api": api, "streams": result.get("streams", {}), "update": result.get("update", {}),
                 "config": {"path": status.get("configPath", "config.yaml"), "content": base, "revision": "fixture", "max_size": 4194304, "writable": True}}
             if name == "search": row["searchQuery"] = "theme"
@@ -1452,6 +1456,38 @@ class Acceptance:
         driver.ui("ConnectionTable", "context")
         driver.ui("PauseConnections", "toggle")
         driver.ui("ConnectionTable", "escape")
+        def horizontal_table_ready():
+            state = driver.ui("ConnectionTable")
+            return state if state.get("scroll", {}).get("horizontalScrollable") else None
+        table_before = wait_until(horizontal_table_ready, "native_empty_connection_headers_have_no_scroll_extent", 10)
+        require(table_before.get("rowCount") == 0, "native_empty_connection_scroll_fixture_has_rows")
+        first_header = next((item for item in table_before.get("headers", []) if item.get("name") == "域名"), None)
+        require(first_header and not first_header.get("offscreen"), "native_connection_first_header_missing")
+        try:
+            driver.ui("ConnectionTable", "scroll-horizontal", "100")
+            def table_at_right():
+                state = driver.ui("ConnectionTable")
+                return state if state.get("scroll", {}).get("horizontalPercent", -1) >= 99 else None
+            table_after = wait_until(table_at_right, "native_connection_horizontal_scroll_did_not_move", 10)
+            frozen_header = next((item for item in table_after.get("headers", []) if item.get("name") == "域名"), None)
+            last_header = next((item for item in table_after.get("headers", []) if item.get("name") == "连接时间"), None)
+            require(frozen_header and not frozen_header.get("offscreen") and
+                    abs(frozen_header["x"] - first_header["x"]) <= 1,
+                    "native_connection_frozen_header_moved")
+            bounds = table_after["bounds"]
+            require(last_header and not last_header.get("offscreen") and last_header["width"] > 0 and
+                    last_header["x"] >= bounds["x"] and
+                    last_header["x"] + last_header["width"] <= bounds["x"] + bounds["width"] + 1,
+                    "native_connection_last_header_not_visible_after_scroll")
+            evidence["connectionHorizontalScroll"] = {
+                "rowCount": table_before["rowCount"], "beforePercent": table_before["scroll"]["horizontalPercent"],
+                "afterPercent": table_after["scroll"]["horizontalPercent"],
+                "firstHeaderBefore": first_header, "firstHeaderAfter": frozen_header, "lastHeaderAfter": last_header}
+        finally:
+            driver.ui("ConnectionTable", "scroll-horizontal", "0")
+        wait_until(lambda: driver.ui("ConnectionTable").get("scroll", {}).get("horizontalPercent", -1) == 0,
+                   "native_connection_horizontal_scroll_did_not_restore", 10)
+        checked("empty_connection_header_horizontal_scroll")
         capture("windows-connections.png")
         checked("logs_pause_resume_and_connections")
 

@@ -207,6 +207,7 @@ public sealed class SettingsPage : NativePage
         contents.MaxWidth = 1000; contents.HorizontalAlignment = HorizontalAlignment.Stretch;
         scroll = new SettingsScrollViewer(); scroll.Id("SettingsScrollViewer"); SetScrollableBody(contents, scroll);
         SizeChanged += (_, _) => { foreach (var adapt in responsiveRows) adapt(PageContainerWidth <= 560); };
+        TransitionSurface.SizeChanged += (_, args) => { if (args.WidthChanged) foreach (var adapt in responsiveRows) adapt(PageContainerWidth <= 560); };
         focusTimer.Tick += (_, _) => RestoreHighlight();
         Session.HostEvent += OnHostEvent;
         Session.PropertyChanged += OnPreferenceChanged;

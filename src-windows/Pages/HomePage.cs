@@ -134,6 +134,7 @@ public sealed class HomePage : NativePage
         exitHeader.Children.Add(viewProxies); exitHeader.Children.Add(exitHint);
         var body = Ui.Column(hero, tiles, liveGrid, exitHeader, exits);
         SizeChanged += (_, _) => ApplyResponsiveLayout(PageContainerWidth);
+        TransitionSurface.SizeChanged += (_, args) => { if (args.WidthChanged) ApplyResponsiveLayout(PageContainerWidth); };
         Loaded += (_, _) => ApplyResponsiveLayout(PageContainerWidth);
         SetScrollableBody(body); UpdateStatus();
     }

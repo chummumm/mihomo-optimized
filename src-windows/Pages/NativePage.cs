@@ -12,7 +12,8 @@ namespace Mihomo.Desktop.Pages;
 public abstract class NativePage : UserControl
 {
     // The reference's content container has a 15px stable scrollbar gutter on
-    // desktop. At <=640px it uses an overlay scrollbar and the full page width.
+    // desktop. At <=640px the gutter is automatic: it exists only while the
+    // vertical scrollbar is visible, just as a normal browser scroller does.
     // This template owns that space once; a theme's ScrollViewer must not also
     // subtract its own scrollbar width or add a content inset.
     private const double ScrollbarGutter = 15;
@@ -57,7 +58,8 @@ public abstract class NativePage : UserControl
     protected bool IsActive => lifetime is { IsCancellationRequested: false };
     protected bool IsRunning => Session.Status.Text("phase") == "running";
     private bool IsNarrowWindow => (Window.GetWindow(this)?.ActualWidth ?? ActualWidth) <= 640;
-    private double ReservedGutter => reservePageGutter && !IsNarrowWindow ? ScrollbarGutter : 0;
+    private double ReservedGutter => reservePageGutter &&
+        (!IsNarrowWindow || pageScroll?.ComputedVerticalScrollBarVisibility == Visibility.Visible) ? ScrollbarGutter : 0;
     // ActualWidth is already inside the shell's top/left border. CSS cqw and
     // @container use this viewport before the page's padding or max-width.
     protected internal double PageContainerWidth => Math.Max(0, ActualWidth - ReservedGutter);
@@ -116,6 +118,13 @@ public abstract class NativePage : UserControl
         header.Narrow = narrow;
     }
 
+    private void PageScrollChanged(object sender, ScrollChangedEventArgs args)
+    {
+        // Auto visibility is resolved during layout. Reflow only when that
+        // resolution changes the reserved width, not on every scroll tick.
+        if (pageScroll is not null && pageScroll.Padding.Right != ReservedGutter) UpdatePageMetrics();
+    }
+
     protected void SetHeaderMeta(UIElement? meta)
     {
         headerMeta.Content = meta;
@@ -136,7 +145,7 @@ public abstract class NativePage : UserControl
     protected ScrollViewer SetScrollableBody(UIElement content, ScrollViewer? scroller = null)
     {
         pagePresenter.Content = null;
-        if (pageScroll is not null) pageScroll.Content = null;
+        if (pageScroll is not null) { pageScroll.ScrollChanged -= PageScrollChanged; pageScroll.Content = null; }
         Body.Children.Clear(); Body.Children.Add(content);
         bodyRow.Height = GridLength.Auto;
         pageScroll = scroller ?? new ScrollViewer();
@@ -146,6 +155,7 @@ public abstract class NativePage : UserControl
         pageScroll.BorderThickness = new Thickness(0);
         pageScroll.Template = PageScrollTemplate;
         pageScroll.Background = System.Windows.Media.Brushes.Transparent;
+        pageScroll.ScrollChanged += PageScrollChanged;
         pageScroll.Content = pageBox; pagePresenter.Content = pageScroll;
         UpdatePageMetrics(); return pageScroll;
     }
@@ -180,7 +190,7 @@ public abstract class NativePage : UserControl
     protected void SetBody(UIElement content)
     {
         pagePresenter.Content = null;
-        if (pageScroll is not null) { pageScroll.Content = null; pageScroll = null; }
+        if (pageScroll is not null) { pageScroll.ScrollChanged -= PageScrollChanged; pageScroll.Content = null; pageScroll = null; }
         bodyRow.Height = new GridLength(1, GridUnitType.Star);
         Body.Children.Clear(); Body.Children.Add(content); pagePresenter.Content = pageBox;
         UpdatePageMetrics();

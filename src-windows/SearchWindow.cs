@@ -90,7 +90,7 @@ internal sealed class SearchWindow : Window
     private double constructorStartedMilliseconds, constructorCompletedMilliseconds;
     private double? sourceInitializedMilliseconds, sourceInitializedCompletedMilliseconds, loadedMilliseconds,
         attachOwnerCompletedMilliseconds, suggestionsStartedMilliseconds, coreRequestsStartedMilliseconds,
-        coreResponsesReadyMilliseconds, coreEntriesCompletedMilliseconds, firstRenderingMilliseconds, contentRenderedMilliseconds;
+        coreResponsesReadyMilliseconds, coreEntriesCompletedMilliseconds, backdropReadyMilliseconds, firstRenderingMilliseconds, contentRenderedMilliseconds;
     private readonly AppSession session;
     private readonly GlobalSearchBox inputBox;
     private readonly int instance;
@@ -181,10 +181,14 @@ internal sealed class SearchWindow : Window
             loadedMilliseconds = openClock.Elapsed.TotalMilliseconds;
             AttachOwner();
             attachOwnerCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
-            PositionFlyout(); FocusInput(); EnterSuggestions();
+            PositionFlyout(); FocusInput();
             CompositionTarget.Rendering += FirstRendering;
-            await LoadCoreEntries();
-            coreEntriesCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            var coreLoad = LoadInitialEntries();
+            await backdropFilter.PrepareAsync();
+            backdropReadyMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            if (closing || closed) return;
+            EnterSuggestions();
+            await coreLoad;
         };
         ContentRendered += (_, _) => contentRenderedMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
         Closed += (_, _) =>
@@ -235,16 +239,21 @@ internal sealed class SearchWindow : Window
     internal object Describe() => new
     {
         instance, visible = IsVisible, closing, closed, choosing, resultCount = results.Items.Count,
-        renderingTier = RenderCapability.Tier >> 16, positionCount, positionMilliseconds,
+        renderingTier = RenderCapability.Tier >> 16, positionCount, positionMilliseconds, backdrop = backdropFilter.Describe(),
         // Relative timings only: no search text, entry names or controller data.
         lifecycleMilliseconds = new { templates = templatesMilliseconds, constructorStarted = constructorStartedMilliseconds,
             constructorCompleted = constructorCompletedMilliseconds, sourceInitialized = sourceInitializedMilliseconds,
             sourceInitializedCompleted = sourceInitializedCompletedMilliseconds, loaded = loadedMilliseconds,
             attachOwnerCompleted = attachOwnerCompletedMilliseconds, suggestionsStarted = suggestionsStartedMilliseconds,
             coreRequestsStarted = coreRequestsStartedMilliseconds, coreResponsesReady = coreResponsesReadyMilliseconds,
-            coreEntriesCompleted = coreEntriesCompletedMilliseconds, firstRendering = firstRenderingMilliseconds,
+            coreEntriesCompleted = coreEntriesCompletedMilliseconds, backdropReady = backdropReadyMilliseconds, firstRendering = firstRenderingMilliseconds,
             contentRendered = contentRenderedMilliseconds }
     };
+    private async Task LoadInitialEntries()
+    {
+        await LoadCoreEntries();
+        coreEntriesCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
+    }
     protected override void OnClosing(CancelEventArgs e)
     {
         // Destroying an active HWND can synchronously raise Deactivated before

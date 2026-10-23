@@ -76,7 +76,7 @@ public sealed class ConnectionsPage : NativePage
         closeAll.Margin = new Thickness(0); closeAll.Content = FluentControls.ButtonContent("close-all", "全部断开"); if (closeAll.Content is Panel content && content.Children[0] is FluentIcon glyph) glyph.SetResourceReference(Control.ForegroundProperty, "DangerBrush"); Tools.Children.Add(closeAll);
         view = CollectionViewSource.GetDefaultView(rows); table.ItemsSource = view; table.Id("ConnectionTable");
         view.Filter = item => item is ConnectionRow row && (sourceFilter.Length == 0 || row.SourceKey == sourceFilter) && row.Search.Contains(search.Text.Trim(), StringComparison.CurrentCultureIgnoreCase);
-        ConfigureTable();
+        ConfigureTable(); Ui.KeepHeadersScrollableWhenEmpty(table);
         var refresh = Menu("刷新", "RefreshConnections", RefreshAsync); menu.Items.Add(refresh);
         var searchMenu = new MenuItem { Header = Ui.Column(Ui.Hint("筛选连接"), search), StaysOpenOnClick = true, Focusable = false }; search.Width = 300; search.Margin = new Thickness(0, 4, 0, 0); menu.Items.Add(searchMenu);
         search.KeyDown += (_, e) => { if (e.Key == Key.Escape) { search.Clear(); menu.IsOpen = false; table.Focus(); e.Handled = true; } };

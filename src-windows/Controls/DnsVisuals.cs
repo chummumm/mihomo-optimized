@@ -150,7 +150,7 @@ internal static class DnsVisuals
               <Grid>
                 <Border x:Name="Halo" Margin="-3" CornerRadius="7" BorderThickness="3" BorderBrush="{DynamicResource AccentBrush}" Opacity=".16" Visibility="Hidden" IsHitTestVisible="False"/>
                 <Border x:Name="Frame" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="4">
-                  <Grid><TextBlock Text="{TemplateBinding SelectionBoxItem}" FontFamily="{TemplateBinding FontFamily}" FontSize="{TemplateBinding FontSize}" FontWeight="Normal" Foreground="{TemplateBinding Foreground}" Margin="10,0,28,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                  <Grid><TextBlock Text="{Binding SelectionBoxItem, RelativeSource={RelativeSource TemplatedParent}}" FontFamily="{TemplateBinding FontFamily}" FontSize="{TemplateBinding FontSize}" FontWeight="Normal" Foreground="{TemplateBinding Foreground}" Margin="10,0,28,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
                     <Path Data="M0,0 L5,5 L10,0Z" Fill="{DynamicResource TextTertiaryBrush}" Width="10" Height="5" Stretch="Fill" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,9,0"/>
                   </Grid>
                 </Border>

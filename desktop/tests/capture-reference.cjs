@@ -49,6 +49,7 @@ function validateScenario (scenario) {
     assert.ok(Number.isInteger(scenario.width) && scenario.width >= 240 && scenario.width <= 4096, 'Invalid reference width')
     assert.ok(Number.isInteger(scenario.height) && scenario.height >= 200 && scenario.height <= 2160, 'Invalid reference height')
     assert.ok(finite(scenario.dpi) && scenario.dpi >= 72 && scenario.dpi <= 384, 'Invalid reference DPI')
+    assert.ok(scenario.routeScrollOffset === undefined || (finite(scenario.routeScrollOffset) && scenario.routeScrollOffset >= 0), 'Invalid observed page scroll offset')
     assert.ok(['light', 'dark', 'system'].includes(scenario.theme), 'Invalid theme preference')
     assert.ok(['zh-CN', 'en-US', 'system'].includes(scenario.language), 'Invalid language preference')
     assert.ok(scenario.status && scenario.api && scenario.config, 'Missing observed state')
@@ -518,6 +519,24 @@ async function waitForPageReady (page, scenario, state) {
         readyAt: new Date().toISOString(), streams: await page.evaluate(() => window.__referenceNative.streamMessages) }
 }
 
+async function restoreObservedScroll (page, scenario) {
+    if (scenario.name === 'tray') return { applicable: false }
+    if (scenario.routeScrollOffset === undefined) return { observed: false }
+    const restored = await page.evaluate(async requested => {
+        const frame = document.getElementById('frame')
+        if (!(frame instanceof HTMLElement)) throw new Error('The reference shell scrolling viewport is missing')
+        const painted = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+        await painted()
+        const maximum = Math.max(0, frame.scrollHeight - frame.clientHeight)
+        const expected = Math.min(requested, maximum)
+        frame.scrollTo({ top: expected, behavior: 'instant' })
+        await painted()
+        return { observed: true, requested, maximum, expected, actual: frame.scrollTop }
+    }, scenario.routeScrollOffset)
+    assert.ok(Math.abs(restored.actual - restored.expected) <= 1, 'The observed shell scroll position was not restored')
+    return restored
+}
+
 async function initializePage (scenario, origin) {
     const state = active = { scenario, api: clone(scenario.api), requests: [], streams: new Set(), caveats: [], errors: [] }
     state.connectionFrames = connectionFrames(state)
@@ -549,6 +568,7 @@ async function initializePage (scenario, origin) {
     await page.locator(scenario.name === 'tray' ? '.tray-flyout' : '.titlebar').waitFor({ state: 'visible' })
     await page.waitForFunction(() => window.__referenceNative?.commands.includes('desktop_status'))
     await waitForPageReady(page, scenario, state)
+    state.scroll = await restoreObservedScroll(page, scenario)
     return { context, page, state }
 }
 
@@ -638,6 +658,9 @@ async function captureStatic (scenario, origin) {
     const { context, page, state } = await initializePage(scenario, origin)
     try {
         await configureScenario(page, scenario)
+        // Modal and subpage actions can bring their opener into view. Restore
+        // the actually observed shell underneath them after their layout settles.
+        state.scroll = await restoreObservedScroll(page, scenario)
         const native = await validatePage(page, state)
         const file = 'reference-' + scenario.name + '.png'
         await page.screenshot({ path: path.join(output, file), animations: 'allow', caret: 'initial' })
@@ -645,7 +668,7 @@ async function captureStatic (scenario, origin) {
         report.scenarios.push({ name: scenario.name, file, sha256: sha256(fs.readFileSync(path.join(output, file))),
             capturedAt: new Date().toISOString(), observedAt: scenario.capturedAt,
             width: scenario.width, height: scenario.height, dpi: scenario.dpi, geometry: metrics,
-            traffic: state.traffic, logs: state.logs, readiness: state.readiness, requests: state.requests, streams: [...state.streams],
+            traffic: state.traffic, logs: state.logs, readiness: state.readiness, scroll: state.scroll, requests: state.requests, streams: [...state.streams],
             commands: native.commands, caveats: state.caveats })
         checkpoint()
         console.log('reference: ' + scenario.name)
@@ -685,8 +708,10 @@ async function captureMotion (scenario, origin) {
     try {
         const action = actionLocator(page, scenario)
         await action.locator.waitFor({ state: 'visible' })
-        await action.locator.scrollIntoViewIfNeeded()
         await waitForPresentation(page, pageRoots[scenario.page])
+        // Keep the pre-action viewport equal to the native observation. Any
+        // scrolling needed by the real click belongs to the recorded action.
+        const scrollBefore = await restoreObservedScroll(page, scenario)
         cdp = await context.newCDPSession(page)
         const frames = []
         let ackError
@@ -733,7 +758,7 @@ async function captureMotion (scenario, origin) {
             trigger: { ...scenario.action, browserEvent: triggered.event }, actionEpochMilliseconds: triggered.epochMilliseconds,
             actionPerformanceMilliseconds: triggered.performanceMilliseconds, targetsMilliseconds: targets,
             recordedFrames: frames.length, selectedUniqueFrames: new Set(selected.map(frame => frame.sourceFrame)).size,
-            frames: selected, readiness: state.readiness, caveats: state.caveats,
+            frames: selected, readiness: state.readiness, scrollBefore, caveats: state.caveats,
             timing: 'Closest actual compositor frame to each requested time. Reused frames and timing error are explicit; serial screenshots do not drive or pause the animation.',
             geometryAfter: await geometry(page) }
         const manifest = 'motion/' + scenario.name + '.json'

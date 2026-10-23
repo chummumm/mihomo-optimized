@@ -116,7 +116,9 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         var resourceHeading = Ui.Label("规则与 Geo 数据", 14, true); resourceHeading.Margin = new Thickness(1, 0, 0, 8); resources = new ResourceUpdatePanel(session);
         resourcesTarget = new Border { Child = Ui.Column(resourceHeading, resources), BorderThickness = new Thickness(2), Padding = new Thickness(0), Margin = new Thickness(-2, 26, -2, -2), CornerRadius = new CornerRadius(4), Focusable = true }.Id("set-resources");
         resourcesTarget.BorderBrush = Brushes.Transparent; L.Bind(resourcesTarget, AutomationProperties.NameProperty, "规则与 Geo 数据"); overview.Children.Add(resourcesTarget);
-        SizeChanged += (_, _) => { currentCard.Padding = PageContainerWidth <= 560 ? new Thickness(16) : new Thickness(24, 20, 24, 20); countsBadge.Visibility = PageContainerWidth <= 560 ? Visibility.Collapsed : Visibility.Visible; UpdateEditorMetrics(); };
+        void AdaptOverview() { currentCard.Padding = PageContainerWidth <= 560 ? new Thickness(16) : new Thickness(24, 20, 24, 20); countsBadge.Visibility = PageContainerWidth <= 560 ? Visibility.Collapsed : Visibility.Visible; }
+        SizeChanged += (_, _) => { AdaptOverview(); UpdateEditorMetrics(); };
+        TransitionSurface.SizeChanged += (_, args) => { if (args.WidthChanged) AdaptOverview(); };
         readAgain = IconAction("从文件重新读取", "ConfigReadAgain", "update", Reread);
         closeEditor = IconAction("关闭", "CloseEditor", "close", CloseEditor);
         save = IconAction("保存并重新加载", "SaveConfig", "save", () => Save(true), true);
@@ -346,7 +348,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
                 if (wasOpen && animate)
                     Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(() =>
                     {
-                        if (generation == editorTransition && !editorOpen && IsActive && IsVisible && openEditor.IsEnabled && Window.GetWindow(this) is { IsActive: true })
+                        if (generation == editorTransition && !editorOpen && IsActive && IsVisible && openEditor.IsEnabled && Keyboard.FocusedElement is null && Window.GetWindow(this) is { IsActive: true })
                             openEditor.Focus();
                     }));
             }

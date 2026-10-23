@@ -25,7 +25,13 @@ public partial class MainWindow : Window
     private readonly NativeTitleBar titleBar;
     private readonly DesktopRecovery recovery;
     private readonly DesktopUpdateNotice updateNotice;
-    private readonly FluentBackdropFilter navigationBackdrop = new() { CornerRadius = new CornerRadius(0, 8, 8, 0) };
+    private readonly FluentBackdropFilter navigationBackdrop = new()
+    {
+        CornerRadius = new CornerRadius(0, 8, 8, 0),
+        // Minimal navigation travels from -285.6 to 0; compact navigation
+        // grows from 48 to 280. Keep their full rightward sampling path ready.
+        MotionOverscan = new Thickness(16, 16, 302, 16)
+    };
     private readonly Grid navigationOverlaySurface = new();
     internal TransientMessageHost Notifications { get; } = new();
     private readonly string shellPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Mihomo Optimized", "native-shell.json");
@@ -606,7 +612,7 @@ public partial class MainWindow : Window
             case "native_arm_motion": return NativeMotionCapture.Arm(this, args);
             case "native_motion_status": return NativeMotionCapture.Status();
             case "native_snapshot":
-                return new { ready = session.Ready, visible = IsVisible, phase = session.Status.Text("phase"), page = currentPage, error = session.Status.Text("lastError") is { Length: > 0 } coreError ? coreError : Notifications.IsErrorVisible ? Notifications.VisibleMessageText : "", busy = preparingExit || session.BusyCommand is not null || session.Status.Text("phase") is "starting" or "stopping", navigationMode, navigationOverlay = overlayOpen, material = backdrop.Material, customTitleBar = true, canGoBack = BackButton.IsEnabled, language = session.Language, theme = session.Theme, captureKind = "wpf-visual-tree", trayVisible = tray.IsFlyoutVisible, searchVisible = searchWindow?.IsVisible == true, search = new { input = SearchButton.Describe(), window = searchWindow?.Describe() } };
+                return new { ready = session.Ready, visible = IsVisible, phase = session.Status.Text("phase"), page = currentPage, routeScrollOffset = activePage?.RouteScrollOffset ?? 0, error = session.Status.Text("lastError") is { Length: > 0 } coreError ? coreError : Notifications.IsErrorVisible ? Notifications.VisibleMessageText : "", busy = preparingExit || session.BusyCommand is not null || session.Status.Text("phase") is "starting" or "stopping", navigationMode, navigationOverlay = overlayOpen, material = backdrop.Material, customTitleBar = true, canGoBack = BackButton.IsEnabled, language = session.Language, theme = session.Theme, captureKind = "wpf-visual-tree", trayVisible = tray.IsFlyoutVisible, searchVisible = searchWindow?.IsVisible == true, search = new { input = SearchButton.Describe(), window = searchWindow?.Describe() } };
             case "native_navigate":
                 return new { navigated = await NavigateAsync(new NavigationTarget(args.Text("page"), EmptyNull(args.Text("target")), EmptyNull(args.Text("query")), EmptyNull(args.Text("action")))) };
             case "native_show": ShowMain(); return new { visible = IsVisible };

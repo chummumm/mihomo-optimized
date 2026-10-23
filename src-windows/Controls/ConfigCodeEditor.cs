@@ -4,6 +4,8 @@ using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Automation.Peers;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
@@ -20,7 +22,9 @@ internal sealed class ConfigCodeEditor : UserControl
         AcceptsReturn = true, AcceptsTab = false, TextWrapping = TextWrapping.NoWrap,
         VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
         FontSize = 12,
-        Padding = new Thickness(14, 12, 14, 12), BorderThickness = new Thickness(0), UndoLimit = 100
+        // WPF reserves another 2 DIP on each side for its bidi caret. Its
+        // line box places this font's ink 2 DIP below the reference textarea.
+        Padding = new Thickness(12, 10, 12, 14), BorderThickness = new Thickness(0), UndoLimit = 100
     };
     private readonly LineNumberGutter gutter;
     private readonly Border frame;
@@ -60,6 +64,7 @@ internal sealed class ConfigCodeEditor : UserControl
         Editor.SetResourceReference(Control.FontFamilyProperty, "MonoFont");
         TextBlock.SetLineHeight(Editor, 20.4); TextBlock.SetLineStackingStrategy(Editor, LineStackingStrategy.BlockLineHeight);
         SpellCheck.SetIsEnabled(Editor, false);
+        Editor.Loaded += (_, _) => BindScrollViewport();
         gutter = new LineNumberGutter(this).Id("ConfigLineNumbers");
         var grid = new Grid(); grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); grid.RowDefinitions.Add(new RowDefinition());
         L.Bind(matchCase, ContentControl.ContentProperty, "区分大小写");
@@ -92,6 +97,39 @@ internal sealed class ConfigCodeEditor : UserControl
         find.PreviewKeyDown += (_, e) => { if (e.Key == Key.Enter) { FindMatch((Keyboard.Modifiers & ModifierKeys.Shift) != 0); e.Handled = true; } };
         L.Changed += () => { gutter.InvalidateVisual(); if (findBar.Visibility == Visibility.Visible) UpdateFindStatus(false); };
         empty.Loaded += (_, _) => { if (empty.Visibility == Visibility.Visible) AnimateEmpty(); };
+    }
+
+    private void BindScrollViewport()
+    {
+        Editor.ApplyTemplate();
+        if (Editor.Template.FindName("PART_ContentHost", Editor) is not ScrollViewer viewer) return;
+        viewer.ApplyTemplate();
+        Bind("PART_VerticalScrollBar", nameof(ScrollViewer.ViewportHeight), false);
+        Bind("PART_HorizontalScrollBar", nameof(ScrollViewer.ViewportWidth), true);
+        void Bind(string name, string viewport, bool horizontal)
+        {
+            if (viewer.Template.FindName(name, viewer) is not ScrollBar bar) return;
+            var binding = new MultiBinding { Mode = BindingMode.OneWay, Converter = new PaddedViewport(horizontal) };
+            binding.Bindings.Add(new Binding(viewport) { Source = viewer });
+            binding.Bindings.Add(new Binding(nameof(Control.Padding)) { Source = Editor });
+            // CSS clientHeight includes padding. WPF's TextBoxView viewport
+            // excludes it; add it back only for the thumb ratio. Maximum,
+            // Value, line/page commands and the actual scrolling stay intact.
+            BindingOperations.SetBinding(bar, ScrollBar.ViewportSizeProperty, binding);
+        }
+    }
+
+    private sealed class PaddedViewport(bool horizontal) : IMultiValueConverter
+    {
+        public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (values.Length != 2 || values[0] is not double viewport || !double.IsFinite(viewport) || viewport < 0 || values[1] is not Thickness padding)
+                return Binding.DoNothing;
+            // Horizontal content also excludes TextBoxView's two 2-DIP bidi
+            // caret margins. All measurements remain DIPs at every monitor DPI.
+            return viewport + (horizontal ? padding.Left + padding.Right + 4 : padding.Top + padding.Bottom);
+        }
+        public object[] ConvertBack(object value, Type[] targetTypes, object parameter, CultureInfo culture) => throw new NotSupportedException();
     }
 
     internal void SetAvailability(bool loaded, bool loading)
