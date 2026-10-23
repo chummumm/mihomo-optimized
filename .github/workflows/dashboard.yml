@@ -56,7 +56,19 @@ jobs:
       - name: Build UI
         run: pnpm build
       - name: Install browser for isolated regression tests
-        run: pnpm exec playwright install --with-deps chromium webkit
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          # The Azure mirror can keep transferring too slowly to trigger apt's
+          # idle timeout: https://github.com/actions/runner-images/issues/14823
+          mirrors=/etc/apt/apt-mirrors.txt
+          if [[ -f "$mirrors" ]]; then
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
+            test -s "$mirrors"
+            grep -Eq '^https://archive\.ubuntu\.com/ubuntu/?([[:space:]]|$)' "$mirrors"
+            grep -Eq '^https://security\.ubuntu\.com/ubuntu/?([[:space:]]|$)' "$mirrors"
+          fi
+          pnpm exec playwright install --with-deps chromium webkit
       - name: Verify connection scrolling, counts and memory-only DNS pages
         run: pnpm test:browser
       - name: Collect throughput edge regression frames

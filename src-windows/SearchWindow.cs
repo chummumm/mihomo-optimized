@@ -90,7 +90,9 @@ internal sealed class SearchWindow : Window
     private double constructorStartedMilliseconds, constructorCompletedMilliseconds;
     private double? sourceInitializedMilliseconds, sourceInitializedCompletedMilliseconds, loadedMilliseconds,
         attachOwnerCompletedMilliseconds, suggestionsStartedMilliseconds, coreRequestsStartedMilliseconds,
-        coreResponsesReadyMilliseconds, coreEntriesCompletedMilliseconds, backdropReadyMilliseconds, firstRenderingMilliseconds, contentRenderedMilliseconds;
+        coreResponsesReadyMilliseconds, coreEntriesCompletedMilliseconds, backdropReadyMilliseconds, firstRenderingMilliseconds, contentRenderedMilliseconds,
+        entranceFirstTickMilliseconds, entranceClockCompletedMilliseconds, entranceFirstRenderingMilliseconds;
+    private double? entranceFirstRenderedOpacity;
     private readonly AppSession session;
     private readonly GlobalSearchBox inputBox;
     private readonly int instance;
@@ -132,7 +134,8 @@ internal sealed class SearchWindow : Window
     private string CommandState => string.Join("|", session.Ready, session.IsUpdating, session.IsDirty, session.Status.Text("phase"), session.Status.Bool("systemProxy"), session.Status.Bool("tun"),
         session.Status.Get("capabilities").ToString());
 
-    public SearchWindow(AppSession session, GlobalSearchBox inputBox, FluentBackdropFilter? preparedBackdrop = null, Task<bool>? preparedPixels = null)
+    public SearchWindow(AppSession session, GlobalSearchBox inputBox, FluentBackdropFilter? preparedBackdrop = null,
+        Task<FluentBackdropFilter.PreparationTicket?>? preparedPixels = null)
     {
         constructorStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         this.session = session; this.inputBox = inputBox; search = inputBox.Input;
@@ -201,6 +204,7 @@ internal sealed class SearchWindow : Window
         {
             closed = true; inputBox.PaletteClosed(instance); lifetime.Cancel(); lifetime.Dispose();
             CompositionTarget.Rendering -= FirstRendering;
+            CompositionTarget.Rendering -= EntranceRendering;
             search.TextChanged -= QueryChanged;
             AutomationProperties.SetHelpText(search, "");
             session.StatusChanged -= OnStatusChanged; session.ThemeChanged -= OnThemeChanged; L.Changed -= OnLanguageChanged;
@@ -230,12 +234,27 @@ internal sealed class SearchWindow : Window
         if (!FluentMotion.Enabled) { suggestionBorder.RenderTransform = Transform.Identity; return; }
         var movement = new TranslateTransform(); suggestionBorder.RenderTransform = movement;
         SettingsSegments.Animate(movement, TranslateTransform.YProperty, -12, 0, 250);
-        SettingsSegments.Animate(suggestionBorder, OpacityProperty, 0, 1, 250);
+        // The same CSS keyframes as SettingsSegments.Animate. These callbacks
+        // only identify WPF clock/render submission; screen pixels remain the
+        // independent evidence of when the window was actually presented.
+        var fade = new DoubleAnimationUsingKeyFrames { Duration = TimeSpan.FromMilliseconds(250), FillBehavior = FillBehavior.Stop };
+        fade.KeyFrames.Add(new LinearDoubleKeyFrame(0, KeyTime.FromPercent(0)));
+        fade.KeyFrames.Add(new SplineDoubleKeyFrame(1, KeyTime.FromPercent(1), new KeySpline(0, 0, 0, 1)));
+        fade.CurrentTimeInvalidated += (_, _) => entranceFirstTickMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
+        fade.Completed += (_, _) => entranceClockCompletedMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
+        CompositionTarget.Rendering += EntranceRendering;
+        suggestionBorder.BeginAnimation(OpacityProperty, fade);
     }
     private void FirstRendering(object? sender, EventArgs args)
     {
         firstRenderingMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
         CompositionTarget.Rendering -= FirstRendering;
+    }
+    private void EntranceRendering(object? sender, EventArgs args)
+    {
+        entranceFirstRenderingMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
+        entranceFirstRenderedOpacity ??= suggestionBorder.Opacity;
+        CompositionTarget.Rendering -= EntranceRendering;
     }
 
     public void FocusInput()
@@ -254,7 +273,9 @@ internal sealed class SearchWindow : Window
             attachOwnerCompleted = attachOwnerCompletedMilliseconds, suggestionsStarted = suggestionsStartedMilliseconds,
             coreRequestsStarted = coreRequestsStartedMilliseconds, coreResponsesReady = coreResponsesReadyMilliseconds,
             coreEntriesCompleted = coreEntriesCompletedMilliseconds, backdropReady = backdropReadyMilliseconds, firstRendering = firstRenderingMilliseconds,
-            contentRendered = contentRenderedMilliseconds }
+            contentRendered = contentRenderedMilliseconds, entranceFirstTick = entranceFirstTickMilliseconds,
+            entranceClockCompleted = entranceClockCompletedMilliseconds, entranceFirstRendering = entranceFirstRenderingMilliseconds,
+            entranceFirstRenderedOpacity }
     };
     private async Task LoadInitialEntries()
     {

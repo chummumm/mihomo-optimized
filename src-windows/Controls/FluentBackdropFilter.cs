@@ -12,6 +12,9 @@ namespace Mihomo.Desktop.Controls;
 /// <summary>A full-resolution backdrop sampled only from explicitly supplied lower visual layers.</summary>
 internal sealed class FluentBackdropFilter : Grid, IDisposable
 {
+    internal sealed record PreparationTicket(long Generation, long RequiredRevision, long FrameRevision,
+        double RequestedAtMilliseconds, double CaptureStartedAtMilliseconds, double CaptureCompletedAtMilliseconds);
+
     private sealed class ObserverScope
     {
         internal readonly List<WeakReference<FluentBackdropFilter>> Filters = [];
@@ -94,7 +97,8 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private Rect clipBounds = Rect.Empty, sampleWindow = Rect.Empty;
     private Size sourceSize, clipSize;
     private long generation;
-    private long sourceRevision, publishedSourceRevision = -1, readyRevision;
+    private long sourceRevision, publishedSourceRevision = -1, publishedGeneration = -1, readyRevision;
+    private double publishedCaptureStartedAtMilliseconds, publishedCaptureCompletedAtMilliseconds;
     private byte[]? baseline, scratch;
     private CancellationTokenSource? processing;
     private TaskCompletionSource<bool> firstReady = NewReady();
@@ -105,6 +109,8 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private double? demandStartedAt;
     private double demandMilliseconds, captureQueueMilliseconds;
     private int demandCacheHits, captureQueuePromotions;
+    private int preparedFrameReuses;
+    private object? lastPreparationUse;
     private double? firstBitmapMilliseconds;
     private static TaskCompletionSource<bool> NewReady() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -190,39 +196,64 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         InvalidateRaster(clear: true); UpdateSubscription();
     }
 
-    internal Task<bool> PrepareAsync() => PrepareCoreAsync(verifyPixels: true);
+    internal Task<PreparationTicket?> PrepareAsync() => PrepareCoreAsync(verifyPixels: true);
 
     // A popup can construct its HWND/layout while this same real-source
-    // verification runs. Afterwards re-check geometry and source revisions;
-    // do not manufacture a second verification merely because Loaded fired.
-    internal async Task<bool> CompletePreparationAsync(Task<bool> preparation)
+    // verification runs. Loaded validates that same request's frame against the
+    // final geometry. Later live revisions must not turn this into a second
+    // serial preparation; page/DPI/geometry changes still invalidate the ticket.
+    internal async Task<bool> CompletePreparationAsync(Task<PreparationTicket?> preparation)
     {
-        await preparation;
-        return await PrepareCoreAsync(verifyPixels: false);
+        var ticket = await preparation;
+        if (disposed || !CanProcess) return false;
+        UpdateGeometry();
+        if (ticket is not null && raster.Source is not null && FilterAvailable
+            && generation == ticket.Generation && publishedGeneration == ticket.Generation
+            && publishedSourceRevision >= ticket.FrameRevision)
+        {
+            preparedFrameReuses++; demandCacheHits++;
+            lastPreparationUse = new
+            {
+                generation = ticket.Generation, requiredRevision = ticket.RequiredRevision,
+                frameRevision = ticket.FrameRevision, currentSourceRevision = sourceRevision,
+                sampledAfterRequestMilliseconds = ticket.CaptureStartedAtMilliseconds - ticket.RequestedAtMilliseconds,
+                sampleDurationMilliseconds = ticket.CaptureCompletedAtMilliseconds - ticket.CaptureStartedAtMilliseconds,
+                sampleAgeAtUseMilliseconds = clock.Elapsed.TotalMilliseconds - ticket.CaptureCompletedAtMilliseconds,
+            };
+            return true;
+        }
+        return await PrepareCoreAsync(verifyPixels: false) is not null;
     }
 
-    private async Task<bool> PrepareCoreAsync(bool verifyPixels)
+    private async Task<PreparationTicket?> PrepareCoreAsync(bool verifyPixels)
     {
         Dispatcher.VerifyAccess();
-        if (disposed || !CanProcess) return false;
+        if (disposed || !CanProcess) return null;
+        double requestedAt = clock.Elapsed.TotalMilliseconds;
         bool verifySource = verifyPixels && !demanding;
         if (verifySource) demandStartedAt = clock.Elapsed.TotalMilliseconds;
         demanding = true; preparationTimer.Stop();
         UpdateGeometry();
-        if (FilterDiagnostic is not ("preparing-full-resolution-backdrop" or "live-full-resolution-gaussian-srgb")) { demanding = false; return false; }
+        if (FilterDiagnostic is not ("preparing-full-resolution-backdrop" or "live-full-resolution-gaussian-srgb")) { demanding = false; return null; }
         // Keep a real pixel verification for each new presentation request.
         // The owner-side observer supplies later revisions while the popup
         // constructs; those changes still wait for their own completed sample.
         if (verifySource) { RearmObservers(); sourceDirty = true; sourceRevision++; }
-        if (raster.Source is not null && !sourceDirty && processing is null && publishedSourceRevision >= sourceRevision)
+        if (raster.Source is not null && publishedGeneration == generation && !sourceDirty && processing is null && publishedSourceRevision >= sourceRevision)
         {
-            demandCacheHits++; CompleteDemand(); return true;
+            demandCacheHits++; CompleteDemand();
+            return new(generation, sourceRevision, publishedSourceRevision, requestedAt,
+                publishedCaptureStartedAtMilliseconds, publishedCaptureCompletedAtMilliseconds);
         }
-        if (coordinateRoot is null || layers.Count == 0 || SystemParameters.HighContrast) { demanding = false; return false; }
-        readyRevision = sourceRevision;
+        if (coordinateRoot is null || layers.Count == 0 || SystemParameters.HighContrast) { demanding = false; return null; }
+        long requiredRevision = sourceRevision;
+        readyRevision = requiredRevision;
         if (firstReady.Task.IsCompleted) firstReady = NewReady();
         QueueCapture();
-        return await firstReady.Task;
+        bool ready = await firstReady.Task;
+        if (!ready || disposed || raster.Source is null || publishedGeneration != generation || publishedSourceRevision < requiredRevision) return null;
+        return new(generation, requiredRevision, publishedSourceRevision, requestedAt,
+            publishedCaptureStartedAtMilliseconds, publishedCaptureCompletedAtMilliseconds);
     }
 
     internal object Describe() => new
@@ -240,6 +271,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         queueMilliseconds, schedulingMilliseconds, convolutionMilliseconds, publishDispatchMilliseconds,
         preparationEnabled, presenting = Presenting, preparationReadyMilliseconds,
         demandMilliseconds, demandCacheHits, captureQueueMilliseconds, captureQueuePromotions,
+        preparedFrameReuses, lastPreparationUse,
         sourceRevision, publishedSourceRevision,
         processing = processing is not null, pendingSourceChange = sourceDirty,
     };
@@ -292,7 +324,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         if (demanding) readyRevision = sourceRevision;
         if (clear)
         {
-            raster.Source = null; publishedSourceRevision = -1; FilterAvailable = false;
+            raster.Source = null; publishedSourceRevision = publishedGeneration = -1; FilterAvailable = false;
             if (firstReady.Task.IsCompleted) firstReady = NewReady();
         }
     }
@@ -453,21 +485,23 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
                 int stride = checked(width * 4), length = checked(stride * height);
                 if (width <= 0 || height <= 0) return;
                 long captureStarted = Stopwatch.GetTimestamp(); lastCaptureAt = clock.Elapsed.TotalMilliseconds;
+                double sampleStartedAt = lastCaptureAt;
                 var snapshot = new RenderTargetBitmap(width, height, dpiX * 96, dpiY * 96, PixelFormats.Pbgra32);
                 try { snapshot.Render(captureVisual); }
                 finally { RearmObservers(); }
                 if (scratch?.Length != length) scratch = new byte[length];
                 snapshot.CopyPixels(scratch, stride, 0); captures++;
                 captureMilliseconds = Stopwatch.GetElapsedTime(captureStarted).TotalMilliseconds;
+                double sampleCompletedAt = clock.Elapsed.TotalMilliseconds;
                 long compareStarted = Stopwatch.GetTimestamp();
                 bool identical = baseline is not null && baseline.AsSpan().SequenceEqual(scratch);
                 compareMilliseconds = Stopwatch.GetElapsedTime(compareStarted).TotalMilliseconds;
-                if (identical) { identicalCaptures++; CompleteReady(revision); return; }
+                if (identical) { identicalCaptures++; CompleteReady(revision, sampleStartedAt, sampleCompletedAt); return; }
                 // Only these two byte buffers are retained. While one is being
                 // processed no second capture can mutate it or build a queue.
                 (baseline, scratch) = (scratch, baseline);
                 var cancellation = new CancellationTokenSource(); processing = cancellation;
-                _ = PublishAsync(baseline!, width, height, dpiX, dpiY, Sigma, Saturation, generation, revision, cancellation);
+                _ = PublishAsync(baseline!, width, height, dpiX, dpiY, Sigma, Saturation, generation, revision, sampleStartedAt, sampleCompletedAt, cancellation);
             }
             catch (Exception error) when (error is COMException or NotSupportedException or InvalidOperationException or ArgumentException or OverflowException)
             { Fallback("capture-unavailable-" + error.GetType().Name); }
@@ -475,7 +509,8 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         }));
     }
 
-    private async Task PublishAsync(byte[] pixels, int width, int height, double scaleX, double scaleY, double sigma, double saturation, long version, long revision, CancellationTokenSource cancellation)
+    private async Task PublishAsync(byte[] pixels, int width, int height, double scaleX, double scaleY, double sigma, double saturation, long version, long revision,
+        double sampleStartedAt, double sampleCompletedAt, CancellationTokenSource cancellation)
     {
         try
         {
@@ -490,7 +525,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
             bitmap.Freeze(); raster.Source = bitmap; filteredFrames++;
             firstBitmapMilliseconds ??= clock.Elapsed.TotalMilliseconds;
             Background = Brushes.Transparent; FilterAvailable = true; FilterDiagnostic = "live-full-resolution-gaussian-srgb";
-            CompleteReady(revision);
+            CompleteReady(revision, sampleStartedAt, sampleCompletedAt);
         }
         catch (OperationCanceledException) { cancelledFrames++; }
         catch (Exception error) when (error is COMException or NotSupportedException or InvalidOperationException or ArgumentException or OverflowException)
@@ -503,9 +538,10 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         }
     }
 
-    private void CompleteReady(long revision)
+    private void CompleteReady(long revision, double sampleStartedAt, double sampleCompletedAt)
     {
-        publishedSourceRevision = revision;
+        publishedSourceRevision = revision; publishedGeneration = generation;
+        publishedCaptureStartedAtMilliseconds = sampleStartedAt; publishedCaptureCompletedAtMilliseconds = sampleCompletedAt;
         if (preparationEnabled) preparationReadyMilliseconds = clock.Elapsed.TotalMilliseconds - preparationStartedAt;
         // Readiness means a real sample captured after the current request (or
         // a newer page/geometry invalidation). It must not wait for a live chart

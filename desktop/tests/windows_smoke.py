@@ -51,6 +51,10 @@ FIREWALL_GROUP = "Mihomo Optimized TUN"
 class SmokeFailure(Exception):
     """An intentionally bounded diagnostic code, never a native error payload."""
 
+    def __init__(self, code: str, *, uia: dict | None = None) -> None:
+        super().__init__(code)
+        self.uia = uia
+
 
 def require(condition: object, code: str) -> None:
     if not condition:
@@ -786,13 +790,23 @@ class NativeDriver:
             "-File", str(script), "-ApplicationProcessId", str(self.identity.pid),
             "-AutomationId", automation_id, "-Action", action, "-Value", value]
         for attempt in range(3):
-            result = subprocess.run(arguments, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=15,
-                creationflags=subprocess.CREATE_NO_WINDOW)
+            try:
+                result = subprocess.run(arguments, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=15,
+                    creationflags=subprocess.CREATE_NO_WINDOW)
+            except subprocess.TimeoutExpired as error:
+                diagnostic = {"action": safe_code(action),
+                    "automationId": safe_code(automation_id), "timedOut": True,
+                    "stdoutLength": len(error.stdout or b""),
+                    "stderrLength": len(error.stderr or b"")}
+                raise SmokeFailure("native_uia_query_timeout_" + safe_code(automation_id),
+                                   uia=diagnostic) from None
             try:
                 response = json.loads(result.stdout.lstrip("\ufeff"))
+                parsed = True
             except (ValueError, TypeError):
                 response = {}
+                parsed = False
             # Closing a popup or rebuilding a page can invalidate a peer while
             # the read-only tree walk is in flight (UIA_E_ELEMENTNOTAVAILABLE).
             # Restart the complete read with fresh peers, including the secret
@@ -802,12 +816,30 @@ class NativeDriver:
                 time.sleep(.1)
                 continue
             break
+        if result.returncode or not (isinstance(response, dict) and "found" in response):
+            # Preserve process-exit evidence even if the helper cannot emit JSON.
+            # Counts and fixed markers are safe; stdout/stderr can contain text
+            # from the editor or a configuration and must never enter artifacts.
+            diagnostic = {"action": safe_code(action),
+                "automationId": safe_code(automation_id), "returnCode": result.returncode,
+                "exitCodeHex": f"0x{result.returncode & 0xFFFFFFFF:08X}",
+                "stdoutLength": len(result.stdout), "stderrLength": len(result.stderr),
+                "jsonParsed": parsed,
+                "stderrIndicators": [marker for marker in (
+                    "ParserError", "ParameterBindingValidationException", "AccessViolationException",
+                    "TypeNotFound", "COMException", "Add-Type") if marker in result.stderr]}
+            if isinstance(response, dict):
+                diagnostic.update({key: safe_code(response[key])
+                    for key in ("stage", "exception", "hresult") if key in response})
         if result.returncode:
             # The helper emits only a bounded operation stage, exception type and HRESULT.
             # Never include raw PowerShell stderr or user-controlled UI values.
-            detail = "_".join(safe_code(response.get(key, "unknown")) for key in ("stage", "exception", "hresult"))
-            raise SmokeFailure("native_uia_query_failed_" + safe_code(automation_id) + "_" + detail)
-        require(isinstance(response, dict) and "found" in response, "native_uia_response_invalid")
+            error_fields = response if isinstance(response, dict) else {}
+            detail = "_".join(safe_code(error_fields.get(key, "unknown")) for key in ("stage", "exception", "hresult"))
+            raise SmokeFailure("native_uia_query_failed_" + safe_code(automation_id) + "_" + detail,
+                               uia=diagnostic)
+        if not (isinstance(response, dict) and "found" in response):
+            raise SmokeFailure("native_uia_response_invalid", uia=diagnostic)
         return response
 
     def screenshot(self, output: Path, secrets: set[str], page: str | None = "settings", surface: str = "main") -> dict:
@@ -1462,8 +1494,8 @@ class Acceptance:
             state = driver.ui("ConfigEditor", "text-viewport")
             viewport = state.get("textViewport", {})
             # Retain numeric positions before asserting. Prefix/suffix reads
-            # validate true offsets without UIA2 cross-range comparisons; no
-            # document text or copied ranges are written to the evidence.
+            # cross-check native UIA3 comparisons against true UTF-16 offsets;
+            # no document text or copied ranges enter the evidence.
             evidence["editorTextRangeProbe"] = {
                 "valueUtf16Length": len(state.get("value", "").encode("utf-16-le")) // 2,
                 **viewport,
@@ -2457,6 +2489,13 @@ def main() -> int:
         print("FAIL: " + code, file=sys.stderr, flush=True)
         if acceptance:
             diagnostic = {"stage": acceptance.stage, "code": code}
+            if isinstance(error, SmokeFailure) and error.uia:
+                # Keep the original probe failure even if finally blocks make
+                # successful UIA calls to restore the editor before this catch.
+                diagnostic["uia"] = error.uia
+            if acceptance.driver:
+                with contextlib.suppress(Exception):
+                    diagnostic["guiExitCode"] = acceptance.driver.process.poll()
             if not isinstance(error, SmokeFailure):
                 # Retain locations and numeric Win32 failures, never exception
                 # text or locals (which may contain configuration credentials).
@@ -2471,9 +2510,6 @@ def main() -> int:
                 function = getattr(error, "funcname", None)
                 if isinstance(function, str):
                     diagnostic["function"] = safe_code(function)
-                if acceptance.driver:
-                    with contextlib.suppress(Exception):
-                        diagnostic["guiExitCode"] = acceptance.driver.process.poll()
             acceptance.report["diagnostics"].append(diagnostic)
             if acceptance.stage == "native_redesign_ui" and acceptance.driver:
                 try:

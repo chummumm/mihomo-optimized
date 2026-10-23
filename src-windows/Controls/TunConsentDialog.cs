@@ -51,7 +51,7 @@ internal static class TunConsentDialog
         cancel.Click += (_, _) => dialog.Complete(false);
         dialog.Loaded += (_, _) => cancel.Focus(); return dialog.ShowDialog() == true;
     }
-    private static FrameworkElement InstallButtonContent(string label)
+    internal static FrameworkElement InstallButtonContent(string label)
     {
         // The supplied Button's UacShield paths and colours, at its original 16px size.
         var shield = new Canvas { Width = 16, Height = 16, Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center };

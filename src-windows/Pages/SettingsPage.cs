@@ -184,7 +184,8 @@ public sealed class SettingsPage : NativePage
         AutomationProperties.SetLiveSetting(runtimeStatus, AutomationLiveSetting.Polite);
         foreach (var button in new[] { saveProbe, resetProbe, installService, uninstallService, check, install, openRelease, openConfig, openLogs, openProject })
         { button.MinHeight = 32; button.Margin = new Thickness(0); button.Padding = new Thickness(11, 0, 11, 0); }
-        installService.Content = FluentControls.ButtonContent("shield-lock", "安装服务");
+        installService.Content = TunConsentDialog.InstallButtonContent("安装服务");
+        installService.Padding = new Thickness(12, 0, 12, 0);
         uninstallService.Content = FluentControls.ButtonContent("trash", "卸载服务");
         check.Content = FluentControls.ButtonContent("update", "检查应用更新");
         install.Content = FluentControls.ButtonContent("arrow-down", "安装并重新启动");
