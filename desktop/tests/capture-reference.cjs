@@ -234,6 +234,10 @@ async function createServer (WebSocketServer) {
 // This adapter supplies the same native IPC and controller transport as the
 // original frontend. It never imports or changes a React/Jotai application store.
 function initializeFixture ({ scenario, origin, secret }) {
+    // The native capture may already have navigation history. React Router
+    // preserves a supplied idx when it starts, so restore the observed Back
+    // availability before mounting without altering any rendered component.
+    history.replaceState({ ...history.state, idx: scenario.canGoBack === true ? 1 : 0 }, '', location.href)
     const OriginalDate = Date
     const startedAt = OriginalDate.now()
     const observedAt = OriginalDate.parse(scenario.capturedAt)
@@ -368,6 +372,7 @@ const selectors = [
     '.config-editor-confirm', '.desktop-import-modal', '.desktop-import-content', '.desktop-yaml', '.desktop-service-dialog', '.modal-container',
     '.dns-tabs', '.dns-metrics', '.dns-trend', '.dns-query-card', '.dns-pagination', '.dns-table',
     '.logs-card', '.logs-panel', '.log-line', '.logs-level-select', '.logs-paused', '.connections-table', '.connections-page',
+    '.connections-rates', '.connections-rate-row', '.connections-traffic', '.connections-chart',
     '.tray-flyout', '.tray-head', '.tray-body', '.tray-mode', '.tray-tiles', '.tray-exits', '.tray-foot',
 ]
 
@@ -763,7 +768,7 @@ async function main () {
     const { WebSocketServer } = referenceRequire('ws')
     const executablePath = browserPath(chromium)
     const origin = await createServer(WebSocketServer)
-    browser = await chromium.launch({ headless: true, executablePath,
+    browser = await chromium.launch({ headless: true, executablePath, ignoreDefaultArgs: ['--hide-scrollbars'],
         args: ['--no-sandbox', '--disable-background-networking', '--disable-component-update', '--disable-features=MediaRouter'] })
     report.browser = { version: browser.version(), executable: path.basename(executablePath), platform: process.platform,
         sourceIndexSHA256: sha256(fs.readFileSync(path.join(dist, 'index.html'))) }

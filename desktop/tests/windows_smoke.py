@@ -1182,7 +1182,7 @@ class Acceptance:
                 api["/" + endpoint] = {"providers": {key: {field: value[field] for field in fields if field in value} for key, value in providers.items()}}
             dpi = result.get("dpi", 96)
             row = {"name": name, "page": snapshot.get("page", "home"), "width": round(result["width"] * 96 / dpi), "height": round(result["height"] * 96 / dpi), "dpi": dpi,
-                "theme": snapshot.get("theme", "light"), "language": snapshot.get("language", "zh-CN"), "appearance": result.get("appearance"), "capturedAt": result.get("capturedAt"),
+                "theme": snapshot.get("theme", "light"), "language": snapshot.get("language", "zh-CN"), "appearance": result.get("appearance"), "capturedAt": result.get("capturedAt"), "canGoBack": snapshot.get("canGoBack", False),
                 "status": status, "api": api, "streams": result.get("streams", {}), "update": result.get("update", {}),
                 "config": {"path": status.get("configPath", "config.yaml"), "content": base, "revision": "fixture", "max_size": 4194304, "writable": True}}
             if name == "search": row["searchQuery"] = "theme"

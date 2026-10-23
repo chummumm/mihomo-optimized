@@ -181,7 +181,7 @@ internal sealed class ResourceUpdatePanel : UserControl
         if (!Running) { UpdateAvailability(pageToken); return; }
         sources.Visibility = Visibility.Visible;
         var current = snapshot.Get("items").Items().ToArray(); var displayed = restarted ? previous.Get("items").Items().Concat(current.Where(item => !previous.Get("items").Items().Any(old => old.Text("id") == item.Text("id")))).ToArray() : current;
-        AddGroup("geodata", "Geo 数据", displayed.Where(item => item.Text("kind") == "geodata").ToArray(), current);
+        AddGroup("geodata", "GeoData", displayed.Where(item => item.Text("kind") == "geodata").ToArray(), current);
         AddGroup("rule-provider", "规则集合", displayed.Where(item => item.Text("kind") == "rule-provider").ToArray(), current);
         // Desktop-managed tasks stay inspectable from the context menu without adding a third resource section.
         managedDetails.Items.Clear(); foreach (var item in displayed.Where(item => item.Text("kind") is "kernel" or "ui"))
@@ -208,7 +208,7 @@ internal sealed class ResourceUpdatePanel : UserControl
             var schedule = schedules.FirstOrDefault(current => current.Text("id") == item.Text("id"));
             var row = new Grid(); row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30, GridUnitType.Star) }); row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(55, GridUnitType.Star) }); row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             var name = Ui.Text(item.Text("name"), 14); name.LineHeight = 20; name.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; var left = Ui.Column(name); left.Margin = new Thickness(0, 0, 16, 0); left.VerticalAlignment = VerticalAlignment.Top;
-            TextBlock Version(string value) { var text = Ui.Muted(value, 12); text.FontFamily = new FontFamily("Cascadia Mono, Consolas"); text.TextWrapping = TextWrapping.NoWrap; text.TextTrimming = TextTrimming.CharacterEllipsis; text.Margin = new Thickness(0, 2, 0, 0); text.ToolTip = value; return text; }
+            TextBlock Version(string value) { var text = Ui.Muted(value, 12); text.SetResourceReference(TextBlock.FontFamilyProperty, "MonoFont"); text.TextWrapping = TextWrapping.NoWrap; text.TextTrimming = TextTrimming.CharacterEllipsis; text.Margin = new Thickness(0, 2, 0, 0); text.ToolTip = value; return text; }
             if (item.Text("current_version").Length > 0) left.Children.Add(Version(item.Text("current_version")));
             var latest = item.Text("latest_version"); if (latest.Length > 0 && latest != item.Text("current_version")) left.Children.Add(Version(L.F("最新版本 {0}", latest))); row.Children.Add(left);
             var status = !unconfirmed && restartVerified && item.Text("kind") == "kernel" ? "已更新" : unconfirmed || restarted && item.Text("status") is "pending" or "checking" or "restarting" ? "结果未确认" : Status(item);

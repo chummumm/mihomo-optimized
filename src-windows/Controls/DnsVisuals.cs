@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Data;
@@ -16,7 +17,16 @@ namespace Mihomo.Desktop.Controls;
 internal static class DnsVisuals
 {
     internal static readonly FontFamily Mono = new("Cascadia Mono, Cascadia Code, Consolas");
+    internal const double HeaderHeight = 10 * 1.43 + 18 + 1;
+    internal const double EmptyTableHeight = HeaderHeight + 13 * 1.43 + 64 + 1;
     internal static string Number(double value, int digits = 0) => value.ToString(digits == 0 ? "N0" : "#,0." + new string('#', digits), CultureInfo.CurrentCulture);
+    internal static string Time(DateTimeOffset date, bool full = false)
+    {
+        var culture = CultureInfo.GetCultureInfo(L.ResolvedLanguage);
+        string format = L.IsEnglish ? full ? "M/d/yyyy, h:mm:ss tt" : "h:mm:ss tt" : full ? "yyyy/M/d HH:mm:ss" : "HH:mm:ss";
+        return date.LocalDateTime.ToString(format, culture);
+    }
+    internal static string Time(string value, bool full = false) => DateTimeOffset.TryParse(value, out var date) ? Time(date, full) : "—";
     internal static TextBlock Caption(string value, bool translate = true)
     {
         var text = translate ? Ui.Label(value, 12) : Ui.Text(value, 12);
@@ -36,11 +46,13 @@ internal static class DnsVisuals
     internal static Style TableCellStyle => (Style)Templates["DnsCell"];
     internal static void Table(DataGrid table)
     {
-        table.BorderThickness = new Thickness(0); table.RowHeight = double.NaN; table.MinRowHeight = 0; table.FontSize = 13;
+        table.BorderThickness = new Thickness(0); table.RowHeight = double.NaN; table.MinRowHeight = 13 * 1.43 + 19; table.FontSize = 13;
         table.GridLinesVisibility = DataGridGridLinesVisibility.None; table.CanUserResizeRows = false; table.CanUserReorderColumns = false;
         table.CanUserSortColumns = false; table.ColumnHeaderStyle = (Style)Templates["DnsHeader"]; table.CellStyle = TableCellStyle;
+        table.ColumnHeaderHeight = HeaderHeight;
         table.RowStyle = (Style)Templates["DnsRow"]; table.SetResourceReference(Control.BackgroundProperty, "DialogTopBrush");
         table.SetResourceReference(Control.BorderBrushProperty, "DividerBrush");
+        foreach (var column in table.Columns) { column.MinWidth = 0; column.CanUserResize = false; column.Width = DataGridLength.Auto; }
         foreach (var column in table.Columns.OfType<DataGridTextColumn>()) column.ElementStyle = TextStyle(false);
     }
     internal static Style TextStyle(bool mono, double size = 13, bool strong = false, bool wrap = false)
@@ -54,15 +66,58 @@ internal static class DnsVisuals
     }
     internal static void Input(Control input)
     {
-        input.MinWidth = 0; input.FontSize = 13; input.Height = 32; input.Padding = new Thickness(10, 0, 10, 0);
+        if (input is ComboBox) input.Style = (Style)Templates["DnsSelect"];
+        input.MinWidth = 0; input.MinHeight = 0; input.FontSize = 13; input.FontWeight = FontWeights.Normal; input.Height = 32; input.Padding = new Thickness(10, 0, 10, 0);
+        input.FocusVisualStyle = null; input.SetResourceReference(Control.ForegroundProperty, "TextPrimaryBrush");
         input.SetResourceReference(Control.BackgroundProperty, "CardBrush"); input.SetResourceReference(Control.BorderBrushProperty, "ControlStrongBrush");
         if (input is TextBox) input.Template = (ControlTemplate)Templates["DnsInputTemplate"];
+    }
+    internal static TextBox InputBox(string hint, string id)
+    {
+        var input = new TextBox { VerticalContentAlignment = VerticalAlignment.Center }.Id(id);
+        L.Bind(input, FrameworkElement.TagProperty, hint); L.Bind(input, FrameworkElement.ToolTipProperty, hint); L.Bind(input, AutomationProperties.NameProperty, hint);
+        return input;
+    }
+    // HTML's automatic table layout uses intrinsic cell widths. Preserve that
+    // behavior without fixed per-column widths or losing the native grid peers.
+    internal static void FitColumns(DataGrid table, IReadOnlyList<double> contentWidths)
+    {
+        if (table.Columns.Count == 0 || table.ActualWidth <= 0) return;
+        double available = table.ActualWidth;
+        if (FindVerticalBar(table) is { Visibility: Visibility.Visible } bar) available -= bar.ActualWidth;
+        var widths = table.Columns.Select((column, index) => Math.Max(
+            TextWidth(table, column.Header?.ToString() ?? "", true, 10, FontWeights.Medium, .6),
+            index < contentWidths.Count ? contentWidths[index] : 0) + 28).ToArray();
+        double natural = widths.Sum(), factor = natural > 0 ? Math.Max(1, available / natural) : 1;
+        for (int index = 0; index < widths.Length; index++)
+        {
+            double width = widths[index] * factor;
+            if (!table.Columns[index].Width.IsAbsolute || Math.Abs(table.Columns[index].Width.Value - width) > .1)
+                table.Columns[index].Width = new DataGridLength(width);
+        }
+        static ScrollBar? FindVerticalBar(DependencyObject item)
+        {
+            for (int index = 0; index < VisualTreeHelper.GetChildrenCount(item); index++)
+            {
+                var child = VisualTreeHelper.GetChild(item, index);
+                if (child is ScrollBar { Orientation: Orientation.Vertical } result) return result;
+                if (FindVerticalBar(child) is { } nested) return nested;
+            }
+            return null;
+        }
+    }
+    internal static double TextWidth(FrameworkElement owner, string value, bool mono = false, double size = 13, FontWeight? weight = null, double spacing = 0)
+    {
+        var family = mono ? Mono : owner.TryFindResource("BodyFont") as FontFamily ?? new FontFamily("Segoe UI");
+        var text = new FormattedText(value, CultureInfo.GetCultureInfo(L.ResolvedLanguage), FlowDirection.LeftToRight,
+            new Typeface(family, FontStyles.Normal, weight ?? FontWeights.Normal, FontStretches.Normal), size, Brushes.Black, VisualTreeHelper.GetDpi(owner).PixelsPerDip);
+        return text.WidthIncludingTrailingWhitespace + spacing * value.Length;
     }
     internal static void SmallButton(Button button, string? glyph = null, bool trailing = false)
     {
         button.Height = 28; button.MinHeight = 28; button.FontSize = 12; button.Padding = new Thickness(10, 0, 10, 0); button.Margin = new Thickness(0);
         if (glyph is null) return;
-        var text = new TextBlock { VerticalAlignment = VerticalAlignment.Center };
+        var text = new TextBlock { FontSize = 12, FontWeight = FontWeights.Normal, LineHeight = 17.16, VerticalAlignment = VerticalAlignment.Center };
         var binding = BindingOperations.GetBinding(button, ContentControl.ContentProperty);
         if (binding is not null) { BindingOperations.ClearBinding(button, ContentControl.ContentProperty); text.SetBinding(TextBlock.TextProperty, binding); }
         else text.Text = button.Content?.ToString() ?? "";
@@ -75,21 +130,49 @@ internal static class DnsVisuals
           <ControlTemplate x:Key="DnsInputTemplate" TargetType="TextBox">
             <Grid>
               <Border x:Name="Halo" Margin="-3" CornerRadius="7" BorderThickness="3" BorderBrush="{DynamicResource AccentBrush}" Opacity=".16" Visibility="Hidden" IsHitTestVisible="False"/>
-              <Border x:Name="Frame" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="4"><ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}" VerticalAlignment="Center"/></Border>
+              <Border x:Name="Frame" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="4"><Grid>
+                <ScrollViewer x:Name="PART_ContentHost" VerticalAlignment="Center"/>
+                <TextBlock x:Name="Hint" Text="{TemplateBinding Tag}" Margin="{TemplateBinding Padding}" FontFamily="{TemplateBinding FontFamily}" FontSize="{TemplateBinding FontSize}" FontWeight="Normal" Foreground="{DynamicResource TextTertiaryBrush}" TextAlignment="{TemplateBinding TextAlignment}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Visibility="Collapsed" IsHitTestVisible="False"/>
+              </Grid></Border>
               <Border x:Name="Hover" BorderBrush="{DynamicResource AccentBrush}" Opacity=".45" BorderThickness="1" CornerRadius="4" Visibility="Hidden" IsHitTestVisible="False"/>
             </Grid>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Frame" Property="BorderBrush" Value="Transparent"/><Setter TargetName="Hover" Property="Visibility" Value="Visible"/></Trigger>
               <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="Frame" Property="BorderBrush" Value="{DynamicResource AccentBrush}"/><Setter TargetName="Hover" Property="Visibility" Value="Hidden"/><Setter TargetName="Halo" Property="Visibility" Value="Visible"/></Trigger>
+              <Trigger Property="Text" Value=""><Setter TargetName="Hint" Property="Visibility" Value="Visible"/></Trigger>
               <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value=".45"/></Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
+          <Style x:Key="DnsSelect" TargetType="ComboBox">
+            <Setter Property="FontFamily" Value="{DynamicResource BodyFont}"/><Setter Property="FontWeight" Value="Normal"/><Setter Property="MaxDropDownHeight" Value="320"/><Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+            <Setter Property="ItemContainerStyle"><Setter.Value><Style TargetType="ComboBoxItem"><Setter Property="FontFamily" Value="{DynamicResource BodyFont}"/><Setter Property="FontWeight" Value="Normal"/><Setter Property="FontSize" Value="13"/></Style></Setter.Value></Setter>
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ComboBox">
+              <Grid>
+                <Border x:Name="Halo" Margin="-3" CornerRadius="7" BorderThickness="3" BorderBrush="{DynamicResource AccentBrush}" Opacity=".16" Visibility="Hidden" IsHitTestVisible="False"/>
+                <Border x:Name="Frame" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="4">
+                  <Grid><TextBlock Text="{TemplateBinding SelectionBoxItem}" FontFamily="{TemplateBinding FontFamily}" FontSize="{TemplateBinding FontSize}" FontWeight="Normal" Foreground="{TemplateBinding Foreground}" Margin="10,0,28,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                    <Path Data="M0,0 L5,5 L10,0Z" Fill="{DynamicResource TextTertiaryBrush}" Width="10" Height="5" Stretch="Fill" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,9,0"/>
+                  </Grid>
+                </Border>
+                <Border x:Name="Hover" BorderBrush="{DynamicResource AccentBrush}" Opacity=".45" BorderThickness="1" CornerRadius="4" Visibility="Hidden" IsHitTestVisible="False"/>
+                <ToggleButton Focusable="False" IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}" ClickMode="Press"><ToggleButton.Style><Style TargetType="ToggleButton"><Setter Property="Template"><Setter.Value><ControlTemplate><Border Background="Transparent"/></ControlTemplate></Setter.Value></Setter></Style></ToggleButton.Style></ToggleButton>
+                <Popup x:Name="PART_Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}" AllowsTransparency="True" Focusable="False" PopupAnimation="None">
+                  <Border Background="{DynamicResource PanelSolidBrush}" BorderBrush="{DynamicResource ControlStrongBrush}" BorderThickness="1" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}" MaxHeight="{TemplateBinding MaxDropDownHeight}"><ScrollViewer CanContentScroll="True" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"><ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/></ScrollViewer></Border>
+                </Popup>
+              </Grid>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Frame" Property="BorderBrush" Value="Transparent"/><Setter TargetName="Hover" Property="Visibility" Value="Visible"/></Trigger>
+                <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="Frame" Property="BorderBrush" Value="{DynamicResource AccentBrush}"/><Setter TargetName="Hover" Property="Visibility" Value="Hidden"/><Setter TargetName="Halo" Property="Visibility" Value="Visible"/></Trigger>
+                <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value=".45"/></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate></Setter.Value></Setter>
+          </Style>
           <Style x:Key="DnsHeader" TargetType="DataGridColumnHeader">
             <Setter Property="Padding" Value="14,9"/><Setter Property="FontSize" Value="10"/><Setter Property="FontWeight" Value="Medium"/>
             <Setter Property="FontFamily" Value="Cascadia Mono, Cascadia Code, Consolas"/><Setter Property="Foreground" Value="{DynamicResource TextDisabledBrush}"/>
             <Setter Property="Background" Value="{DynamicResource DialogTopBrush}"/><Setter Property="BorderBrush" Value="{DynamicResource DividerBrush}"/>
             <Setter Property="BorderThickness" Value="0,0,0,1"/><Setter Property="HorizontalContentAlignment" Value="Left"/>
-            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="DataGridColumnHeader"><Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}"><ContentPresenter/></Border></ControlTemplate></Setter.Value></Setter>
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="DataGridColumnHeader"><Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}"><TextBlock Text="{TemplateBinding Content}" FontFamily="{TemplateBinding FontFamily}" FontSize="{TemplateBinding FontSize}" FontWeight="{TemplateBinding FontWeight}" Foreground="{TemplateBinding Foreground}" LineHeight="14.3" TextWrapping="NoWrap"/></Border></ControlTemplate></Setter.Value></Setter>
           </Style>
           <Style x:Key="DnsCell" TargetType="DataGridCell">
             <Setter Property="Padding" Value="14,9"/><Setter Property="BorderThickness" Value="0,0,0,1"/><Setter Property="BorderBrush" Value="{DynamicResource DividerBrush}"/>

@@ -262,7 +262,7 @@ internal sealed class TrayWindow : Window
         var uploadRate = Rate("arrow-up", up); uploadRate.Margin = new Thickness(0, 2, 0, 0);
         var rates = Ui.Column(Rate("arrow-down", down), uploadRate); rates.MinWidth = 92; rates.VerticalAlignment = VerticalAlignment.Center; footerGrid.Children.Add(rates); Grid.SetColumn(sparkline, 1); footerGrid.Children.Add(sparkline);
         var powerContents = new Grid(); powerContents.Children.Add(powerIcon); powerContents.Children.Add(powerProgress);
-        power = FluentControls.IconButton("power", "启动内核", "TrayPower", 36); power.Content = powerContents; power.Style = FluentControls.Style("Button"); power.VerticalAlignment = VerticalAlignment.Center;
+        power = FluentControls.IconButton("power", "启动内核", "TrayPower", 36); power.Content = powerContents; power.Style = FluentControls.Style("Button"); power.Padding = new Thickness(0); power.VerticalAlignment = VerticalAlignment.Center;
         power.Click += async (_, _) => await Run(Running ? "desktop_stop" : "desktop_start"); Grid.SetColumn(power, 2); footerGrid.Children.Add(power);
         var footer = new Border { Child = footerGrid, Padding = new Thickness(16, 12, 12, 12), BorderThickness = new Thickness(0, 1, 0, 0) }; footer.SetResourceReference(Border.BorderBrushProperty, "DividerBrush"); footer.SetResourceReference(Border.BackgroundProperty, "DialogTopBrush"); Grid.SetRow(footer, 2); ClientArea.Children.Add(footer);
         backdrop = new NativeBackdrop(this, ClientArea, session, transient: true);
@@ -339,10 +339,7 @@ internal sealed class TrayWindow : Window
             stoppedTitle.Text = busy ? label : L.T("内核未运行"); stoppedHint.Text = session.Status.Text("lastError", fallback: busy ? L.T("首次启动可能需要更长时间，请稍候。") : L.T("启动后即可切换模式、出口与快捷开关。"));
             stoppedIcon.Visibility = busy ? Visibility.Collapsed : Visibility.Visible; stoppedProgress.IsActive = busy;
             powerProgress.IsActive = busy || outerBusy || changing; powerIcon.Visibility = powerProgress.IsActive ? Visibility.Collapsed : Visibility.Visible;
-            powerIcon.Filled = running;
-            power.SetResourceReference(Control.BackgroundProperty, running ? "AccentBrush" : "ControlBrush");
-            power.SetResourceReference(Control.ForegroundProperty, running ? "AccentTextBrush" : "TextPrimaryBrush");
-            power.SetResourceReference(Control.BorderBrushProperty, running ? "AccentBrush" : "ControlStrokeBrush");
+            FluentControlState.SetKind(power, running ? "Primary" : "Button");
             powerProgress.SetResourceReference(FluentProgressRing.ForegroundProperty, running ? "AccentTextBrush" : "AccentBrush");
             L.Bind(power, AutomationProperties.NameProperty, running ? "停止内核" : "启动内核"); L.Bind(power, ToolTipProperty, running ? "停止内核" : "启动内核");
         }

@@ -15,6 +15,7 @@
   </shell:WindowChrome.WindowChrome>
   <Window.Resources>
     <Style x:Key="CaptionButton" TargetType="Button">
+      <Setter Property="FocusVisualStyle" Value="{StaticResource FluentFocus}"/>
       <Setter Property="Width" Value="46"/><Setter Property="Height" Value="48"/>
       <Setter Property="Background" Value="Transparent"/><Setter Property="BorderThickness" Value="0"/>
       <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
@@ -51,6 +52,7 @@
       </ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style x:Key="TitleSearch" TargetType="Button">
+      <Setter Property="FocusVisualStyle" Value="{StaticResource FluentFocus}"/>
       <Setter Property="Background" Value="{DynamicResource ControlBrush}"/><Setter Property="BorderBrush" Value="{DynamicResource ControlStrokeBrush}"/><Setter Property="BorderThickness" Value="1"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
         <Grid><Border x:Name="Frame" controls:ShellVisuals.Background="{TemplateBinding Background}" BorderThickness="1" BorderBrush="{TemplateBinding BorderBrush}" CornerRadius="4"><ContentPresenter HorizontalAlignment="Stretch" VerticalAlignment="Center"/></Border>
@@ -63,6 +65,7 @@
       </ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style x:Key="ShellNavItem" TargetType="ListBoxItem">
+      <Setter Property="FocusVisualStyle" Value="{StaticResource FluentFocus}"/>
       <Setter Property="controls:ShellVisuals.TrackPress" Value="True"/>
       <Setter Property="Height" Value="36"/><Setter Property="Margin" Value="4,0,4,4"/><Setter Property="Padding" Value="12,0"/>
       <Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="VerticalContentAlignment" Value="Center"/>
@@ -147,6 +150,7 @@
         <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
           <ContentControl x:Name="UpdateNoticeSlot" HorizontalContentAlignment="Stretch"/>
           <ContentControl x:Name="PageContent" Grid.Row="1" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch"/>
+          <Grid x:Name="ContentPageOverlayHost" Grid.RowSpan="2" Panel.ZIndex="5"/>
         </Grid>
       </Border>
       <Border x:Name="NavigationScrim" Grid.ColumnSpan="2" Background="Transparent" Visibility="Collapsed" MouseLeftButtonDown="CloseNavigationOverlay" Panel.ZIndex="5"/>
@@ -160,6 +164,7 @@
         </StackPanel>
       </Border>
     </Grid>
+    <Grid x:Name="PageOverlayHost" Grid.RowSpan="2" Panel.ZIndex="15" ClipToBounds="True"/>
     <Canvas x:Name="ConnectedOverlay" Grid.RowSpan="2" IsHitTestVisible="False" Panel.ZIndex="20"/>
   </Grid>
 </Window>

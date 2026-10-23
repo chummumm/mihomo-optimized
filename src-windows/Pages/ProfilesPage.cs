@@ -29,6 +29,11 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private readonly TextBlock editorNotice = Ui.Muted("").Id("ConfigEditorNotice");
     private readonly TextBlock editorPosition = Ui.Muted("").Id("ConfigEditorPosition");
     private readonly Grid editPane = new() { Visibility = Visibility.Collapsed };
+    private readonly Border editorOverlay = new()
+    {
+        Margin = new Thickness(-1, -1, 0, 0), BorderThickness = new Thickness(1, 1, 0, 0),
+        CornerRadius = new CornerRadius(8, 0, 0, 0), RenderTransformOrigin = new Point(.5, .3),
+    };
     private readonly Grid editorContent = new();
     private readonly Border editorHeader = new();
     private readonly Border editorNoticeFrame = new();
@@ -74,11 +79,12 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private enum Confirmation { None, Close, Read }
     private bool Busy => reading || saving || importing;
     public bool CanGoBack => editorOpen;
+    internal bool HasEditorSurface => editorOverlay.Parent is not null;
     public event Action? BackStateChanged;
 
     public ProfilesPage(AppSession session) : base(session, "profiles", "配置", "管理当前 YAML，导入订阅并更新规则与 Geo 数据")
     {
-        importButton = IconAction("导入配置", "ImportConfig", "arrow-import", ChooseFile, true); Tools.Children.Add(importButton);
+        importButton = IconAction("导入配置", "ImportConfig", "arrow-import", ChooseFile, true); importButton.Margin = new Thickness(0); Tools.Children.Add(importButton);
         SetHeaderMeta(null);
         openEditor = IconAction("编辑配置文件", "EditConfig", "edit", OpenEditor);
         reload = IconAction("重新加载已保存配置", "ReloadConfig", "update", Reload);
@@ -93,20 +99,20 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         var current = new Grid(); current.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); current.ColumnDefinitions.Add(new ColumnDefinition()); current.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         var fileIcon = new FluentIcon("document-text", 24); fileIcon.SetResourceReference(Control.ForegroundProperty, "AccentLinkBrush");
         var iconWell = new Border { Child = fileIcon, Width = 48, Height = 48, CornerRadius = new CornerRadius(8), Margin = new Thickness(0, 0, 16, 0), VerticalAlignment = VerticalAlignment.Center }; iconWell.SetResourceReference(Border.BackgroundProperty, "ControlAltBrush"); current.Children.Add(iconWell);
-        path.TextWrapping = TextWrapping.NoWrap; path.TextTrimming = TextTrimming.CharacterEllipsis; path.FontFamily = new FontFamily("Cascadia Mono, Consolas"); path.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); path.LineHeight = 16; path.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; path.Id("CurrentConfigPath");
+        path.TextWrapping = TextWrapping.NoWrap; path.TextTrimming = TextTrimming.CharacterEllipsis; path.SetResourceReference(TextBlock.FontFamilyProperty, "MonoFont"); path.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); path.LineHeight = 16; path.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; path.Id("CurrentConfigPath");
         fileName.TextWrapping = TextWrapping.NoWrap; fileName.TextTrimming = TextTrimming.CharacterEllipsis; fileName.LineHeight = 24; fileName.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; fileName.Id("CurrentConfigName"); fileName.SetResourceReference(TextBlock.FontFamilyProperty, "DisplayFont");
         var inUse = Ui.Hint("正在使用"); inUse.LineHeight = 16; inUse.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
         var identity = Ui.Column(inUse, fileName, path); identity.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(identity, 1); current.Children.Add(identity);
         var countsBadge = new Border { Child = counts, Padding = new Thickness(8, 2, 8, 2), CornerRadius = new CornerRadius(4), Margin = new Thickness(16, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center }; countsBadge.SetResourceReference(Border.BackgroundProperty, "ControlAltBrush"); Grid.SetColumn(countsBadge, 2); current.Children.Add(countsBadge);
         var fileActions = new WrapPanel { Margin = new Thickness(0, 16, 0, 0) }; foreach (var button in new[] { openEditor, reload, more }) { button.Margin = new Thickness(0, 0, 8, 0); fileActions.Children.Add(button); }
-        var currentCard = Ui.Card(Ui.Column(current, fileActions), 0); currentCard.Padding = new Thickness(24, 20, 24, 20); currentCard.Margin = new Thickness(0); currentCard.CornerRadius = new CornerRadius(4); overview.Children.Add(currentCard);
+        var currentCard = Ui.Card(Ui.Column(current, fileActions), 0); currentCard.Padding = new Thickness(24, 20, 24, 20); currentCard.Margin = new Thickness(0); currentCard.CornerRadius = new CornerRadius(8); overview.Children.Add(currentCard);
         var importHeading = new DockPanel { Margin = new Thickness(1, 28, 0, 8) }; var aside = Ui.Hint("替换当前主配置，原文件自动备份"); aside.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); DockPanel.SetDock(aside, Dock.Right); importHeading.Children.Add(aside); importHeading.Children.Add(Ui.Label("导入新配置", 14, true)); overview.Children.Add(importHeading);
         overview.Children.Add(ImportRow("file", "从文件导入", "YAML / YML，最大 4 MiB。也可以把文件直接拖进窗口。", Action("选择文件", "ImportConfigFile", ChooseFile)));
         importUrl.MinWidth = 0; importUrl.HorizontalAlignment = HorizontalAlignment.Stretch; importUrl.Margin = new Thickness(0, 0, 8, 0); importUrl.ToolTip = "https://";
         importUrlButton = Action("导入", "ImportConfigUrl", ImportUrl); importUrlButton.Margin = new Thickness(0);
         var urlRow = new Grid(); urlRow.ColumnDefinitions.Add(new ColumnDefinition()); urlRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); urlRow.Children.Add(importUrl); Grid.SetColumn(importUrlButton, 1); urlRow.Children.Add(importUrlButton);
         overview.Children.Add(ImportRow("link", "从 URL 导入", "返回完整 YAML 配置的 HTTP / HTTPS 地址", null, urlRow));
-        overview.Children.Add(ImportRow("code", "粘贴 YAML", "把整份配置粘贴到文本框中", Action("粘贴 YAML", "PasteConfig", Paste)));
+        var pasteRow = ImportRow("code", "粘贴 YAML", "把整份配置粘贴到文本框中", Action("粘贴 YAML", "PasteConfig", Paste)); pasteRow.Margin = new Thickness(0); overview.Children.Add(pasteRow);
         var resourceHeading = Ui.Label("规则与 Geo 数据", 14, true); resourceHeading.Margin = new Thickness(1, 0, 0, 8); resources = new ResourceUpdatePanel(session);
         resourcesTarget = new Border { Child = Ui.Column(resourceHeading, resources), BorderThickness = new Thickness(2), Padding = new Thickness(0), Margin = new Thickness(-2, 26, -2, -2), CornerRadius = new CornerRadius(4), Focusable = true }.Id("set-resources");
         resourcesTarget.BorderBrush = Brushes.Transparent; L.Bind(resourcesTarget, AutomationProperties.NameProperty, "规则与 Geo 数据"); overview.Children.Add(resourcesTarget);
@@ -133,7 +139,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         confirmationPane = Ui.Card(confirmationLayout, 0); confirmationPane.Padding = new Thickness(14, 12, 12, 12); confirmationPane.CornerRadius = new CornerRadius(8); confirmationPane.Visibility = Visibility.Collapsed; confirmationPane.Margin = new Thickness(0); confirmationPane.Id("ConfigDiscardConfirmation"); confirmationPane.SetResourceReference(Border.BackgroundProperty, "WarningBackgroundBrush"); confirmationPane.SetResourceReference(Border.BorderBrushProperty, "CardStrokeBrush"); confirmationPane.RenderTransformOrigin = new Point(.5, 1);
         BuildEditor(); overviewScroll = new ScrollViewer(); SetScrollableBody(overview, overviewScroll);
         Editor.TextChanged += EditorChanged; code.PositionChanged += UpdatePosition;
-        PreviewKeyDown += (_, e) => { if (CanGoBack && e.Key == Key.S && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; _ = RunAsync(() => Save(true)); } };
+        editorOverlay.PreviewKeyDown += (_, e) => { if (CanGoBack && e.Key == Key.S && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; _ = RunAsync(() => Save(true)); } };
         code.SaveRequested += () => _ = RunAsync(() => Save(true)); code.CloseRequested += () => _ = RunAsync(CloseEditor);
         code.LimitExceeded += () => Dispatcher.BeginInvoke(new Action(() => { problem = "配置大小超过允许的上限，刚才的输入未被接受。"; UpdateEditorState(); }));
         importUrl.TextChanged += (_, _) => ApplyInteractionState(); importUrl.PreviewKeyDown += async (_, e) => { if (e.Key == Key.Enter && importUrlButton.IsEnabled) { e.Handled = true; await RunAsync(ImportUrl); } };
@@ -150,7 +156,10 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     }
     private Border ImportRow(string icon, string title, string description, UIElement? action, UIElement? footer = null)
     {
-        var row = new Grid(); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); row.ColumnDefinitions.Add(new ColumnDefinition()); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        var row = new Grid { VerticalAlignment = VerticalAlignment.Center }; row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); row.ColumnDefinitions.Add(new ColumnDefinition()); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        // SettingsCard keeps a fourth, empty chevron track and its 16 px gap.
+        var chevronGap = new ColumnDefinition { Width = new GridLength(16) }; row.ColumnDefinitions.Add(chevronGap);
+        row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         row.Children.Add(new FluentIcon(icon, 20) { Margin = new Thickness(0, 0, 16, 0), VerticalAlignment = VerticalAlignment.Center });
         var label = Ui.Label(title); label.LineHeight = 20; label.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; var hint = Ui.Hint(description); hint.LineHeight = 16; hint.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
         var copy = Ui.Column(label, hint); copy.Margin = new Thickness(0, 0, 16, 0); copy.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(copy, 1); row.Children.Add(copy);
@@ -159,10 +168,13 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         Border? foot = null;
         if (footer is not null) { foot = new Border { Child = footer, Padding = new Thickness(52, 12, 16, 16), BorderThickness = new Thickness(0, 1, 0, 0) }; foot.SetResourceReference(Border.BorderBrushProperty, "DividerBrush"); foot.SetResourceReference(Border.BackgroundProperty, "SubtleSurfaceBrush"); content.Children.Add(foot); }
         var card = Ui.Card(content, 0); card.Margin = new Thickness(0, 0, 0, 4); card.CornerRadius = new CornerRadius(4);
-        card.SizeChanged += (_, _) => { var compact = PageContainerWidth <= 560; if (action is not null) { Grid.SetRow(action, compact ? 1 : 0); Grid.SetColumn(action, compact ? 1 : 2); if (action is FrameworkElement element) { element.HorizontalAlignment = compact ? HorizontalAlignment.Left : HorizontalAlignment.Right; element.Margin = new Thickness(0, compact ? 4 : 0, 0, 0); } } if (foot is not null) foot.Padding = new Thickness(compact ? 16 : 52, 12, 16, 16); }; return card;
+        card.SizeChanged += (_, _) => { var compact = PageContainerWidth <= 560; chevronGap.Width = new GridLength(compact ? 0 : 16); copy.Margin = new Thickness(0, 0, compact ? 0 : 16, 0); if (action is not null) { Grid.SetRow(action, compact ? 1 : 0); Grid.SetColumn(action, compact ? 1 : 2); if (action is FrameworkElement element) { element.HorizontalAlignment = compact ? HorizontalAlignment.Left : HorizontalAlignment.Right; element.Margin = new Thickness(0, compact ? 4 : 0, 0, 0); } } if (foot is not null) foot.Padding = new Thickness(compact ? 16 : 52, 12, 16, 16); }; return card;
     }
     private void BuildEditor()
     {
+        editorOverlay.Child = editPane; editorOverlay.Id("ConfigEditorOverlay"); editorOverlay.SetResourceReference(Border.BorderBrushProperty, "LayerStrokeBrush");
+        KeyboardNavigation.SetTabNavigation(editorOverlay, KeyboardNavigationMode.Cycle);
+        editPane.SizeChanged += (_, _) => UpdateEditorClip();
         editPane.SetResourceReference(Panel.BackgroundProperty, "SolidBaseBrush"); editPane.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); editPane.RowDefinitions.Add(new RowDefinition());
         var layer = new Border(); layer.SetResourceReference(Border.BackgroundProperty, "LayerBrush"); Grid.SetRowSpan(layer, 2); editPane.Children.Add(layer);
         var crumbs = new Grid(); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(48) }); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); crumbs.ColumnDefinitions.Add(new ColumnDefinition());
@@ -172,7 +184,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         editorTitle.LineHeight = 36; editorTitle.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; editorTitle.SetResourceReference(TextBlock.FontFamilyProperty, "DisplayFont"); editorTitle.TextWrapping = TextWrapping.NoWrap; editorTitle.TextTrimming = TextTrimming.CharacterEllipsis; Grid.SetColumn(editorTitle, 3); crumbs.Children.Add(editorTitle); editorHeader.Child = crumbs; editPane.Children.Add(editorHeader);
         for (var index = 0; index < 5; index++) editorContent.RowDefinitions.Add(new RowDefinition { Height = index == 2 ? new GridLength(1, GridUnitType.Star) : GridLength.Auto, MinHeight = index == 2 ? 120 : 0 }); Grid.SetRow(editorContent, 1); editPane.Children.Add(editorContent);
         var bar = new Grid { Margin = new Thickness(0, 0, 0, 8) }; bar.ColumnDefinitions.Add(new ColumnDefinition()); bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        editorPath.FontFamily = new FontFamily("Cascadia Mono, Consolas"); editorPath.TextWrapping = TextWrapping.NoWrap; editorPath.TextTrimming = TextTrimming.CharacterEllipsis; editorPath.Id("ConfigEditorPath");
+        editorPath.SetResourceReference(TextBlock.FontFamilyProperty, "MonoFont"); editorPath.TextWrapping = TextWrapping.NoWrap; editorPath.TextTrimming = TextTrimming.CharacterEllipsis; editorPath.Id("ConfigEditorPath");
         var file = new DockPanel { Height = 28 }; var icon = new FluentIcon("file", 14) { Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center }; icon.SetResourceReference(Control.ForegroundProperty, "AccentLinkBrush"); DockPanel.SetDock(icon, Dock.Left); file.Children.Add(icon); file.Children.Add(editorPath); bar.Children.Add(file);
         var state = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(12, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center }; state.Children.Add(editorDot); state.Children.Add(editorState); Grid.SetColumn(state, 1); bar.Children.Add(state); editorContent.Children.Add(bar);
         editorNotice.FontSize = 12; editorNotice.LineHeight = 16; editorNotice.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; editorNoticeFrame.Child = editorNotice; editorNoticeFrame.Padding = new Thickness(12, 8, 12, 8); editorNoticeFrame.BorderThickness = new Thickness(1); editorNoticeFrame.CornerRadius = new CornerRadius(4); editorNoticeFrame.Margin = new Thickness(0, 0, 0, 8); Grid.SetRow(editorNoticeFrame, 1); editorContent.Children.Add(editorNoticeFrame);
@@ -186,9 +198,28 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private void UpdateEditorMetrics()
     {
         var width = Window.GetWindow(this)?.ActualWidth ?? 1000; var narrow = width <= 768;
+        editorOverlay.Margin = narrow ? new Thickness(0) : new Thickness(-1, -1, 0, 0);
+        editorOverlay.BorderThickness = narrow ? new Thickness(0) : new Thickness(1, 1, 0, 0);
+        editorOverlay.CornerRadius = narrow ? new CornerRadius(0) : new CornerRadius(8, 0, 0, 0);
         editorHeader.Padding = narrow ? new Thickness(4, 8, 12, 8) : new Thickness(Math.Clamp(width * .02, 8, 28), 20, Math.Clamp(width * .03, 16, 36), 12);
         var horizontal = narrow ? 12 : Math.Clamp(width * .03, 16, 36); editorContent.Margin = new Thickness(horizontal, 0, horizontal, narrow ? 12 : 20);
         editorCrumb.Visibility = editorSeparator.Visibility = narrow ? Visibility.Collapsed : Visibility.Visible; editorTitle.FontSize = narrow ? 20 : 28; editorTitle.LineHeight = narrow ? 28 : 36;
+        UpdateEditorClip();
+    }
+    private void UpdateEditorClip()
+    {
+        var width = editPane.ActualWidth; var height = editPane.ActualHeight;
+        if (width <= 0 || height <= 0) return;
+        var radius = Math.Min(Math.Max(0, editorOverlay.CornerRadius.TopLeft - editorOverlay.BorderThickness.Left), Math.Min(width, height));
+        var geometry = new StreamGeometry();
+        using (var drawing = geometry.Open())
+        {
+            drawing.BeginFigure(new Point(radius, 0), true, true);
+            drawing.LineTo(new Point(width, 0), true, false); drawing.LineTo(new Point(width, height), true, false);
+            drawing.LineTo(new Point(0, height), true, false); drawing.LineTo(new Point(0, radius), true, false);
+            if (radius > 0) drawing.ArcTo(new Point(radius, 0), new Size(radius, radius), 0, false, SweepDirection.Clockwise, true, false);
+        }
+        geometry.Freeze(); editPane.Clip = geometry;
     }
     private void HostEvent(string name, JsonElement data)
     {
@@ -281,32 +312,52 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     {
         EnsureNoUpdate();
         if (saving || importing) throw new InvalidOperationException(L.T("配置操作正在进行，请稍后重试。"));
-        SetEditorVisible(true); if (reading && readTask is not null) await readTask; else if (!loaded) await ReadDocument();
-        if (!Session.IsUpdating) Editor.Focus();
+        SetEditorVisible(true); var generation = editorTransition;
+        if (reading && readTask is not null) await readTask; else if (!loaded) await ReadDocument();
+        // The reference focuses after its drill-in content has mounted. A
+        // cached document can otherwise reach Focus before WPF has laid it out.
+        await Dispatcher.InvokeAsync(() =>
+        {
+            if (generation == editorTransition && editorOpen && IsActive && IsVisible && Editor.IsLoaded && Editor.IsEnabled && !Session.IsUpdating)
+                Editor.Focus();
+        }, DispatcherPriority.Loaded);
     }
     private void SetEditorVisible(bool visible, bool animate = true)
     {
         var wasOpen = editorOpen; editorOpen = visible; var generation = ++editorTransition;
         if (visible)
         {
-            editPane.Visibility = Visibility.Visible; SetPageGutter(false); SetPagePadding(new Thickness(0)); SetHeaderVisible(false); SetBody(editPane); UpdateEditorMetrics();
-            editPane.RenderTransformOrigin = new Point(.5, .3); var scale = new ScaleTransform(); editPane.RenderTransform = scale;
-            ProxyVisuals.Tween(scale, ScaleTransform.ScaleXProperty, .94, 1, 300); ProxyVisuals.Tween(scale, ScaleTransform.ScaleYProperty, .94, 1, 300); ProxyVisuals.Tween(editPane, OpacityProperty, 0, 1, 300);
+            editPane.Visibility = editorHeader.Visibility = editorContent.Visibility = Visibility.Visible;
+            editorOverlay.IsHitTestVisible = true; SetPageOverlay(editorOverlay); UpdateEditorMetrics();
+            var scale = new ScaleTransform(); editorOverlay.RenderTransform = scale;
+            ProxyVisuals.Tween(scale, ScaleTransform.ScaleXProperty, .94, 1, 300); ProxyVisuals.Tween(scale, ScaleTransform.ScaleYProperty, .94, 1, 300); ProxyVisuals.Tween(editorOverlay, OpacityProperty, 0, 1, 300);
         }
         else
         {
+            if (editorOverlay.IsKeyboardFocusWithin) Keyboard.ClearFocus();
+            editorOverlay.IsHitTestVisible = false;
+            // SubPage releases its header/body immediately; only its surface
+            // fades out over the still-mounted overview during the short exit.
+            editorHeader.Visibility = editorContent.Visibility = Visibility.Collapsed;
             void Complete()
             {
-                if (generation != editorTransition) return; editPane.Visibility = Visibility.Collapsed; SetPageGutter(true); SetPagePadding(null); SetHeaderVisible(true); SetScrollableBody(overview, overviewScroll); BackStateChanged?.Invoke();
+                if (generation != editorTransition) return;
+                editPane.Visibility = Visibility.Collapsed; SetPageOverlay(null); BackStateChanged?.Invoke();
+                if (wasOpen && animate)
+                    Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(() =>
+                    {
+                        if (generation == editorTransition && !editorOpen && IsActive && IsVisible && openEditor.IsEnabled && Window.GetWindow(this) is { IsActive: true })
+                            openEditor.Focus();
+                    }));
             }
             if (wasOpen && animate && ProxyVisuals.Animate && IsLoaded)
             {
-                var scale = editPane.RenderTransform as ScaleTransform ?? new ScaleTransform(); editPane.RenderTransform = scale;
-                ProxyVisuals.Tween(scale, ScaleTransform.ScaleXProperty, scale.ScaleX, .98, 83, new Point(1, 0), new Point(1, 1)); ProxyVisuals.Tween(scale, ScaleTransform.ScaleYProperty, scale.ScaleY, .98, 83, new Point(1, 0), new Point(1, 1)); ProxyVisuals.Tween(editPane, OpacityProperty, editPane.Opacity, 0, 83, Complete, new Point(1, 0), new Point(1, 1));
+                var scale = editorOverlay.RenderTransform as ScaleTransform ?? new ScaleTransform(); editorOverlay.RenderTransform = scale;
+                ProxyVisuals.Tween(scale, ScaleTransform.ScaleXProperty, scale.ScaleX, .98, 83, new Point(1, 0), new Point(1, 1)); ProxyVisuals.Tween(scale, ScaleTransform.ScaleYProperty, scale.ScaleY, .98, 83, new Point(1, 0), new Point(1, 1)); ProxyVisuals.Tween(editorOverlay, OpacityProperty, editorOverlay.Opacity, 0, 83, Complete, new Point(1, 0), new Point(1, 1));
             }
             else Complete();
         }
-        Tools.Visibility = visible ? Visibility.Collapsed : Visibility.Visible; SetConfirmation(Confirmation.None); BackStateChanged?.Invoke();
+        SetConfirmation(Confirmation.None); BackStateChanged?.Invoke();
     }
     public async Task<bool> GoBackAsync() { await CloseEditor(); return !CanGoBack; }
     private Task CloseEditor()

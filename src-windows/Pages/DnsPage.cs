@@ -23,21 +23,21 @@ public sealed class DnsPage : NativePage
     private readonly DnsTrendChart trend = new();
     private readonly SettingsSegments duration = new();
     private JsonElement latestMeta, latestStats, latestUpstreams, latestQueries;
-    private readonly TextBox upstreamFilter = Ui.SearchBox("筛选上游或出口", "DnsUpstreamFilter");
+    private readonly TextBox upstreamFilter = DnsVisuals.InputBox("筛选上游或出口", "DnsUpstreamFilter");
     private readonly ComboBox outcome = new() { SelectedValuePath = "Tag" };
     private readonly DnsFlowPanel capacity = new() { Gap = 20, RowGap = 6, Margin = new Thickness(0, -8, 0, 20) };
     private readonly TextBlock upstreamNote = DnsVisuals.Caption("", false), upstreamDefinition = DnsVisuals.Caption("", false);
     private readonly DataGrid queries = Ui.Table(("时间", nameof(QueryRow.Time), 100), ("域名", nameof(QueryRow.Domain), -2), ("类型", nameof(QueryRow.Type), 70), ("客户端", nameof(QueryRow.Client), 130), ("结果来源", nameof(QueryRow.Outcome), 125), ("RCODE", nameof(QueryRow.Rcode), 95), ("耗时", nameof(QueryRow.Latency), 100));
     private readonly DataGrid upstreams = Ui.Table(("实际出站", nameof(UpstreamRow.Outbound), 135), ("上游", nameof(UpstreamRow.Address), 240), ("交换次数", nameof(UpstreamRow.Attempts), 110), ("成功交换", nameof(UpstreamRow.Successes), 110), ("错误", nameof(UpstreamRow.Errors), 110), ("取消", nameof(UpstreamRow.Canceled), 110), ("超时", nameof(UpstreamRow.Timeouts), 90), ("RCODE 错误", nameof(UpstreamRow.RcodeErrors), 110), ("已完成成功率", nameof(UpstreamRow.Ratio), 130), ("成功平均耗时", nameof(UpstreamRow.Latency), 150));
     private readonly DnsTopList domains = new(), clients = new();
-    private readonly TextBox domain = Ui.SearchBox("精确域名", "DnsDomainFilter"), client = Ui.SearchBox("精确 IP 或 unknown", "DnsClientFilter"), type = Ui.SearchBox("A / AAAA", "DnsTypeFilter");
+    private readonly TextBox domain = DnsVisuals.InputBox("精确域名", "DnsDomainFilter"), client = DnsVisuals.InputBox("精确 IP 或 unknown", "DnsClientFilter"), type = DnsVisuals.InputBox("A / AAAA", "DnsTypeFilter");
     private readonly CheckBox live = new() { IsChecked = false, VerticalAlignment = VerticalAlignment.Center };
     private readonly FluentIcon liveIcon = new("play", 14);
     private readonly TextBlock liveLabel = Ui.Text(""), liveHint = DnsVisuals.Caption("", false);
-    private readonly Ellipse liveDot = new() { Width = 8, Height = 8, Visibility = Visibility.Collapsed, VerticalAlignment = VerticalAlignment.Center };
+    private readonly LivePing liveDot = new() { Visibility = Visibility.Collapsed, VerticalAlignment = VerticalAlignment.Center };
     private readonly TextBlock position = Ui.Text("", 12), pageRows = DnsVisuals.Caption("", false), queryNote = DnsVisuals.Caption("", false);
     private readonly ComboBox pageSize = new() { Width = 72, Height = 28, ItemsSource = new[] { 50, 100 }, SelectedIndex = 0 };
-    private readonly TextBox jumpInput = Ui.SearchBox("跳转到指定页码", "DnsPageNumber");
+    private readonly TextBox jumpInput = DnsVisuals.InputBox("跳转到指定页码", "DnsPageNumber");
     private readonly Button previous, next, first, last, jump;
     private readonly DnsTabs tabs = new();
     private readonly TextBlock overviewUpdated = DnsVisuals.Caption("", false), queryUpdated = DnsVisuals.Caption("", false), upstreamUpdated = DnsVisuals.Caption("", false);
@@ -61,11 +61,14 @@ public sealed class DnsPage : NativePage
     private long metadataAt;
     private int Limit => pageSize.SelectedItem is int value ? value : 50;
     private UpstreamRow[] upstreamRows = [];
+    private QueryRow[] queryRows = [];
 
     public DnsPage(AppSession session) : base(session, "dns", "DNS", "")
     {
         queries.Id("DnsQueries"); upstreams.Id("DnsUpstreams"); tabs.Id("DnsTabs"); duration.Id("DnsTrendDuration"); pageSize.Id("DnsPageSize"); live.Id("DnsLive"); trend.Id("DnsTrend");
         DnsVisuals.Table(queries); DnsVisuals.Table(upstreams); ConfigureQueryColumns(); ConfigureUpstreamColumns();
+        queries.SizeChanged += (_, args) => { if (args.WidthChanged) FitQueryColumns(); };
+        upstreams.SizeChanged += (_, args) => { if (args.WidthChanged) FitUpstreamColumns(); };
         foreach (var input in new Control[] { domain, client, type, outcome, pageSize, jumpInput }) DnsVisuals.Input(input);
         pageSize.Width = 72; pageSize.Height = 28; pageSize.FontSize = 12;
         position.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
@@ -80,7 +83,7 @@ public sealed class DnsPage : NativePage
             outcome.Items.Add(L.Bind(new ComboBoxItem { Tag = value }, ContentControl.ContentProperty, value.Length == 0 ? "全部" : OutcomeLabel(value)));
         outcome.SelectedIndex = 0; outcome.Id("DnsOutcomeFilter");
 
-        var overview = new StackPanel();
+        var overview = ContentPanel();
         overview.Children.Add(Heading("最近 24 小时", overviewUpdated, "RefreshDns", RefreshAsync));
         foreach (string label in new[] { "查询量", "QPS", "缓存命中率", "错误", "平均耗时" })
         {
@@ -102,7 +105,7 @@ public sealed class DnsPage : NativePage
         overview.Children.Add(Section(Ui.Column(trendHeading, trend, trendEmpty, legend)));
         var domainsCard = Section(Top("热门域名", domains)); var clientsCard = Section(Top("热门客户端", clients)); topGrid.Children.Add(domainsCard); topGrid.Children.Add(clientsCard); overview.Children.Add(topGrid);
 
-        var queryLayout = new StackPanel();
+        var queryLayout = ContentPanel();
         var filters = new DnsFilterPanel();
         filters.Children.Add(Field("域名", domain)); filters.Children.Add(Field("客户端", client)); filters.Children.Add(Field("类型", type)); filters.Children.Add(Field("结果来源", outcome));
         var apply = Action("应用筛选", "ApplyDnsFilter", ApplyFilters, true); apply.Margin = new Thickness(0, 0, 8, 0);
@@ -112,7 +115,7 @@ public sealed class DnsPage : NativePage
         var filterHint = DnsVisuals.Caption("域名与客户端使用精确匹配；域名忽略大小写和一个末尾根点。"); filterHint.Margin = new Thickness(0, 6, 0, 0);
         queryLayout.Children.Add(Section(Ui.Column(filters, filterHint)));
         foreach (var input in new[] { domain, client, type }) input.KeyDown += async (_, e) => { if (e.Key == Key.Enter) { e.Handled = true; await RunAsync(ApplyFilters); } };
-        live.Style = (Style)DnsVisuals.Templates["DnsLive"]; liveIcon.Margin = new Thickness(0, 0, 6, 0); live.Content = DnsVisuals.Inline(liveIcon, liveLabel); liveDot.SetResourceReference(Shape.FillProperty, "SuccessBrush");
+        live.Style = (Style)DnsVisuals.Templates["DnsLive"]; liveIcon.Margin = new Thickness(0, 0, 6, 0); live.Content = DnsVisuals.Inline(liveIcon, liveLabel);
         var liveItems = new DnsFlowPanel { Gap = 8, RowGap = 8 }; liveItems.Children.Add(live); liveItems.Children.Add(liveDot); liveItems.Children.Add(liveHint);
         var liveRow = new DnsFlowPanel { Gap = 12, RowGap = 8, SpaceBetween = true, Margin = new Thickness(0, 16, 0, 0) };
         liveRow.Children.Add(liveItems); liveRow.Children.Add(ResourceStatus(queryUpdated, "RefreshDnsQueries", LoadQueries)); queryLayout.Children.Add(liveRow);
@@ -130,9 +133,10 @@ public sealed class DnsPage : NativePage
         pageSize.SelectionChanged += async (_, _) => { ResetPages(); if (observabilityEnabled) await RunAsync(LoadQueries); };
         live.Checked += async (_, _) => { UpdateLive(); if (live.IsChecked == true) { ResetPages(); await RunAsync(LoadQueries); } }; live.Unchecked += (_, _) => UpdateLive();
         var pageInfo = new DnsFlowPanel { Gap = 16, RowGap = 8 }; pageInfo.Children.Add(position);
-        var sizeLabel = Ui.Label("每页条数", 12); sizeLabel.Margin = new Thickness(0, 0, 6, 0); pageInfo.Children.Add(DnsVisuals.Inline(sizeLabel, pageSize)); pageInfo.Children.Add(pageRows);
+        var sizeLabel = Ui.Label("每页条数", 12); sizeLabel.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); sizeLabel.Margin = new Thickness(0, 0, 6, 0); pageInfo.Children.Add(DnsVisuals.Inline(sizeLabel, pageSize)); pageInfo.Children.Add(pageRows);
         foreach (var button in new[] { first, previous, next, last }) pageActions.Children.Add(button);
         var jumpLabel = Ui.Label("跳至", 12); jumpLabel.Margin = new Thickness(0, 0, 6, 0); var jumpSuffix = Ui.Label("页", 12); jumpSuffix.Margin = new Thickness(6, 0, 8, 0);
+        jumpLabel.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); jumpSuffix.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
         jumpFrame = new Border { Child = DnsVisuals.Inline(jumpLabel, jumpInput, jumpSuffix, jump), BorderThickness = new Thickness(1, 0, 0, 0), Margin = new Thickness(4, 0, 0, 0), Padding = new Thickness(12, 0, 0, 0) }; jumpFrame.SetResourceReference(Border.BorderBrushProperty, "DividerBrush"); pageActions.Children.Add(jumpFrame);
         var pagination = new DnsFlowPanel { Gap = 12, RowGap = 12, SpaceBetween = true }; pagination.Children.Add(pageInfo); pagination.Children.Add(pageActions);
         paginationFrame = new Border { Child = pagination, BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(14, 10, 14, 10) }; paginationFrame.SetResourceReference(Border.BorderBrushProperty, "DividerBrush");
@@ -140,7 +144,7 @@ public sealed class DnsPage : NativePage
         queryNote.Margin = new Thickness(0, 6, 0, 0); queryLayout.Children.Add(queryNote);
         queries.MouseDoubleClick += (_, _) => { if (queries.SelectedItem is QueryRow row) DnsQueryDialog.Show(this, row.Data); };
 
-        var upstreamLayout = new StackPanel(); upstreamLayout.Children.Add(Heading("本次收集累计", upstreamUpdated, "RefreshDnsUpstreams", LoadUpstreams));
+        var upstreamLayout = ContentPanel(); upstreamLayout.Children.Add(Heading("本次收集累计", upstreamUpdated, "RefreshDnsUpstreams", LoadUpstreams));
         var upstreamScope = DnsVisuals.Caption("统计业务解析的实际上游交换，包含后台刷新与辅助查询；节点域名与 DNS 服务器域名的基础解析、缓存命中和本地答案不计入。"); upstreamScope.Margin = new Thickness(0, 2, 0, 0);
         var upstreamRatio = DnsVisuals.Caption("成功率 = 成功 /（成功 + 错误），取消与进行中的交换不计入分母；超时和 RCODE 错误是错误总数的子集。竞速完成或停止等待都可能产生取消，不等于客户端解析失败。"); upstreamRatio.Margin = new Thickness(0, 2, 0, 0); upstreamDefinition.Margin = new Thickness(0, 2, 0, 4);
         upstreamLayout.Children.Add(Ui.Column(upstreamScope, upstreamRatio, upstreamDefinition));
@@ -165,6 +169,12 @@ public sealed class DnsPage : NativePage
         UpdatePaging(); ShowState("正在读取 DNS 数据…", "", true); RenderTrend();
     }
     private sealed record MetricView(Border Frame, TextBlock Value, TextBlock Hint, DnsMeter? Meter);
+    private static StackPanel ContentPanel()
+    {
+        // TabItem selection colors belong to its header, not to the dashboard
+        // content that WPF also treats as the item's logical child.
+        var panel = new StackPanel(); panel.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); panel.SetValue(TextElement.FontWeightProperty, FontWeights.Normal); return panel;
+    }
     private Border Section(UIElement content) { var card = DnsVisuals.Card(content); sections.Add(card); return card; }
     private static StackPanel Top(string label, DnsTopList list)
     {
@@ -177,11 +187,20 @@ public sealed class DnsPage : NativePage
     }
     private StackPanel ResourceStatus(TextBlock updated, string id, Func<Task> operation)
     {
-        var button = Action("刷新", id, operation); button.Content = new FluentIcon("update", 14); button.Width = 28; button.Height = 28; button.MinHeight = 28; button.Padding = new Thickness(0); button.Margin = new Thickness(12, 0, 0, 0); button.Style = FluentControls.Style("Ghost"); L.Bind(button, ToolTipProperty, "刷新"); return DnsVisuals.Inline(updated, button);
+        var icon = new FluentIcon("update", 14) { Margin = new Thickness(0, 0, 6, 0) };
+        var button = Action("刷新", id, async () =>
+        {
+            ProxyVisuals.SetBusyIcon(icon, true);
+            try { await operation(); }
+            finally { ProxyVisuals.SetBusyIcon(icon, false); }
+        });
+        DnsVisuals.SmallButton(button); button.Content = DnsVisuals.Inline(icon, Ui.Label("刷新", 12)); button.Margin = new Thickness(12, 0, 0, 0); button.Style = FluentControls.Style("Ghost"); L.Bind(button, ToolTipProperty, "刷新"); return DnsVisuals.Inline(updated, button);
     }
     private static Grid TableSurface(DataGrid table, TextBlock empty)
     {
-        var grid = new Grid(); grid.Children.Add(table); empty.Margin = new Thickness(16, 36, 16, 16); empty.TextAlignment = TextAlignment.Center; empty.HorizontalAlignment = HorizontalAlignment.Center; empty.VerticalAlignment = VerticalAlignment.Center; empty.IsHitTestVisible = false; grid.Children.Add(empty); return grid;
+        var grid = new Grid(); grid.Children.Add(table);
+        empty.FontSize = 13; empty.LineHeight = 18.59; empty.Margin = new Thickness(16, DnsVisuals.HeaderHeight + 32, 16, 33); empty.TextAlignment = TextAlignment.Center; empty.HorizontalAlignment = HorizontalAlignment.Center; empty.VerticalAlignment = VerticalAlignment.Top; empty.IsHitTestVisible = false; grid.Children.Add(empty);
+        var line = new Border { Height = 1, VerticalAlignment = VerticalAlignment.Bottom, IsHitTestVisible = false }; line.SetResourceReference(Border.BackgroundProperty, "DividerBrush"); line.SetBinding(VisibilityProperty, new Binding(nameof(empty.Visibility)) { Source = empty }); grid.Children.Add(line); return grid;
     }
     private void Responsive()
     {
@@ -225,20 +244,22 @@ public sealed class DnsPage : NativePage
         ((DataGridTextColumn)queries.Columns[0]).ElementStyle = DnsVisuals.TextStyle(true, 12);
         ((DataGridTextColumn)queries.Columns[2]).ElementStyle = DnsVisuals.TextStyle(true, 12);
         ((DataGridTextColumn)queries.Columns[6]).ElementStyle = DnsVisuals.TextStyle(true, 12);
-        var domainColumn = new DataGridTemplateColumn { Width = queries.Columns[1].Width, MinWidth = 140 };
+        var domainColumn = new DataGridTemplateColumn { Width = queries.Columns[1].Width, MinWidth = 0, CanUserResize = false };
         L.Bind(domainColumn, DataGridColumn.HeaderProperty, "域名");
         var domainTemplate = new DataTemplate(); var button = new FrameworkElementFactory(typeof(Button)); button.SetBinding(ContentControl.ContentProperty, new Binding(nameof(QueryRow.Domain))); button.SetBinding(ToolTipProperty, new Binding(nameof(QueryRow.Domain))); button.SetValue(Control.TemplateProperty, LinkTemplate); button.SetValue(Control.BackgroundProperty, Brushes.Transparent); button.SetValue(Control.BorderThicknessProperty, new Thickness(0)); button.SetValue(Control.PaddingProperty, new Thickness(0)); button.SetValue(FrameworkElement.MaxWidthProperty, 320d); button.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Left); button.SetValue(Control.FontSizeProperty, 13d); button.SetValue(Control.FontWeightProperty, FontWeights.Medium); button.AddHandler(Button.ClickEvent, new RoutedEventHandler((sender, _) => { if ((sender as FrameworkElement)?.DataContext is QueryRow row) DnsQueryDialog.Show(this, row.Data); })); domainTemplate.VisualTree = button; domainColumn.CellTemplate = domainTemplate; queries.Columns[1] = domainColumn;
-        var outcomeColumn = new DataGridTemplateColumn { Width = 125, MinWidth = 110 }; L.Bind(outcomeColumn, DataGridColumn.HeaderProperty, "结果来源");
+        var outcomeColumn = new DataGridTemplateColumn { Width = DataGridLength.Auto, MinWidth = 0, CanUserResize = false }; L.Bind(outcomeColumn, DataGridColumn.HeaderProperty, "结果来源");
         var outcomeTemplate = new DataTemplate(); var pill = new FrameworkElementFactory(typeof(DnsOutcome)); pill.SetBinding(DnsOutcome.ValueProperty, new Binding(nameof(QueryRow.OutcomeKey))); outcomeTemplate.VisualTree = pill; outcomeColumn.CellTemplate = outcomeTemplate; queries.Columns[4] = outcomeColumn;
     }
     private void ConfigureUpstreamColumns()
     {
         ((DataGridTextColumn)upstreams.Columns[0]).ElementStyle = DnsVisuals.TextStyle(false, 13, true);
-        ((DataGridTextColumn)upstreams.Columns[1]).ElementStyle = DnsVisuals.TextStyle(true, 12, false, true);
+        var addressStyle = DnsVisuals.TextStyle(true, 12, false, true); addressStyle.Setters.Add(new Setter(MaxWidthProperty, 480d));
+        ((DataGridTextColumn)upstreams.Columns[1]).ElementStyle = addressStyle;
         foreach (int index in new[] { 2, 3, 6, 7, 8, 9 }) ((DataGridTextColumn)upstreams.Columns[index]).ElementStyle = DnsVisuals.TextStyle(true, 12);
+        foreach (int index in new[] { 2, 3, 6, 7 }) if (((DataGridTextColumn)upstreams.Columns[index]).Binding is Binding binding) binding.StringFormat = "N0";
         for (int index = 4; index <= 5; index++)
         {
-            bool error = index == 4; var column = new DataGridTemplateColumn { Width = 110 }; L.Bind(column, DataGridColumn.HeaderProperty, error ? "错误" : "取消");
+            bool error = index == 4; var column = new DataGridTemplateColumn { Width = DataGridLength.Auto, MinWidth = 0, CanUserResize = false }; L.Bind(column, DataGridColumn.HeaderProperty, error ? "错误" : "取消");
             var template = new DataTemplate(); var panel = new FrameworkElementFactory(typeof(StackPanel)); var value = new FrameworkElementFactory(typeof(TextBlock)); value.SetBinding(TextBlock.TextProperty, new Binding(error ? nameof(UpstreamRow.Errors) : nameof(UpstreamRow.Canceled)) { StringFormat = "N0" }); value.SetValue(TextBlock.FontFamilyProperty, DnsVisuals.Mono); value.SetValue(TextBlock.FontSizeProperty, 12d); value.SetValue(TextBlock.LineHeightProperty, 17.16); panel.AppendChild(value);
             string waitPath = error ? nameof(UpstreamRow.ErrorWait) : nameof(UpstreamRow.CanceledWait);
             var wait = new FrameworkElementFactory(typeof(TextBlock), "Wait"); wait.SetBinding(TextBlock.TextProperty, new Binding(waitPath)); wait.SetValue(TextBlock.FontFamilyProperty, DnsVisuals.Mono); wait.SetValue(TextBlock.FontSizeProperty, 11d); wait.SetValue(TextBlock.LineHeightProperty, 15.73); wait.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 2, 0, 0)); wait.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); panel.AppendChild(wait); template.VisualTree = panel;
@@ -247,7 +268,7 @@ public sealed class DnsPage : NativePage
     }
     private static readonly ControlTemplate LinkTemplate = (ControlTemplate)System.Windows.Markup.XamlReader.Parse("""
         <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
-          <TextBlock Name="Label" Text="{TemplateBinding Content}" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextPrimaryBrush}"/>
+          <TextBlock Name="Label" Text="{TemplateBinding Content}" FontFamily="{TemplateBinding FontFamily}" FontSize="{TemplateBinding FontSize}" FontWeight="{TemplateBinding FontWeight}" LineHeight="18.59" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextPrimaryBrush}"/>
           <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Label" Property="Foreground" Value="{DynamicResource AccentBrush}"/><Setter TargetName="Label" Property="TextDecorations" Value="Underline"/></Trigger></ControlTemplate.Triggers>
         </ControlTemplate>
         """);
@@ -300,7 +321,7 @@ public sealed class DnsPage : NativePage
         var budget = Fact("记录记账预算", DnsVisuals.Number(memory / 1048576, 2) + " / " + DnsVisuals.Number(limit / 1048576, 1) + " MiB");
         var meter = new DnsMeter { Width = 48, Height = 4, Duration = 0, Margin = new Thickness(6, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center }; meter.Set(limit > 0 ? memory / limit : 0);
         capacity.Children.Add(DnsVisuals.Inline(budget, meter));
-        capacity.Children.Add(Fact("开始收集时间", DateTimeOffset.TryParse(latestMeta.Text("started_at"), out var date) ? date.ToLocalTime().ToString(CultureInfo.CurrentCulture) : "—"));
+        capacity.Children.Add(Fact("开始收集时间", DnsVisuals.Time(latestMeta.Text("started_at"), true)));
         static TextBlock Fact(string label, string value)
         {
             var text = DnsVisuals.Caption("", false); text.Inlines.Add(new Run(L.T(label) + ": "));
@@ -321,7 +342,7 @@ public sealed class DnsPage : NativePage
         overviewUpdated.Text = Updated(statsAt); RenderTrend();
     }
     private static string Ratio(double hits, double count) => count > 0 ? DnsVisuals.Number(hits * 100 / count, 1) + "%" : "—";
-    private static string Updated(DateTimeOffset? date) => date.HasValue ? L.F("更新于 {0}", date.Value.ToLocalTime().ToString("T", CultureInfo.CurrentCulture)) : "";
+    private static string Updated(DateTimeOffset? date) => date.HasValue ? L.T("更新于") + ": " + DnsVisuals.Time(date.Value) : "";
     private void RenderTrend()
     {
         int hours = duration.SelectedIndex == 0 ? 1 : duration.SelectedIndex == 1 ? 6 : 24;
@@ -335,13 +356,14 @@ public sealed class DnsPage : NativePage
         upstreamRows = latestUpstreams.Get("items").Items().Select(item => new UpstreamRow(item)).ToArray(); FilterUpstreams();
         bool legacy = upstreamRows.Length > 0 && upstreamRows.All(row => row.Data.Get("success_elapsed_ms_avg").ValueKind == JsonValueKind.Undefined);
         L.Bind(upstreams.Columns[9], DataGridColumn.HeaderProperty, legacy ? "综合平均耗时" : "成功平均耗时");
+        FitUpstreamColumns();
         upstreamDefinition.Text = L.T(legacy ? "此内核仅提供含失败、取消在内的综合平均耗时，可能未提供成功耗时与实际出站；未知出站不视为 DIRECT。" : "耗时列仅统计成功交换；错误与取消下方分别显示对应的平均等待时间。同一上游按已确认的实际出站分别统计，未知出站不视为 DIRECT。");
         upstreamNote.Text = L.F("上游数量上限: {0} · 超过上游数量上限的交换: {1}", DnsVisuals.Number(latestUpstreams.Number("limit")), DnsVisuals.Number(latestUpstreams.Number("overflowed"))); upstreamUpdated.Text = Updated(upstreamsAt);
     }
     private void FilterUpstreams()
     {
         upstreams.ItemsSource = upstreamRows.Where(row => (row.Address + " " + row.Outbound).Contains(upstreamFilter.Text.Trim(), StringComparison.CurrentCultureIgnoreCase)).ToArray();
-        upstreamEmpty.Visibility = upstreams.Items.Count > 0 ? Visibility.Collapsed : Visibility.Visible; upstreams.MinHeight = upstreams.Items.Count > 0 ? 0 : 114;
+        upstreamEmpty.Visibility = upstreams.Items.Count > 0 ? Visibility.Collapsed : Visibility.Visible; upstreams.MinHeight = upstreams.Items.Count > 0 ? 0 : DnsVisuals.EmptyTableHeight; FitUpstreamColumns();
     }
     private Task ApplyFilters() { queryFilter = MakeFilter(); ResetPages(); return LoadQueries(); }
     private string MakeFilter()
@@ -351,7 +373,7 @@ public sealed class DnsPage : NativePage
         if (type.Text.Trim().Length > 0) parts.Add("qtype=" + Uri.EscapeDataString(type.Text.Trim().ToUpperInvariant())); if (outcome.SelectedValue is string result && result.Length > 0) parts.Add("outcome=" + Uri.EscapeDataString(result));
         return parts.Count > 0 ? "&" + string.Join('&', parts) : "";
     }
-    private void ResetPages() { queryRead++; queryBusy = false; page = 0; cursors.Clear(); cursors.Add(""); anchor = ""; total = null; queries.ItemsSource = null; latestQueries = default; UpdatePaging(); }
+    private void ResetPages() { queryRead++; queryBusy = false; page = 0; cursors.Clear(); cursors.Add(""); anchor = ""; total = null; queryRows = []; queries.ItemsSource = null; latestQueries = default; jumpInput.Clear(); UpdatePaging(); }
     private async Task GoToPage(int target)
     {
         if (queryBusy || target < 0 || target >= cursors.Count || target == page) return;
@@ -386,7 +408,7 @@ public sealed class DnsPage : NativePage
     }
     private void RenderQueries()
     {
-        queries.ItemsSource = latestQueries.Get("items").Items().Select(item => new QueryRow(item)).ToArray();
+        queryRows = latestQueries.Get("items").Items().Select(item => new QueryRow(item)).ToArray(); queries.ItemsSource = queryRows;
         string location = L.F("第 {0} / {1} 页 · 共 {2} 条", DnsVisuals.Number(page + 1), total.HasValue ? DnsVisuals.Number(cursors.Count) : "—", total.HasValue ? DnsVisuals.Number(total.Value) : "—");
         position.Inlines.Clear(); int offset = 0;
         foreach (System.Text.RegularExpressions.Match match in System.Text.RegularExpressions.Regex.Matches(location, @"[\d][\d,.\u00a0]*|—"))
@@ -395,13 +417,47 @@ public sealed class DnsPage : NativePage
         }
         position.Inlines.Add(new Run(location[offset..])); pageRows.Text = L.F("本页 {0} 条", DnsVisuals.Number(queries.Items.Count));
         queryNote.Text = (!total.HasValue ? L.T("更新内核后可显示总数并直接跳页。") + "\n" : "") + L.T("仅统计仍保留的查询明细，不包含已过期或被淘汰的记录。") + "\n" + L.F("保留明细: {0} · 已淘汰: {1}", DnsVisuals.Number(latestQueries.Number("retained")), DnsVisuals.Number(latestQueries.Number("evicted")));
-        queryUpdated.Text = Updated(queriesAt); queryEmpty.Text = L.T(queryFilter.Length > 0 ? "保留的明细中没有符合条件的查询。" : "暂时没有 DNS 查询。"); queryEmpty.Visibility = queries.Items.Count > 0 ? Visibility.Collapsed : Visibility.Visible; queries.MinHeight = queries.Items.Count > 0 ? 0 : 114; UpdatePaging();
+        queryUpdated.Text = Updated(queriesAt); queryEmpty.Text = L.T("保留的明细中没有符合条件的查询。"); queryEmpty.Visibility = queries.Items.Count > 0 ? Visibility.Collapsed : Visibility.Visible; queries.MinHeight = queries.Items.Count > 0 ? 0 : DnsVisuals.EmptyTableHeight; FitQueryColumns(); UpdatePaging();
+    }
+    private void FitQueryColumns()
+    {
+        var widths = new double[queries.Columns.Count];
+        foreach (var row in queryRows)
+        {
+            string[] values = [row.Time, row.Domain, row.Type, row.Client, row.Outcome, row.Rcode, row.Latency];
+            for (int index = 0; index < values.Length; index++)
+            {
+                bool mono = index is 0 or 2 or 6;
+                double width = DnsVisuals.TextWidth(queries, values[index], mono, mono || index == 4 ? 12 : 13, index is 1 or 4 ? FontWeights.Medium : FontWeights.Normal);
+                if (index == 1) width = Math.Min(320, width);
+                if (index == 4) width += 30; // pill padding, six-pixel lamp and gap
+                widths[index] = Math.Max(widths[index], width);
+            }
+        }
+        DnsVisuals.FitColumns(queries, widths);
+    }
+    private void FitUpstreamColumns()
+    {
+        var widths = new double[upstreams.Columns.Count];
+        foreach (var row in upstreams.Items.OfType<UpstreamRow>())
+        {
+            string[] values = [row.Outbound, row.Address, DnsVisuals.Number(row.Attempts), DnsVisuals.Number(row.Successes), DnsVisuals.Number(row.Errors), DnsVisuals.Number(row.Canceled), DnsVisuals.Number(row.Timeouts), DnsVisuals.Number(row.RcodeErrors), row.Ratio, row.Latency];
+            for (int index = 0; index < values.Length; index++)
+            {
+                double width = DnsVisuals.TextWidth(upstreams, values[index], index != 0, index == 0 ? 13 : 12, index is 0 or 8 or 9 ? FontWeights.SemiBold : FontWeights.Normal);
+                if (index == 1) width = Math.Clamp(width, DnsVisuals.TextWidth(upstreams, new string('0', 20), true, 12), 480);
+                if (index is 4 or 5) width = Math.Max(width, DnsVisuals.TextWidth(upstreams, index == 4 ? row.ErrorWait : row.CanceledWait, true, 11));
+                widths[index] = Math.Max(widths[index], width);
+            }
+        }
+        DnsVisuals.FitColumns(upstreams, widths);
     }
     private void UpdatePaging()
     {
         bool idle = !queryBusy && observabilityEnabled;
         first.IsEnabled = previous.IsEnabled = idle && page > 0; next.IsEnabled = idle && latestQueries.Bool("has_more") && page + 1 < cursors.Count;
         last.IsEnabled = idle && total.HasValue && page + 1 < cursors.Count; jumpInput.IsEnabled = total.HasValue;
+        jumpInput.Tag = (page + 1).ToString(CultureInfo.InvariantCulture);
         jump.IsEnabled = idle && total.HasValue && int.TryParse(jumpInput.Text, out int target) && target > 0 && target <= cursors.Count && target != page + 1; live.IsEnabled = page == 0; UpdateLive();
     }
     protected override Task LiveAsync(CancellationToken cancellationToken) => PollAsync(TimeSpan.FromSeconds(5), async () =>
@@ -422,7 +478,7 @@ public sealed class DnsPage : NativePage
     private static string OutcomeLabel(string value) => value switch { "cache_fresh" => "有效缓存", "cache_stale" => "过期缓存", "hosts" => "Hosts", "fake_ip" => "Fake IP", "upstream" => "上游", "reject" => "拒绝", "drop" => "丢弃", "error" => "错误", "local" => "本地答复", _ => value };
     public sealed record QueryRow(JsonElement Data)
     {
-        public string Time => Ui.Time(Data.Text("time")); public string Domain => Data.Text("qname"); public string Type => Data.Text("qtype"); public string Client => Data.Text("client") == "unknown" ? L.T("未知") : Data.Text("client"); public string OutcomeKey => Data.Text("outcome"); public string Outcome => L.T(OutcomeLabel(OutcomeKey)); public string Latency => Data.Number("elapsed_ms").ToString("0.##") + " ms"; public string Rcode => Data.Text("rcode", fallback: "—");
+        public string Time => DnsVisuals.Time(Data.Text("time")); public string Domain => Data.Text("qname"); public string Type => Data.Text("qtype"); public string Client => Data.Text("client") == "unknown" ? L.T("未知") : Data.Text("client"); public string OutcomeKey => Data.Text("outcome"); public string Outcome => L.T(OutcomeLabel(OutcomeKey)); public string Latency => Data.Number("elapsed_ms").ToString("0.##") + " ms"; public string Rcode => Data.Text("rcode", fallback: "—");
     }
     public sealed record UpstreamRow(JsonElement Data)
     {

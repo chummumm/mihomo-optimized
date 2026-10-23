@@ -122,8 +122,8 @@ public sealed class LogsPage : NativePage
             if (listScroll is not null) listScroll.ScrollChanged += OnScrollChanged;
         };
         var emptyContent = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-        var dot = new Border { Width = 8, Height = 8, CornerRadius = new CornerRadius(4), HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 12) };
-        dot.SetResourceReference(Border.BackgroundProperty, "SuccessBrush"); emptyContent.Children.Add(dot);
+        var dot = new LivePing { HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 12) };
+        emptyContent.Children.Add(dot);
         var emptyText = Ui.Hint("等待新的日志…", 13); emptyText.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); emptyContent.Children.Add(emptyText); empty.Children.Add(emptyContent);
         resume = new Button { Style = (Style)templates["Resume"], Background = resumeFill }.Id("ResumeLogs");
         L.Bind(resume, ContentControl.ContentProperty, "继续"); L.Bind(resume, AutomationProperties.NameProperty, "继续"); resume.Click += (_, _) => pause.IsChecked = false;

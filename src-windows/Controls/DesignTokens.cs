@@ -28,6 +28,7 @@ internal static class DesignTokens
         ("ControlElevationBrush", "#29000000", "#12FFFFFF"),
         ("ControlElevationTopBrush", "#0F000000", "#18FFFFFF"),
         ("ControlStrongBrush", "#72000000", "#8BFFFFFF"),
+        ("ScrollbarStrongHoverBrush", "#5A5A5A", "#C0C0C1"),
         ("ControlFocusBrush", "#FFFFFF", "#B21E1E1E"),
         ("SubtleHoverBrush", "#0A000000", "#0FFFFFFF"),
         ("SubtlePressedBrush", "#06000000", "#0BFFFFFF"),

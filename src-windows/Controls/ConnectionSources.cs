@@ -17,7 +17,7 @@ internal sealed class ConnectionSources : UserControl
     private readonly Canvas highlightLayer = new() { IsHitTestVisible = false };
     private readonly Canvas retiring = new() { IsHitTestVisible = false };
     private readonly Border highlight = new() { CornerRadius = new CornerRadius(4), BorderThickness = new Thickness(1), IsHitTestVisible = false };
-    private readonly Border indicator = new() { Width = 3, Height = 16, CornerRadius = new CornerRadius(2), HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(-1, 0, 0, 0) };
+    private readonly Border indicator = new() { Width = 3, Height = 16, CornerRadius = new CornerRadius(2), HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Center };
     private readonly TranslateTransform selectionPosition = new();
     private readonly ScrollViewer scroll;
     private readonly Dictionary<string, SourceButton> buttons = new(StringComparer.Ordinal);
@@ -94,7 +94,9 @@ internal sealed class ConnectionSources : UserControl
     private void PositionSelection()
     {
         if (!buttons.TryGetValue(selected, out var target) || target.ActualWidth <= 0) { highlight.Visibility = Visibility.Collapsed; return; }
-        var slot = LayoutInformation.GetLayoutSlot(target); var next = new Rect(slot.TopLeft, new Size(target.ActualWidth, target.ActualHeight)); highlight.Visibility = Visibility.Visible;
+        // An absolutely positioned CSS child starts inside the button's 1px
+        // border. Keep the travelling selection in that same padding box.
+        var slot = LayoutInformation.GetLayoutSlot(target); var next = new Rect(slot.X + 1, slot.Y + 1, Math.Max(0, target.ActualWidth - 2), Math.Max(0, target.ActualHeight - 2)); highlight.Visibility = Visibility.Visible;
         if (positioned && next == lastSelection) return;
         if (!positioned || !IsLoaded) { selectionPosition.X = next.X; selectionPosition.Y = next.Y; highlight.Width = next.Width; highlight.Height = next.Height; }
         else

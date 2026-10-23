@@ -19,7 +19,7 @@ internal sealed class ConfigCodeEditor : UserControl
     {
         AcceptsReturn = true, AcceptsTab = false, TextWrapping = TextWrapping.NoWrap,
         VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-        FontFamily = new FontFamily("Cascadia Mono, Consolas"), FontSize = 12,
+        FontSize = 12,
         Padding = new Thickness(14, 12, 14, 12), BorderThickness = new Thickness(0), UndoLimit = 100
     };
     private readonly LineNumberGutter gutter;
@@ -57,6 +57,7 @@ internal sealed class ConfigCodeEditor : UserControl
             </ControlTemplate>
             """);
         Editor.SetResourceReference(Control.ForegroundProperty, "TextPrimaryBrush");
+        Editor.SetResourceReference(Control.FontFamilyProperty, "MonoFont");
         TextBlock.SetLineHeight(Editor, 20.4); TextBlock.SetLineStackingStrategy(Editor, LineStackingStrategy.BlockLineHeight);
         SpellCheck.SetIsEnabled(Editor, false);
         gutter = new LineNumberGutter(this).Id("ConfigLineNumbers");
@@ -225,7 +226,7 @@ internal sealed class ConfigCodeEditor : UserControl
         protected override Size MeasureOverride(Size availableSize)
         {
             var glyph = new FormattedText("0", CultureInfo.InvariantCulture, FlowDirection.LeftToRight, new Typeface(owner.Editor.FontFamily, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal), owner.Editor.FontSize, Brushes.Black, VisualTreeHelper.GetDpi(this).PixelsPerDip);
-            return new Size(22 + Math.Max(2, owner.lineStarts.Length.ToString(CultureInfo.InvariantCulture).Length) * glyph.WidthIncludingTrailingWhitespace, 0);
+            return new Size(23 + Math.Max(2, owner.lineStarts.Length.ToString(CultureInfo.InvariantCulture).Length) * glyph.WidthIncludingTrailingWhitespace, 0);
         }
         protected override void OnRender(DrawingContext drawing)
         {

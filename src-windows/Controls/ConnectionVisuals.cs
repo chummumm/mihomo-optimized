@@ -25,7 +25,7 @@ internal static class ConnectionVisuals
           <Setter Property="Height" Value="34"/><Setter Property="Padding" Value="10,0"/><Setter Property="FontSize" Value="12"/><Setter Property="FontWeight" Value="Normal"/>
           <Setter Property="Background" Value="{DynamicResource SolidCardBrush}"/><Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
           <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="DataGridColumnHeader">
-            <Grid Background="{TemplateBinding Background}"><Border BorderBrush="{DynamicResource DividerBrush}" BorderThickness="0,0,0,1"><Border x:Name="Hover" Padding="{TemplateBinding Padding}" Background="Transparent"><StackPanel Orientation="Horizontal" VerticalAlignment="Center"><ContentPresenter VerticalAlignment="Center"/><icons:FluentIcon x:Name="Sort" Margin="4,0,0,0" Width="11" Height="11" VerticalAlignment="Center" Visibility="Collapsed"/></StackPanel></Border></Border><Thumb x:Name="PART_LeftHeaderGripper" Style="{StaticResource ResizeGrip}" HorizontalAlignment="Left" Margin="-6,0,0,0"/><Thumb x:Name="PART_RightHeaderGripper" Style="{StaticResource ResizeGrip}" HorizontalAlignment="Right" Margin="0,0,-6,0"/></Grid>
+            <Grid Background="{TemplateBinding Background}"><Border BorderBrush="{DynamicResource DividerBrush}" BorderThickness="0,0,0,1"><Border x:Name="Hover" Padding="{TemplateBinding Padding}" Background="Transparent"><StackPanel Orientation="Horizontal" VerticalAlignment="Center"><TextBlock Text="{TemplateBinding Content}" FontSize="{TemplateBinding FontSize}" FontWeight="{TemplateBinding FontWeight}" Foreground="{TemplateBinding Foreground}" VerticalAlignment="Center" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/><icons:FluentIcon x:Name="Sort" Margin="4,0,0,0" Width="11" Height="11" VerticalAlignment="Center" Visibility="Collapsed"/></StackPanel></Border></Border><Thumb x:Name="PART_LeftHeaderGripper" Style="{StaticResource ResizeGrip}" HorizontalAlignment="Left" Margin="-6,0,0,0"/><Thumb x:Name="PART_RightHeaderGripper" Style="{StaticResource ResizeGrip}" HorizontalAlignment="Right" Margin="0,0,-6,0"/></Grid>
             <ControlTemplate.Triggers><Trigger Property="SortDirection" Value="Ascending"><Setter TargetName="Sort" Property="Kind" Value="arrow-up"/><Setter TargetName="Sort" Property="Visibility" Value="Visible"/></Trigger><Trigger Property="SortDirection" Value="Descending"><Setter TargetName="Sort" Property="Kind" Value="arrow-down"/><Setter TargetName="Sort" Property="Visibility" Value="Visible"/></Trigger></ControlTemplate.Triggers>
           </ControlTemplate></Setter.Value></Setter>
         </Style>
@@ -134,13 +134,21 @@ public sealed class ConnectionHostCell : Control
 
 internal sealed class ConnectionRateReading : TextBlock
 {
-    internal ConnectionRateReading() { FontSize = 28; FontWeight = FontWeights.SemiBold; SetResourceReference(FontFamilyProperty, "DisplayFont"); SetResourceReference(ForegroundProperty, "TextPrimaryBrush"); LineHeight = 36; LineStackingStrategy = LineStackingStrategy.BlockLineHeight; }
+    private TextBlock? unitLabel;
+    internal ConnectionRateReading() { FontSize = 28; FontWeight = FontWeights.SemiBold; SetResourceReference(FontFamilyProperty, "DisplayFont"); SetResourceReference(ForegroundProperty, "TextPrimaryBrush"); LineHeight = 36; LineStackingStrategy = LineStackingStrategy.MaxHeight; }
+    internal void SetMetrics(bool phone)
+    {
+        FontSize = phone ? 20 : 28; LineHeight = 36;
+        if (unitLabel is not null) unitLabel.LineHeight = LineHeight;
+    }
     internal void Set(double value)
     {
         var text = ByteReading.Rate(value); if (text == Tag as string) return; Tag = text;
         var separator = text.LastIndexOf(' '); Inlines.Clear(); Inlines.Add(new Run(text[..separator]));
-        var unit = Ui.Muted(text[(separator + 1)..], 13); unit.Margin = new Thickness(4, 0, 0, 0); unit.FontWeight = FontWeights.Normal;
-        Inlines.Add(new InlineUIContainer(unit) { BaselineAlignment = BaselineAlignment.Baseline }); AutomationProperties.SetName(this, text);
+        // The source's smaller unit inherits the reading's absolute line-height.
+        // Baseline-align both line boxes and allow their union to set row height.
+        unitLabel = Ui.Muted(text[(separator + 1)..], 13); unitLabel.Margin = new Thickness(4, 0, 0, 0); unitLabel.FontWeight = FontWeights.Normal; unitLabel.LineHeight = LineHeight;
+        Inlines.Add(new InlineUIContainer(unitLabel) { BaselineAlignment = BaselineAlignment.Baseline }); AutomationProperties.SetName(this, text);
     }
 }
 
@@ -154,6 +162,7 @@ internal sealed class ConnectionTotal : StackPanel
     internal ConnectionTotal(bool upload)
     {
         this.upload = upload; Orientation = Orientation.Horizontal;
+        value.LineHeight = 17.16;
         arrow = new FluentIcon(upload ? "arrow-up" : "arrow-down", 12) { Margin = new Thickness(0, 0, 6, 0), RenderTransform = movement, VerticalAlignment = VerticalAlignment.Center };
         arrow.SetResourceReference(Control.ForegroundProperty, upload ? "TextSecondaryBrush" : "AccentLinkBrush"); Children.Add(arrow); Children.Add(value);
     }

@@ -5,7 +5,6 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Documents;
-using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using Mihomo.Desktop.Services;
@@ -16,58 +15,16 @@ namespace Mihomo.Desktop.Controls;
 internal static class ProxyVisuals
 {
     internal static bool Animate => SystemParameters.ClientAreaAnimation && !SystemParameters.HighContrast;
-    private static readonly ResourceDictionary templates = (ResourceDictionary)XamlReader.Parse("""
-      <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-        <Style x:Key="Tile" TargetType="Button">
-          <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/><Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
-          <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/><Setter Property="BorderThickness" Value="1"/>
-          <Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="VerticalContentAlignment" Value="Stretch"/>
-          <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
-            <Grid><Border x:Name="Frame" CornerRadius="4" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
-              <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
-            </Border><Border x:Name="Focus" Margin="1" CornerRadius="3" BorderThickness="2" BorderBrush="{DynamicResource TextPrimaryBrush}" Visibility="Collapsed" IsHitTestVisible="False"/></Grid>
-            <ControlTemplate.Triggers>
-              <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Focus" Property="Visibility" Value="Visible"/></Trigger>
-            </ControlTemplate.Triggers>
-          </ControlTemplate></Setter.Value></Setter>
-        </Style>
-        <Style x:Key="Chip" TargetType="Button" BasedOn="{StaticResource Tile}">
-          <Setter Property="Background" Value="{DynamicResource ControlBrush}"/><Setter Property="BorderBrush" Value="{DynamicResource ControlStrokeBrush}"/>
-          <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
-            <Grid><Border x:Name="Frame" CornerRadius="4" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
-              <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
-            </Border><Border x:Name="Focus" Margin="1" CornerRadius="3" BorderThickness="2" BorderBrush="{DynamicResource TextPrimaryBrush}" Visibility="Collapsed" IsHitTestVisible="False"/></Grid>
-            <ControlTemplate.Triggers>
-              <Trigger Property="IsPressed" Value="True"><Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/></Trigger>
-              <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Focus" Property="Visibility" Value="Visible"/></Trigger>
-            </ControlTemplate.Triggers>
-          </ControlTemplate></Setter.Value></Setter>
-        </Style>
-        <Style x:Key="Graph" TargetType="Button" BasedOn="{StaticResource Tile}">
-          <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
-            <Border x:Name="Frame" CornerRadius="10" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
-              <ContentPresenter HorizontalAlignment="Stretch" VerticalAlignment="Stretch"/>
-            </Border>
-            <ControlTemplate.Triggers><Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Frame" Property="BorderBrush" Value="{DynamicResource AccentBrush}"/></Trigger></ControlTemplate.Triggers>
-          </ControlTemplate></Setter.Value></Setter>
-        </Style>
-        <Style x:Key="Expander" TargetType="Expander">
-          <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/><Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/><Setter Property="BorderThickness" Value="1"/>
-          <Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="Focusable" Value="True"/>
-          <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Expander">
-            <Grid><Border CornerRadius="4" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Background="{TemplateBinding Background}">
-              <StackPanel>
-                <Border x:Name="HeaderFrame" Background="Transparent" CornerRadius="3"><DockPanel>
-                  <ContentPresenter Content="{TemplateBinding Header}" ContentTemplate="{TemplateBinding HeaderTemplate}" HorizontalAlignment="Stretch"/>
-                </DockPanel></Border>
-                <Border x:Name="Reveal" Height="0" ClipToBounds="True"><ContentPresenter x:Name="Body" Content="{TemplateBinding Content}" ContentTemplate="{TemplateBinding ContentTemplate}" HorizontalAlignment="Stretch"/></Border>
-              </StackPanel>
-            </Border><Border x:Name="Focus" CornerRadius="3" Margin="1" BorderThickness="2" BorderBrush="{DynamicResource TextPrimaryBrush}" Visibility="Collapsed" IsHitTestVisible="False"/></Grid>
-            <ControlTemplate.Triggers><Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Focus" Property="Visibility" Value="Visible"/></Trigger></ControlTemplate.Triggers>
-          </ControlTemplate></Setter.Value></Setter>
-        </Style>
-      </ResourceDictionary>
-      """);
+    private static double templateLoadMilliseconds;
+    private static readonly ResourceDictionary templates = LoadTemplates();
+    internal static double TemplateLoadMilliseconds => templateLoadMilliseconds;
+    private static ResourceDictionary LoadTemplates()
+    {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var resource = new ResourceDictionary { Source = new Uri("/mihomo-optimized;component/Controls/ProxyTemplates.xaml", UriKind.Relative) };
+        templateLoadMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        return resource;
+    }
     internal static Style Style(string key) => (Style)templates[key];
     internal static void SetBusyIcon(FluentIcon icon, bool busy) => BusyIconMotion.Set(icon, busy);
     private sealed class BusyIconMotion

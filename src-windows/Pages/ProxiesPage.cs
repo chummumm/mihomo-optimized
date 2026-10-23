@@ -17,6 +17,9 @@ namespace Mihomo.Desktop.Pages;
 
 public sealed class ProxiesPage : NativePage
 {
+    private readonly long constructionStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+    private double constructionFieldsMs, constructionControlsMs, constructionTopologyMs, constructionSnapshotMs, constructionTotalMs;
+    private object? lastRenderTiming, constructionRenderTiming, lastNavigationGeometry;
     private readonly StackPanel content = new();
     private readonly StackPanel groupList = new();
     private readonly StackPanel providerList = new();
@@ -34,7 +37,7 @@ public sealed class ProxiesPage : NativePage
     private readonly Dictionary<string, bool> providersBusy = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ProxyTilePanel> providerPanels = new(StringComparer.Ordinal);
     private readonly ProxyTilePanel nodesPanel = new();
-    private readonly Ellipse liveDot = new() { Width = 8, Height = 8, Margin = new Thickness(0, 0, 14, 0), VerticalAlignment = VerticalAlignment.Center };
+    private readonly LivePing liveDot = new() { Margin = new Thickness(0, 0, 14, 0), VerticalAlignment = VerticalAlignment.Center };
     private readonly Border topologyReveal = new() { ClipToBounds = true };
     private readonly FluentIcon topologyCaret = new("chevron-up", 12);
     private readonly TextBlock topologyToggleLabel = Ui.Label("收起拓扑");
@@ -72,6 +75,8 @@ public sealed class ProxiesPage : NativePage
     private bool? preparationCacheHit;
     private double? preparationElapsedMs;
     private bool preparationPending;
+    private NavigationTarget? preparedNavigation;
+    private string preparedController = "";
     private string lastPhase = "";
     private CancellationTokenSource? topologyLifetime;
     private NavigationTarget? pendingNavigation;
@@ -86,6 +91,8 @@ public sealed class ProxiesPage : NativePage
 
     public ProxiesPage(AppSession session) : base(session, "proxies", "代理", "策略组、代理节点与实时流量路径")
     {
+        constructionFieldsMs = System.Diagnostics.Stopwatch.GetElapsedTime(constructionStarted).TotalMilliseconds;
+        var constructionStage = System.Diagnostics.Stopwatch.GetTimestamp();
         search.Width = 200; search.Margin = new Thickness(0, 0, 8, 0); Tools.Children.Add(search);
         testAll = Action("测速", "MeasureAllProxies", MeasureAll, true);
         testAll.Margin = new Thickness(0);
@@ -134,8 +141,15 @@ public sealed class ProxiesPage : NativePage
             if (IsActive) _ = RunAsync(RefreshAsync);
         };
         groupList.SizeChanged += (_, _) => breakLabel.Visibility = PageContainerWidth <= 640 ? Visibility.Collapsed : Visibility.Visible;
+        constructionControlsMs = System.Diagnostics.Stopwatch.GetElapsedTime(constructionStage).TotalMilliseconds;
+        constructionStage = System.Diagnostics.Stopwatch.GetTimestamp();
         ApplyTopologyVisibility();
+        constructionTopologyMs = System.Diagnostics.Stopwatch.GetElapsedTime(constructionStage).TotalMilliseconds;
+        constructionStage = System.Diagnostics.Stopwatch.GetTimestamp();
         TryPresentRuntimeSnapshot();
+        constructionSnapshotMs = System.Diagnostics.Stopwatch.GetElapsedTime(constructionStage).TotalMilliseconds;
+        constructionRenderTiming = lastRenderTiming;
+        constructionTotalMs = System.Diagnostics.Stopwatch.GetElapsedTime(constructionStarted).TotalMilliseconds;
     }
 
     public override Task RefreshAsync()
@@ -197,7 +211,17 @@ public sealed class ProxiesPage : NativePage
     {
         applyingPreferences = true; breakConnections.IsChecked = Session.CloseConnectionsOnSwitch; applyingPreferences = false;
         shownProviders = Session.ShowProxyProvider;
-        RenderGroups(); RenderProviders(); RenderNodes(); RefreshMap(); UpdateSummary(); ApplyTestControls();
+        var stage = System.Diagnostics.Stopwatch.GetTimestamp();
+        RenderGroups(); var groupsMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+        stage = System.Diagnostics.Stopwatch.GetTimestamp();
+        RenderProviders(); var providersMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+        stage = System.Diagnostics.Stopwatch.GetTimestamp();
+        RenderNodes(); var nodesMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+        stage = System.Diagnostics.Stopwatch.GetTimestamp();
+        RefreshMap(); var topologyMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+        stage = System.Diagnostics.Stopwatch.GetTimestamp();
+        UpdateSummary(); ApplyTestControls();
+        lastRenderTiming = new { groupsMs, providersMs, nodesMs, topologyMs, summaryMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds };
     }
     private void UpdateSummary()
     {
@@ -414,10 +438,25 @@ public sealed class ProxiesPage : NativePage
         var generation = ++preparationGeneration;
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         preparationCacheHit = null; preparationElapsedMs = null; preparationPending = true;
+        preparedNavigation = null;
         try
         {
             preparationCacheHit = TryPresentRuntimeSnapshot();
             if (preparationCacheHit != true) await RefreshAsync();
+            if (target.Action == "focus-group" && target.Target is { Length: > 0 } name && IsActive && IsRunning && lastController == ControllerIdentity)
+            {
+                var controller = ControllerIdentity;
+                OpenNavigationGroup(name);
+                // Realize the target before Main starts its entrance clock.
+                // NavigateToAsync then measures that first animated frame without
+                // another Render or dispatcher wait consuming the entrance offset.
+                await Dispatcher.InvokeAsync(scroll.UpdateLayout, DispatcherPriority.Loaded);
+                if (generation == preparationGeneration && IsActive && IsRunning && controller == ControllerIdentity && groupCards.ContainsKey(name))
+                {
+                    preparedNavigation = target;
+                    preparedController = controller;
+                }
+            }
         }
         finally
         {
@@ -433,11 +472,21 @@ public sealed class ProxiesPage : NativePage
     {
         cacheHit = preparationCacheHit,
         elapsedMs = preparationElapsedMs,
-        pending = preparationPending
+        pending = preparationPending,
+        construction = new { fieldsMs = constructionFieldsMs, controlsMs = constructionControlsMs, topologyMs = constructionTopologyMs, snapshotMs = constructionSnapshotMs, totalMs = constructionTotalMs, templateLoadMs = ProxyVisuals.TemplateLoadMilliseconds, render = constructionRenderTiming },
+        geometry = lastNavigationGeometry
     };
 
     public override async Task NavigateToAsync(NavigationTarget target)
     {
+        if (preparedNavigation == target && preparedController == ControllerIdentity && IsActive && IsRunning && target.Target is { } preparedName && groupCards.TryGetValue(preparedName, out var preparedCard))
+        {
+            preparedNavigation = null; pendingNavigation = null;
+            await CenterAsync(preparedCard, false);
+            Flash(preparedCard);
+            return;
+        }
+        preparedNavigation = null;
         pendingNavigation = target;
         if (target.Query is not null) search.Text = target.Query;
         if (!IsRunning) { Message(InactiveMessage); return; }
@@ -465,10 +514,9 @@ public sealed class ProxiesPage : NativePage
         var target = pendingNavigation; pendingNavigation = null; if (target is null) return;
         if (target.Action == "test-all") { _ = RunAsync(MeasureAll); return; }
         if (target.Target is not { Length: > 0 } name) return;
-        search.Clear(); filterTimer.Stop();
         if (target.Action == "focus-group")
         {
-            preferences.OpenGroups ??= Groups().Take(1).Select(item => item.Name).ToHashSet(StringComparer.Ordinal); preferences.OpenGroups.Add(name); preferences.Save(); Render();
+            OpenNavigationGroup(name);
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Loaded);
             if (IsActive && groupCards.TryGetValue(name, out var card))
             {
@@ -481,6 +529,7 @@ public sealed class ProxiesPage : NativePage
         }
         else if (target.Action == "focus-node")
         {
+            search.Clear(); filterTimer.Stop();
             Render();
             await Dispatcher.InvokeAsync(() =>
             {
@@ -493,6 +542,16 @@ public sealed class ProxiesPage : NativePage
             }, DispatcherPriority.Loaded);
         }
     }
+    private void OpenNavigationGroup(string name)
+    {
+        bool filtered = search.Text.Length > 0;
+        search.Clear(); filterTimer.Stop();
+        var open = preferences.OpenGroups ?? Groups().Take(1).Select(item => item.Name).ToHashSet(StringComparer.Ordinal);
+        bool changed = open.Add(name);
+        if (changed) { preferences.OpenGroups = open; preferences.Save(); }
+        if (filtered) Render();
+        else if (changed) RenderGroups();
+    }
     private static void Flash(Border card) => ProxyVisuals.Attention(card);
 
     private async Task CenterAsync(FrameworkElement element, bool smooth)
@@ -502,6 +561,7 @@ public sealed class ProxiesPage : NativePage
         var bounds = element.TransformToAncestor(scroll).TransformBounds(new Rect(element.RenderSize));
         var from = scroll.VerticalOffset;
         var destination = Math.Clamp(from + bounds.Top + bounds.Height / 2 - scroll.ViewportHeight / 2, 0, scroll.ScrollableHeight);
+        lastNavigationGeometry = new { entranceTranslateY = TransitionSurface.RenderTransform.Value.OffsetY, viewportHeight = scroll.ViewportHeight, targetTop = bounds.Top, targetHeight = bounds.Height, scrollFrom = from, scrollDestination = destination };
         if (!smooth || !ProxyVisuals.Animate || Math.Abs(destination - from) < 1) { scroll.ScrollToVerticalOffset(destination); scroll.UpdateLayout(); return; }
         var lifetime = CancellationTokenSource.CreateLinkedTokenSource(PageToken); scrollLifetime = lifetime;
         var clock = System.Diagnostics.Stopwatch.StartNew();
@@ -561,7 +621,7 @@ public sealed class ProxiesPage : NativePage
         Rate(flowDown, "↓", down); Rate(flowUp, "↑", up);
         flowCount.Inlines.Clear(); var count = new Run(activeConnections.ToString()) { FontFamily = new FontFamily("Cascadia Mono, Consolas") }; count.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); flowCount.Inlines.Add(count); flowCount.Inlines.Add(new Run(L.F("{0} 个连接", "")));
         var compact = PageContainerWidth <= 640; flowCount.Visibility = compact ? Visibility.Collapsed : Visibility.Visible; flowUp.Margin = new Thickness(0, 0, compact ? 0 : 14, 0);
-        liveDot.SetResourceReference(Shape.FillProperty, activeConnections > 0 ? "SuccessBrush" : "FaintBrush");
+        liveDot.SetResourceReference(LivePing.FillProperty, activeConnections > 0 ? "SuccessBrush" : "FaintBrush");
     }
     private void UpdateMapAnimation()
     {
@@ -570,7 +630,7 @@ public sealed class ProxiesPage : NativePage
         catch (InvalidOperationException) { topology.SetActive(false); }
     }
     public override void Activate() { if (!IsActive) TryPresentRuntimeSnapshot(); base.Activate(); ApplyTopologyVisibility(); }
-    public override void Deactivate() { StopScrollNavigation(); StopTopology(); filterTimer.Stop(); renderTimer.Stop(); base.Deactivate(); }
+    public override void Deactivate() { preparedNavigation = null; StopScrollNavigation(); StopTopology(); filterTimer.Stop(); renderTimer.Stop(); base.Deactivate(); }
     protected override void OnStatusChanged()
     {
         var phase = Session.Status.Text("phase"); var becameRunning = phase == "running" && lastPhase != "running"; lastPhase = phase;

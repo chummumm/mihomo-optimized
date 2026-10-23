@@ -124,8 +124,12 @@ public partial class MainWindow : Window
             if (changed && activePage is not null && !await activePage.CanLeaveAsync()) { SelectNavigation(currentPage); return false; }
             if (changed)
             {
+                double routeScrollOffset = ReferenceEquals(PageContent.Content, activePage) ? activePage?.RouteScrollOffset ?? 0 : 0;
                 if (activePage is IPageBackNavigation previousBack) previousBack.BackStateChanged -= UpdateBackButton;
                 if (remember && activePage is not null) history.Add(location with { Action = null });
+                // A portal belongs to its route, even during the short closing
+                // animation; a cached page must not leave it over the next one.
+                activePage?.SetOverlayHost(null);
                 activePage?.Deactivate();
                 var stage = Stopwatch.GetTimestamp();
                 if (!pages.TryGetValue(target.Page, out page!)) { page = PageFactory.Create(target.Page, session); pages.Add(target.Page, page); }
@@ -134,6 +138,7 @@ public partial class MainWindow : Window
                 if (page is IPageBackNavigation nextBack) nextBack.BackStateChanged += UpdateBackButton;
                 stage = Stopwatch.GetTimestamp();
                 SelectNavigation(target.Page); CloseOverlay(true); UpdatePageActivity();
+                page.SetRouteScrollOffset(routeScrollOffset);
                 timing.ActivationMs = Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
                 connected = !RecoveryRequired && ConnectedNavigation.HasPending(this, target.Target);
                 timing.Connected = connected;
@@ -465,19 +470,18 @@ public partial class MainWindow : Window
     }
     private void ApplySubpageState()
     {
-        bool editing = EditorOpen, full = editing && ActualWidth <= 768;
+        bool editing = EditorOpen, full = activePage is ProfilesPage { HasEditorSurface: true } && ActualWidth <= 768;
         // HTML inert leaves the navigation's appearance intact. Block pointer
         // and keyboard entry while retaining those original colors and metrics.
-        NavigationPane.IsHitTestVisible = SearchButton.IsHitTestVisible = !editing;
+        NavigationPane.IsHitTestVisible = SearchButton.IsHitTestVisible = UpdateNoticeSlot.IsHitTestVisible = !editing;
         KeyboardNavigation.SetTabNavigation(NavigationPane, editing ? KeyboardNavigationMode.None : KeyboardNavigationMode.Continue);
         KeyboardNavigation.SetTabNavigation(SearchButton, editing ? KeyboardNavigationMode.None : KeyboardNavigationMode.Continue);
+        KeyboardNavigation.SetTabNavigation(UpdateNoticeSlot, editing ? KeyboardNavigationMode.None : KeyboardNavigationMode.Continue);
         if (editing && searchWindow is { IsVisible: true }) searchWindow.Close();
-        TitleBar.Visibility = full ? Visibility.Hidden : Visibility.Visible;
-        Grid.SetRow(ContentLayout, full ? 0 : 1); Grid.SetRowSpan(ContentLayout, full ? 2 : 1);
-        NavigationDock.Visibility = full ? Visibility.Collapsed : Visibility.Visible;
-        System.Windows.Shell.WindowChrome.SetIsHitTestVisibleInChrome(ContentLayout, full);
-        MainContentBorder.CornerRadius = full || navigationMode == "minimal" ? new CornerRadius(0) : new CornerRadius(8, 0, 0, 0);
-        MainContentBorder.BorderThickness = full ? new Thickness(0) : navigationMode == "minimal" ? new Thickness(0, 1, 0, 0) : new Thickness(1, 1, 0, 0);
+        if (activePage is ProfilesPage profiles) profiles.SetOverlayHost(full ? PageOverlayHost : ContentPageOverlayHost);
+        System.Windows.Shell.WindowChrome.SetIsHitTestVisibleInChrome(PageOverlayHost, full);
+        MainContentBorder.CornerRadius = navigationMode == "minimal" ? new CornerRadius(0) : new CornerRadius(8, 0, 0, 0);
+        MainContentBorder.BorderThickness = navigationMode == "minimal" ? new Thickness(0, 1, 0, 0) : new Thickness(1, 1, 0, 0);
     }
     private async Task GoBackAsync()
     {

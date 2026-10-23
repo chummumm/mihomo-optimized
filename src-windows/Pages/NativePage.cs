@@ -2,6 +2,7 @@ using System.Net.Http;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Markup;
 using Mihomo.Desktop.Controls;
 using Mihomo.Desktop.Services;
@@ -24,7 +25,7 @@ public abstract class NativePage : UserControl
                                     ContentTemplateSelector="{TemplateBinding ContentTemplateSelector}"
                                     ContentStringFormat="{TemplateBinding ContentStringFormat}"
                                     CanContentScroll="{TemplateBinding CanContentScroll}" Margin="{TemplateBinding Padding}"/>
-            <ScrollBar x:Name="PART_VerticalScrollBar" Width="12" HorizontalAlignment="Right"
+            <ScrollBar x:Name="PART_VerticalScrollBar" Width="15" HorizontalAlignment="Right"
                        Orientation="Vertical" Minimum="0" Maximum="{TemplateBinding ScrollableHeight}"
                        ViewportSize="{TemplateBinding ViewportHeight}" IsTabStop="False"
                        Value="{Binding VerticalOffset, Mode=OneWay, RelativeSource={RelativeSource TemplatedParent}}"
@@ -36,6 +37,10 @@ public abstract class NativePage : UserControl
     protected readonly WrapPanel Tools = new() { HorizontalAlignment = HorizontalAlignment.Right };
     protected readonly Grid Body = new();
     private readonly Grid layout = new();
+    private readonly Grid viewport = new();
+    private readonly ContentPresenter pagePresenter = new();
+    private FrameworkElement? pageOverlay;
+    private Panel? overlayHost;
     private readonly Border pageBox;
     private readonly FluentPageHeader header;
     private readonly ContentPresenter headerMeta = new() { Visibility = Visibility.Collapsed, Margin = new Thickness(0, 4, 0, 0) };
@@ -70,6 +75,11 @@ public abstract class NativePage : UserControl
     // The original route animates inside its fixed scrolling viewport. Moving
     // the ScrollViewer itself changes both scrolling targets and the gutter.
     internal FrameworkElement TransitionSurface => pageBox;
+    // The source has one shell scroller shared by all routes. Cached native
+    // pages must inherit that viewport offset instead of restoring an old
+    // per-page position; a short route naturally clamps the shared offset.
+    internal double RouteScrollOffset => pageScroll?.VerticalOffset ?? 0;
+    internal void SetRouteScrollOffset(double offset) => pageScroll?.ScrollToVerticalOffset(Math.Max(0, offset));
 
     protected NativePage(AppSession session, string key, string title, string subtitle)
     {
@@ -88,7 +98,8 @@ public abstract class NativePage : UserControl
         layout.Children.Add(header);
         notice.Margin = new Thickness(0, 0, 0, 12); notice.Visibility = Visibility.Collapsed;
         notice.Id(key + "Notice"); Grid.SetRow(notice, 1); layout.Children.Add(notice);
-        Grid.SetRow(Body, 2); layout.Children.Add(Body); Content = pageBox;
+        Grid.SetRow(Body, 2); layout.Children.Add(Body);
+        pagePresenter.Content = pageBox; viewport.Children.Add(pagePresenter); Content = viewport;
         SizeChanged += (_, _) => UpdatePageMetrics();
         Loaded += (_, _) => UpdatePageMetrics();
     }
@@ -124,7 +135,7 @@ public abstract class NativePage : UserControl
     /// <summary>Scroll the page heading together with its cards, keeping a stable desktop viewport.</summary>
     protected ScrollViewer SetScrollableBody(UIElement content, ScrollViewer? scroller = null)
     {
-        Content = null;
+        pagePresenter.Content = null;
         if (pageScroll is not null) pageScroll.Content = null;
         Body.Children.Clear(); Body.Children.Add(content);
         bodyRow.Height = GridLength.Auto;
@@ -135,7 +146,7 @@ public abstract class NativePage : UserControl
         pageScroll.BorderThickness = new Thickness(0);
         pageScroll.Template = PageScrollTemplate;
         pageScroll.Background = System.Windows.Media.Brushes.Transparent;
-        pageScroll.Content = pageBox; Content = pageScroll;
+        pageScroll.Content = pageBox; pagePresenter.Content = pageScroll;
         UpdatePageMetrics(); return pageScroll;
     }
 
@@ -168,11 +179,43 @@ public abstract class NativePage : UserControl
     public virtual Task<bool> CanLeaveAsync() => Task.FromResult(true);
     protected void SetBody(UIElement content)
     {
-        Content = null;
+        pagePresenter.Content = null;
         if (pageScroll is not null) { pageScroll.Content = null; pageScroll = null; }
         bodyRow.Height = new GridLength(1, GridUnitType.Star);
-        Body.Children.Clear(); Body.Children.Add(content); Content = pageBox;
+        Body.Children.Clear(); Body.Children.Add(content); pagePresenter.Content = pageBox;
         UpdatePageMetrics();
+    }
+    /// <summary>Keep the parent page painted beneath an inert, full-viewport subpage.</summary>
+    protected void SetPageOverlay(FrameworkElement? overlay)
+    {
+        if (ReferenceEquals(pageOverlay, overlay)) return;
+        if (pageOverlay is not null) (overlayHost ?? viewport).Children.Remove(pageOverlay);
+        pageOverlay = overlay;
+        bool covered = overlay is not null;
+        pagePresenter.IsHitTestVisible = !covered;
+        if (covered)
+        {
+            if (pagePresenter.IsKeyboardFocusWithin) Keyboard.ClearFocus();
+            KeyboardNavigation.SetTabNavigation(pagePresenter, KeyboardNavigationMode.None);
+            KeyboardNavigation.SetControlTabNavigation(pagePresenter, KeyboardNavigationMode.None);
+            KeyboardNavigation.SetDirectionalNavigation(pagePresenter, KeyboardNavigationMode.None);
+            (overlayHost ?? viewport).Children.Add(overlay!);
+        }
+        else
+        {
+            pagePresenter.ClearValue(KeyboardNavigation.TabNavigationProperty);
+            pagePresenter.ClearValue(KeyboardNavigation.ControlTabNavigationProperty);
+            pagePresenter.ClearValue(KeyboardNavigation.DirectionalNavigationProperty);
+        }
+    }
+    // A narrow subpage is a window-level portal. Moving only its surface keeps
+    // the parent page, title bar and rail in their original layout underneath.
+    internal void SetOverlayHost(Panel? host)
+    {
+        if (ReferenceEquals(overlayHost, host)) return;
+        if (pageOverlay is not null) (overlayHost ?? viewport).Children.Remove(pageOverlay);
+        overlayHost = host;
+        if (pageOverlay is not null) (overlayHost ?? viewport).Children.Add(pageOverlay);
     }
     protected void Message(string text, bool error = false)
     {

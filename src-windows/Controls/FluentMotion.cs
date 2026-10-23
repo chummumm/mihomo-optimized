@@ -50,8 +50,14 @@ public static class FluentMotion
         if (!Enabled) return;
         var duration = TimeSpan.FromMilliseconds(300);
         element.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(0, 1, duration) { EasingFunction = Decelerate, FillBehavior = FillBehavior.Stop });
-        movement.BeginAnimation(back ? TranslateTransform.XProperty : TranslateTransform.YProperty,
-            new DoubleAnimation(back ? -40 : 28, 0, duration) { EasingFunction = Decelerate, FillBehavior = FillBehavior.Stop });
+        var axis = back ? TranslateTransform.XProperty : TranslateTransform.YProperty;
+        double from = back ? -40 : 28;
+        // Connected navigation measures its destination before the next WPF
+        // animation tick. Make the real starting transform observable now.
+        movement.SetValue(axis, from);
+        var animation = new DoubleAnimation(from, 0, duration) { EasingFunction = Decelerate, FillBehavior = FillBehavior.Stop };
+        animation.Completed += (_, _) => { movement.BeginAnimation(axis, null); movement.SetValue(axis, 0d); };
+        movement.BeginAnimation(axis, animation);
     }
 
     public static void Flash(FrameworkElement element)

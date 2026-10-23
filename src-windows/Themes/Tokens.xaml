@@ -19,6 +19,7 @@
   <SolidColorBrush x:Key="ControlElevationBrush" Color="#29000000" />
   <SolidColorBrush x:Key="ControlElevationTopBrush" Color="#0F000000" />
   <SolidColorBrush x:Key="ControlStrongBrush" Color="#72000000" />
+  <SolidColorBrush x:Key="ScrollbarStrongHoverBrush" Color="#5A5A5A" />
   <SolidColorBrush x:Key="ControlFocusBrush" Color="#FFFFFF" />
   <SolidColorBrush x:Key="SubtleHoverBrush" Color="#0A000000" />
   <SolidColorBrush x:Key="SubtlePressedBrush" Color="#06000000" />

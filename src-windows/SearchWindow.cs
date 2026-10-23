@@ -53,8 +53,8 @@ internal sealed class SearchWindow : Window
     private static readonly double templatesMilliseconds = Stopwatch.GetElapsedTime(templatesStarted).TotalMilliseconds;
     private sealed class ResultItem : ListBoxItem
     {
-        internal required Func<Task> Execute { get; init; }
-        internal required Func<bool> CanExecute { get; init; }
+        internal required Func<Task> Execute { get; set; }
+        internal required Func<bool> CanExecute { get; set; }
     }
     private sealed class ResultList : ListBox
     {
@@ -82,13 +82,15 @@ internal sealed class SearchWindow : Window
             || Detail.Contains(query, StringComparison.OrdinalIgnoreCase)
             || Keywords.Contains(query, StringComparison.OrdinalIgnoreCase);
     }
+    private sealed record ResultAppearance(string Key, string Category, string Icon, string Title, string Detail, bool Enabled, bool IsEnglish);
 
     private const int MaximumVisibleResults = 8;
     private const double ShadowInset = 16;
     private readonly Stopwatch openClock = Stopwatch.StartNew();
     private double constructorStartedMilliseconds, constructorCompletedMilliseconds;
     private double? sourceInitializedMilliseconds, sourceInitializedCompletedMilliseconds, loadedMilliseconds,
-        attachOwnerCompletedMilliseconds, suggestionsStartedMilliseconds, coreEntriesCompletedMilliseconds;
+        attachOwnerCompletedMilliseconds, suggestionsStartedMilliseconds, coreRequestsStartedMilliseconds,
+        coreResponsesReadyMilliseconds, coreEntriesCompletedMilliseconds, firstRenderingMilliseconds, contentRenderedMilliseconds;
     private readonly AppSession session;
     private readonly GlobalSearchBox inputBox;
     private readonly int instance;
@@ -102,12 +104,17 @@ internal sealed class SearchWindow : Window
     private readonly Border suggestionBorder;
     private readonly List<Entry> entries = new();
     private readonly List<Entry> coreEntries = new();
+    private ResultAppearance[] renderedResults = [];
+    private string renderedQuery = "";
     private readonly CancellationTokenSource lifetime = new();
     private readonly FluentBackdropFilter backdropFilter = new FluentBackdropFilter { CornerRadius = new CornerRadius(7) }.Id("SearchBackdrop");
     private readonly Grid flyoutSurface;
     private Window? anchorOwner;
     private bool positioning;
     private bool positionQueued;
+    private Rect positionedBounds = Rect.Empty;
+    private int positionCount;
+    private double positionMilliseconds;
     private string coreIdentity = "";
     private string runtimeMode = "";
     private string commandState = "";
@@ -148,6 +155,7 @@ internal sealed class SearchWindow : Window
         suggestionScroll = new ScrollViewer { Content = suggestions, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Padding = new Thickness(4), CanContentScroll = false };
         var content = new Grid(); content.Children.Add(backdropFilter); content.Children.Add(suggestionScroll);
         suggestionBorder = new Border { Child = content, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), MaxHeight = 380, Margin = new Thickness(ShadowInset) };
+        if (FluentMotion.Enabled) { suggestionBorder.Opacity = 0; suggestionBorder.RenderTransform = new TranslateTransform(0, -12); }
         suggestionBorder.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush");
         suggestionBorder.Effect = new DropShadowEffect { Direction = 270, ShadowDepth = 8, BlurRadius = 16, Color = Colors.Black, Opacity = IsDark ? .26 : .14 };
         flyoutSurface = new Grid { Background = Brushes.Transparent }; flyoutSurface.Children.Add(suggestionBorder);
@@ -166,7 +174,6 @@ internal sealed class SearchWindow : Window
                 source.AddHook(WindowMessage);
                 if (source.CompositionTarget is { } target) target.BackgroundColor = Colors.Transparent;
             }
-            PositionFlyout();
             sourceInitializedCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         };
         Loaded += async (_, _) =>
@@ -175,12 +182,15 @@ internal sealed class SearchWindow : Window
             AttachOwner();
             attachOwnerCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
             PositionFlyout(); FocusInput(); EnterSuggestions();
+            CompositionTarget.Rendering += FirstRendering;
             await LoadCoreEntries();
             coreEntriesCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         };
+        ContentRendered += (_, _) => contentRenderedMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
         Closed += (_, _) =>
         {
             closed = true; inputBox.PaletteClosed(instance); lifetime.Cancel(); lifetime.Dispose();
+            CompositionTarget.Rendering -= FirstRendering;
             search.TextChanged -= QueryChanged;
             AutomationProperties.SetHelpText(search, "");
             session.StatusChanged -= OnStatusChanged; session.ThemeChanged -= OnThemeChanged; L.Changed -= OnLanguageChanged;
@@ -205,10 +215,16 @@ internal sealed class SearchWindow : Window
     private void EnterSuggestions()
     {
         suggestionsStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
-        if (!FluentMotion.Enabled) return;
+        suggestionBorder.Opacity = 1;
+        if (!FluentMotion.Enabled) { suggestionBorder.RenderTransform = Transform.Identity; return; }
         var movement = new TranslateTransform(); suggestionBorder.RenderTransform = movement;
         SettingsSegments.Animate(movement, TranslateTransform.YProperty, -12, 0, 250);
         SettingsSegments.Animate(suggestionBorder, OpacityProperty, 0, 1, 250);
+    }
+    private void FirstRendering(object? sender, EventArgs args)
+    {
+        firstRenderingMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
+        CompositionTarget.Rendering -= FirstRendering;
     }
 
     public void FocusInput()
@@ -219,12 +235,15 @@ internal sealed class SearchWindow : Window
     internal object Describe() => new
     {
         instance, visible = IsVisible, closing, closed, choosing, resultCount = results.Items.Count,
+        renderingTier = RenderCapability.Tier >> 16, positionCount, positionMilliseconds,
         // Relative timings only: no search text, entry names or controller data.
         lifecycleMilliseconds = new { templates = templatesMilliseconds, constructorStarted = constructorStartedMilliseconds,
             constructorCompleted = constructorCompletedMilliseconds, sourceInitialized = sourceInitializedMilliseconds,
             sourceInitializedCompleted = sourceInitializedCompletedMilliseconds, loaded = loadedMilliseconds,
             attachOwnerCompleted = attachOwnerCompletedMilliseconds, suggestionsStarted = suggestionsStartedMilliseconds,
-            coreEntriesCompleted = coreEntriesCompletedMilliseconds }
+            coreRequestsStarted = coreRequestsStartedMilliseconds, coreResponsesReady = coreResponsesReadyMilliseconds,
+            coreEntriesCompleted = coreEntriesCompletedMilliseconds, firstRendering = firstRenderingMilliseconds,
+            contentRendered = contentRenderedMilliseconds }
     };
     protected override void OnClosing(CancelEventArgs e)
     {
@@ -282,6 +301,7 @@ internal sealed class SearchWindow : Window
         if (closing || closed || positioning || Owner is null) return;
         var handle = new WindowInteropHelper(this).Handle;
         if (handle == IntPtr.Zero) return;
+        var started = Stopwatch.GetTimestamp();
         positioning = true;
         try
         {
@@ -319,10 +339,17 @@ internal sealed class SearchWindow : Window
             suggestionBorder.MaxHeight = maxHeight; suggestionBorder.Height = panelHeight;
             Width = width + 2 * ShadowInset; Height = panelHeight + 2 * ShadowInset;
             // Physical coordinates keep the flyout on the owner's monitor at mixed DPI settings.
-            _ = SetWindowPos(handle, IntPtr.Zero, (int)Math.Round(left - ShadowInset * scale), (int)Math.Round(top - ShadowInset * verticalScale),
-                (int)Math.Round((width + 2 * ShadowInset) * scale), (int)Math.Round((panelHeight + 2 * ShadowInset) * verticalScale), 0x0014);
+            // A data refresh with the same six commands must not send another
+            // synchronous layered-window resize during the entrance animation.
+            var bounds = new Rect(Math.Round(left - ShadowInset * scale), Math.Round(top - ShadowInset * verticalScale),
+                Math.Round((width + 2 * ShadowInset) * scale), Math.Round((panelHeight + 2 * ShadowInset) * verticalScale));
+            if (positionedBounds != bounds)
+            {
+                _ = SetWindowPos(handle, IntPtr.Zero, (int)bounds.X, (int)bounds.Y, (int)bounds.Width, (int)bounds.Height, 0x0014);
+                positionedBounds = bounds; positionCount++;
+            }
         }
-        finally { positioning = false; }
+        finally { positioning = false; positionMilliseconds += Stopwatch.GetElapsedTime(started).TotalMilliseconds; }
     }
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -393,25 +420,45 @@ internal sealed class SearchWindow : Window
         string query = search.Text.Trim();
         var candidates = query.Length == 0 ? entries.Where(entry => entry.Category == "command").Take(6).ToArray()
             : entries.Where(entry => entry.Matches(query)).OrderByDescending(entry => entry.Title.StartsWith(query, StringComparison.OrdinalIgnoreCase)).ToArray();
-        results.Items.Clear();
-        foreach (Entry entry in candidates.Take(MaximumVisibleResults)) results.Items.Add(RenderResult(entry, query));
+        var visible = candidates.Take(MaximumVisibleResults).ToArray();
+        var appearance = visible.Select(entry => new ResultAppearance(entry.Key, entry.Category, entry.Icon, entry.Title, entry.Detail, entry.IsEnabled, L.IsEnglish)).ToArray();
+        bool contentChanged = renderedQuery != query || !renderedResults.SequenceEqual(appearance);
+        if (contentChanged)
+        {
+            results.Items.Clear();
+            foreach (Entry entry in visible) results.Items.Add(RenderResult(entry, query));
+            renderedQuery = query; renderedResults = appearance;
+        }
+        else
+        {
+            // Endpoint loading and status-only updates leave identical rows
+            // in place, including their realized templates and UIA providers.
+            // Their commands still follow the latest entry, never old data.
+            for (int index = 0; index < visible.Length; index++)
+                UpdateEntry((ResultItem)results.Items[index], visible[index]);
+        }
         int selected = 0;
         if (selectedKey is not null)
             for (int index = 0; index < results.Items.Count; index++)
                 if (((ListBoxItem)results.Items[index]).Tag is Entry entry && entry.Key == selectedKey) { selected = index; break; }
         if (results.Items.Count > 0) results.SelectedIndex = selected;
-        resultCount.Text = L.T("试试这些"); resultCount.Visibility = query.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        resultCount.Text = L.T("试试这些");
+        var headingVisibility = query.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        bool layoutChanged = contentChanged || resultCount.Visibility != headingVisibility;
+        resultCount.Visibility = headingVisibility;
         string countDescription = candidates.Length > MaximumVisibleResults ? L.F("{0} 个结果，显示前 {1} 项；请细化关键词", candidates.Length, MaximumVisibleResults)
             : L.F("{0} 个结果", candidates.Length);
         AutomationProperties.SetItemStatus(results, countDescription);
-        empty.Text = L.F("没有找到“{0}”。可以搜索节点、策略组、规则、设置项或命令。", query);
-        empty.Visibility = candidates.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        string emptyText = L.F("没有找到“{0}”。可以搜索节点、策略组、规则、设置项或命令。", query);
+        var emptyVisibility = candidates.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        layoutChanged |= empty.Visibility != emptyVisibility || emptyVisibility == Visibility.Visible && empty.Text != emptyText;
+        empty.Text = emptyText; empty.Visibility = emptyVisibility;
         state.Text = loading ? L.T("正在读取策略组、节点和规则…")
             : loadError is not null ? L.F("部分内容未能读取：{0}。按 F5 重试。", loadError)
             : !RuntimeReady ? L.T("启动内核后，可搜索策略组、节点和规则。页面与设置始终可搜索。")
             : L.T("选择结果可定位到页面、控件或规则；节点结果会定位到节点。");
         AutomationProperties.SetHelpText(search, state.Text);
-        QueuePositionFlyout();
+        if (layoutChanged) QueuePositionFlyout();
     }
 
     private ListBoxItem RenderResult(Entry entry, string query)
@@ -438,8 +485,15 @@ internal sealed class SearchWindow : Window
         AutomationProperties.SetHelpText(item, entry.IsEnabled ? "" : L.T("当前状态无法执行此命令，请等待正在进行的操作完成。"));
         item.MouseEnter += (_, _) => { results.SelectedItem = item; };
         item.PreviewMouseLeftButtonDown += (_, e) => { e.Handled = true; results.SelectedItem = item; };
-        item.PreviewMouseLeftButtonUp += async (_, e) => { e.Handled = true; await RunEntry(entry); };
+        item.PreviewMouseLeftButtonUp += async (_, e) => { e.Handled = true; await item.Execute(); };
         return item;
+    }
+
+    private void UpdateEntry(ResultItem item, Entry entry)
+    {
+        item.Tag = entry;
+        item.Execute = () => RunEntry(entry);
+        item.CanExecute = () => entry.IsEnabled && !closing && !closed && !choosing;
     }
 
     private static void AppendHighlight(TextBlock text, string title, string query)
@@ -460,11 +514,13 @@ internal sealed class SearchWindow : Window
         loading = true; loadError = null; Filter(preserveSelection: true);
         try
         {
+            coreRequestsStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
             Task<JsonElement> proxies = session.ApiAsync(HttpMethod.Get, "proxies", cancellationToken: lifetime.Token);
             Task<JsonElement> rules = session.ApiAsync(HttpMethod.Get, "rules", cancellationToken: lifetime.Token);
             Task<JsonElement> configs = session.ApiAsync(HttpMethod.Get, "configs", cancellationToken: lifetime.Token);
             // Keep readable categories available even when a different endpoint fails.
             try { await Task.WhenAll(proxies, rules, configs); } catch (Exception) when (!lifetime.IsCancellationRequested) { }
+            coreResponsesReadyMilliseconds = openClock.Elapsed.TotalMilliseconds;
             if (closed || lifetime.IsCancellationRequested || identity != ControllerIdentity || !RuntimeReady) return;
             coreEntries.Clear(); coreIdentity = identity;
             if (configs.IsCompletedSuccessfully) runtimeMode = configs.Result.Text("mode");
