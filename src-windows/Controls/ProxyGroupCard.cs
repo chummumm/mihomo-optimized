@@ -13,7 +13,7 @@ namespace Mihomo.Desktop.Controls;
 internal sealed class ProxyGroupCard : Border
 {
     internal ProxyExpander Expander { get; } = new();
-    private readonly Grid header = new();
+    private readonly Grid header = new() { VerticalAlignment = VerticalAlignment.Center };
     private readonly Border headerPadding;
     private readonly Grid identity = new();
     private readonly FluentIcon icon = new("nav-proxies", 20);
@@ -142,6 +142,20 @@ internal sealed class ProxyMemberGrid : Grid
             var next = e.Key switch { Key.Home => 0, Key.End => buttons.Length - 1, Key.Left => index - 1, Key.Right => index + 1, Key.Up => index - panel.Columns, _ => index + panel.Columns };
             buttons[Math.Clamp(next, 0, buttons.Length - 1)].Focus(); e.Handled = true;
         };
+    }
+    protected override Size MeasureOverride(Size constraint)
+    {
+        var desired = base.MeasureOverride(constraint);
+        // The reference viewport has a fixed row height, 1 px padding and
+        // -1 px margins. Its cards stay 56 px high while the row occupies 54 px.
+        return cards.Count == 0 ? desired : new Size(desired.Width, Math.Max(0, desired.Height - 2));
+    }
+    protected override Size ArrangeOverride(Size finalSize)
+    {
+        if (cards.Count == 0) { Clip = null; return base.ArrangeOverride(finalSize); }
+        base.ArrangeOverride(new Size(finalSize.Width, finalSize.Height + 2));
+        Clip = new RectangleGeometry(new Rect(-1, -1, finalSize.Width + 2, finalSize.Height + 2));
+        return finalSize;
     }
     internal void Update(string group, IReadOnlyList<string> names, IReadOnlyDictionary<string, ProxyNodeInfo> nodes, string selected, bool selectable, string? pending)
     {

@@ -16,6 +16,21 @@ internal static class NativeVisualCapture
     internal sealed record ScreenRegion(int X, int Y, int Width, int Height, double Dpi,
         int VisibleX, int VisibleY, int VisibleWidth, int VisibleHeight);
 
+    internal static void ResizeForCapture(Window window, double width, double height)
+    {
+        // A hosted Windows desktop can be smaller than the default window.
+        // Keep the real HWND wholly inside its monitor's working area before
+        // recording; the reference fixture uses the resulting client size.
+        var handle = new System.Windows.Interop.WindowInteropHelper(window).Handle;
+        var area = System.Windows.Forms.Screen.FromHandle(handle).WorkingArea;
+        var dpi = VisualTreeHelper.GetDpi(window);
+        int pixelsWide = Math.Min(area.Width, (int)Math.Round(width * dpi.DpiScaleX));
+        int pixelsHigh = Math.Min(area.Height, (int)Math.Round(height * dpi.DpiScaleY));
+        if (!SetWindowPos(handle, IntPtr.Zero, area.Left + (area.Width - pixelsWide) / 2,
+            area.Top + (area.Height - pixelsHigh) / 2, pixelsWide, pixelsHigh, 0x0014))
+            throw new System.ComponentModel.Win32Exception();
+    }
+
     // Resolve WPF geometry on the dispatcher once; the screen read itself runs
     // independently so recording does not render or block the application's UI.
     internal static ScreenRegion ScreenBounds(Window owner, string surface)
@@ -73,6 +88,9 @@ internal static class NativeVisualCapture
 
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr GetDC(IntPtr window);
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern int ReleaseDC(IntPtr window, IntPtr dc);
     [System.Runtime.InteropServices.DllImport("gdi32.dll", SetLastError = true)]

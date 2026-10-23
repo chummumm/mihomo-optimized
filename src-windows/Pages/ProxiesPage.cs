@@ -48,6 +48,7 @@ public sealed class ProxiesPage : NativePage
     private readonly Button toggleTopology;
     private readonly Grid topologyBody = new();
     private readonly ScrollViewer scroll;
+    private CancellationTokenSource? scrollLifetime;
     private readonly Dictionary<string, ProxyNodeInfo> nodes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ProxyNodeInfo> measured = new(StringComparer.Ordinal);
     private readonly Dictionary<(string Section, string Name), ProxyNodeTile> tiles = [];
@@ -59,6 +60,7 @@ public sealed class ProxiesPage : NativePage
     private readonly DispatcherTimer filterTimer = new() { Interval = TimeSpan.FromMilliseconds(130) };
     private readonly DispatcherTimer renderTimer = new() { Interval = TimeSpan.FromMilliseconds(200) };
     private JsonElement providerData;
+    private JsonElement presentedProxies, presentedProviders, presentedConfigs;
     private string[] order = [];
     private string mode = "rule";
     private string lastController = "";
@@ -121,9 +123,15 @@ public sealed class ProxiesPage : NativePage
         PreviewKeyDown += (_, e) => { if (e.Key == Key.T && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; _ = RunAsync(MeasureAll); } };
         topology.Picked += (action, name) => _ = RunAsync(() => NavigateToAsync(new NavigationTarget("proxies", name, Action: action)));
         Session.ThemeChanged += topology.RefreshPalette;
-        Session.HostEvent += (name, data) => { if (name == "desktop-config-changed" && IsActive) _ = RunAsync(RefreshAsync); };
+        Session.HostEvent += (name, data) =>
+        {
+            if (name != "desktop-config-changed") return;
+            InvalidateRefresh();
+            if (IsActive) _ = RunAsync(RefreshAsync);
+        };
         groupList.SizeChanged += (_, _) => breakLabel.Visibility = PageContainerWidth <= 640 ? Visibility.Collapsed : Visibility.Visible;
         ApplyTopologyVisibility();
+        TryPresentRuntimeSnapshot();
     }
 
     public override Task RefreshAsync()
@@ -132,14 +140,34 @@ public sealed class ProxiesPage : NativePage
         refreshToken = PageToken; refreshController = ControllerIdentity;
         return refreshing = RefreshCore(++refreshGeneration, refreshToken, refreshController);
     }
+    private void InvalidateRefresh() { refreshGeneration++; refreshing = null; }
     private async Task RefreshCore(long generation, CancellationToken token, string controller)
     {
         if (!IsRunning) { ClearInactive(); return; }
-        if (lastController != controller) { lastController = controller; measured.Clear(); tiles.Clear(); topologyModel.Clear(); up = down = 0; }
+        ResetControllerData(controller);
         var proxyTask = Get("proxies", token); var providerTask = Get("providers/proxies", token); var configTask = Get("configs", token);
         await Task.WhenAll(proxyTask, providerTask, configTask);
         if (!IsRunning || controller != ControllerIdentity || generation != refreshGeneration || token.IsCancellationRequested) return;
-        var all = (await proxyTask).Get("proxies"); providerData = (await providerTask).Get("providers"); mode = (await configTask).Text("mode").ToLowerInvariant();
+        PresentRuntimeData(await proxyTask, await providerTask, await configTask);
+        await ApplyPendingNavigation(); StartTopology();
+    }
+    private void ResetControllerData(string controller)
+    {
+        if (lastController == controller) return;
+        lastController = controller; measured.Clear(); tiles.Clear(); topologyModel.Clear(); up = down = 0;
+        presentedProxies = presentedProviders = presentedConfigs = default;
+    }
+    private bool TryPresentRuntimeSnapshot()
+    {
+        if (!IsRunning || !Session.TryGetProxyRuntimeSnapshot(out var proxies, out var providers, out var configs)) return false;
+        ResetControllerData(ControllerIdentity);
+        if (!proxies.Equals(presentedProxies) || !providers.Equals(presentedProviders) || !configs.Equals(presentedConfigs))
+            PresentRuntimeData(proxies, providers, configs);
+        return true;
+    }
+    private void PresentRuntimeData(JsonElement proxies, JsonElement providers, JsonElement configs)
+    {
+        var all = proxies.Get("proxies"); providerData = providers.Get("providers"); mode = configs.Text("mode").ToLowerInvariant();
         nodes.Clear();
         foreach (var item in all.Fields()) nodes[item.Name] = ProxyNodeInfo.From(item.Name, item.Value);
         foreach (var provider in VisibleProviderData()) foreach (var item in provider.Value.Get("proxies").Items())
@@ -150,7 +178,8 @@ public sealed class ProxiesPage : NativePage
         order = all.Get("GLOBAL").Get("all").Items().Select(item => item.Text()).ToArray();
         if (order.Length == 0) order = nodes.Keys.ToArray();
         foreach (var key in tiles.Keys.Where(key => !nodes.ContainsKey(key.Name)).ToArray()) tiles.Remove(key);
-        Message(""); Render(); await ApplyPendingNavigation(); StartTopology();
+        Message(""); Render();
+        presentedProxies = proxies; presentedProviders = providers; presentedConfigs = configs;
     }
     private IEnumerable<JsonProperty> VisibleProviderData() => providerData.Fields().Where(item => item.Name != "default" && item.Value.Text("vehicleType") != "Compatible");
     private IEnumerable<ProxyNodeInfo> Groups(bool withGlobal = true)
@@ -264,12 +293,12 @@ public sealed class ProxiesPage : NativePage
     }
     private async Task ChangeProvider(string name, bool check)
     {
-        if (!providersBusy.TryAdd(name, check)) return; RenderProviders();
+        if (!providersBusy.TryAdd(name, check)) return; InvalidateRefresh(); RenderProviders();
         try
         {
             if (check) await Get("providers/proxies/" + Uri.EscapeDataString(name) + "/healthcheck");
             else await Session.ApiAsync(HttpMethod.Put, "providers/proxies/" + Uri.EscapeDataString(name), cancellationToken: PageToken);
-            measured.Clear(); await RefreshAsync();
+            InvalidateRefresh(); measured.Clear(); await RefreshAsync();
         }
         finally { providersBusy.Remove(name); RenderProviders(); }
     }
@@ -310,12 +339,14 @@ public sealed class ProxiesPage : NativePage
     private async Task Select(string group, string name)
     {
         if (!IsRunning || !nodes.TryGetValue(group, out var current) || current.Type != "Selector" || current.Now == name || !selecting.Add(group)) return;
+        InvalidateRefresh();
         pendingSelections[group] = name; RenderGroups();
         var token = PageToken; var controller = ControllerIdentity;
         try
         {
             await Session.ApiAsync(HttpMethod.Put, "proxies/" + Uri.EscapeDataString(group), new { name }, token);
             if (controller != ControllerIdentity || token.IsCancellationRequested) return;
+            InvalidateRefresh();
             nodes[group] = current with { Now = name }; RenderGroups(); RefreshMap();
             if (Session.CloseConnectionsOnSwitch)
             {
@@ -379,7 +410,23 @@ public sealed class ProxiesPage : NativePage
         pendingNavigation = target;
         if (target.Query is not null) search.Text = target.Query;
         if (!IsRunning) { Message(InactiveMessage); return; }
-        await RefreshAsync();
+        bool snapshotReady = TryPresentRuntimeSnapshot();
+        var refresh = RefreshAsync();
+        bool targetReady = target.Action switch
+        {
+            "focus-group" => target.Target is { } group && groupCards.ContainsKey(group),
+            "focus-node" => target.Target is { } node && nodes.ContainsKey(node),
+            _ => true
+        };
+        if (snapshotReady && targetReady)
+        {
+            // Keep real network refreshes and their controller/page guards, but
+            // do not hold the connected transition behind a duplicate read.
+            _ = RunAsync(() => refresh);
+            await ApplyPendingNavigation();
+            return;
+        }
+        await refresh;
         if (pendingNavigation is not null) await ApplyPendingNavigation();
     }
     private async Task ApplyPendingNavigation()
@@ -391,7 +438,15 @@ public sealed class ProxiesPage : NativePage
         if (target.Action == "focus-group")
         {
             preferences.OpenGroups ??= Groups().Take(1).Select(item => item.Name).ToHashSet(StringComparer.Ordinal); preferences.OpenGroups.Add(name); preferences.Save(); Render();
-            await Dispatcher.InvokeAsync(() => { if (groupCards.TryGetValue(name, out var card)) { card.BringIntoView(); expanders[name].Focus(); if (Window.GetWindow(this) is not { } window || !ConnectedNavigation.HasPending(window, name)) Flash(card); } }, DispatcherPriority.Loaded);
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Loaded);
+            if (IsActive && groupCards.TryGetValue(name, out var card))
+            {
+                // Search, Home and the topology all use the same short accent
+                // highlight. Programmatic navigation does not take keyboard focus.
+                Flash(card);
+                var connected = Window.GetWindow(this) is { } window && ConnectedNavigation.HasPending(window, name);
+                await CenterAsync(card, !connected);
+            }
         }
         else if (target.Action == "focus-node")
         {
@@ -408,6 +463,33 @@ public sealed class ProxiesPage : NativePage
         }
     }
     private static void Flash(Border card) => ProxyVisuals.Attention(card);
+
+    private async Task CenterAsync(FrameworkElement element, bool smooth)
+    {
+        StopScrollNavigation(); scroll.UpdateLayout();
+        if (!IsActive || !element.IsVisible || scroll.ViewportHeight <= 0) return;
+        var bounds = element.TransformToAncestor(scroll).TransformBounds(new Rect(element.RenderSize));
+        var from = scroll.VerticalOffset;
+        var destination = Math.Clamp(from + bounds.Top + bounds.Height / 2 - scroll.ViewportHeight / 2, 0, scroll.ScrollableHeight);
+        if (!smooth || !ProxyVisuals.Animate || Math.Abs(destination - from) < 1) { scroll.ScrollToVerticalOffset(destination); scroll.UpdateLayout(); return; }
+        var lifetime = CancellationTokenSource.CreateLinkedTokenSource(PageToken); scrollLifetime = lifetime;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            while (IsActive && clock.Elapsed.TotalMilliseconds < 250)
+            {
+                lifetime.Token.ThrowIfCancellationRequested();
+                var progress = Math.Clamp(clock.Elapsed.TotalMilliseconds / 250, 0, 1);
+                var eased = FluentMotion.Decelerate.Ease(progress);
+                scroll.ScrollToVerticalOffset(from + (destination - from) * eased);
+                await Task.Delay(16, lifetime.Token);
+            }
+            if (IsActive && !lifetime.IsCancellationRequested) scroll.ScrollToVerticalOffset(destination);
+        }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
+        finally { if (ReferenceEquals(scrollLifetime, lifetime)) scrollLifetime = null; lifetime.Dispose(); }
+    }
+    private void StopScrollNavigation() { scrollLifetime?.Cancel(); scrollLifetime = null; }
 
     private void ApplyTopologyVisibility()
     {
@@ -456,8 +538,8 @@ public sealed class ProxiesPage : NativePage
         try { var bounds = topology.TransformToAncestor(scroll).TransformBounds(new Rect(topology.RenderSize)); topology.SetActive(bounds.Bottom > 0 && bounds.Top < scroll.ViewportHeight); }
         catch (InvalidOperationException) { topology.SetActive(false); }
     }
-    public override void Activate() { base.Activate(); ApplyTopologyVisibility(); }
-    public override void Deactivate() { StopTopology(); filterTimer.Stop(); renderTimer.Stop(); base.Deactivate(); }
+    public override void Activate() { if (!IsActive) TryPresentRuntimeSnapshot(); base.Activate(); ApplyTopologyVisibility(); }
+    public override void Deactivate() { StopScrollNavigation(); StopTopology(); filterTimer.Stop(); renderTimer.Stop(); base.Deactivate(); }
     protected override void OnStatusChanged()
     {
         var phase = Session.Status.Text("phase"); var becameRunning = phase == "running" && lastPhase != "running"; lastPhase = phase;
@@ -469,7 +551,7 @@ public sealed class ProxiesPage : NativePage
     protected override void OnLanguageChanged() { Render(); if (!IsRunning) Message(InactiveMessage); }
     private void ClearInactive()
     {
-        StopTopology(); nodes.Clear(); providerData = default; order = []; topologyModel.Clear(); up = down = 0; activeConnections = 0;
+        StopTopology(); nodes.Clear(); providerData = default; presentedProxies = presentedProviders = presentedConfigs = default; order = []; topologyModel.Clear(); up = down = 0; activeConnections = 0;
         groupList.Children.Clear(); providerList.Children.Clear(); nodeSection.Children.Clear(); topology.SetModel(TopologyModel.Empty); UpdateSummary(); RefreshMapReadings(); Message(InactiveMessage);
     }
 }

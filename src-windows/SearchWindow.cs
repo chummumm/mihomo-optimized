@@ -84,6 +84,7 @@ internal sealed class SearchWindow : Window
     private const double ShadowInset = 16;
     private readonly AppSession session;
     private readonly GlobalSearchBox inputBox;
+    private readonly int instance;
     private readonly TextBox search;
     private readonly ResultList results = new() { BorderThickness = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Stretch, Background = Brushes.Transparent };
     private readonly TextBlock resultCount = Ui.Hint("试试这些");
@@ -118,6 +119,7 @@ internal sealed class SearchWindow : Window
     public SearchWindow(AppSession session, GlobalSearchBox inputBox)
     {
         this.session = session; this.inputBox = inputBox; search = inputBox.Input;
+        instance = inputBox.PaletteCreated();
         L.Bind(this, TitleProperty, "搜索"); this.Id("GlobalSearchWindow");
         Width = 380; Height = 330; MinWidth = 0; MinHeight = 0;
         WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize; AllowsTransparency = true;
@@ -164,7 +166,7 @@ internal sealed class SearchWindow : Window
         };
         Closed += (_, _) =>
         {
-            closed = true; lifetime.Cancel(); lifetime.Dispose();
+            closed = true; inputBox.PaletteClosed(instance); lifetime.Cancel(); lifetime.Dispose();
             search.TextChanged -= QueryChanged;
             AutomationProperties.SetHelpText(search, "");
             session.StatusChanged -= OnStatusChanged; session.ThemeChanged -= OnThemeChanged; L.Changed -= OnLanguageChanged;
@@ -198,6 +200,7 @@ internal sealed class SearchWindow : Window
         if (closing || closed) return;
         inputBox.FocusInput();
     }
+    internal object Describe() => new { instance, visible = IsVisible, closing, closed, choosing, resultCount = results.Items.Count };
     protected override void OnClosing(CancelEventArgs e)
     {
         // Destroying an active HWND can synchronously raise Deactivated before
@@ -212,9 +215,7 @@ internal sealed class SearchWindow : Window
         closing = true;
         try
         {
-            if (clearQuery) inputBox.ClearQuery();
-            if (blur) inputBox.BlurInput();
-            Close();
+            inputBox.DismissPalette(Close, clearQuery, blur);
         }
         finally { if (!closed) closing = false; }
     }

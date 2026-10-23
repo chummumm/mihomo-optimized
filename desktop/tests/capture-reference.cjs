@@ -253,7 +253,7 @@ function initializeFixture ({ scenario, origin, secret }) {
         status: { ...scenario.status, lastError: null,
             controller: scenario.status.phase === 'running' ? { url: origin, secret } : null },
         config: structuredClone(scenario.config),
-        dirty: false, commands: [], errors: [], blocked: [], action: null, armed: null,
+        dirty: false, commands: [], errors: [], blocked: [], action: null, armed: null, streamMessages: {},
         emit (event, payload) {
             for (const [id, handler] of listeners.get(event) || []) {
                 callbacks.get(handler)?.({ event, id, payload: structuredClone(payload) })
@@ -276,6 +276,11 @@ function initializeFixture ({ scenario, origin, secret }) {
                 throw new Error('External WebSockets are blocked in reference capture')
             }
             super(url, protocols)
+            // Observe transport delivery without importing or changing an
+            // application store. A connected socket alone is not rendered data.
+            super.addEventListener('message', () => {
+                state.streamMessages[endpoint.pathname] = (state.streamMessages[endpoint.pathname] || 0) + 1
+            })
             this.referenceListeners = new Map()
         }
         addEventListener (type, callback, options) {
@@ -354,7 +359,7 @@ function initializeFixture ({ scenario, origin, secret }) {
 
 const selectors = [
     '.titlebar', '.titlebar-left', '.titlebar-center', '.auto-suggest-input', '.auto-suggest-list', '.auto-suggest-item',
-    '.navigation-pane', '.navigation-overlay', '.page-container', '.page', '.header', '.home-hero', '.home-tiles',
+    '.navigation-pane', '.navigation-overlay', '.page-container', '.route-view', '.page', '.header', '.home-page', '.home-hero', '.home-tiles',
     '.home-chart', '.home-stats', '.home-exits', '.home-exit', '.proxies-page', '.proxy-topology', '.proxy-group',
     '.proxy-nodes', '.settings-section', '.settings-section-title', '.setting-card', '.setting-row',
     '#set-theme', '#set-language', '#set-lan', '.button-select', '.switch', '.settings-ports',
@@ -400,6 +405,114 @@ async function geometry (page) {
     }, selectors)
 }
 
+const pageRoots = {
+    home: '.home-page', proxies: '.proxies-page', connections: '.connections-page', dns: '.dns-page',
+    rules: '.rules-page', logs: '.logs-page', profiles: '.profiles-page', settings: '.settings-page', tray: '.tray-flyout',
+}
+
+async function waitForPresentation (page, selector) {
+    await page.locator(selector).waitFor({ state: 'visible' })
+    // Visibility only checks the target's layout box. In particular it does not
+    // wait for a route-view ancestor's opacity animation; run41 captured Home's
+    // shell while its populated route was still transparent and translated.
+    await page.waitForFunction(selector => {
+        const target = document.querySelector(selector)
+        if (!target) return false
+        for (let element = target; element; element = element.parentElement) {
+            const style = getComputedStyle(element)
+            if (style.display === 'none' || style.visibility !== 'visible' || Number(style.opacity) < 0.999) return false
+            if (element.getAnimations().some(animation => {
+                const timing = animation.effect?.getComputedTiming()
+                return Number.isFinite(timing?.endTime) && ['running', 'pending'].includes(animation.playState)
+            })) return false
+        }
+        const rect = target.getBoundingClientRect()
+        return rect.width > 0 && rect.height > 0
+    }, selector)
+    // Two paint opportunities after the final layout, without disabling,
+    // seeking, or finishing the original animation on behalf of the browser.
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+}
+
+async function waitForPageReady (page, scenario, state) {
+    const route = scenario.name === 'tray' ? 'tray' : scenario.page
+    const selector = pageRoots[route]
+    assert.ok(selector, 'No reference readiness contract for route ' + route)
+    const proxies = scenario.api['/proxies'].proxies
+    const policyTypes = new Set(['Selector', 'URLTest', 'Fallback', 'LoadBalance'])
+    const ordered = (proxies.GLOBAL?.all || []).filter(name => !['DIRECT', 'REJECT', 'PASS', 'GLOBAL'].includes(name))
+    const groups = ordered.filter(name => policyTypes.has(proxies[name]?.type))
+    const exits = groups.filter(name => ['Selector', 'URLTest', 'Fallback'].includes(proxies[name]?.type)).slice(0, route === 'tray' ? 3 : 4)
+    const config = scenario.api['/configs']
+    const expected = {
+        route, selector, phase: scenario.status.phase, exits, groups,
+        renderedGroups: String(config.mode).toLowerCase() === 'global' ? ['GLOBAL', ...groups] : groups,
+        mode: String(config.mode).toLowerCase(), lan: !!config['allow-lan'],
+        ports: [config['mixed-port'] ?? 0, config.port ?? 0, config['socks-port'] ?? 0].map(String),
+        language: scenario.language === 'en-US' ? 'en_US' : 'zh_CN',
+        rules: scenario.api['/rules'].rules.length,
+        configPath: scenario.status.configPath || '—',
+        connections: scenario.api['/connections'].connections?.length || 0,
+        connectionFrames: state.connectionFrames.length,
+        logs: Math.min(scenario.streams?.logs?.length || 0, 200),
+        logFrames: scenario.streams?.logs?.length || 0,
+        dnsQueries: scenario.api['/dns/observability/stats']?.last_24h?.queries,
+    }
+    await page.locator(selector).waitFor({ state: 'visible' })
+    await page.waitForFunction(expected => {
+        const text = selector => document.querySelector(selector)?.textContent?.trim()
+        const texts = selector => [...document.querySelectorAll(selector)].map(element => element.textContent.trim())
+        const same = (actual, expected) => JSON.stringify(actual) === JSON.stringify(expected)
+        const streams = window.__referenceNative.streamMessages
+        if (!document.querySelector(expected.selector)) return false
+        switch (expected.route) {
+            case 'home':
+            case 'tray': {
+                const tray = expected.route === 'tray'
+                const phase = document.querySelector(tray ? '.tray-flyout' : '.home-hero')?.dataset.phase
+                if (phase !== expected.phase) return false
+                if (phase !== 'running') return true
+                return same(texts(tray ? '.tray-exit-text > b' : '.home-exit-name > b'), expected.exits) &&
+                    (streams['/connections'] || 0) >= expected.connectionFrames
+            }
+            case 'proxies':
+                return text('.proxies-summary .reading') === String(expected.groups.length) &&
+                    same([...document.querySelectorAll('.proxy-group[data-group]')].map(element => element.dataset.group), expected.renderedGroups)
+            case 'settings':
+                return document.querySelector('#set-language [aria-pressed="true"]')?.value === expected.language &&
+                    document.querySelector('#set-mode [aria-pressed="true"]')?.value === expected.mode &&
+                    document.querySelector('#set-lan [role="switch"]')?.getAttribute('aria-checked') === String(expected.lan) &&
+                    same(['settings-mixed-port', 'settings-http-port', 'settings-socks-port'].map(id => document.getElementById(id)?.value), expected.ports)
+            case 'rules':
+                return text('.rules-count .reading') === String(expected.rules) &&
+                    (expected.rules === 0 || !!document.querySelector('.rule-item'))
+            case 'profiles': {
+                const counts = text('.profile-current-counts')?.match(/\d+/g)?.map(Number)
+                return text('.profile-current-path') === expected.configPath &&
+                    (expected.phase !== 'running' || same(counts, [expected.groups.length, expected.rules]))
+            }
+            case 'dns':
+                return document.querySelector('#dns-tab-overview')?.getAttribute('aria-selected') === 'true' &&
+                    text('.dns-metric strong')?.replace(/,/g, '') === String(expected.dnsQueries)
+            case 'logs':
+                return text('.logs-count .reading') === String(expected.logs) &&
+                    document.querySelectorAll('.log-line').length === expected.logs &&
+                    (streams['/logs'] || 0) >= expected.logFrames
+            case 'connections':
+                return text('.connections-summary .reading') === String(expected.connections) &&
+                    !!document.querySelector('.connections-table') &&
+                    (streams['/connections'] || 0) >= expected.connectionFrames
+            default: return false
+        }
+    }, expected)
+    if (scenario.update?.available === true && scenario.update.version && route !== 'tray') {
+        await page.locator('.desktop-update-notice').waitFor({ state: 'visible' })
+    }
+    await waitForPresentation(page, selector)
+    state.readiness = { route, selector, observedDataMatched: true, ancestorAnimationsSettled: true,
+        readyAt: new Date().toISOString(), streams: await page.evaluate(() => window.__referenceNative.streamMessages) }
+}
+
 async function initializePage (scenario, origin) {
     const state = active = { scenario, api: clone(scenario.api), requests: [], streams: new Set(), caveats: [], errors: [] }
     state.connectionFrames = connectionFrames(state)
@@ -430,20 +543,20 @@ async function initializePage (scenario, origin) {
     await page.evaluate(async () => { await document.fonts.ready })
     await page.locator(scenario.name === 'tray' ? '.tray-flyout' : '.titlebar').waitFor({ state: 'visible' })
     await page.waitForFunction(() => window.__referenceNative?.commands.includes('desktop_status'))
-    await page.waitForTimeout(750)
-    if (scenario.update?.available === true && scenario.name !== 'tray') {
-        await page.waitForFunction(() => window.__referenceNative.commands.includes('desktop_check_update'))
-        await page.waitForTimeout(150)
-    }
+    await waitForPageReady(page, scenario, state)
     return { context, page, state }
 }
 
 async function configureScenario (page, scenario) {
+    let presentation = pageRoots[scenario.name === 'tray' ? 'tray' : scenario.page]
     if (scenario.name === 'search') {
         const input = page.locator('.titlebar .auto-suggest-input')
         await input.focus()
         await input.fill(scenario.searchQuery || '')
         await page.locator('.auto-suggest-list').waitFor({ state: 'visible' })
+        await page.waitForFunction(query => document.querySelector('.auto-suggest-input')?.value === query &&
+            document.querySelectorAll('.auto-suggest-item').length > 0, scenario.searchQuery || '')
+        presentation = '.auto-suggest-list'
     } else if (scenario.name === 'rules') {
         // Use the same title-bar search navigation as the native scenario. In
         // the original this sets the full rule payload without focusing or
@@ -459,15 +572,18 @@ async function configureScenario (page, scenario) {
         }).first()
         await result.click()
         await page.waitForFunction(payload => document.querySelector('.rules-filter input')?.value === payload, rule.payload)
+        await page.locator('.rule-item .payload').filter({ hasText: rule.payload }).first().waitFor({ state: 'visible' })
     } else if (scenario.name === 'tun-consent') {
         await page.locator('[data-tile="tun"] .home-tile-main').click()
         await page.locator('.desktop-service-dialog').waitFor({ state: 'visible' })
+        presentation = '.desktop-service-dialog'
     } else if (scenario.name === 'import-config') {
         await page.getByRole('button', { name: scenario.language === 'en-US' ? 'Paste YAML' : '粘贴 YAML', exact: true }).click()
         const editor = page.locator('.desktop-import-modal .desktop-yaml')
         await editor.waitFor({ state: 'visible' })
         await editor.fill(scenario.import?.content ?? '')
         await editor.evaluate(element => { element.setSelectionRange(0, 0); element.scrollTop = 0 })
+        presentation = '.desktop-import-modal'
     } else if (scenario.name === 'config-editor' || scenario.name === 'config-unsaved') {
         await page.locator('.profile-current-actions button').first().click()
         const editor = page.locator('.config-editor-text')
@@ -482,15 +598,21 @@ async function configureScenario (page, scenario) {
             await page.locator('.config-editor-modal .subpage-back').click()
             await page.locator('.config-editor-confirm').waitFor({ state: 'visible' })
         }
+        presentation = scenario.name === 'config-unsaved' ? '.config-editor-confirm' : '.config-editor-modal'
     } else if (scenario.name === 'dns-queries') {
         await page.locator('#dns-tab-queries').click()
         await page.locator('.dns-pagination select').selectOption('100')
-        await page.waitForFunction(() => document.querySelector('.dns-pagination select')?.value === '100' &&
-            !document.querySelector('.dns-query-card [aria-busy="true"]'))
+        await page.waitForFunction(expected => document.querySelector('.dns-pagination select')?.value === '100' &&
+            !document.querySelector('.dns-query-card [aria-busy="true"]') &&
+            document.querySelectorAll('.dns-query-card tbody tr:not(:has(.dns-empty))').length === expected,
+        scenario.api['/dns/observability/queries'].items.length)
+        presentation = '.dns-query-card'
     } else if (scenario.navigationOverlay) {
         await page.locator('.titlebar-left > button').nth(1).click()
+        await page.locator('.app.nav-open').waitFor({ state: 'visible' })
+        presentation = '.nav-slot > .sidebar'
     }
-    await page.waitForTimeout(600)
+    await waitForPresentation(page, presentation)
 }
 
 async function validatePage (page, state) {
@@ -514,7 +636,7 @@ async function captureStatic (scenario, origin) {
         report.scenarios.push({ name: scenario.name, file, sha256: sha256(fs.readFileSync(path.join(output, file))),
             capturedAt: new Date().toISOString(), observedAt: scenario.capturedAt,
             width: scenario.width, height: scenario.height, dpi: scenario.dpi, geometry: metrics,
-            traffic: state.traffic, logs: state.logs, requests: state.requests, streams: [...state.streams],
+            traffic: state.traffic, logs: state.logs, readiness: state.readiness, requests: state.requests, streams: [...state.streams],
             commands: native.commands, caveats: state.caveats })
         checkpoint()
         console.log('reference: ' + scenario.name)
@@ -555,7 +677,7 @@ async function captureMotion (scenario, origin) {
         const action = actionLocator(page, scenario)
         await action.locator.waitFor({ state: 'visible' })
         await action.locator.scrollIntoViewIfNeeded()
-        await page.waitForTimeout(400)
+        await waitForPresentation(page, pageRoots[scenario.page])
         cdp = await context.newCDPSession(page)
         const frames = []
         let ackError
@@ -602,7 +724,7 @@ async function captureMotion (scenario, origin) {
             trigger: { ...scenario.action, browserEvent: triggered.event }, actionEpochMilliseconds: triggered.epochMilliseconds,
             actionPerformanceMilliseconds: triggered.performanceMilliseconds, targetsMilliseconds: targets,
             recordedFrames: frames.length, selectedUniqueFrames: new Set(selected.map(frame => frame.sourceFrame)).size,
-            frames: selected, caveats: state.caveats,
+            frames: selected, readiness: state.readiness, caveats: state.caveats,
             timing: 'Closest actual compositor frame to each requested time. Reused frames and timing error are explicit; serial screenshots do not drive or pause the animation.',
             geometryAfter: await geometry(page) }
         const manifest = 'motion/' + scenario.name + '.json'

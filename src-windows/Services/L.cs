@@ -36,17 +36,19 @@ public static partial class L
     static partial void RegisterRecovery(Dictionary<string, string> catalog);
 
     public static string T(string text) => IsEnglish && english.TryGetValue(text, out var translated) ? translated : text;
+    private static string T(ContextualText text) => IsEnglish && english.TryGetValue(text.Context + "\u0004" + text.Text, out var translated) ? translated : T(text.Text);
     public static string F(string template, params object?[] arguments) => string.Format(CultureInfo.CurrentCulture, T(template), arguments);
 
-    public static TElement Bind<TElement>(TElement element, DependencyProperty property, string text) where TElement : DependencyObject
+    public static TElement Bind<TElement>(TElement element, DependencyProperty property, string text, string? context = null) where TElement : DependencyObject
     {
-        BindingOperations.SetBinding(element, property, CreateBinding(text));
+        BindingOperations.SetBinding(element, property, CreateBinding(text, context));
         return element;
     }
-    internal static Binding CreateBinding(string text) => new(nameof(LanguageRevision.Value))
+    internal static Binding CreateBinding(string text, string? context = null) => new(nameof(LanguageRevision.Value))
     {
-        Source = revision, Mode = BindingMode.OneWay, Converter = TranslationConverter.Instance, ConverterParameter = text
+        Source = revision, Mode = BindingMode.OneWay, Converter = TranslationConverter.Instance, ConverterParameter = context is null ? text : new ContextualText(text, context)
     };
+    private sealed record ContextualText(string Text, string Context);
     internal static void SetLanguage(string language)
     {
         if (language is not ("zh-CN" or "en-US" or "system")) throw new ArgumentException("Unknown language", nameof(language));
@@ -66,7 +68,7 @@ public static partial class L
     private sealed class TranslationConverter : IValueConverter
     {
         internal static readonly TranslationConverter Instance = new();
-        public object Convert(object value, Type targetType, object parameter, CultureInfo culture) => T((string)parameter);
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture) => parameter is ContextualText text ? T(text) : T((string)parameter);
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) => throw new NotSupportedException();
     }
 }

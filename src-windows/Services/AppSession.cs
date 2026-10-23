@@ -25,6 +25,15 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     private readonly CancellationTokenSource lifetime = new();
     private CancellationTokenSource controllerLifetime = new();
     private string controllerIdentity = "";
+    private const long RuntimeSnapshotMaximumBytes = 4 * 1024 * 1024;
+    private const long RuntimeSnapshotLifetimeMilliseconds = 10_000;
+    private readonly object runtimeSnapshotGate = new();
+    private readonly Dictionary<string, RuntimeSnapshot> runtimeSnapshots = new(StringComparer.Ordinal);
+    private long runtimeSnapshotGeneration;
+    private string runtimeSnapshotController = "";
+    private bool runtimeSnapshotsRunning;
+    private int runtimeSnapshotWrites;
+    private sealed record RuntimeSnapshot(JsonElement Value, string Controller, long Generation, long Timestamp);
     private readonly string appearancePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Mihomo Optimized", "native-appearance.json");
     private Task dirtySync = Task.CompletedTask;
     private bool dirty;
@@ -73,6 +82,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         {
             if (exiting) return;
             Ready = false;
+            SetRuntimeSnapshotState(false, "");
             Status = JsonSerializer.SerializeToElement(new { phase = "error", lastError = error.Message });
             StatusChanged?.Invoke(this, EventArgs.Empty);
             Notify(error.Message, true);
@@ -116,6 +126,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         catch (Exception error)
         {
             Ready = false;
+            SetRuntimeSnapshotState(false, "");
             Status = JsonSerializer.SerializeToElement(new { phase = "error", lastError = error.Message });
             StatusChanged?.Invoke(this, EventArgs.Empty);
             throw;
@@ -149,6 +160,8 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             BusyCommand = method;
             StatusChanged?.Invoke(this, EventArgs.Empty);
         }
+        bool runtimeWrite = runtimeAction || method is "desktop_patch_config" or "desktop_save_config" or "desktop_import_config" or "desktop_import_config_url";
+        if (runtimeWrite) ChangeRuntimeSnapshotWrites(1);
         try
         {
             JsonElement result = await host.CallAsync(method, args, cancellationToken);
@@ -158,6 +171,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         }
         finally
         {
+            if (runtimeWrite) ChangeRuntimeSnapshotWrites(-1);
             if (runtimeAction) { BusyCommand = null; StatusChanged?.Invoke(this, EventArgs.Empty); }
         }
     }
@@ -235,6 +249,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
                 previous.Cancel();
                 previous.Dispose();
             }
+            SetRuntimeSnapshotState(!exiting && HostChannel.Text(Status, "phase") == "running", identity);
             Ready = true;
             StatusChanged?.Invoke(this, EventArgs.Empty);
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Status)));
@@ -244,9 +259,11 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     private void OnHostEvent(string name, JsonElement data)
     {
         if (name == "desktop-status") ApplyStatus(data);
+        if (name == "desktop-config-changed") InvalidateRuntimeSnapshots();
         if (name == "desktop-exit-requested" && HostChannel.Text(data, "reason") == "update")
         {
             exiting = true;
+            SetRuntimeSnapshotState(false, "");
             host.ExpectExit();
         }
         Dispatch(() => HostEvent?.Invoke(name, data));
@@ -309,6 +326,91 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(UpdateDismissedVersion)));
     }
 
+    /// <summary>Recent display data only. ApiAsync always performs a real request.</summary>
+    public bool TryGetRuntimeSnapshot(string path, out JsonElement snapshot)
+    {
+        snapshot = default;
+        string? key = RuntimeSnapshotKey(path);
+        if (key is null) return false;
+        lock (runtimeSnapshotGate)
+        {
+            if (!runtimeSnapshotsRunning || runtimeSnapshotWrites != 0 || !runtimeSnapshots.TryGetValue(key, out var value)) return false;
+            long age = Environment.TickCount64 - value.Timestamp;
+            if (value.Controller != runtimeSnapshotController || value.Generation != runtimeSnapshotGeneration || age < 0 || age > RuntimeSnapshotLifetimeMilliseconds)
+            {
+                runtimeSnapshots.Remove(key);
+                return false;
+            }
+            // The element is an owned, immutable clone from a successful GET.
+            snapshot = value.Value;
+            return true;
+        }
+    }
+
+    internal bool TryGetProxyRuntimeSnapshot(out JsonElement proxies, out JsonElement providers, out JsonElement configs)
+    {
+        // Read the display model atomically; a host config event may invalidate
+        // the generation on its reader thread between individual lookups.
+        lock (runtimeSnapshotGate)
+        {
+            proxies = providers = configs = default;
+            return TryGetRuntimeSnapshot("proxies", out proxies)
+                && TryGetRuntimeSnapshot("providers/proxies", out providers)
+                && TryGetRuntimeSnapshot("configs", out configs);
+        }
+    }
+
+    private static string? RuntimeSnapshotKey(string path) => path switch
+    {
+        "proxies" or "/proxies" => "proxies",
+        "providers/proxies" or "/providers/proxies" => "providers/proxies",
+        "configs" or "/configs" => "configs",
+        _ => null
+    };
+
+    private void SetRuntimeSnapshotState(bool running, string controller)
+    {
+        lock (runtimeSnapshotGate)
+        {
+            if (running != runtimeSnapshotsRunning || controller != runtimeSnapshotController || !running && runtimeSnapshots.Count != 0)
+            {
+                runtimeSnapshotGeneration++;
+                runtimeSnapshots.Clear();
+            }
+            runtimeSnapshotsRunning = running;
+            runtimeSnapshotController = controller;
+        }
+    }
+
+    private void InvalidateRuntimeSnapshots()
+    {
+        lock (runtimeSnapshotGate) { runtimeSnapshotGeneration++; runtimeSnapshots.Clear(); }
+    }
+
+    private void ChangeRuntimeSnapshotWrites(int change)
+    {
+        lock (runtimeSnapshotGate)
+        {
+            runtimeSnapshotWrites += change;
+            runtimeSnapshotGeneration++;
+            runtimeSnapshots.Clear();
+        }
+    }
+
+    private void StoreRuntimeSnapshot(string? key, JsonElement snapshot, long bytes, string controller, long generation)
+    {
+        if (key is null) return;
+        lock (runtimeSnapshotGate)
+        {
+            if (!runtimeSnapshotsRunning || runtimeSnapshotWrites != 0 || controller != runtimeSnapshotController || generation != runtimeSnapshotGeneration) return;
+            bool valid = snapshot.ValueKind == JsonValueKind.Object && (key == "configs" || snapshot.Get(key == "proxies" ? "proxies" : "providers").ValueKind == JsonValueKind.Object);
+            // Three fixed keys, at most 4 MiB each. Large valid responses still
+            // reach the caller; they simply do not become shared display data.
+            if (!valid || bytes > RuntimeSnapshotMaximumBytes) { runtimeSnapshots.Remove(key); return; }
+            runtimeSnapshots[key] = new RuntimeSnapshot(snapshot, controller, generation, Environment.TickCount64);
+        }
+    }
+
     private (Uri Uri, string Secret) Endpoint(string path)
     {
         if (Status.ValueKind != JsonValueKind.Object || !Status.TryGetProperty("controller", out var controller) || controller.ValueKind != JsonValueKind.Object)
@@ -327,8 +429,14 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     {
         var (uri, secret) = Endpoint(path);
         var controllerToken = controllerLifetime.Token;
+        string requestController = controllerIdentity;
+        long snapshotGeneration;
+        lock (runtimeSnapshotGate) snapshotGeneration = runtimeSnapshotGeneration;
+        string? snapshotKey = method == HttpMethod.Get && uri.Query.Length == 0 ? RuntimeSnapshotKey(uri.AbsolutePath) : null;
+        bool runtimeWrite = method != HttpMethod.Get;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken, controllerToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(45));
+        if (runtimeWrite) ChangeRuntimeSnapshotWrites(1);
         try
         {
             using var request = new HttpRequestMessage(method, uri);
@@ -355,6 +463,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             timeout.Token.ThrowIfCancellationRequested();
             if (!response.IsSuccessStatusCode)
             {
+                if (snapshotKey is not null) InvalidateRuntimeSnapshots();
                 string detail = "";
                 try { using var error = JsonDocument.Parse(data.ToArray()); detail = HostChannel.Text(error.RootElement, "message"); } catch (JsonException) { }
                 throw new DesktopException("api_failed", detail.Length is > 0 and < 500 ? detail : L.F("内核返回 HTTP {0}", (int)response.StatusCode));
@@ -371,12 +480,19 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
                     PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(RuntimeMode)));
                 });
             }
-            return parsed.RootElement.Clone();
+            timeout.Token.ThrowIfCancellationRequested();
+            var result = parsed.RootElement.Clone();
+            StoreRuntimeSnapshot(snapshotKey, result, data.Length, requestController, snapshotGeneration);
+            return result;
         }
         catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && !cancellationToken.IsCancellationRequested && !controllerToken.IsCancellationRequested)
         {
+            InvalidateRuntimeSnapshots();
             throw new DesktopException("request_timeout", "请求超时，请刷新状态后重试。");
         }
+        catch (HttpRequestException) { InvalidateRuntimeSnapshots(); throw; }
+        catch (IOException) { InvalidateRuntimeSnapshots(); throw; }
+        finally { if (runtimeWrite) ChangeRuntimeSnapshotWrites(-1); }
     }
 
     public async IAsyncEnumerable<JsonElement> StreamAsync(string path, [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -475,7 +591,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public void Navigate(string key) => Dispatch(() => NavigateRequested?.Invoke(key));
     public void Navigate(NavigationTarget target) => Dispatch(() => NavigateTargetRequested?.Invoke(target));
     public void RequestExit() => Dispatch(() => ExitRequested?.Invoke());
-    public void ExpectExit() { exiting = true; host.ExpectExit(); }
+    public void ExpectExit() { exiting = true; SetRuntimeSnapshotState(false, ""); host.ExpectExit(); }
     private static void Dispatch(Action action)
     {
         if (Application.Current.Dispatcher.CheckAccess()) action();
@@ -485,6 +601,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         exiting = true;
+        SetRuntimeSnapshotState(false, "");
         lifetime.Cancel();
         controllerLifetime.Cancel();
         SystemEvents.UserPreferenceChanged -= OnSystemThemeChanged;

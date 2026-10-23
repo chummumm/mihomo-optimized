@@ -5,6 +5,7 @@ using System.Windows.Automation.Provider;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using Mihomo.Desktop.Services;
 
 namespace Mihomo.Desktop.Controls;
@@ -15,7 +16,10 @@ public sealed class GlobalSearchBox : Grid
     private readonly TextBlock placeholder = Ui.Hint("搜索节点、规则、设置或命令", 14);
     private readonly Border shortcut;
     private bool showShortcut = true;
-    private bool suppressOpen;
+    private int suppressOpen;
+    private int openRequests, suppressedRequests, palettesCreated, palettesClosed;
+    private int activePalette;
+    private string lastOpenReason = "none";
     internal TextBox Input { get; } = new()
     {
         Height = 32, FontSize = 14, MaxLength = 2048,
@@ -53,12 +57,12 @@ public sealed class GlobalSearchBox : Grid
             Margin = new Thickness(0, 8, 10, 0), IsHitTestVisible = false
         };
         glyph.SetResourceReference(Control.ForegroundProperty, "TextSecondaryBrush"); Children.Add(glyph);
-        Input.GotKeyboardFocus += (_, _) => { if (!suppressOpen) OpenRequested?.Invoke(); };
-        Input.PreviewMouseLeftButtonDown += (_, _) => { if (!suppressOpen) OpenRequested?.Invoke(); };
+        Input.GotKeyboardFocus += (_, _) => RequestOpen("focus");
+        Input.PreviewMouseLeftButtonDown += (_, _) => RequestOpen("pointer");
         Input.TextChanged += (_, _) =>
         {
             UpdateChrome();
-            if (!suppressOpen && InputFocused) OpenRequested?.Invoke();
+            if (InputFocused) RequestOpen("text");
         };
         UpdateChrome();
     }
@@ -70,21 +74,56 @@ public sealed class GlobalSearchBox : Grid
     }
     internal void ClearQuery()
     {
-        suppressOpen = true;
+        suppressOpen++;
         try { Input.Clear(); }
-        finally { suppressOpen = false; }
+        finally { suppressOpen--; }
     }
     internal void BlurInput()
     {
-        if (!InputFocused) return;
-        suppressOpen = true;
+        suppressOpen++;
         try
         {
-            if (Window.GetWindow(this) is { } window) FocusManager.SetFocusedElement(window, null);
-            Keyboard.ClearFocus();
+            // An inactive owner can still remember this input as its logical
+            // focus. Clear that reference even when keyboard focus is elsewhere.
+            var scope = FocusManager.GetFocusScope(Input);
+            if (ReferenceEquals(FocusManager.GetFocusedElement(scope), Input))
+                FocusManager.SetFocusedElement(scope, null);
+            if (InputFocused) Keyboard.ClearFocus();
         }
-        finally { suppressOpen = false; }
+        finally { suppressOpen--; }
     }
+    internal void DismissPalette(Action close, bool clearQuery, bool blur)
+    {
+        // Closing an owned HWND can restore focus to its owner's input after
+        // Closed handlers have released the old palette. Keep passive opening
+        // suppressed through that restoration, not just through TextBox.Clear.
+        suppressOpen++;
+        try
+        {
+            if (clearQuery) ClearQuery();
+            if (blur) BlurInput();
+            close();
+            if (blur) BlurInput();
+        }
+        finally
+        {
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) suppressOpen--;
+            else _ = Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, new Action(() =>
+            {
+                try { if (blur) BlurInput(); }
+                finally { suppressOpen--; }
+            }));
+        }
+    }
+    private void RequestOpen(string reason)
+    {
+        if (suppressOpen > 0) { suppressedRequests++; return; }
+        openRequests++; lastOpenReason = reason; OpenRequested?.Invoke();
+    }
+    internal int PaletteCreated() => activePalette = ++palettesCreated;
+    internal void PaletteClosed(int instance) { palettesClosed++; if (activePalette == instance) activePalette = 0; }
+    internal object Describe() => new { inputFocused = InputFocused, queryLength = Input.Text.Length,
+        suppressOpen, openRequests, suppressedRequests, lastOpenReason, palettesCreated, palettesClosed, activePalette };
     private void UpdateChrome()
     {
         bool blank = Input.Text.Length == 0;
@@ -105,7 +144,7 @@ public sealed class GlobalSearchBox : Grid
         public void Invoke() => owner.Dispatcher.Invoke(() =>
         {
             if (!owner.IsEnabled) throw new ElementNotEnabledException();
-            owner.FocusInput(); owner.OpenRequested?.Invoke();
+            owner.FocusInput(); owner.RequestOpen("automation");
         });
     }
 }

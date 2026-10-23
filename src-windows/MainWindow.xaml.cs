@@ -34,6 +34,7 @@ public partial class MainWindow : Window
     private string currentPage = "home";
     private string navigationMode = "expanded";
     private bool navigating;
+    private long navigationRevision;
     private bool selecting;
     private bool allowClose;
     private bool preparingExit;
@@ -87,7 +88,7 @@ public partial class MainWindow : Window
         Activated += (_, _) => UpdateCaptionActivity(true);
         Deactivated += (_, _) => UpdateCaptionActivity(false);
         IsVisibleChanged += (_, _) => { UpdatePageActivity(); UpdateNavigationIndicator(false); };
-        SizeChanged += (_, _) => ApplyNavigationSize();
+        SizeChanged += (_, _) => { ConnectedNavigation.Cancel(this); ApplyNavigationSize(); };
         MainContentBorder.SizeChanged += (_, _) => UpdateNoticeMetrics();
         PreviewKeyDown += OnKey;
         NavigationList.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler((_, _) => UpdateNavigationIndicator(false)));
@@ -103,6 +104,7 @@ public partial class MainWindow : Window
         bool changed = activePage is null || target.Page != currentPage;
         if (changed && EditorOpen) return false;
         navigating = true;
+        long revision = ++navigationRevision;
         try
         {
             if (changed && activePage is not null && !await activePage.CanLeaveAsync()) { SelectNavigation(currentPage); return false; }
@@ -115,24 +117,26 @@ public partial class MainWindow : Window
                 currentPage = target.Page; activePage = page;
                 if (page is IPageBackNavigation nextBack) nextBack.BackStateChanged += UpdateBackButton;
                 SelectNavigation(target.Page); CloseOverlay(true); UpdatePageActivity();
-                if (ConnectedNavigation.HasPending(this, target.Target)) { page.BeginAnimation(OpacityProperty, null); page.Opacity = 1; page.RenderTransform = Transform.Identity; }
-                else FluentMotion.Enter(RecoveryRequired ? recovery : page, back);
+                if (ConnectedNavigation.HasPending(this, target.Target)) ConnectedNavigation.Hold(this, ConnectedOverlay, page, target.Target);
+                else ConnectedNavigation.Cancel(this);
+                FluentMotion.Enter(RecoveryRequired ? recovery : page.TransitionSurface, back);
             }
             else { page = activePage!; CloseOverlay(true); }
             location = target with { Action = null }; UpdateBackButton();
         }
-        catch (Exception error) { ShowNotice(error.Message, true); return false; }
+        catch (Exception error) { if (revision == navigationRevision) { ConnectedNavigation.Cancel(this); ShowNotice(error.Message, true); } return false; }
         finally { navigating = false; UpdateBackButton(); }
         try
         {
-            if (RecoveryRequired) return true;
+            if (RecoveryRequired) { ConnectedNavigation.Cancel(this); return true; }
             // Target operations (focus, search or testing) do not hold the shell's
             // navigation lock. A slow latency test must not trap the current page.
             await page.NavigateToAsync(target);
-            if (ReferenceEquals(page, activePage)) ConnectedNavigation.Play(this, ConnectedOverlay, page, target.Target);
+            if (revision != navigationRevision || !ReferenceEquals(page, activePage)) return false;
+            ConnectedNavigation.Play(this, ConnectedOverlay, page, target.Target, page.TransitionSurface);
             UpdateBackButton(); return true;
         }
-        catch (Exception error) { ShowNotice(error.Message, true); return false; }
+        catch (Exception error) { if (revision == navigationRevision) { ConnectedNavigation.Cancel(this); ShowNotice(error.Message, true); } return false; }
     }
 
     private IEnumerable<ListBoxItem> NavigationItems => NavigationList.Items.Cast<ListBoxItem>().Concat(SettingsNavigation.Items.Cast<ListBoxItem>());
@@ -229,7 +233,7 @@ public partial class MainWindow : Window
         Show(); if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
         Activate(); Focus(); UpdatePageActivity();
     }
-    public void HideToTray() { CloseOverlay(false); Hide(); activePage?.Deactivate(); }
+    public void HideToTray() { ConnectedNavigation.Cancel(this); CloseOverlay(false); Hide(); activePage?.Deactivate(); }
     private void UpdatePageActivity()
     {
         bool recovering = RecoveryRequired;
@@ -554,7 +558,7 @@ public partial class MainWindow : Window
             case "native_arm_motion": return NativeMotionCapture.Arm(this, args);
             case "native_motion_status": return NativeMotionCapture.Status();
             case "native_snapshot":
-                return new { ready = session.Ready, visible = IsVisible, phase = session.Status.Text("phase"), page = currentPage, error = session.Status.Text("lastError") is { Length: > 0 } coreError ? coreError : Notifications.IsErrorVisible ? Notifications.VisibleMessageText : "", busy = preparingExit || session.BusyCommand is not null || session.Status.Text("phase") is "starting" or "stopping", navigationMode, navigationOverlay = overlayOpen, material = backdrop.Material, customTitleBar = true, canGoBack = BackButton.IsEnabled, language = session.Language, theme = session.Theme, captureKind = "wpf-visual-tree", trayVisible = tray.IsFlyoutVisible, searchVisible = searchWindow?.IsVisible == true };
+                return new { ready = session.Ready, visible = IsVisible, phase = session.Status.Text("phase"), page = currentPage, error = session.Status.Text("lastError") is { Length: > 0 } coreError ? coreError : Notifications.IsErrorVisible ? Notifications.VisibleMessageText : "", busy = preparingExit || session.BusyCommand is not null || session.Status.Text("phase") is "starting" or "stopping", navigationMode, navigationOverlay = overlayOpen, material = backdrop.Material, customTitleBar = true, canGoBack = BackButton.IsEnabled, language = session.Language, theme = session.Theme, captureKind = "wpf-visual-tree", trayVisible = tray.IsFlyoutVisible, searchVisible = searchWindow?.IsVisible == true, search = new { input = SearchButton.Describe(), window = searchWindow?.Describe() } };
             case "native_navigate":
                 return new { navigated = await NavigateAsync(new NavigationTarget(args.Text("page"), EmptyNull(args.Text("target")), EmptyNull(args.Text("query")), EmptyNull(args.Text("action")))) };
             case "native_show": ShowMain(); return new { visible = IsVisible };
@@ -562,7 +566,7 @@ public partial class MainWindow : Window
             case "native_resize":
                 double width = args.Number("width"), height = args.Number("height");
                 if (width < 640 || width > 2000 || height < 520 || height > 1400) throw new ArgumentOutOfRangeException(nameof(args), "Automation dimensions must be within 640–2000 × 520–1400.");
-                ShowMain(); WindowState = WindowState.Normal; Width = width; Height = height; UpdateLayout(); ApplyNavigationSize();
+                ShowMain(); WindowState = WindowState.Normal; NativeVisualCapture.ResizeForCapture(this, width, height); UpdateLayout(); ApplyNavigationSize();
                 return new { width = ActualWidth, height = ActualHeight, navigationMode };
             case "native_show_tray": tray.ShowFlyout(); return new { visible = tray.IsFlyoutVisible };
             case "native_finish_exit": preparedExit = true; _ = FinishExitAsync(); return new { exiting = true };

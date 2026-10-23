@@ -188,6 +188,7 @@ public sealed class SettingsPage : NativePage
             Row("set-lan", "wifi", "允许来自局域网的连接", "其他设备可以通过本机的代理端口连接", SettingToggle(allowLan), focus: allowLan),
             Row("set-ports", "router", "混合代理端口", "修改后立即应用到运行中的内核", null, portFields, mixedPort),
             Row("set-probe", "top-speed", "测速 URL", "用于手动节点测速，留空使用默认地址。", null, ProbeFields(), probeUrl));
+        L.Bind((TextBlock)proxy.Children[0], TextBlock.TextProperty, "代理", "settings-section");
         runtimeStatus.Margin = new Thickness(2, 8, 2, 0); proxy.Children.Add(runtimeStatus);
         var tunSection = Section("TUN 与系统服务",
             Row("set-tun", "shield-lock", "TUN 模式", "TUN 通过系统服务运行。首次启用会请求管理员授权；服务模式需要安装版。", SettingToggle(tun), focus: tun),
@@ -411,7 +412,7 @@ public sealed class SettingsPage : NativePage
         applying = true;
         theme.ItemsSource = new[] { new Choice(L.T("跟随系统"), "system"), new Choice(L.T("浅色"), "light"), new Choice(L.T("深色"), "dark") };
         language.ItemsSource = new[] { new Choice("中文", "zh-CN"), new Choice("English", "en-US") };
-        mode.ItemsSource = new[] { new Choice(L.ShortMode("rule"), "rule"), new Choice(L.ShortMode("global"), "global"), new Choice(L.ShortMode("direct"), "direct") };
+        mode.ItemsSource = new[] { new Choice(L.T("规则"), "rule"), new Choice(L.ShortMode("global"), "global"), new Choice(L.ShortMode("direct"), "direct") };
         theme.SelectedValue = Session.Theme; language.SelectedValue = L.ResolvedLanguage;
         mode.SelectedValue = runtime.Text("mode"); applying = false;
     }

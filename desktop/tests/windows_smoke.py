@@ -1243,7 +1243,44 @@ class Acceptance:
             if screenshot:
                 capture("windows-search.png", surface="search")
             driver.ui(result_id, "invoke")
-            wait_until(lambda: driver.snapshot().get("page") == page and not driver.ui("GlobalSearchWindow").get("found"), "native_search_destination_failed", 15)
+            last_snapshot = {}
+            last_window = {}
+
+            def arrived() -> bool:
+                nonlocal last_snapshot, last_window
+                last_snapshot = driver.snapshot()
+                if last_snapshot.get("page") != page:
+                    return False
+                last_window = driver.ui("GlobalSearchWindow")
+                return not last_window.get("found")
+
+            try:
+                # The pipe's state is diagnostic; success still requires the
+                # independently queried UIA window to have actually disappeared.
+                wait_until(arrived, "native_search_destination_failed", 15)
+            except SmokeFailure as failure:
+                if str(failure) == "native_search_destination_failed":
+                    try:
+                        diagnostic = {"expectedPage": page, "resultId": safe_code(result_id),
+                            "snapshot": {key: last_snapshot[key] for key in
+                                ("ready", "visible", "phase", "page", "busy", "searchVisible") if key in last_snapshot},
+                            "uiaWindow": {key: last_window[key] for key in ("found", "enabled", "offscreen") if key in last_window}}
+                        search_state = last_snapshot.get("search") or {}
+                        fields = {"input": ("inputFocused", "queryLength", "suppressOpen", "openRequests", "suppressedRequests", "lastOpenReason", "palettesCreated", "palettesClosed", "activePalette"),
+                            "window": ("instance", "visible", "closing", "closed", "choosing", "resultCount")}
+                        diagnostic["snapshot"]["search"] = {
+                            part: {key: search_state[part][key] for key in keys if key in search_state[part]}
+                            if isinstance(search_state.get(part), dict) else None for part, keys in fields.items()}
+                        # Never serialize the snapshot's general error payload,
+                        # query text, controller endpoint, or host credentials.
+                        serialized = json.dumps(diagnostic, indent=2, ensure_ascii=False) + "\n"
+                        require(all(secret not in serialized for secret in self.secrets), "search_diagnostic_would_expose_secret")
+                        filename = "native-search-failure.json"
+                        (self.artifacts / filename).write_text(serialized, encoding="utf-8")
+                        evidence["searchFailureDiagnostic"] = filename
+                    except Exception as diagnostic_error:
+                        evidence["searchFailureDiagnosticError"] = type(diagnostic_error).__name__
+                raise
 
         driver.invoke("native_show")
         # Match the reference browser's neutral pointer position; an arbitrary

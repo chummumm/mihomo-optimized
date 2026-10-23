@@ -107,6 +107,9 @@ public sealed class HomePage : NativePage
         foreach (StackPanel reading in rates.Children) foreach (FrameworkElement item in reading.Children) item.HorizontalAlignment = HorizontalAlignment.Right;
         phase.FontFamily = up.FontFamily = down.FontFamily = connectionCount.FontFamily = downloadTotal.FontFamily = new FontFamily("Segoe UI Variable Display, Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Microsoft YaHei");
         phase.LineHeight = 28; up.LineHeight = down.LineHeight = 24; description.LineHeight = 20;
+        // The reference's smaller inline unit inherits a 24px line-height,
+        // extending its Windows rate line box to 28px without moving the digits.
+        up.Margin = down.Margin = new Thickness(0, 0, 0, 4);
         ByteReading.SetRate(up, 0); ByteReading.SetRate(down, 0);
         throughputHint.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush");
         var chartHead = new HomeFlowRow(24, 8) { AlignTop = true };

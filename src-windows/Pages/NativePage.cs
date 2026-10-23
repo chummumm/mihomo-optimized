@@ -24,7 +24,7 @@ public abstract class NativePage : UserControl
                                     ContentTemplateSelector="{TemplateBinding ContentTemplateSelector}"
                                     ContentStringFormat="{TemplateBinding ContentStringFormat}"
                                     CanContentScroll="{TemplateBinding CanContentScroll}" Margin="{TemplateBinding Padding}"/>
-            <ScrollBar x:Name="PART_VerticalScrollBar" Width="15" HorizontalAlignment="Right"
+            <ScrollBar x:Name="PART_VerticalScrollBar" Width="12" HorizontalAlignment="Right"
                        Orientation="Vertical" Minimum="0" Maximum="{TemplateBinding ScrollableHeight}"
                        ViewportSize="{TemplateBinding ViewportHeight}" IsTabStop="False"
                        Value="{Binding VerticalOffset, Mode=OneWay, RelativeSource={RelativeSource TemplatedParent}}"
@@ -67,6 +67,9 @@ public abstract class NativePage : UserControl
         _ => "内核未运行，可在主页启动。"
     });
     public string Title { get; }
+    // The original route animates inside its fixed scrolling viewport. Moving
+    // the ScrollViewer itself changes both scrolling targets and the gutter.
+    internal FrameworkElement TransitionSurface => pageBox;
 
     protected NativePage(AppSession session, string key, string title, string subtitle)
     {
