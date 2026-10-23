@@ -146,11 +146,37 @@ internal static class ProcessFixtures
                 await Console.In.ReadLineAsync();
                 return 0;
             }
+            if (action == "unverified-server")
+            {
+                if (!broker.IsFirst) return 3;
+                // This fixture deliberately does not authenticate its client.
+                // It isolates the real client's server-image check: using two
+                // authenticated endpoints races the server's Disconnect against
+                // GetNamedPipeServerProcessId in the rejected client.
+                using var pipe = new NamedPipeServerStream(BrokerPipeName(scope), PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                using var connectionDeadline = new CancellationTokenSource(10000);
+                Console.WriteLine("READY");
+                await pipe.WaitForConnectionAsync(connectionDeadline.Token);
+                using var reader = new StreamReader(pipe, leaveOpen: true);
+                string? command = await reader.ReadLineAsync(connectionDeadline.Token);
+                Console.WriteLine(command is null ? "NO_COMMAND" : "UNEXPECTED_COMMAND");
+                return command is null ? 0 : 6;
+            }
             if (broker.IsFirst) return 4;
             using var deadline = new CancellationTokenSource(5000);
             return await broker.SendAsync("activate", deadline.Token) ? 0 : 5;
         }
-        catch (UnauthorizedAccessException) { return 2; }
+        catch (UnauthorizedAccessException error) { Console.Error.WriteLine("REJECTED_PEER: " + error.Message); return 2; }
+        catch (Exception error) { Console.Error.WriteLine(error); return 9; }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static string BrokerPipeName(string scope)
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        using var process = Process.GetCurrentProcess();
+        string key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity.User!.Value + ":" + process.SessionId + ":" + scope)))[..24];
+        return "MihomoOptimized.Native." + key;
     }
 
     private static Process StartBroker(string executable, string scope, string action)
@@ -166,45 +192,59 @@ internal static class ProcessFixtures
         string ui = CopyAppHost(AppContext.BaseDirectory, "mihomo-optimized.exe");
         string otherDirectory = Path.Combine(Path.GetTempPath(), "MihomoBrokerTest-" + Guid.NewGuid().ToString("N"));
         string otherUi = CopyAppHost(otherDirectory, "mihomo-optimized.exe");
-        string scope = Guid.NewGuid().ToString("N");
-        using var deadline = new CancellationTokenSource(15000);
-        using var server = StartBroker(ui, scope, "server");
+        using var deadline = new CancellationTokenSource(30000);
         try
         {
-            if (await server.StandardOutput.ReadLineAsync(deadline.Token) != "READY")
-                throw new Exception("Broker fixture did not start: " + await server.StandardError.ReadToEndAsync(deadline.Token));
-            using var identity = WindowsIdentity.GetCurrent();
-            string key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity.User!.Value + ":" + Process.GetCurrentProcess().SessionId + ":" + scope)))[..24];
-            using (var impostor = new NamedPipeClientStream(".", "MihomoOptimized.Native." + key, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification))
+            string scope = Guid.NewGuid().ToString("N");
+            using (var server = StartBroker(ui, scope, "server"))
             {
-                await impostor.ConnectAsync(deadline.Token);
-                bool accepted = false;
                 try
                 {
-                    using var writer = new StreamWriter(impostor, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
-                    using var reader = new StreamReader(impostor, leaveOpen: true);
-                    await writer.WriteLineAsync("{\"command\":\"activate\"}");
-                    accepted = await reader.ReadLineAsync(deadline.Token) is not null;
+                    if (await server.StandardOutput.ReadLineAsync(deadline.Token) != "READY")
+                        throw new Exception("Broker fixture did not start: " + await server.StandardError.ReadToEndAsync(deadline.Token));
+                    using (var impostor = new NamedPipeClientStream(".", BrokerPipeName(scope), PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification))
+                    {
+                        await impostor.ConnectAsync(deadline.Token);
+                        bool accepted = false;
+                        try
+                        {
+                            using var writer = new StreamWriter(impostor, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+                            using var reader = new StreamReader(impostor, leaveOpen: true);
+                            await writer.WriteLineAsync("{\"command\":\"activate\"}");
+                            accepted = await reader.ReadLineAsync(deadline.Token) is not null;
+                        }
+                        catch (IOException) { }
+                        if (accepted) throw new Exception("A same-user process at the wrong image path reached the instance handler");
+                    }
+                    using var legitimate = StartBroker(ui, scope, "client");
+                    await legitimate.WaitForExitAsync(deadline.Token);
+                    if (legitimate.ExitCode != 0) throw new Exception($"Legitimate same-image broker exchange failed (exit {legitimate.ExitCode}): " + await legitimate.StandardError.ReadToEndAsync(deadline.Token));
                 }
-                catch (IOException) { }
-                if (accepted) throw new Exception("A same-user process at the wrong image path reached the instance handler");
+                finally
+                {
+                    server.StandardInput.Close();
+                    await server.WaitForExitAsync(deadline.Token);
+                }
             }
-            using (var legitimate = StartBroker(ui, scope, "client"))
+            Console.WriteLine("Native Windows instance broker: legitimate same-image client accepted; same-user wrong-image client rejected.");
+            string foreignScope = Guid.NewGuid().ToString("N");
+            using (var foreignServer = StartBroker(otherUi, foreignScope, "unverified-server"))
             {
-                await legitimate.WaitForExitAsync(deadline.Token);
-                if (legitimate.ExitCode != 0) throw new Exception("Legitimate same-image broker exchange failed: " + await legitimate.StandardError.ReadToEndAsync(deadline.Token));
+                if (await foreignServer.StandardOutput.ReadLineAsync(deadline.Token) != "READY")
+                    throw new Exception("Foreign-path broker fixture did not start: " + await foreignServer.StandardError.ReadToEndAsync(deadline.Token));
+                using var client = StartBroker(ui, foreignScope, "client");
+                await client.WaitForExitAsync(deadline.Token);
+                string clientError = await client.StandardError.ReadToEndAsync(deadline.Token);
+                string? observed = await foreignServer.StandardOutput.ReadLineAsync(deadline.Token);
+                await foreignServer.WaitForExitAsync(deadline.Token);
+                if (client.ExitCode != 2) throw new Exception($"Client did not reject a foreign-path server (exit {client.ExitCode}): {clientError}");
+                if (observed != "NO_COMMAND" || foreignServer.ExitCode != 0)
+                    throw new Exception($"Foreign-path server received a command or failed (observed {observed}, exit {foreignServer.ExitCode}): " + await foreignServer.StandardError.ReadToEndAsync(deadline.Token));
             }
-            using (var wrongPath = StartBroker(otherUi, scope, "client"))
-            {
-                await wrongPath.WaitForExitAsync(deadline.Token);
-                if (wrongPath.ExitCode != 2) throw new Exception("Client accepted a server at another installation path");
-            }
-            Console.WriteLine("Native Windows instance broker: authenticated same-image client accepted; same-user wrong-image client and other-installation server rejected.");
+            Console.WriteLine("Native Windows instance broker: client rejected another installation's server before transmitting any command.");
         }
         finally
         {
-            server.StandardInput.Close();
-            await server.WaitForExitAsync(deadline.Token);
             File.Delete(ui);
             Directory.Delete(otherDirectory, true);
         }

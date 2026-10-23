@@ -27,7 +27,7 @@ internal sealed class SearchWindow : Window
         FontFamily = new System.Windows.Media.FontFamily("Segoe UI Variable, Segoe UI, Microsoft YaHei UI"); FontSize = 14;
         SetResourceReference(BackgroundProperty, "AppBackgroundBrush"); SetResourceReference(ForegroundProperty, "TextPrimaryBrush");
         search.Id("SearchInput"); results.Id("SearchResults");
-        System.Windows.Automation.AutomationProperties.SetName(search, "搜索页面、策略组、节点、规则或命令");
+        System.Windows.Automation.AutomationProperties.SetName(search, "搜索页面、策略组、节点或命令");
         var layout = new DockPanel(); DockPanel.SetDock(search, Dock.Top); layout.Children.Add(search); layout.Children.Add(results); Content = layout;
         foreach (var (key, title) in new[] { ("home", "主页"), ("proxies", "代理"), ("connections", "连接"), ("dns", "DNS"), ("rules", "规则"), ("logs", "日志"), ("profiles", "配置"), ("settings", "设置") })
             entries.Add(new Entry(title, "页面", () => { session.Navigate(key); return Task.CompletedTask; }));
