@@ -202,7 +202,7 @@ public sealed class SettingsPage : NativePage
             Row("set-mode", "arrow-swap", "代理模式", "规则模式按分流规则选择出口；全局模式全部走代理；直连模式不经过代理", mode),
             Row("set-lan", "wifi", "允许来自局域网的连接", "其他设备可以通过本机的代理端口连接", SettingToggle(allowLan), focus: allowLan),
             Row("set-ports", "router", "混合代理端口", "修改后立即应用到运行中的内核", null, portFields, mixedPort),
-            Row("set-probe", "top-speed", "测速 URL", "用于手动节点测速，留空使用默认地址。", null, ProbeFields(), probeUrl));
+            Row("set-probe", "top-speed", "测速 URL", "用于面板手动节点测速，留空使用默认地址。策略组自动测速与代理集健康检查使用各自设置。", null, ProbeFields(), probeUrl));
         L.Bind((TextBlock)proxy.Children[0], TextBlock.TextProperty, "代理", "settings-section");
         runtimeStatus.Margin = new Thickness(2, 8, 2, 0); proxy.Children.Add(runtimeStatus);
         var tunSection = Section("TUN 与系统服务",
@@ -643,14 +643,16 @@ public sealed class SettingsPage : NativePage
     private Task SaveProbe()
     {
         if (Session.IsUpdating) throw new InvalidOperationException(L.T("正在安装应用更新，请等待更新完成。"));
-        Session.SetTestUrl(probeUrl.Text);
+        var value = string.IsNullOrWhiteSpace(probeUrl.Text) ? DefaultProbeUrl : probeUrl.Text;
+        if (!Session.SetTestUrl(value)) return Task.CompletedTask;
         probeDraft = false; applying = true; probeUrl.Text = Session.TestUrl; applying = false;
         ApplyProbeControls(); Message("测速地址已保存。"); return Task.CompletedTask;
     }
     private Task ResetProbe()
     {
         if (Session.IsUpdating) throw new InvalidOperationException(L.T("正在安装应用更新，请等待更新完成。"));
-        Session.SetTestUrl(DefaultProbeUrl); probeDraft = false;
+        if (!Session.SetTestUrl(DefaultProbeUrl)) return Task.CompletedTask;
+        probeDraft = false;
         applying = true; probeUrl.Text = Session.TestUrl; applying = false;
         ApplyProbeControls(); Message("测速地址已恢复默认。"); return Task.CompletedTask;
     }
@@ -659,8 +661,7 @@ public sealed class SettingsPage : NativePage
         // TextChanged can fire while the constructor is still assigning the action buttons.
         if (saveProbe is null || resetProbe is null) return;
         probeUrl.IsEnabled = !Session.IsUpdating;
-        saveProbe.IsEnabled = !Session.IsUpdating && probeDraft;
-        resetProbe.IsEnabled = !Session.IsUpdating && (probeUrl.Text != DefaultProbeUrl || Session.TestUrl != DefaultProbeUrl);
+        saveProbe.IsEnabled = resetProbe.IsEnabled = !Session.IsUpdating;
     }
     public override async Task NavigateToAsync(NavigationTarget target)
     {

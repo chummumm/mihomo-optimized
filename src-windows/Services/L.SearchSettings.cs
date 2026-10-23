@@ -47,6 +47,8 @@ public static partial class L
             ("其他设备可以通过本机的代理端口连接", "Other devices can connect through this computer’s proxy ports"),
             ("修改后立即应用到运行中的内核", "Changes apply to the running core immediately"),
             ("用于手动节点测速，留空使用默认地址。", "Used for manual node speed tests. Empty uses the default."),
+            ("用于面板手动节点测速，留空使用默认地址。策略组自动测速与代理集健康检查使用各自设置。", "Used for manual node speed tests. Empty uses the default. Automatic group tests and provider health checks use their own settings."),
+            ("未能保存测速地址，原设置未变。", "Could not save the test URL. The previous setting is unchanged."),
             ("开", "On"), ("关", "Off"),
             ("发行说明 {0}", "Release notes {0}"), ("更新前请先保存配置更改。", "Save your configuration changes before updating."),
             ("请先保存或关闭正在编辑的配置，再安装更新。", "Save or close the configuration editor before installing an update."),

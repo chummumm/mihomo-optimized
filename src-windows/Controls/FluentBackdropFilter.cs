@@ -88,7 +88,8 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private Func<Rect>? preparationViewport;
     private bool preparationEnabled, presentationEnabled = true, renderingSubscribed, demanding;
     private FrameworkElement? coordinateRoot;
-    private bool listening, disposed, geometryDirty = true, sourceDirty = true, captureQueued, capturing, updatingGeometry;
+    private bool listening, disposed, geometryDirty = true, sourceDirty = true, capturing, updatingGeometry;
+    private DispatcherOperation? captureOperation;
     private double dpiX = 1, dpiY = 1, padding;
     private Rect clipBounds = Rect.Empty, sampleWindow = Rect.Empty;
     private Size sourceSize, clipSize;
@@ -101,6 +102,9 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private double captureMilliseconds, compareMilliseconds, filterMilliseconds, retryAfterMilliseconds;
     private double queueMilliseconds, schedulingMilliseconds, convolutionMilliseconds, publishDispatchMilliseconds;
     private double lastCaptureAt = double.NegativeInfinity, preparationStartedAt, preparationReadyMilliseconds;
+    private double? demandStartedAt;
+    private double demandMilliseconds, captureQueueMilliseconds;
+    private int demandCacheHits, captureQueuePromotions;
     private double? firstBitmapMilliseconds;
     private static TaskCompletionSource<bool> NewReady() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -186,20 +190,34 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         InvalidateRaster(clear: true); UpdateSubscription();
     }
 
-    internal async Task<bool> PrepareAsync()
+    internal Task<bool> PrepareAsync() => PrepareCoreAsync(verifyPixels: true);
+
+    // A popup can construct its HWND/layout while this same real-source
+    // verification runs. Afterwards re-check geometry and source revisions;
+    // do not manufacture a second verification merely because Loaded fired.
+    internal async Task<bool> CompletePreparationAsync(Task<bool> preparation)
+    {
+        await preparation;
+        return await PrepareCoreAsync(verifyPixels: false);
+    }
+
+    private async Task<bool> PrepareCoreAsync(bool verifyPixels)
     {
         Dispatcher.VerifyAccess();
         if (disposed || !CanProcess) return false;
-        bool verifySource = !demanding;
+        bool verifySource = verifyPixels && !demanding;
+        if (verifySource) demandStartedAt = clock.Elapsed.TotalMilliseconds;
         demanding = true; preparationTimer.Stop();
         UpdateGeometry();
         if (FilterDiagnostic is not ("preparing-full-resolution-backdrop" or "live-full-resolution-gaussian-srgb")) { demanding = false; return false; }
-        // Verify the actual lower pixels at presentation demand. A source can
-        // have changed while its owner was hidden, or while another WPF RTB
-        // temporarily removed the cyclic-root marker. Reusing the prepared
-        // convolution is safe only after this inexpensive pixel comparison.
+        // Keep a real pixel verification for each new presentation request.
+        // The owner-side observer supplies later revisions while the popup
+        // constructs; those changes still wait for their own completed sample.
         if (verifySource) { RearmObservers(); sourceDirty = true; sourceRevision++; }
-        if (raster.Source is not null && !sourceDirty && processing is null && publishedSourceRevision >= sourceRevision) { demanding = false; return true; }
+        if (raster.Source is not null && !sourceDirty && processing is null && publishedSourceRevision >= sourceRevision)
+        {
+            demandCacheHits++; CompleteDemand(); return true;
+        }
         if (coordinateRoot is null || layers.Count == 0 || SystemParameters.HighContrast) { demanding = false; return false; }
         readyRevision = sourceRevision;
         if (firstReady.Task.IsCompleted) firstReady = NewReady();
@@ -221,6 +239,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         captureMilliseconds, compareMilliseconds, filterMilliseconds, firstBitmapMilliseconds,
         queueMilliseconds, schedulingMilliseconds, convolutionMilliseconds, publishDispatchMilliseconds,
         preparationEnabled, presenting = Presenting, preparationReadyMilliseconds,
+        demandMilliseconds, demandCacheHits, captureQueueMilliseconds, captureQueuePromotions,
         sourceRevision, publishedSourceRevision,
         processing = processing is not null, pendingSourceChange = sourceDirty,
     };
@@ -261,6 +280,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private void StopListening()
     {
         listening = false; demanding = false; preparationTimer.Stop();
+        captureOperation?.Abort(); captureOperation = null;
         if (renderingSubscribed) { renderingSubscribed = false; CompositionTarget.Rendering -= Rendering; }
         InvalidateRaster(clear: true); firstReady.TrySetResult(false);
         sampling.Visibility = Visibility.Collapsed;
@@ -395,7 +415,16 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
 
     private void QueueCapture()
     {
-        if (disposed || !listening || !CanProcess || capturing || updatingGeometry || captureQueued || processing is not null || observer.Drawing is null || clock.Elapsed.TotalMilliseconds < retryAfterMilliseconds) return;
+        if (disposed || !listening || !CanProcess || capturing || updatingGeometry || processing is not null || observer.Drawing is null || clock.Elapsed.TotalMilliseconds < retryAfterMilliseconds) return;
+        // Initial presentation is urgent. Subsequent live sampling runs after
+        // normal WPF presentation, so an RTB does not preempt the menu's next
+        // animation frame. There is still only one queued/in-flight capture.
+        var priority = demanding || Presenting && !FilterAvailable ? DispatcherPriority.Render : DispatcherPriority.Background;
+        if (captureOperation is { Status: DispatcherOperationStatus.Pending } pending)
+        {
+            if (pending.Priority < priority) { pending.Priority = priority; captureQueuePromotions++; }
+            return;
+        }
         if (!Presenting && !demanding)
         {
             // Hidden preparation is not a second render loop. Source changes
@@ -407,14 +436,15 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
                 preparationTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(1, delay)); preparationTimer.Start(); return;
             }
         }
-        captureQueued = true;
-        _ = Dispatcher.BeginInvoke(Presenting || demanding ? DispatcherPriority.Render : DispatcherPriority.Background, new Action(() =>
+        long queued = Stopwatch.GetTimestamp();
+        captureOperation = Dispatcher.BeginInvoke(priority, new Action(() =>
         {
-            captureQueued = false;
+            captureOperation = null;
             if (disposed || !listening || !CanProcess || processing is not null || !sourceDirty) return;
             capturing = true;
             try
             {
+                captureQueueMilliseconds = Stopwatch.GetElapsedTime(queued).TotalMilliseconds;
                 UpdateGeometry();
                 if (FilterDiagnostic is not ("preparing-full-resolution-backdrop" or "live-full-resolution-gaussian-srgb")) return;
                 sourceDirty = false;
@@ -480,7 +510,13 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         // Readiness means a real sample captured after the current request (or
         // a newer page/geometry invalidation). It must not wait for a live chart
         // to stop changing: later dirty frames continue through the live queue.
-        if (revision >= readyRevision) { demanding = false; firstReady.TrySetResult(true); }
+        if (revision >= readyRevision) { CompleteDemand(); firstReady.TrySetResult(true); }
+    }
+
+    private void CompleteDemand()
+    {
+        if (demanding && demandStartedAt is { } started) demandMilliseconds = clock.Elapsed.TotalMilliseconds - started;
+        demanding = false; demandStartedAt = null;
     }
 
     private void RearmObservers()

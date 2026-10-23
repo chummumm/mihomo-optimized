@@ -182,10 +182,15 @@ public sealed class ProxiesPage : NativePage
     {
         if (!IsRunning || !Session.TryGetProxyRuntimeSnapshot(out var proxies, out var providers, out var configs)) return false;
         ResetControllerData(ControllerIdentity);
-        if (!proxies.Equals(presentedProxies) || !providers.Equals(presentedProviders) || !configs.Equals(presentedConfigs))
+        if (!proxies.Equals(presentedProxies) || !providers.Equals(presentedProviders) || !configs.Equals(presentedConfigs) ||
+            shownProviders != Session.ShowProxyProvider || breakConnections.IsChecked != Session.CloseConnectionsOnSwitch ||
+            renderedLanguage != L.ResolvedLanguage)
             PresentRuntimeData(proxies, providers, configs);
         return true;
     }
+    // Called only by the shell's one-time, inactive Home -> Proxies preparation.
+    // It consumes existing read-only snapshots and never creates a page lifetime.
+    internal bool TryPrepareIdleSnapshot() => !IsActive && TryPresentRuntimeSnapshot();
     private void PresentRuntimeData(JsonElement proxies, JsonElement providers, JsonElement configs)
     {
         // Activation still requests authoritative data. A new JSON document

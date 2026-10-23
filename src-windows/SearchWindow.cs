@@ -132,7 +132,7 @@ internal sealed class SearchWindow : Window
     private string CommandState => string.Join("|", session.Ready, session.IsUpdating, session.IsDirty, session.Status.Text("phase"), session.Status.Bool("systemProxy"), session.Status.Bool("tun"),
         session.Status.Get("capabilities").ToString());
 
-    public SearchWindow(AppSession session, GlobalSearchBox inputBox, FluentBackdropFilter? preparedBackdrop = null)
+    public SearchWindow(AppSession session, GlobalSearchBox inputBox, FluentBackdropFilter? preparedBackdrop = null, Task<bool>? preparedPixels = null)
     {
         constructorStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         this.session = session; this.inputBox = inputBox; search = inputBox.Input;
@@ -189,7 +189,8 @@ internal sealed class SearchWindow : Window
             backdropFilter.BeginPresentation();
             CompositionTarget.Rendering += FirstRendering;
             var coreLoad = LoadInitialEntries();
-            await backdropFilter.PrepareAsync();
+            if (preparedPixels is null) await backdropFilter.PrepareAsync();
+            else await backdropFilter.CompletePreparationAsync(preparedPixels);
             backdropReadyMilliseconds = openClock.Elapsed.TotalMilliseconds;
             if (closing || closed) return;
             EnterSuggestions();

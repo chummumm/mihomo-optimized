@@ -541,13 +541,17 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         SavePreferences();
     }
 
-    public void SetTestUrl(string url)
+    public bool SetTestUrl(string url)
     {
         url = url.Trim();
         if (!ValidTestUrl(url)) throw new ArgumentException(L.T("请输入有效的 HTTP 或 HTTPS 探测地址。"), nameof(url));
+        // Publish the new value only after the atomic preferences write has
+        // succeeded. A failed save must leave both the active URL and the
+        // editor's draft intact, without a second success notification.
+        if (!SavePreferences(testUrl: url)) return false;
         TestUrl = url;
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(TestUrl)));
-        SavePreferences();
+        return true;
     }
     private static bool ValidTestUrl(string url) => url.Length <= 2048 && Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https" && uri.UserInfo.Length == 0 && !string.IsNullOrWhiteSpace(uri.Host);
     public void SetCloseConnectionsOnSwitch(bool enabled)
@@ -563,16 +567,21 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         SavePreferences();
     }
 
-    private void SavePreferences()
+    private bool SavePreferences(string? testUrl = null)
     {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(appearancePath)!);
             string temporary = appearancePath + ".tmp";
-            File.WriteAllText(temporary, JsonSerializer.Serialize(new { theme = Theme, language = Language, testUrl = TestUrl, closeConnectionsOnSwitch = CloseConnectionsOnSwitch, showProxyProvider = ShowProxyProvider }));
+            File.WriteAllText(temporary, JsonSerializer.Serialize(new { theme = Theme, language = Language, testUrl = testUrl ?? TestUrl, closeConnectionsOnSwitch = CloseConnectionsOnSwitch, showProxyProvider = ShowProxyProvider }));
             File.Move(temporary, appearancePath, true);
+            return true;
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { Notify("设置已生效，但未能保存偏好。", true); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            Notify(testUrl is null ? "设置已生效，但未能保存偏好。" : "未能保存测速地址，原设置未变。", true);
+            return false;
+        }
     }
 
     public void ApplyTheme()

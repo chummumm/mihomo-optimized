@@ -782,15 +782,26 @@ class NativeDriver:
 
     def ui(self, automation_id: str, action: str = "read", value: str = "") -> dict:
         script = Path(__file__).with_name("uia-query.ps1").resolve()
-        result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        arguments = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
             "-File", str(script), "-ApplicationProcessId", str(self.identity.pid),
-            "-AutomationId", automation_id, "-Action", action, "-Value", value],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW)
-        try:
-            response = json.loads(result.stdout.lstrip("\ufeff"))
-        except (ValueError, TypeError):
-            response = {}
+            "-AutomationId", automation_id, "-Action", action, "-Value", value]
+        for attempt in range(3):
+            result = subprocess.run(arguments, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            try:
+                response = json.loads(result.stdout.lstrip("\ufeff"))
+            except (ValueError, TypeError):
+                response = {}
+            # Closing a popup or rebuilding a page can invalidate a peer while
+            # the read-only tree walk is in flight (UIA_E_ELEMENTNOTAVAILABLE).
+            # Restart the complete read with fresh peers, including the secret
+            # check before screenshots. Never replay actions or hide other errors.
+            if (result.returncode and action == "read" and isinstance(response, dict)
+                    and response.get("hresult") == "0x80040201" and attempt < 2):
+                time.sleep(.1)
+                continue
+            break
         if result.returncode:
             # The helper emits only a bounded operation stage, exception type and HRESULT.
             # Never include raw PowerShell stderr or user-controlled UI values.
@@ -1450,7 +1461,19 @@ class Acceptance:
         def editor_view(*, endpoint: str, percent: float | None = None, caret: str | None = None):
             state = driver.ui("ConfigEditor")
             viewport = state.get("textViewport", {})
-            if not viewport.get(endpoint) or caret and not viewport.get(caret):
+            # Retain the numeric probe on failure too. A nonempty long document
+            # cannot have a degenerate document range or a caret at both ends.
+            evidence["editorTextRangeProbe"] = {
+                "valueUtf16Length": len(state.get("value", "").encode("utf-16-le")) // 2,
+                **viewport,
+            }
+            require(viewport.get("documentTextLength", 0) > 0
+                    and viewport.get("documentStartVsEnd", 0) < 0,
+                    "native_editor_textpattern_document_degenerate")
+            require(not (viewport.get("caretAtStart") and viewport.get("caretAtEnd")),
+                    "native_editor_textpattern_caret_at_both_ends")
+            opposite = "startsDocument" if endpoint == "endsDocument" else "endsDocument"
+            if not viewport.get(endpoint) or viewport.get(opposite) or caret and not viewport.get(caret):
                 return None
             if percent is not None and abs(state.get("scroll", {}).get("verticalPercent", -1) - percent) > .01:
                 return None

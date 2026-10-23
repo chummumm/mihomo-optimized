@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Markup;
 using System.Windows.Media;
@@ -147,6 +148,7 @@ internal sealed class ConfigImportDialog
         preview.MaxLength = maxBytes;
         TextBlock.SetLineHeight(preview, 19.2); TextBlock.SetLineStackingStrategy(preview, LineStackingStrategy.BlockLineHeight);
         SpellCheck.SetIsEnabled(preview, false);
+        preview.Loaded += (_, _) => ReserveResizeCorner();
         previewFrame.Children.Add(preview);
         placeholder.Margin = new Thickness(13, 11, 13, 11); placeholder.VerticalAlignment = VerticalAlignment.Top;
         placeholder.SetResourceReference(TextBlock.FontFamilyProperty, "MonoFont"); placeholder.IsHitTestVisible = false; previewFrame.Children.Add(placeholder);
@@ -230,6 +232,29 @@ internal sealed class ConfigImportDialog
     }
 
     private static FrameworkElement Spaced(FrameworkElement element, double below = 16) { element.Margin = new Thickness(0, 0, 0, below); return element; }
+    private void ReserveResizeCorner()
+    {
+        preview.ApplyTemplate();
+        if (preview.Template.FindName("PART_ContentHost", preview) is not ScrollViewer viewer) return;
+        viewer.ApplyTemplate();
+        // A resizable textarea reserves its bottom-right scrollbar corner even
+        // when only one scrollbar is visible. Shorten only that bar's track;
+        // the text viewport, extent and scroll offsets remain unchanged.
+        Reserve("PART_VerticalScrollBar", nameof(ScrollViewer.ComputedHorizontalScrollBarVisibility), new Thickness(0, 0, 0, 15));
+        Reserve("PART_HorizontalScrollBar", nameof(ScrollViewer.ComputedVerticalScrollBarVisibility), new Thickness(0, 0, 15, 0));
+        void Reserve(string name, string otherVisibility, Thickness margin)
+        {
+            if (viewer.Template.FindName(name, viewer) is not ScrollBar bar) return;
+            var style = new Style(typeof(ScrollBar), bar.Style ?? bar.TryFindResource(typeof(ScrollBar)) as Style);
+            var onlyScrollbar = new DataTrigger
+            {
+                Binding = new Binding(otherVisibility) { Source = viewer },
+                Value = Visibility.Collapsed
+            };
+            onlyScrollbar.Setters.Add(new Setter(FrameworkElement.MarginProperty, margin));
+            style.Triggers.Add(onlyScrollbar); bar.Style = style;
+        }
+    }
     private static Button Button(string label, string id, string? icon = null)
     {
         var button = new Button { Height = 32, Content = icon is null ? Ui.Label(label) : FluentControls.ButtonContent(icon, label), Padding = new Thickness(12, 0, 12, 0) }.Id(id);

@@ -7,10 +7,12 @@ param(
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $script:operationStage = 'initialize'
+$script:textProbeActive = $false
 trap {
     # Keep CI diagnostics useful without printing control values, YAML or URLs.
     $exception = $_.Exception
     while ($exception.InnerException) { $exception = $exception.InnerException }
+    if ($script:textProbeActive) { $script:operationStage = [NativeTextViewportProbe]::Stage }
     @{found=$false; error='uia_operation_failed'; stage=$script:operationStage;
         exception=$exception.GetType().Name;
         hresult=('0x{0:X8}' -f ([long]$exception.HResult -band 0xFFFFFFFFL))} | ConvertTo-Json -Compress
@@ -52,6 +54,74 @@ if (-not $element) { @{found=$false} | ConvertTo-Json -Compress; exit 0 }
 $result = @{ found=$true; enabled=$element.Current.IsEnabled; offscreen=$element.Current.IsOffscreen;
     name=$element.Current.Name; focused=$element.Current.HasKeyboardFocus;
     controlType=$element.Current.ControlType.ProgrammaticName }
+if ($AutomationId -eq 'ConfigEditor' -and $Action -eq 'read') {
+    # Keep range comparisons strongly typed across the UIAutomation COM boundary.
+    # Only lengths, endpoint relations and flags leave this helper, never text.
+    Add-Type -AssemblyName WindowsBase
+    Add-Type -ReferencedAssemblies @(
+        [System.Windows.Automation.AutomationElement].Assembly.Location,
+        [System.Windows.Automation.Text.TextPatternRangeEndpoint].Assembly.Location,
+        [System.Windows.Point].Assembly.Location) -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Windows.Automation;
+using System.Windows.Automation.Text;
+public static class NativeTextViewportProbe
+{
+    public static string Stage = "read_text_document";
+    public static Dictionary<string, object> Read(TextPattern pattern)
+    {
+        Stage = "read_text_document";
+        TextPatternRange document = pattern.DocumentRange;
+        Stage = "read_text_document_length";
+        int textLength = document.GetText(-1).Length;
+        Stage = "read_text_document_endpoints";
+        int documentSpan = document.CompareEndpoints(TextPatternRangeEndpoint.Start,
+            document, TextPatternRangeEndpoint.End);
+        Stage = "read_text_visible_ranges";
+        TextPatternRange[] visible = pattern.GetVisibleRanges();
+        bool startsDocument = false, endsDocument = false;
+        var visibleComparisons = new List<int[]>();
+        Stage = "read_text_visible_endpoints";
+        foreach (TextPatternRange range in visible)
+        {
+            int start = range.CompareEndpoints(TextPatternRangeEndpoint.Start,
+                document, TextPatternRangeEndpoint.Start);
+            int end = range.CompareEndpoints(TextPatternRangeEndpoint.End,
+                document, TextPatternRangeEndpoint.End);
+            startsDocument |= start == 0;
+            endsDocument |= end == 0;
+            visibleComparisons.Add(new int[] { start, end });
+        }
+        Stage = "read_text_selection";
+        TextPatternRange[] selection = pattern.GetSelection();
+        bool caretAtStart = false, caretAtEnd = false;
+        int[] selectionComparisons = null;
+        Stage = "read_text_caret_endpoints";
+        if (selection.Length == 1)
+        {
+            TextPatternRange caret = selection[0];
+            int span = caret.CompareEndpoints(TextPatternRangeEndpoint.Start,
+                caret, TextPatternRangeEndpoint.End);
+            int start = caret.CompareEndpoints(TextPatternRangeEndpoint.Start,
+                document, TextPatternRangeEndpoint.Start);
+            int end = caret.CompareEndpoints(TextPatternRangeEndpoint.End,
+                document, TextPatternRangeEndpoint.End);
+            caretAtStart = span == 0 && start == 0;
+            caretAtEnd = span == 0 && end == 0;
+            selectionComparisons = new int[] { span, start, end };
+        }
+        return new Dictionary<string, object> {
+            { "documentTextLength", textLength }, { "documentStartVsEnd", documentSpan },
+            { "ranges", visible.Length }, { "visibleComparisons", visibleComparisons },
+            { "selectionComparisons", selectionComparisons },
+            { "startsDocument", startsDocument }, { "endsDocument", endsDocument },
+            { "caretAtStart", caretAtStart }, { "caretAtEnd", caretAtEnd }
+        };
+    }
+}
+'@
+}
 $script:operationStage = $Action
 switch ($Action) {
     'invoke' {
@@ -234,29 +304,9 @@ public static class NativeEscapeInput {
             $pattern = $null
             $script:operationStage = 'read_text_pattern'
             if ($element.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$pattern)) {
-                $script:operationStage = 'read_text_document'
-                $document = $pattern.DocumentRange
-                $start = [System.Windows.Automation.Text.TextPatternRangeEndpoint]::Start
-                $end = [System.Windows.Automation.Text.TextPatternRangeEndpoint]::End
-                $script:operationStage = 'read_text_visible_ranges'
-                $visible = @($pattern.GetVisibleRanges())
-                $startsDocument = $false; $endsDocument = $false
-                $script:operationStage = 'read_text_visible_endpoints'
-                foreach ($range in $visible) {
-                    $startsDocument = $startsDocument -or ($range.CompareEndpoints($start, $document, $start) -eq 0)
-                    $endsDocument = $endsDocument -or ($range.CompareEndpoints($end, $document, $end) -eq 0)
-                }
-                $script:operationStage = 'read_text_selection'
-                $selection = @($pattern.GetSelection())
-                $caretAtStart = $false; $caretAtEnd = $false
-                $script:operationStage = 'read_text_caret_endpoints'
-                if ($selection.Count -eq 1 -and $selection[0].CompareEndpoints($start, $selection[0], $end) -eq 0) {
-                    $caretAtStart = $selection[0].CompareEndpoints($start, $document, $start) -eq 0
-                    $caretAtEnd = $selection[0].CompareEndpoints($end, $document, $end) -eq 0
-                }
-                # Export endpoint relationships, never document text or ranges.
-                $result.textViewport = @{ ranges=$visible.Count; startsDocument=$startsDocument;
-                    endsDocument=$endsDocument; caretAtStart=$caretAtStart; caretAtEnd=$caretAtEnd }
+                $script:textProbeActive = $true
+                $result.textViewport = [NativeTextViewportProbe]::Read($pattern)
+                $script:textProbeActive = $false
             }
         }
         if ($element.Current.ControlType -eq [System.Windows.Automation.ControlType]::DataGrid) {

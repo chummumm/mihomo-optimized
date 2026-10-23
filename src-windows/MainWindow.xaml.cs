@@ -180,7 +180,7 @@ public partial class MainWindow : Window
             location = target with { Action = null }; UpdateBackButton();
         }
         catch (Exception error) { if (revision == navigationRevision) { ConnectedNavigation.Cancel(this); ShowNotice(error.Message, true); } return false; }
-        finally { navigating = false; UpdateBackButton(); }
+        finally { navigating = false; UpdateBackButton(); UpdateProxiesPreparation(); }
         try
         {
             if (RecoveryRequired) { ConnectedNavigation.Cancel(this); return true; }
@@ -317,6 +317,7 @@ public partial class MainWindow : Window
         if (IsVisible && WindowState != WindowState.Minimized && !recovering) activePage?.Activate();
         else activePage?.Deactivate();
         if (resumed && activePage is { } page) _ = ResumePageTargetAsync(page, location);
+        UpdateProxiesPreparation();
     }
     private bool RecoveryRequired => currentPage is not ("home" or "settings" or "profiles") && session.Status.Text("phase") != "running";
     private async Task ResumePageTargetAsync(NativePage page, NavigationTarget target)
@@ -552,7 +553,10 @@ public partial class MainWindow : Window
         if (EditorOpen) return;
         CloseOverlay(false);
         if (searchWindow is { IsVisible: true }) { searchWindow.FocusInput(); return; }
-        var dialog = new SearchWindow(session, SearchButton, searchBackdrop) { Owner = this }; searchWindow = dialog;
+        // Verify current lower-layer pixels before HWND creation and popup
+        // layout. Loaded checks the final viewport/revision again.
+        var preparation = searchBackdrop.PrepareAsync();
+        var dialog = new SearchWindow(session, SearchButton, searchBackdrop, preparation) { Owner = this }; searchWindow = dialog;
         dialog.Closed += (_, _) => { if (ReferenceEquals(searchWindow, dialog)) searchWindow = null; };
         dialog.Show(); dialog.FocusInput();
     }
@@ -628,6 +632,7 @@ public partial class MainWindow : Window
     public async Task FinishExitAsync()
     {
         if (allowClose) return; allowClose = true;
+        CancelProxiesPreparation();
         foreach (var page in pages.Values) page.Deactivate();
         L.Changed -= OnLanguageChanged; searchWindow?.Close(); backdrop.Dispose(); navigationBackdrop.Dispose(); searchBackdrop.Dispose(); titleBar.Dispose(); tray.Dispose();
         Notifications.Dispose();
@@ -641,6 +646,7 @@ public partial class MainWindow : Window
         connected = ConnectedNavigation.Describe(),
         navigation = navigationTiming?.Describe(),
         preparation = pages.TryGetValue("proxies", out var page) && page is ProxiesPage proxies ? proxies.DescribeNavigationPreparation() : null,
+        idleProxiesPreparation = DescribeProxiesPreparation(),
         search = searchWindow?.Describe(),
         navigationBackdrop = navigationBackdrop.Describe(),
         backdrop = FluentBackdropFilter.DescribeCompilation()
