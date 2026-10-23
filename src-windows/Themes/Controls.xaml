@@ -160,7 +160,7 @@
           <ToggleButton.Style><Style TargetType="ToggleButton"><Setter Property="Template"><Setter.Value><ControlTemplate><Border Background="Transparent"/></ControlTemplate></Setter.Value></Setter></Style></ToggleButton.Style>
         </ToggleButton>
         <Popup x:Name="PART_Popup" Placement="Custom" AllowsTransparency="True" Focusable="False" PopupAnimation="None">
-          <Border x:Name="PART_PopupFrame" Margin="16" MinWidth="{Binding ActualWidth,RelativeSource={RelativeSource TemplatedParent}}" MaxHeight="320" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource AcrylicStrokeBrush}" Background="{DynamicResource AcrylicBrush}" Padding="4">
+          <Border x:Name="PART_PopupFrame" Margin="16" MaxWidth="360" MaxHeight="320" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource AcrylicStrokeBrush}" Background="{DynamicResource AcrylicBrush}" Padding="4">
             <Border.Effect><DropShadowEffect BlurRadius="16" ShadowDepth="8" Direction="270" Opacity="0.14"/></Border.Effect>
             <ScrollViewer CanContentScroll="True" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"><ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/></ScrollViewer>
           </Border>

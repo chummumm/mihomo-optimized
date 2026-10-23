@@ -56,7 +56,7 @@ public static class FluentControlState
                 if (popup is not null)
                 {
                     popup.PlacementTarget = combo;
-                    popup.CustomPopupPlacementCallback = (_, _, _) => [new CustomPopupPlacement(new Point(-16, -21 - Math.Min(Math.Max(0, combo.SelectedIndex), 8) * 34), PopupPrimaryAxis.Vertical)];
+                    popup.CustomPopupPlacementCallback = (_, _, _) => PlacePopup(combo);
                     popup.Opened += PopupOpened;
                 }
             }
@@ -151,7 +151,14 @@ public static class FluentControlState
                 double x = (hover ? 3 : 4) + (selected ? pressed ? 17 : 20 : 0);
                 Number(thumb, FrameworkElement.WidthProperty, width, animate);
                 Number(thumb, FrameworkElement.HeightProperty, height, animate);
-                if (thumb.RenderTransform is TranslateTransform transform) Number(transform, TranslateTransform.XProperty, x, animate);
+                if (thumb.RenderTransform is TranslateTransform transform)
+                {
+                    // A transform supplied by ControlTemplate can be frozen and
+                    // shared. Direct BeginAnimation does not perform a
+                    // Storyboard's automatic per-instance clone.
+                    if (transform.IsFrozen) { transform = transform.CloneCurrentValue(); thumb.RenderTransform = transform; }
+                    Number(transform, TranslateTransform.XProperty, x, animate);
+                }
                 Paint(thumb, Border.BackgroundProperty, Color(enabled ? selected ? "AccentTextBrush" : "TextSecondaryBrush" : selected ? "AppBackgroundBrush" : "TextDisabledBrush"), milliseconds, animate);
             }
         }
@@ -179,6 +186,12 @@ public static class FluentControlState
             int generation = ++popupGeneration;
             if (combo.IsDropDownOpen)
             {
+                if (Part("PART_PopupFrame") is { } popupFrame)
+                {
+                    var (viewportWidth, _) = PopupViewport(combo);
+                    popupFrame.MaxWidth = Math.Min(360, Math.Max(0, viewportWidth - 16));
+                    popupFrame.MinWidth = Math.Min(combo.ActualWidth + 8, popupFrame.MaxWidth);
+                }
                 bool reopening = popup.IsOpen;
                 popup.IsOpen = true;
                 if (reopening) PopupOpened(popup, EventArgs.Empty);
@@ -189,6 +202,20 @@ public static class FluentControlState
             var fade = new DoubleAnimation(frame.Opacity, 0, FluentMotion.Faster);
             fade.Completed += (_, _) => { if (generation == popupGeneration && popup is not null && !combo.IsDropDownOpen) popup.IsOpen = false; };
             frame.BeginAnimation(UIElement.OpacityProperty, fade);
+        }
+        private static (double Width, double Left) PopupViewport(ComboBox combo)
+        {
+            if (Window.GetWindow(combo) is not { } owner) return (SystemParameters.WorkArea.Width, 0);
+            var viewport = owner.Content as FrameworkElement ?? owner;
+            return (viewport.ActualWidth, combo.TranslatePoint(new Point(), viewport).X);
+        }
+        private CustomPopupPlacement[] PlacePopup(ComboBox combo)
+        {
+            var (viewportWidth, anchorLeft) = PopupViewport(combo);
+            double left = Math.Max(8, Math.Min(anchorLeft - 4, viewportWidth - Math.Max(combo.ActualWidth + 8, 160) - 8));
+            // Popup includes 16px of transparent room for the shadow; CSS left is the frame edge.
+            double shadowInset = Part("PART_PopupFrame")?.Margin.Left ?? 16;
+            return [new CustomPopupPlacement(new Point(left - anchorLeft - shadowInset, -21 - Math.Min(Math.Max(0, combo.SelectedIndex), 8) * 34), PopupPrimaryAxis.Vertical)];
         }
         private void PopupOpened(object? sender, EventArgs e)
         {

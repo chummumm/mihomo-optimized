@@ -170,7 +170,7 @@ internal sealed class ConfigImportDialog
         replace = Button("替换并应用", "ConfigImportReplace", "save"); FluentControls.Primary(replace);
         replaceContent = replace.Content as UIElement ?? Ui.Label("替换并应用");
         savingContent = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
-        var progress = new FluentProgressRing { Width = 16, Height = 16, IsActive = true, Margin = new Thickness(0, 0, 8, 0) };
+        var progress = new FluentProgressRing { Width = 16, Height = 16, IsActive = true, IsButtonSpinner = true, Margin = new Thickness(0, 0, 8, 0) };
         progress.SetResourceReference(FluentProgressRing.ForegroundProperty, "TextSecondaryBrush");
         savingContent.Children.Add(progress); savingContent.Children.Add(Ui.Label("正在导入…"));
         cancel = Button("取消", "CancelConfigImport"); AddActions(actions, replace, cancel); actions.Margin = new Thickness(0, 24, 0, 0); body.Children.Add(actions);

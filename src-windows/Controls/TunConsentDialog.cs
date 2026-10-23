@@ -35,7 +35,7 @@ internal static class TunConsentDialog
             if (busy) return;
             busy = true; install.IsEnabled = cancel.IsEnabled = false;
             var content = new StackPanel { Orientation = Orientation.Horizontal };
-            var progress = new FluentProgressRing { Width = 16, Height = 16, IsActive = true, Margin = new Thickness(0, 0, 8, 0) }; progress.SetResourceReference(FluentProgressRing.ForegroundProperty, "TextSecondaryBrush");
+            var progress = new FluentProgressRing { Width = 16, Height = 16, IsActive = true, IsButtonSpinner = true, Margin = new Thickness(0, 0, 8, 0) }; progress.SetResourceReference(FluentProgressRing.ForegroundProperty, "TextSecondaryBrush");
             var text = Ui.Label(label); text.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); content.Children.Add(progress); content.Children.Add(text); install.Content = content;
             try { await operation(); busy = false; dialog.Complete(true); }
             catch (Exception exception) { reportError(exception.Message); }

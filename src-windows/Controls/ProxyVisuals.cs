@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -67,6 +69,77 @@ internal static class ProxyVisuals
       </ResourceDictionary>
       """);
     internal static Style Style(string key) => (Style)templates[key];
+    internal static void SetBusyIcon(FluentIcon icon, bool busy) => BusyIconMotion.Set(icon, busy);
+    private sealed class BusyIconMotion
+    {
+        private static readonly ConditionalWeakTable<FluentIcon, BusyIconMotion> states = new();
+        private readonly FluentIcon icon;
+        private readonly ScaleTransform scale = new(1, 1);
+        private readonly RotateTransform rotation = new();
+        private bool busy;
+        private bool playing;
+        private bool subscribed;
+        private BusyIconMotion(FluentIcon icon)
+        {
+            this.icon = icon;
+            var transforms = new TransformGroup(); transforms.Children.Add(scale); transforms.Children.Add(rotation);
+            icon.RenderTransform = transforms; icon.RenderTransformOrigin = new Point(.5, .5);
+            icon.Loaded += Loaded; icon.Unloaded += Unloaded; icon.IsVisibleChanged += (_, _) => Update();
+            if (icon.IsLoaded) Attach();
+        }
+        internal static void Set(FluentIcon icon, bool busy)
+        {
+            var state = states.GetValue(icon, value => new BusyIconMotion(value));
+            state.busy = busy; state.Update();
+        }
+        private void Loaded(object sender, RoutedEventArgs e) => Attach();
+        private void Attach()
+        {
+            if (!subscribed) { SystemParameters.StaticPropertyChanged += PreferenceChanged; subscribed = true; }
+            Update();
+        }
+        private void Unloaded(object sender, RoutedEventArgs e)
+        {
+            if (subscribed) SystemParameters.StaticPropertyChanged -= PreferenceChanged;
+            subscribed = false; Stop();
+        }
+        private void PreferenceChanged(object? sender, PropertyChangedEventArgs e)
+        {
+            if (e.PropertyName is nameof(SystemParameters.ClientAreaAnimation) or nameof(SystemParameters.HighContrast))
+                icon.Dispatcher.InvokeAsync(Update);
+        }
+        private void Update()
+        {
+            bool active = busy && icon.IsLoaded && icon.IsVisible && Animate;
+            if (playing == active) return;
+            Stop();
+            if (!active) return;
+            playing = true;
+            if (icon.Kind == "update")
+                rotation.BeginAnimation(RotateTransform.AngleProperty, new DoubleAnimation(0, 360, TimeSpan.FromMilliseconds(900)) { RepeatBehavior = RepeatBehavior.Forever });
+            else if (icon.Kind == "speed")
+            {
+                icon.BeginAnimation(UIElement.OpacityProperty, Charge(.55));
+                scale.BeginAnimation(ScaleTransform.ScaleXProperty, Charge(.88));
+                scale.BeginAnimation(ScaleTransform.ScaleYProperty, Charge(.88));
+            }
+        }
+        private static DoubleAnimationUsingKeyFrames Charge(double midpoint)
+        {
+            var animation = new DoubleAnimationUsingKeyFrames { Duration = TimeSpan.FromMilliseconds(900), RepeatBehavior = RepeatBehavior.Forever };
+            animation.KeyFrames.Add(new DiscreteDoubleKeyFrame(1, KeyTime.FromTimeSpan(TimeSpan.Zero)));
+            animation.KeyFrames.Add(new SplineDoubleKeyFrame(midpoint, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(450)), new KeySpline(.8, 0, .2, 1)));
+            animation.KeyFrames.Add(new SplineDoubleKeyFrame(1, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(900)), new KeySpline(.8, 0, .2, 1)));
+            return animation;
+        }
+        private void Stop()
+        {
+            playing = false;
+            icon.BeginAnimation(UIElement.OpacityProperty, null);
+            scale.BeginAnimation(ScaleTransform.ScaleXProperty, null); scale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+            rotation.BeginAnimation(RotateTransform.AngleProperty, null);
+        }
+    }
     internal static string Tone(string tone) => tone switch { "good" => "SuccessBrush", "warn" => "WarningBrush", "bad" => "DangerBrush", "live" => "AccentBrush", "quiet" => "FaintBrush", _ => "TextTertiaryBrush" };
     internal static void Surface(ButtonBase button, string hover, string pressed) => _ = new SurfaceTransition(button, hover, pressed);
     internal static void FadeBackground(Border frame, Brush? target, bool animate = true)

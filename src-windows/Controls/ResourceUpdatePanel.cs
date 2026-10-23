@@ -171,7 +171,7 @@ internal sealed class ResourceUpdatePanel : UserControl
         if (!Equals(start.Tag, commandState))
         {
             start.Tag = commandState;
-            if (progress) { var content = new StackPanel { Orientation = Orientation.Horizontal }; content.Children.Add(new FluentProgressRing { Width = 16, Height = 16, IsActive = true, Margin = new Thickness(0, 0, 8, 0) }); content.Children.Add(Ui.Label(title)); start.Content = content; }
+            if (progress) { var content = new StackPanel { Orientation = Orientation.Horizontal }; content.Children.Add(new FluentProgressRing { Width = 16, Height = 16, IsActive = true, IsButtonSpinner = true, Margin = new Thickness(0, 0, 8, 0) }); content.Children.Add(Ui.Label(title)); start.Content = content; }
             else start.Content = FluentControls.ButtonContent("arrow-circle-up", title);
         }
         L.Bind(start, AutomationProperties.NameProperty, title);

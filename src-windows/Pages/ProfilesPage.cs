@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
@@ -449,7 +450,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
             accept.Click += async (_, _) =>
             {
                 if (exiting || Busy || Session.IsUpdating) return; exiting = true; accept.IsEnabled = cancel.IsEnabled = false;
-                var loading = new StackPanel { Orientation = Orientation.Horizontal }; loading.Children.Add(new FluentProgressRing { Width = 16, Height = 16, IsActive = true, Margin = new Thickness(0, 0, 8, 0) }); loading.Children.Add(Ui.Label("丢弃修改并退出")); accept.Content = loading;
+                var loading = new StackPanel { Orientation = Orientation.Horizontal }; loading.Children.Add(new FluentProgressRing { Width = 16, Height = 16, IsActive = true, IsButtonSpinner = true, Margin = new Thickness(0, 0, 8, 0) }); loading.Children.Add(Ui.Label("丢弃修改并退出")); loading.SetResourceReference(TextElement.ForegroundProperty, "TextSecondaryBrush"); accept.Content = loading;
                 try { await ResetDraft(); SetEditorVisible(false, false); dialog.Complete(true); }
                 catch (Exception error) { Session.Notify(error.Message, true); exiting = false; accept.IsEnabled = cancel.IsEnabled = true; accept.Content = FluentControls.ButtonContent("close", "丢弃修改并退出"); }
             };

@@ -43,6 +43,8 @@ public sealed class ProxiesPage : NativePage
     private long topologyTransition;
     private readonly ProgressBar progress = new() { Height = 3, Margin = new Thickness(0, 0, 0, 16), Visibility = Visibility.Collapsed, Maximum = 100 };
     private readonly Button testAll;
+    private readonly FluentIcon testIcon = new("speed", 16) { Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center };
+    private readonly TextBlock testLabel = Ui.Text("");
     private readonly Button toggleTopology;
     private readonly Grid topologyBody = new();
     private readonly ScrollViewer scroll;
@@ -79,7 +81,9 @@ public sealed class ProxiesPage : NativePage
     public ProxiesPage(AppSession session) : base(session, "proxies", "代理", "策略组、代理节点与实时流量路径")
     {
         search.Width = 200; search.Margin = new Thickness(0, 0, 8, 0); Tools.Children.Add(search);
-        testAll = Action("测速", "MeasureAllProxies", MeasureAll, true); testAll.Content = FluentControls.ButtonContent("speed", "测速"); L.Bind(testAll, ToolTipProperty, "全部测速 (Ctrl+T)"); Tools.Children.Add(testAll);
+        testAll = Action("测速", "MeasureAllProxies", MeasureAll, true);
+        var testContent = new StackPanel { Orientation = Orientation.Horizontal }; testContent.Children.Add(testIcon); testContent.Children.Add(testLabel); testAll.Content = testContent; testLabel.Text = L.T("测速");
+        L.Bind(testAll, ToolTipProperty, "全部测速 (Ctrl+T)"); Tools.Children.Add(testAll);
         var refreshMenu = new ContextMenu(); var refresh = L.Bind(new MenuItem().Id("RefreshProxies"), HeaderedItemsControl.HeaderProperty, "刷新"); refresh.Click += async (_, _) => await RunAsync(RefreshAsync); refreshMenu.Items.Add(refresh); ContextMenu = refreshMenu;
         summary.Id("ProxySummary"); SetHeaderMeta(summary); progress.Id("ProxyTestProgress"); content.Children.Add(progress);
         var topologyHeader = new DockPanel { MinHeight = 40, Margin = new Thickness(16, 8, 8, 8) };
@@ -350,12 +354,11 @@ public sealed class ProxiesPage : NativePage
     {
         var busy = testing.Count > 0;
         progress.Visibility = busy ? Visibility.Visible : Visibility.Collapsed; ProxyVisuals.Tween(progress, RangeBase.ValueProperty, progress.Value, testTotal > 0 ? testDone * 100d / testTotal : 0, 250);
-        if (busy)
-        {
-            var row = new StackPanel { Orientation = Orientation.Horizontal }; var ring = new FluentProgressRing { Width = 16, Height = 16, Margin = new Thickness(0, 0, 8, 0), IsActive = true }; ring.SetResourceReference(FluentProgressRing.ForegroundProperty, "AccentTextBrush"); row.Children.Add(ring); row.Children.Add(Ui.Text(L.F("正在测速 {0}/{1}", testDone, testTotal))); testAll.Content = row;
-        }
-        else testAll.Content = FluentControls.ButtonContent("speed", "测速");
-        testAll.IsEnabled = IsRunning && !busy;
+        testLabel.Text = busy ? L.F("正在测速 {0}/{1}", testDone, testTotal) : L.T("测速");
+        ProxyVisuals.SetBusyIcon(testIcon, busy);
+        // The reference keeps this accent action enabled while its speed icon
+        // works. MeasureAll still rejects a second concurrent batch.
+        testAll.IsEnabled = IsRunning;
     }
 
     public override async Task NavigateToAsync(NavigationTarget target)

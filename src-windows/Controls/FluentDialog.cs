@@ -16,10 +16,15 @@ internal sealed class FluentDialog : Window
 {
     private static readonly HashSet<Window> pendingConfirmations = [];
     private readonly Grid mask = new();
+    private readonly Grid notificationSurface = new();
     private readonly Border surface;
+    private readonly DropShadowEffect ambientShadow = new() { Color = Colors.Black, BlurRadius = 64, ShadowDepth = 32, Direction = 270, RenderingBias = RenderingBias.Quality };
+    private readonly DropShadowEffect contactShadow = new() { Color = Colors.Black, BlurRadius = 21, ShadowDepth = 2, Direction = 270, RenderingBias = RenderingBias.Quality };
     private readonly ScaleTransform scale = new(1, 1);
     private readonly DialogDismissal dismissal;
     private bool completing, closed;
+    internal bool IsClosed => closed;
+    internal Panel NotificationSurface => notificationSurface;
     internal Func<bool>? CanDismiss { get; set; }
     internal FluentDialog(Window owner, string title, UIElement body, IReadOnlyList<Button> actions, bool large = false, DialogDismissal dismissal = DialogDismissal.Immediate)
     {
@@ -54,22 +59,43 @@ internal sealed class FluentDialog : Window
         var bottom = new Border { Child = footer, Padding = new Thickness(padding), BorderThickness = new Thickness(0, 1, 0, 0), CornerRadius = new CornerRadius(0, 0, 7, 7) };
         bottom.SetResourceReference(Border.BorderBrushProperty, "DividerBrush"); bottom.SetResourceReference(Border.BackgroundProperty, "DialogBottomBrush");
         var stack = new StackPanel(); stack.Children.Add(top); if (hasFooter) stack.Children.Add(bottom);
-        surface = new Border { Child = stack, Width = Math.Min(large ? 640 : 448, Math.Max(280, Width - 32)), CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(1), VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center, RenderTransformOrigin = new Point(.5, .5), RenderTransform = scale,
-            Effect = new DropShadowEffect { Color = Colors.Black, BlurRadius = 64, ShadowDepth = 32, Direction = 270, Opacity = .1876 } };
-        surface.SetResourceReference(Border.BackgroundProperty, "DialogBottomBrush"); surface.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush");
-        mask.Children.Add(surface); Content = mask;
+        var card = new Border { Child = stack, CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(1) };
+        card.SetResourceReference(Border.BackgroundProperty, "DialogBottomBrush"); card.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush");
+        var layers = new Grid();
+        // Independent casters reproduce the two CSS box shadows without shadowing one another.
+        foreach (var effect in new[] { contactShadow, ambientShadow })
+        {
+            var caster = new Border { CornerRadius = new CornerRadius(8), Effect = effect, IsHitTestVisible = false };
+            caster.SetResourceReference(Border.BackgroundProperty, "DialogBottomBrush"); layers.Children.Add(caster);
+        }
+        layers.Children.Add(card);
+        surface = new Border { Child = layers, Width = Math.Min(large ? 640 : 448, Math.Max(280, Width - 32)), VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center, RenderTransformOrigin = new Point(.5, .5), RenderTransform = scale };
+        mask.Children.Add(surface); notificationSurface.Children.Add(mask); Content = notificationSurface;
         mask.MouseDown += (_, e) => { if (ReferenceEquals(e.OriginalSource, mask)) Complete(false); };
         PreviewKeyDown += (_, e) => { if (e.Key == Key.Escape) { e.Handled = true; Complete(false); } };
         Closing += (_, e) => { if (!completing && CanDismiss?.Invoke() == false) e.Cancel = true; };
-        Closed += (_, _) => { closed = true; mask.BeginAnimation(OpacityProperty, null); surface.BeginAnimation(OpacityProperty, null); };
+        Closed += (_, _) =>
+        {
+            closed = true; DesignTokens.Changed -= UpdateShadows;
+            mask.BeginAnimation(OpacityProperty, null); surface.BeginAnimation(OpacityProperty, null);
+            if (Owner is MainWindow main) main.RestoreNotifications();
+        };
         Loaded += (_, _) =>
         {
+            if (Owner is MainWindow main) main.AttachNotifications(notificationSurface);
+            DesignTokens.Changed += UpdateShadows; UpdateShadows();
             if (!FluentMotion.Enabled) return;
             if (dismissal == DialogDismissal.StateToggle) mask.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, FluentMotion.Fast) { FillBehavior = FillBehavior.Stop });
             surface.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, FluentMotion.Normal) { EasingFunction = FluentMotion.Decelerate, FillBehavior = FillBehavior.Stop });
             if (Width > 768)
                 foreach (var property in new[] { ScaleTransform.ScaleXProperty, ScaleTransform.ScaleYProperty }) scale.BeginAnimation(property, new DoubleAnimation(1.05, 1, FluentMotion.Normal) { EasingFunction = FluentMotion.Decelerate, FillBehavior = FillBehavior.Stop });
         };
+    }
+    private void UpdateShadows()
+    {
+        bool dark = TryFindResource("DialogBottomBrush") is SolidColorBrush background && background.Color.R < 128;
+        ambientShadow.Opacity = dark ? .37 : .1876;
+        contactShadow.Opacity = dark ? .37 : .1474;
     }
     internal void Complete(bool accepted)
     {

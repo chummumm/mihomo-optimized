@@ -696,7 +696,8 @@ class NativeDriver:
         self.buffer = bytearray()
         self.next_id = 0
         self.pipe_name = "mihomo-acceptance-" + secrets.token_hex(20)
-        self.process = desktop.spawn([str(app), "--automation-pipe", self.pipe_name], app.parent)
+        self.process = desktop.spawn([str(app), "--automation-pipe", self.pipe_name,
+            "--automation-diagnostics", str((artifacts / "native-fault.json").resolve())], app.parent)
         self.identity = processes.identity(self.process.pid)
         try:
             require(self.identity and self.identity.path == os.path.normcase(str(app.resolve())),
@@ -1486,7 +1487,10 @@ class Acceptance:
         require(not self.driver.snapshot().get("error"), "automatic_startup_ui_reported_failure")
         visible = self.driver.ui("*")
         preparing_text = "\n".join(item.get("name", "") for item in visible.get("elements", []))
-        require(visible.get("found") and "正在准备启动资源" in preparing_text,
+        recovery_hint = self.driver.ui("RecoveryHint")
+        recovery_start = self.driver.ui("RecoveryStartCore")
+        require(visible.get("found") and recovery_hint.get("found") and "准备所需资源" in recovery_hint.get("name", "")
+                and recovery_start.get("found") and not recovery_start.get("enabled"),
                 "automatic_startup_proxy_preparation_message_missing")
         require(not re.search(r"请先.*启动内核|内核尚未运行|没有代理策略组|导入订阅", preparing_text),
                 "automatic_startup_proxy_stopped_hint_visible")

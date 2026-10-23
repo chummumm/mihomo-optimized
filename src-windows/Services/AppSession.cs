@@ -33,6 +33,8 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     private Task<JsonElement>? updateCheck;
     public JsonElement Status { get; private set; } = JsonSerializer.SerializeToElement(new { phase = "connecting" });
     public JsonElement Update { get; private set; } = JsonSerializer.SerializeToElement(new { available = false });
+    public string? UpdateDismissedVersion { get; private set; }
+    public string? BusyCommand { get; private set; }
     public string Theme { get; private set; } = "system";
     public string Language { get; private set; } = "zh-CN";
     public string TestUrl { get; private set; } = "https://www.gstatic.com/generate_204";
@@ -100,13 +102,23 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public async Task StartAsync()
     {
         if (started) return;
-        host.Start();
-        started = true;
-        ApplyTheme();
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-        ApplyStatus(await host.CallAsync("desktop_status", null, timeout.Token));
-        _ = PollAsync();
-        _ = CheckUpdateOnLaunchAsync();
+        try
+        {
+            host.Start();
+            started = true;
+            ApplyTheme();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            ApplyStatus(await host.CallAsync("desktop_status", null, timeout.Token));
+            _ = PollAsync();
+            _ = CheckUpdateOnLaunchAsync();
+        }
+        catch (Exception error)
+        {
+            Ready = false;
+            Status = JsonSerializer.SerializeToElement(new { phase = "error", lastError = error.Message });
+            StatusChanged?.Invoke(this, EventArgs.Empty);
+            throw;
+        }
     }
 
     public async Task<JsonElement> CommandAsync(string method, object? args = null, CancellationToken cancellationToken = default)
@@ -128,10 +140,25 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             launchCheckConsumed = true;
             return await CheckUpdateAsync(cancellationToken);
         }
-        JsonElement result = await host.CallAsync(method, args, cancellationToken);
-        if (result.ValueKind == JsonValueKind.Object && result.TryGetProperty("phase", out _)) ApplyStatus(result);
-        if (method == "desktop_exit" && result.ValueKind == JsonValueKind.Object && result.TryGetProperty("exiting", out var leaving) && leaving.ValueKind == JsonValueKind.True) ExpectExit();
-        return result;
+        bool runtimeAction = method is "desktop_start" or "desktop_stop" or "desktop_restart" or "desktop_reload_config"
+            or "desktop_set_tun" or "desktop_set_system_proxy" or "desktop_install_service" or "desktop_uninstall_service";
+        if (runtimeAction)
+        {
+            if (BusyCommand is not null) throw new DesktopException("desktop_busy", "另一项桌面操作正在进行中，请稍候。");
+            BusyCommand = method;
+            StatusChanged?.Invoke(this, EventArgs.Empty);
+        }
+        try
+        {
+            JsonElement result = await host.CallAsync(method, args, cancellationToken);
+            if (result.ValueKind == JsonValueKind.Object && result.TryGetProperty("phase", out _)) ApplyStatus(result);
+            if (method == "desktop_exit" && result.ValueKind == JsonValueKind.Object && result.TryGetProperty("exiting", out var leaving) && leaving.ValueKind == JsonValueKind.True) ExpectExit();
+            return result;
+        }
+        finally
+        {
+            if (runtimeAction) { BusyCommand = null; StatusChanged?.Invoke(this, EventArgs.Empty); }
+        }
     }
 
     private void RejectDuringUpdate(string method)
@@ -243,10 +270,16 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
 
     private async Task<JsonElement> CheckUpdateAsync(CancellationToken cancellationToken)
     {
+        if (updateCheck is null)
+        {
+            Update = JsonSerializer.SerializeToElement(new { available = false });
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Update)));
+        }
         Task<JsonElement> check = updateCheck ??= host.CallAsync("desktop_check_update", null, lifetime.Token);
         try
         {
             Update = await check.WaitAsync(cancellationToken);
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Update)));
             return Update;
         }
         finally { if (check.IsCompleted && ReferenceEquals(updateCheck, check)) updateCheck = null; }
@@ -261,12 +294,18 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
                 await Task.Delay(TimeSpan.FromSeconds(2), lifetime.Token);
             if (launchCheckConsumed) return;
             launchCheckConsumed = true;
-            var update = await CheckUpdateAsync(lifetime.Token);
-            if (update.TryGetProperty("available", out var available) && available.ValueKind == JsonValueKind.True)
-                Notify(L.F("发现新版本 {0}，可在设置中更新。", HostChannel.Text(update, "version")));
+            await CheckUpdateAsync(lifetime.Token);
         }
         catch (OperationCanceledException) { }
         catch (Exception) { /* Automatic checks do not interrupt offline startup; manual checks show their error. */ }
+    }
+
+    public void DismissUpdate()
+    {
+        var version = HostChannel.Text(Update, "version");
+        if (version.Length == 0) return;
+        UpdateDismissedVersion = version;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(UpdateDismissedVersion)));
     }
 
     private (Uri Uri, string Secret) Endpoint(string path)

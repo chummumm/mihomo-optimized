@@ -145,11 +145,7 @@
       </Grid>
       <Border x:Name="MainContentBorder" Grid.Column="1" CornerRadius="8,0,0,0" Background="{DynamicResource LayerBrush}" BorderBrush="{DynamicResource LayerStrokeBrush}" BorderThickness="1,1,0,0" ClipToBounds="True">
         <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
-          <Border x:Name="NoticeBorder" Visibility="Collapsed" Padding="14,10" Margin="20,16,20,0" CornerRadius="4" Background="{DynamicResource SubtleSurfaceBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1">
-            <DockPanel><Button DockPanel.Dock="Right" Width="28" Height="28" Padding="4" Content="×" ToolTip="{services:Tr 关闭提示}" AutomationProperties.Name="{services:Tr 关闭提示}" Click="DismissNotice" Margin="12,0,0,0"/>
-              <TextBlock x:Name="NoticeText" TextWrapping="Wrap" VerticalAlignment="Center" AutomationProperties.AutomationId="MainError"/>
-            </DockPanel>
-          </Border>
+          <ContentControl x:Name="UpdateNoticeSlot" HorizontalContentAlignment="Stretch"/>
           <ContentControl x:Name="PageContent" Grid.Row="1" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch"/>
         </Grid>
       </Border>

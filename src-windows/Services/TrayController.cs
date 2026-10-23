@@ -99,7 +99,7 @@ internal sealed class TrayController : IDisposable
     public void Refresh()
     {
         string phase = session.Status.Text("phase");
-        bool idle = session.Ready && !session.IsUpdating && !commandBusy && phase is not ("starting" or "stopping" or "connecting");
+        bool idle = session.Ready && !session.IsUpdating && session.BusyCommand is null && !commandBusy && phase is not ("starting" or "stopping" or "connecting");
         stateItem.Text = L.T(phase switch { "running" => "内核运行中", "starting" => "正在启动内核…", "stopping" => "正在停止内核…", "error" => "内核需要处理", "stopped" => "内核已停止", _ => "正在连接…" });
         icon.Text = "Mihomo Optimized · " + stateItem.Text;
         openItem.Text = L.T("打开主界面"); coreItem.Text = L.T(IsRunning ? "停止内核" : "启动内核"); restartItem.Text = L.T("重启内核");
@@ -317,7 +317,7 @@ internal sealed class TrayWindow : Window
             string label = L.T(phase switch { "running" => "运行中", "starting" => "正在启动…", "stopping" => "正在停止…", "error" => "需要处理", "stopped" => "已停止", _ => "正在连接…" });
             string modeLabel = L.T(mode.Mode switch { "global" => "全局模式", "direct" => "直连模式", _ => "规则模式" }); state.Text = label + (running ? " · " + modeLabel : "");
             stateDot.SetResourceReference(Shape.FillProperty, running ? "SuccessBrush" : busy ? "WarningBrush" : phase == "error" ? "DangerBrush" : "TextTertiaryBrush");
-            bool interactive = session.Ready && !busy && !outerBusy && !changing && !session.IsUpdating;
+            bool interactive = session.Ready && !busy && !outerBusy && !changing && !session.IsUpdating && session.BusyCommand is null;
             proxy.IsChecked = session.Status.Bool("systemProxy"); tun.IsChecked = session.Status.Bool("tun"); lan.IsChecked = allowLan;
             power.IsEnabled = interactive; proxy.IsEnabled = interactive && session.Status.Get("capabilities").Bool("systemProxy"); tun.IsEnabled = interactive && session.Status.Get("capabilities").Bool("tun"); lan.IsEnabled = mode.IsEnabled = interactive && running && runtimeReady && !session.IsDirty;
             foreach (var item in new[] { proxy, tun, lan }) if (item.Content is FluentIcon glyph) glyph.Filled = item.IsChecked == true;

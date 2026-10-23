@@ -97,7 +97,10 @@ public sealed class RulesPage : NativePage
             var update = Action("更新", "UpdateRuleProvider_" + name, () => UpdateProvider(name));
             update.Style = FluentControls.Style("Ghost"); update.Height = 28; update.FontSize = 13; update.Padding = new Thickness(10, 0, 10, 0); update.Margin = new Thickness(0);
             var busy = updating.Contains(name); var buttonContent = new StackPanel { Orientation = Orientation.Horizontal };
-            buttonContent.Children.Add(busy ? new FluentProgressRing { Width = 16, Height = 16, IsActive = true, Margin = new Thickness(0, 0, 8, 0) } : new FluentIcon("update", 16) { Margin = new Thickness(0, 0, 8, 0) }); buttonContent.Children.Add(Ui.Label("更新", 13)); update.Content = buttonContent; update.IsEnabled = !busy && IsRunning;
+            var updateIcon = new FluentIcon("update", 14) { Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center };
+            ProxyVisuals.SetBusyIcon(updateIcon, busy);
+            buttonContent.Children.Add(updateIcon); buttonContent.Children.Add(Ui.Label("更新", 13)); update.Content = buttonContent; update.IsEnabled = !busy && IsRunning;
+            if (busy) buttonContent.SetResourceReference(TextElement.ForegroundProperty, "TextSecondaryBrush");
             var row = new RuleProviderLayout { Margin = new Thickness(16, 10, 16, 10) };
             var nameText = Ui.Text(name, 13, true); nameText.MaxWidth = 240; nameText.TextWrapping = TextWrapping.NoWrap; nameText.TextTrimming = TextTrimming.CharacterEllipsis; nameText.ToolTip = name; nameText.Opacity = busy ? .6 : 1;
             var nameRow = new RuleProviderHeader(); foreach (var item in new FrameworkElement[] { nameText, ProviderTag(value.Text("vehicleType")), ProviderTag(value.Text("behavior"), true) }) nameRow.Children.Add(item); row.Children.Add(nameRow);

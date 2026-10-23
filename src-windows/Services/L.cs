@@ -25,6 +25,7 @@ public static partial class L
         RegisterProxyEditor(catalog);
         RegisterSearchSettings(catalog);
         RegisterDns(catalog);
+        RegisterRecovery(catalog);
         return catalog;
     }
     static partial void RegisterCommon(Dictionary<string, string> catalog);
@@ -32,6 +33,7 @@ public static partial class L
     static partial void RegisterProxyEditor(Dictionary<string, string> catalog);
     static partial void RegisterSearchSettings(Dictionary<string, string> catalog);
     static partial void RegisterDns(Dictionary<string, string> catalog);
+    static partial void RegisterRecovery(Dictionary<string, string> catalog);
 
     public static string T(string text) => IsEnglish && english.TryGetValue(text, out var translated) ? translated : text;
     public static string F(string template, params object?[] arguments) => string.Format(CultureInfo.CurrentCulture, T(template), arguments);

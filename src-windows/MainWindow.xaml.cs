@@ -22,6 +22,9 @@ public partial class MainWindow : Window
     private readonly TrayController tray;
     private readonly NativeBackdrop backdrop;
     private readonly NativeTitleBar titleBar;
+    private readonly DesktopRecovery recovery;
+    private readonly DesktopUpdateNotice updateNotice;
+    internal TransientMessageHost Notifications { get; } = new();
     private readonly string shellPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Mihomo Optimized", "native-shell.json");
     private NativePage? activePage;
     private SearchWindow? searchWindow;
@@ -45,6 +48,10 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         this.session = session;
+        recovery = new DesktopRecovery(session);
+        updateNotice = new DesktopUpdateNotice(session);
+        UpdateNoticeSlot.Content = updateNotice;
+        AttachNotifications(ClientArea);
         SearchButton.OpenRequested += ShowSearch;
         try { if (File.Exists(shellPath)) { using var saved = JsonDocument.Parse(File.ReadAllText(shellPath)); preferCompact = saved.RootElement.Bool("navigationCollapsed"); } }
         catch (Exception error) when (error is IOException or JsonException or UnauthorizedAccessException) { }
@@ -53,7 +60,11 @@ public partial class MainWindow : Window
         titleBar = new NativeTitleBar(this, MaximizeButton, ToggleMaximize);
         tray = new TrayController(this, session);
         session.StatusChanged += (_, _) => UpdateStatus();
-        session.PropertyChanged += (_, e) => { if (e.PropertyName == nameof(AppSession.RuntimeMode)) UpdateTitleSubtitle(); };
+        session.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(AppSession.RuntimeMode)) UpdateTitleSubtitle();
+            if (e.PropertyName is nameof(AppSession.Update) or nameof(AppSession.UpdateDismissedVersion)) UpdateUpdateNotice();
+        };
         session.Notification += ShowNotice;
         session.NavigateRequested += key => _ = NavigateAsync(key);
         session.NavigateTargetRequested += target => _ = NavigateAsync(target);
@@ -71,6 +82,7 @@ public partial class MainWindow : Window
         Deactivated += (_, _) => UpdateCaptionActivity(false);
         IsVisibleChanged += (_, _) => { UpdatePageActivity(); UpdateNavigationIndicator(false); };
         SizeChanged += (_, _) => ApplyNavigationSize();
+        MainContentBorder.SizeChanged += (_, _) => UpdateNoticeMetrics();
         PreviewKeyDown += OnKey;
         NavigationList.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler((_, _) => UpdateNavigationIndicator(false)));
         Loaded += async (_, _) => { ApplyNavigationSize(); UpdateStatus(); if (activePage is null) await NavigateAsync("home"); };
@@ -94,11 +106,11 @@ public partial class MainWindow : Window
                 if (remember && activePage is not null) history.Add(location with { Action = null });
                 activePage?.Deactivate();
                 if (!pages.TryGetValue(target.Page, out page!)) { page = PageFactory.Create(target.Page, session); pages.Add(target.Page, page); }
-                currentPage = target.Page; activePage = page; PageContent.Content = page;
+                currentPage = target.Page; activePage = page;
                 if (page is IPageBackNavigation nextBack) nextBack.BackStateChanged += UpdateBackButton;
                 SelectNavigation(target.Page); CloseOverlay(true); UpdatePageActivity();
                 if (ConnectedNavigation.HasPending(this, target.Target)) { page.BeginAnimation(OpacityProperty, null); page.Opacity = 1; page.RenderTransform = Transform.Identity; }
-                else FluentMotion.Enter(page, back);
+                else FluentMotion.Enter(RecoveryRequired ? recovery : page, back);
             }
             else { page = activePage!; CloseOverlay(true); }
             location = target with { Action = null }; UpdateBackButton();
@@ -107,6 +119,7 @@ public partial class MainWindow : Window
         finally { navigating = false; UpdateBackButton(); }
         try
         {
+            if (RecoveryRequired) return true;
             // Target operations (focus, search or testing) do not hold the shell's
             // navigation lock. A slow latency test must not trap the current page.
             await page.NavigateToAsync(target);
@@ -152,12 +165,13 @@ public partial class MainWindow : Window
         string version = ShortVersion(session.Status.Text("coreVersion")); VersionText.Text = version.Length > 0 ? L.F("内核 {0}", version) : "—";
         AutomationProperties.SetName(CoreCardButton, L.T("本地内核") + " · " + PhaseText.Text);
         CoreCardButton.ToolTip = PhaseText.Text + " · " + VersionText.Text;
-        UpdateBadge.Visibility = session.Update.Bool("available") ? Visibility.Visible : Visibility.Collapsed;
+        UpdateUpdateNotice();
         UpdateTitleSubtitle();
         string error = session.Status.Text("lastError");
         if (error.Length > 0 && error != lastCoreError) ShowNotice(error, true);
-        if (lastCoreError.Length > 0 && error.Length == 0 && NoticeText.Text == lastCoreError) NoticeBorder.Visibility = Visibility.Collapsed;
         lastCoreError = error;
+        recovery.Refresh();
+        UpdatePageActivity();
         tray.Refresh();
     }
     private static string ShortVersion(string value)
@@ -180,11 +194,26 @@ public partial class MainWindow : Window
     }
     private void ShowNotice(string text, bool error)
     {
-        NoticeText.Text = L.T(text);
-        NoticeText.SetResourceReference(TextBlock.ForegroundProperty, error ? "DangerBrush" : "TextPrimaryBrush");
-        NoticeBorder.Visibility = string.IsNullOrEmpty(text) ? Visibility.Collapsed : Visibility.Visible;
+        if (!string.IsNullOrEmpty(text)) Notifications.Show(L.T(text), error ? TransientMessageKind.Error : TransientMessageKind.Info);
     }
-    private void DismissNotice(object sender, RoutedEventArgs e) => NoticeBorder.Visibility = Visibility.Collapsed;
+    private void UpdateUpdateNotice()
+    {
+        updateNotice.Refresh();
+        UpdateBadge.Visibility = updateNotice.Available ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    internal void AttachNotifications(Panel surface)
+    {
+        if (ReferenceEquals(Notifications.Parent, surface)) return;
+        if (Notifications.Parent is Panel previous) previous.Children.Remove(Notifications);
+        Grid.SetRowSpan(Notifications, 2); Grid.SetColumnSpan(Notifications, 2); Panel.SetZIndex(Notifications, 60);
+        surface.Children.Add(Notifications);
+    }
+    internal void RestoreNotifications()
+    {
+        var dialog = OwnedWindows.OfType<FluentDialog>().LastOrDefault(window => window.IsVisible && !window.IsClosed);
+        AttachNotifications(dialog?.NotificationSurface ?? ClientArea);
+    }
 
     public void ShowMain()
     {
@@ -194,8 +223,20 @@ public partial class MainWindow : Window
     public void HideToTray() { CloseOverlay(false); Hide(); activePage?.Deactivate(); }
     private void UpdatePageActivity()
     {
-        if (IsVisible && WindowState != WindowState.Minimized) activePage?.Activate();
+        bool recovering = RecoveryRequired;
+        bool resumed = !navigating && ReferenceEquals(PageContent.Content, recovery) && !recovering;
+        var shown = recovering ? recovery : activePage;
+        if (!ReferenceEquals(PageContent.Content, shown)) PageContent.Content = shown;
+        if (IsVisible && WindowState != WindowState.Minimized && !recovering) activePage?.Activate();
         else activePage?.Deactivate();
+        if (resumed && activePage is { } page) _ = ResumePageTargetAsync(page, location);
+    }
+    private bool RecoveryRequired => currentPage is not ("home" or "settings" or "profiles") && session.Status.Text("phase") != "running";
+    private async Task ResumePageTargetAsync(NativePage page, NavigationTarget target)
+    {
+        try { if (ReferenceEquals(page, activePage)) await page.NavigateToAsync(target); }
+        catch (OperationCanceledException) { }
+        catch (Exception error) { ShowNotice(error.Message, true); }
     }
     private void ToggleNavigation(object sender, RoutedEventArgs e)
     {
@@ -231,8 +272,10 @@ public partial class MainWindow : Window
         MainContentBorder.CornerRadius = next == "minimal" ? new CornerRadius(0) : new CornerRadius(8, 0, 0, 0);
         MainContentBorder.BorderThickness = next == "minimal" ? new Thickness(0, 1, 0, 0) : new Thickness(1, 1, 0, 0);
         ApplySubpageState();
+        UpdateNoticeMetrics();
         Dispatcher.InvokeAsync(() => UpdateNavigationIndicator(false), System.Windows.Threading.DispatcherPriority.Loaded);
     }
+    private void UpdateNoticeMetrics() => updateNotice.SetContainerWidth(Math.Max(0, MainContentBorder.ActualWidth - MainContentBorder.BorderThickness.Left - MainContentBorder.BorderThickness.Right), ActualWidth <= 640);
     private void ApplyNavigationContent(bool animate = false, bool? showLabels = null)
     {
         bool expanded = showLabels ?? (overlayOpen || overlayClosing || navigationMode == "expanded");
@@ -352,7 +395,7 @@ public partial class MainWindow : Window
         var menu = new ContextMenu { PlacementTarget = CoreCardButton, Placement = navigationMode == "expanded" || overlayOpen ? PlacementMode.Bottom : PlacementMode.Right };
         menu.Items.Add(new MenuItem { Header = PhaseText.Text + " · " + VersionText.Text, IsEnabled = false }); menu.Items.Add(new Separator());
         bool running = session.Status.Text("phase") == "running";
-        bool idle = session.Ready && !session.IsUpdating && !shellCommandBusy && session.Status.Text("phase") is not ("starting" or "stopping");
+        bool idle = session.Ready && !session.IsUpdating && session.BusyCommand is null && !shellCommandBusy && session.Status.Text("phase") is not ("starting" or "stopping");
         void Add(string text, string icon, bool enabled, Func<Task> operation)
         {
             var item = new MenuItem { Header = L.T(text), Icon = new FluentIcon(icon), IsEnabled = enabled };
@@ -489,6 +532,7 @@ public partial class MainWindow : Window
         if (allowClose) return; allowClose = true;
         foreach (var page in pages.Values) page.Deactivate();
         L.Changed -= OnLanguageChanged; searchWindow?.Close(); backdrop.Dispose(); titleBar.Dispose(); tray.Dispose();
+        Notifications.Dispose();
         await session.DisposeAsync(); Close(); Application.Current.Shutdown();
     }
 
@@ -499,7 +543,7 @@ public partial class MainWindow : Window
             case "native_arm_motion": return NativeMotionCapture.Arm(this, args);
             case "native_motion_status": return NativeMotionCapture.Status();
             case "native_snapshot":
-                return new { ready = session.Ready, visible = IsVisible, phase = session.Status.Text("phase"), page = currentPage, error = NoticeBorder.Visibility == Visibility.Visible ? NoticeText.Text : "", busy = preparingExit || session.Status.Text("phase") is "starting" or "stopping", navigationMode, navigationOverlay = overlayOpen, material = backdrop.Material, customTitleBar = true, canGoBack = BackButton.IsEnabled, language = session.Language, theme = session.Theme, captureKind = "wpf-visual-tree", trayVisible = tray.IsFlyoutVisible, searchVisible = searchWindow?.IsVisible == true };
+                return new { ready = session.Ready, visible = IsVisible, phase = session.Status.Text("phase"), page = currentPage, error = session.Status.Text("lastError") is { Length: > 0 } coreError ? coreError : Notifications.IsErrorVisible ? Notifications.VisibleMessageText : "", busy = preparingExit || session.BusyCommand is not null || session.Status.Text("phase") is "starting" or "stopping", navigationMode, navigationOverlay = overlayOpen, material = backdrop.Material, customTitleBar = true, canGoBack = BackButton.IsEnabled, language = session.Language, theme = session.Theme, captureKind = "wpf-visual-tree", trayVisible = tray.IsFlyoutVisible, searchVisible = searchWindow?.IsVisible == true };
             case "native_navigate":
                 return new { navigated = await NavigateAsync(new NavigationTarget(args.Text("page"), EmptyNull(args.Text("target")), EmptyNull(args.Text("query")), EmptyNull(args.Text("action")))) };
             case "native_show": ShowMain(); return new { visible = IsVisible };

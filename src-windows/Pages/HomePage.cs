@@ -195,7 +195,7 @@ public sealed class HomePage : NativePage
             processes = connections = 0; downloaded = uploaded = 0; port = 0; allowLan = false;
         }
         bool busy = state is "starting" or "stopping" or "connecting";
-        bool interactive = Session.Ready && !busy && !Session.IsUpdating && pending.Length == 0;
+        bool interactive = Session.Ready && !busy && !Session.IsUpdating && Session.BusyCommand is null && pending.Length == 0;
         modes.SetMode(runtimeMode);
         phase.Text = L.T(state switch { "running" => "已连接", "starting" => "正在启动", "stopping" => "正在停止", "error" => "运行异常", "stopped" => "未运行", _ => "正在连接…" });
         phase.SetResourceReference(TextBlock.ForegroundProperty, state == "error" ? "DangerBrush" : "TextPrimaryBrush");

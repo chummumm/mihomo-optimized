@@ -99,7 +99,7 @@ public sealed class SettingsPage : NativePage
     private TaskCompletionSource<bool>? pendingOperation;
     private string renderedUpdate = "";
 
-    private bool DesktopBusy => changing || !Session.Ready || Session.IsUpdating || Session.Status.Text("phase") is "connecting" or "starting" or "stopping";
+    private bool DesktopBusy => changing || !Session.Ready || Session.IsUpdating || Session.BusyCommand is not null || Session.Status.Text("phase") is "connecting" or "starting" or "stopping";
     private bool RuntimeEditable => !DesktopBusy && IsRunning && !Session.IsDirty && runtimeIdentity == ControllerIdentity;
 
     public SettingsPage(AppSession session) : base(session, "settings", "设置", "")

@@ -145,5 +145,9 @@ public static partial class L
         catalog["日志"] = "Logs";
         catalog["配置"] = "Configuration";
         catalog["未测量"] = "Not measured";
+        catalog["发现新版本"] = "New version available";
+        catalog["查看更新"] = "View update";
+        catalog["关闭更新提示"] = "Dismiss update notice";
+        catalog["另一项桌面操作正在进行中，请稍候。"] = "Another desktop operation is in progress. Please wait.";
     }
 }

@@ -14,6 +14,7 @@ public partial class App : Application
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        NativeFaultDiagnostics.Attach(this, e.Args);
         try
         {
             if (e.Args.FirstOrDefault() is "--install" or "--uninstall" or "--stop-for-update" or "--start-if-installed")
