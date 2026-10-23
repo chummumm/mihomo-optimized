@@ -5,7 +5,7 @@
         WindowStartupLocation="CenterScreen" FontFamily="Segoe UI Variable, Segoe UI, Microsoft YaHei UI"
         FontSize="14" Background="{DynamicResource AppBackgroundBrush}" Foreground="{DynamicResource TextPrimaryBrush}"
         Icon="Assets/icon.ico" AutomationProperties.AutomationId="MainWindow">
-  <Grid>
+  <Grid x:Name="ClientArea" Background="{DynamicResource AppBackgroundBrush}">
     <Grid.RowDefinitions><RowDefinition Height="52" /><RowDefinition Height="*" /></Grid.RowDefinitions>
     <Grid Margin="14,4,18,4">
       <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>

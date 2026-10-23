@@ -9,7 +9,7 @@ use crate::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::io::Read;
+use std::{io::Read, sync::TryLockError};
 
 fn decode<T: DeserializeOwned>(params: Map<String, Value>) -> Result<T> {
     serde_json::from_value(Value::Object(params))
@@ -85,9 +85,22 @@ fn with_manager<T>(
     operation(&mut manager)
 }
 
-pub fn status(context: &HostContext, params: Map<String, Value>) -> Result<Value> {
+pub fn status(
+    state: &HostState,
+    context: &HostContext,
+    params: Map<String, Value>,
+) -> Result<Value> {
     decode::<Empty>(params)?;
-    encode(context.status()?)
+    // External service and login-startup changes must be visible while idle.
+    // Never wait behind resource preparation or another long core operation.
+    match state.0.try_lock() {
+        Ok(manager) => encode(manager.status()),
+        Err(TryLockError::WouldBlock) => encode(context.status()?),
+        Err(TryLockError::Poisoned(_)) => Err(AppError::new(
+            "state_unavailable",
+            "桌面状态不可用，请重新启动程序",
+        )),
+    }
 }
 
 fn core_action(

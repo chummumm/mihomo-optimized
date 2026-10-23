@@ -223,9 +223,12 @@ public partial class MainWindow : Window
                 string path = Path.GetFullPath(HostChannel.Text(args, "path"));
                 if (!path.EndsWith(".png", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("Screenshot must be a PNG file");
                 ShowMain(); UpdateLayout();
-                var dpi = VisualTreeHelper.GetDpi(this);
-                var bitmap = new RenderTargetBitmap((int)Math.Ceiling(ActualWidth * dpi.DpiScaleX), (int)Math.Ceiling(ActualHeight * dpi.DpiScaleY), dpi.PixelsPerInchX, dpi.PixelsPerInchY, PixelFormats.Pbgra32);
-                bitmap.Render(this);
+                // WPF renders the client area; the system caption and resize
+                // frame are not part of this visual. Match the bitmap to the
+                // rendered element instead of leaving transparent frame space.
+                var dpi = VisualTreeHelper.GetDpi(ClientArea);
+                var bitmap = new RenderTargetBitmap((int)Math.Ceiling(ClientArea.ActualWidth * dpi.DpiScaleX), (int)Math.Ceiling(ClientArea.ActualHeight * dpi.DpiScaleY), dpi.PixelsPerInchX, dpi.PixelsPerInchY, PixelFormats.Pbgra32);
+                bitmap.Render(ClientArea);
                 var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(bitmap));
                 using (var file = File.Create(path)) png.Save(file);
                 return new { path };

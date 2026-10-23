@@ -236,13 +236,22 @@ pub fn run() -> Result<()> {
     let state = HostState(Arc::new(Mutex::new(manager)));
     let (work, requests) = mpsc::sync_channel(WORK_QUEUE_CAPACITY);
     let stopping = Arc::new(AtomicBool::new(false));
+    let worker_state = state.clone();
     let worker_context = context.clone();
     let worker_stopping = stopping.clone();
     let poll_state = state.clone();
     let poll_stopping = stopping.clone();
     thread::Builder::new()
         .name("desktop-operations".into())
-        .spawn(move || operations(state, worker_context, requests, worker_stopping, start))
+        .spawn(move || {
+            operations(
+                worker_state,
+                worker_context,
+                requests,
+                worker_stopping,
+                start,
+            )
+        })
         .map_err(|e| AppError::io("无法启动桌面操作线程", e))?;
     // Subscription/update downloads deliberately release the manager lock.
     // Keep the authenticated TUN heartbeat alive during that network work;
@@ -266,7 +275,7 @@ pub fn run() -> Result<()> {
         .spawn(move || read_requests(output))
         .map_err(|e| AppError::io("无法启动桌面请求通道", e))?;
     crate::update_cache::start_cleanup_worker();
-    protocol_loop(context, messages, work, stopping)
+    protocol_loop(state, context, messages, work, stopping)
 }
 
 fn read_requests(output: SyncSender<Message>) {
@@ -298,6 +307,7 @@ fn reply(id: Option<i64>, result: Result<Value>) -> Value {
 }
 
 fn protocol_loop(
+    state: HostState,
     context: HostContext,
     messages: Receiver<Message>,
     work: SyncSender<Request>,
@@ -330,7 +340,7 @@ fn protocol_loop(
                 } else if request.method == "desktop_status" {
                     Some(reply(
                         Some(request.id),
-                        commands::status(&context, request.params),
+                        commands::status(&state, &context, request.params),
                     ))
                 } else {
                     let id = request.id;
