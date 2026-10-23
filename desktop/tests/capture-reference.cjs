@@ -591,7 +591,11 @@ async function configureScenario (page, scenario) {
         await editor.fill(scenario.editor?.content ?? scenario.config.content)
         await editor.evaluate((element, selection) => {
             element.setSelectionRange(selection.start, selection.start + selection.length)
-            element.dispatchEvent(new Event('select', { bubbles: true }))
+            // React's onSelect does not subscribe to a textarea's native
+            // `select` event. Use the original editor's ordinary key-up tracker
+            // after restoring the observed selection, so the visible line/column
+            // describes the caret we actually capture rather than fill()'s end.
+            element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Shift', bubbles: true }))
             element.scrollTop = 0
         }, { start: scenario.editor?.selectionStart || 0, length: scenario.editor?.selectionLength || 0 })
         if (scenario.name === 'config-unsaved') {

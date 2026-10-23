@@ -87,6 +87,9 @@ public static partial class L
         catalog["代理集"] = "Providers";
         catalog["以下更新仅处理规则与地理数据库。应用、内核及内置界面由桌面更新统一管理。"] = "These updates only handle rules and GeoData. Desktop updates manage the application, core and bundled dashboard together.";
         catalog["保存会校验 YAML 基本结构；完整配置校验在重新加载时进行。草稿仅保留在内存中，关闭编辑器前会确认未保存的修改。"] = "Saving checks the basic YAML structure; full validation runs on reload. Drafts stay in memory. You will be asked before closing with unsaved changes.";
+        catalog["保存会校验 YAML 基本结构；完整配置校验在重新加载时进行。草稿仅留在内存中，关闭或切换控制器后清除。"] = "Saving checks the basic YAML structure; full configuration validation runs on reload. Drafts stay in memory and are cleared when you close the editor or switch controllers.";
+        catalog["有尚未保存的修改"] = "You have unsaved changes";
+        catalog["当前草稿尚未保存"] = "Your draft is not saved";
         catalog["保存并重新加载"] = "Save and reload";
         catalog["保存并重新加载会先写入配置文件，再由内核校验并应用。控制器地址和密钥等启动配置需重启内核后生效。"] = "Save and reload writes the file, then asks the core to validate and apply it. Startup settings such as the controller address and secret require a core restart.";
         catalog["关闭后将丢弃尚未保存的修改。确定关闭吗？"] = "Closing will discard your unsaved changes. Close the editor?";

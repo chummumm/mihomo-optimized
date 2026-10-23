@@ -64,7 +64,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private string revision = "", originalContent = "", documentPath = "", problem = "", lastPhase = "";
     private bool applyingDocument, loaded, reading, saving, reloading, importing, dirty, conflict, saved, reloadPending, updateWasActive;
     private bool writable = true;
-    private bool importOpening, leaveOpening;
+    private bool importOpening, importPreviewVisible, leaveOpening;
     private long documentGeneration, draftGeneration, summaryReadAt;
     private int? groupCount, ruleCount;
     private int maxBytes = MaximumConfigBytes;
@@ -123,14 +123,14 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         editorFooter.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); editorFooter.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); editorFooter.Children.Add(readAgain); readAgain.HorizontalAlignment = HorizontalAlignment.Left; Grid.SetColumn(rightActions, 1); editorFooter.Children.Add(rightActions);
         editorFooter.SizeChanged += (_, _) => { var compact = editorFooter.ActualWidth < readAgain.DesiredSize.Width + rightActions.DesiredSize.Width + 8; Grid.SetRow(rightActions, compact ? 1 : 0); Grid.SetColumn(rightActions, compact ? 0 : 1); Grid.SetColumnSpan(rightActions, compact ? 2 : 1); rightActions.Margin = new Thickness(0, compact ? 8 : 0, 0, 0); };
         keepEditing = IconAction("继续编辑", "ConfigKeepEditing", "edit", () => { SetConfirmation(Confirmation.None); Editor.Focus(); return Task.CompletedTask; });
-        confirmDiscard = IconAction("放弃修改", "ConfigConfirmDiscard", "trash", ConfirmDiscard); confirmDiscard.SetResourceReference(Control.ForegroundProperty, "DangerBrush");
+        confirmDiscard = IconAction("放弃修改", "ConfigConfirmDiscard", "trash", ConfirmDiscard); FluentControlState.SetKind(confirmDiscard, "Danger");
         var confirmationLayout = new Grid(); confirmationLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(34) }); confirmationLayout.ColumnDefinitions.Add(new ColumnDefinition()); confirmationLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); confirmationLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); confirmationLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var warning = new FluentIcon("warning", 20) { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Left }; warning.SetResourceReference(Control.ForegroundProperty, "WarningBrush"); confirmationLayout.Children.Add(warning);
         confirmationTitle.LineHeight = confirmationText.LineHeight = 20; confirmationTitle.LineStackingStrategy = confirmationText.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; confirmationText.FontSize = 14; confirmationText.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush"); confirmationText.Margin = new Thickness(0, 2, 0, 0);
         var confirmationCopy = Ui.Column(confirmationTitle, confirmationText); confirmationCopy.Margin = new Thickness(0, 0, 14, 0); Grid.SetColumn(confirmationCopy, 1); confirmationLayout.Children.Add(confirmationCopy);
         var confirmationActions = new WrapPanel { HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center }; keepEditing.Margin = new Thickness(0, 0, 8, 0); confirmDiscard.Margin = new Thickness(0); confirmationActions.Children.Add(keepEditing); confirmationActions.Children.Add(confirmDiscard); Grid.SetColumn(confirmationActions, 2); confirmationLayout.Children.Add(confirmationActions);
         confirmationLayout.SizeChanged += (_, _) => { var compact = confirmationLayout.ActualWidth < 34 + 260 + confirmationActions.DesiredSize.Width; Grid.SetRow(confirmationActions, compact ? 1 : 0); Grid.SetColumn(confirmationActions, compact ? 0 : 2); Grid.SetColumnSpan(confirmationActions, compact ? 3 : 1); confirmationActions.Margin = new Thickness(0, compact ? 12 : 0, 0, 0); };
-        confirmationPane = Ui.Card(confirmationLayout, 0); confirmationPane.Padding = new Thickness(14, 12, 12, 12); confirmationPane.CornerRadius = new CornerRadius(8); confirmationPane.Visibility = Visibility.Collapsed; confirmationPane.Margin = new Thickness(0); confirmationPane.Id("ConfigDiscardConfirmation"); confirmationPane.SetResourceReference(Border.BackgroundProperty, "WarningBackgroundBrush"); confirmationPane.RenderTransformOrigin = new Point(.5, 1);
+        confirmationPane = Ui.Card(confirmationLayout, 0); confirmationPane.Padding = new Thickness(14, 12, 12, 12); confirmationPane.CornerRadius = new CornerRadius(8); confirmationPane.Visibility = Visibility.Collapsed; confirmationPane.Margin = new Thickness(0); confirmationPane.Id("ConfigDiscardConfirmation"); confirmationPane.SetResourceReference(Border.BackgroundProperty, "WarningBackgroundBrush"); confirmationPane.SetResourceReference(Border.BorderBrushProperty, "CardStrokeBrush"); confirmationPane.RenderTransformOrigin = new Point(.5, 1);
         BuildEditor(); overviewScroll = new ScrollViewer(); SetScrollableBody(overview, overviewScroll);
         Editor.TextChanged += EditorChanged; code.PositionChanged += UpdatePosition;
         PreviewKeyDown += (_, e) => { if (CanGoBack && e.Key == Key.S && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; _ = RunAsync(() => Save(true)); } };
@@ -165,8 +165,8 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     {
         editPane.SetResourceReference(Panel.BackgroundProperty, "SolidBaseBrush"); editPane.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); editPane.RowDefinitions.Add(new RowDefinition());
         var layer = new Border(); layer.SetResourceReference(Border.BackgroundProperty, "LayerBrush"); Grid.SetRowSpan(layer, 2); editPane.Children.Add(layer);
-        var crumbs = new Grid(); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(40) }); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); crumbs.ColumnDefinitions.Add(new ColumnDefinition());
-        var back = FluentControls.IconButton("arrow-left", "返回", "ConfigEditorBack"); back.Click += async (_, _) => await RunAsync(CloseEditor); crumbs.Children.Add(back);
+        var crumbs = new Grid(); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(48) }); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); crumbs.ColumnDefinitions.Add(new ColumnDefinition());
+        var back = FluentControls.IconButton("arrow-left", "返回", "ConfigEditorBack", 40); back.Height = 36; back.HorizontalAlignment = HorizontalAlignment.Left; back.Click += async (_, _) => await RunAsync(CloseEditor); crumbs.Children.Add(back);
         var parent = Ui.Label("配置", 28, true); parent.LineHeight = 36; parent.SetResourceReference(TextBlock.FontFamilyProperty, "DisplayFont"); parent.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); editorCrumb.Content = parent; editorCrumb.Click += async (_, _) => await RunAsync(CloseEditor); Grid.SetColumn(editorCrumb, 1); crumbs.Children.Add(editorCrumb);
         editorSeparator.Margin = new Thickness(8, 0, 8, 0); editorSeparator.SetResourceReference(Control.ForegroundProperty, "TextSecondaryBrush"); Grid.SetColumn(editorSeparator, 2); crumbs.Children.Add(editorSeparator);
         editorTitle.LineHeight = 36; editorTitle.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; editorTitle.SetResourceReference(TextBlock.FontFamilyProperty, "DisplayFont"); editorTitle.TextWrapping = TextWrapping.NoWrap; editorTitle.TextTrimming = TextTrimming.CharacterEllipsis; Grid.SetColumn(editorTitle, 3); crumbs.Children.Add(editorTitle); editorHeader.Child = crumbs; editPane.Children.Add(editorHeader);
@@ -178,8 +178,9 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         editorNotice.FontSize = 12; editorNotice.LineHeight = 16; editorNotice.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; editorNoticeFrame.Child = editorNotice; editorNoticeFrame.Padding = new Thickness(12, 8, 12, 8); editorNoticeFrame.BorderThickness = new Thickness(1); editorNoticeFrame.CornerRadius = new CornerRadius(4); editorNoticeFrame.Margin = new Thickness(0, 0, 0, 8); Grid.SetRow(editorNoticeFrame, 1); editorContent.Children.Add(editorNoticeFrame);
         code.Margin = new Thickness(0, 0, 0, 8); Grid.SetRow(code, 2); editorContent.Children.Add(code);
         var status = new Grid { Margin = new Thickness(0, 0, 0, 8) }; status.ColumnDefinitions.Add(new ColumnDefinition()); status.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); status.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        var note = Ui.Hint("保存会校验 YAML 基本结构；完整配置校验在重新加载时进行。草稿仅保留在内存中，关闭编辑器前会确认未保存的修改。"); note.MaxWidth = 65 * 7.2; note.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); note.Margin = new Thickness(0, 0, 16, 0); status.Children.Add(note);
-        editorPosition.TextWrapping = TextWrapping.NoWrap; editorPosition.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); editorPosition.Margin = new Thickness(0, 0, 16, 0); Grid.SetColumn(editorPosition, 1); status.Children.Add(editorPosition); var encoding = Ui.Muted("YAML · UTF-8", 12); encoding.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); Grid.SetColumn(encoding, 2); status.Children.Add(encoding); Grid.SetRow(status, 3); editorContent.Children.Add(status);
+        var note = Ui.Hint("保存会校验 YAML 基本结构；完整配置校验在重新加载时进行。草稿仅留在内存中，关闭或切换控制器后清除。"); note.HorizontalAlignment = HorizontalAlignment.Left; note.LineHeight = 12 * 1.43; note.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; note.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); note.Margin = new Thickness(0, 0, 16, 0); status.Children.Add(note);
+        note.Loaded += (_, _) => note.MaxWidth = 65 * new FormattedText("0", System.Globalization.CultureInfo.InvariantCulture, FlowDirection.LeftToRight, new Typeface(note.FontFamily, note.FontStyle, note.FontWeight, note.FontStretch), note.FontSize, Brushes.Black, VisualTreeHelper.GetDpi(note).PixelsPerDip).WidthIncludingTrailingWhitespace;
+        editorPosition.TextWrapping = TextWrapping.NoWrap; editorPosition.LineHeight = 12 * 1.43; editorPosition.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; editorPosition.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); editorPosition.Margin = new Thickness(0, 0, 16, 0); Grid.SetColumn(editorPosition, 1); status.Children.Add(editorPosition); var encoding = Ui.Muted("YAML · UTF-8", 12); encoding.LineHeight = 12 * 1.43; encoding.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; encoding.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); Grid.SetColumn(encoding, 2); status.Children.Add(encoding); Grid.SetRow(status, 3); editorContent.Children.Add(status);
         var footer = new Grid(); footer.Children.Add(editorFooter); footer.Children.Add(confirmationPane); Grid.SetRow(footer, 4); editorContent.Children.Add(footer); UpdateEditorMetrics();
     }
     private void UpdateEditorMetrics()
@@ -324,7 +325,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         var previous = confirmation; confirmation = value; editorFooter.Visibility = value == Confirmation.None ? Visibility.Visible : Visibility.Collapsed; confirmationPane.Visibility = value == Confirmation.None ? Visibility.Collapsed : Visibility.Visible;
         if (value != Confirmation.None)
         {
-            confirmationTitle.Text = L.T(value == Confirmation.Close ? "放弃修改并关闭？" : "放弃修改并重新读取？"); confirmationText.Text = L.T(confirmation == Confirmation.Close ? "关闭后将丢弃尚未保存的修改。确定关闭吗？" : "重新读取会丢弃当前草稿。确定从配置文件重新读取吗？");
+            confirmationTitle.Text = L.T(value == Confirmation.Close ? "有尚未保存的修改" : "当前草稿尚未保存"); confirmationText.Text = L.T(confirmation == Confirmation.Close ? "关闭后将丢弃尚未保存的修改。确定关闭吗？" : "重新读取会丢弃当前草稿。确定从配置文件重新读取吗？");
             confirmDiscard.Content = FluentControls.ButtonContent(value == Confirmation.Close ? "trash" : "update", value == Confirmation.Close ? "丢弃并关闭" : "丢弃并重新读取");
             L.Bind(confirmDiscard, AutomationProperties.NameProperty, value == Confirmation.Close ? "丢弃并关闭" : "丢弃并重新读取");
             var move = new TranslateTransform(); var scale = new ScaleTransform(); var motion = new TransformGroup(); motion.Children.Add(scale); motion.Children.Add(move); confirmationPane.RenderTransform = motion;
@@ -391,8 +392,9 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private void ApplyInteractionState()
     {
         var updating = Session.IsUpdating; var available = !Busy && !updating;
-        overview.IsEnabled = available; AllowDrop = available; importButton.IsEnabled = available; openEditor.IsEnabled = available; reload.IsEnabled = available;
-        importUrlButton.IsEnabled = available && !string.IsNullOrWhiteSpace(importUrl.Text);
+        var overviewAvailable = available || (importing && importPreviewVisible && !reading && !saving && !updating);
+        overview.IsEnabled = overviewAvailable; AllowDrop = available; importButton.IsEnabled = overviewAvailable; openEditor.IsEnabled = overviewAvailable; reload.IsEnabled = overviewAvailable;
+        importUrlButton.IsEnabled = overviewAvailable && !string.IsNullOrWhiteSpace(importUrl.Text);
         Editor.IsReadOnly = !loaded || !writable || Busy || updating || confirmation != Confirmation.None; Editor.IsEnabled = loaded && !reading; code.SetAvailability(loaded, reading);
         readAgain.IsEnabled = available; discard.IsEnabled = available && dirty; closeEditor.IsEnabled = !Busy; keepEditing.IsEnabled = !Busy; confirmDiscard.IsEnabled = available;
         save.IsEnabled = available && loaded && writable && !conflict && confirmation == Confirmation.None && (dirty || reloadPending);
@@ -500,12 +502,16 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
             {
                 ApplyDocument(ValidateDocument(document), true); reloadPending = !applied; saved = true; imported = true;
                 Message(applied ? IsRunning ? "配置已保存并应用。" : "配置已保存并校验，内核启动时将使用此配置。" : "配置已保存，可以稍后应用。"); ApplyInteractionState();
+            }, previewVisible =>
+            {
+                if (importPreviewVisible == previewVisible) return;
+                importPreviewVisible = previewVisible; ApplyInteractionState();
             });
             return imported;
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception error) { throw EditorFailure(error); }
-        finally { importing = false; importOpening = false; ApplyInteractionState(); }
+        finally { importing = false; importOpening = false; importPreviewVisible = false; ApplyInteractionState(); }
     }
     public override async Task NavigateToAsync(NavigationTarget target)
     {

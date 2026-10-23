@@ -93,6 +93,7 @@ public sealed class SettingsPage : NativePage
     private string previousPhase = "";
     private bool applying;
     private bool changing;
+    private bool? pendingLan;
     private bool probeDraft;
     private bool checking;
     private bool installing;
@@ -114,7 +115,7 @@ public sealed class SettingsPage : NativePage
                 await RunAsync(() => ChangeRuntime(new() { ["mode"] = value }));
         };
         BindToggle(autostart, "desktop_set_autostart"); BindToggle(systemProxy, "desktop_set_system_proxy");
-        RoutedEventHandler changeLan = async (_, _) => { if (!applying) await RunAsync(() => ChangeRuntime(new() { ["allow-lan"] = allowLan.IsChecked == true })); };
+        RoutedEventHandler changeLan = async (_, _) => await ChangeLanAsync();
         allowLan.Checked += changeLan; allowLan.Unchecked += changeLan;
         RoutedEventHandler changeTun = async (_, _) =>
         {
@@ -411,7 +412,9 @@ public sealed class SettingsPage : NativePage
     {
         applying = true;
         theme.ItemsSource = new[] { new Choice(L.T("跟随系统"), "system"), new Choice(L.T("浅色"), "light"), new Choice(L.T("深色"), "dark") };
-        language.ItemsSource = new[] { new Choice("中文", "zh-CN"), new Choice("English", "en-US") };
+        // These labels do not change with the selected language. Keep the same
+        // containers so the selection indicator can finish its 167ms slide.
+        language.ItemsSource ??= new[] { new Choice("中文", "zh-CN"), new Choice("English", "en-US") };
         mode.ItemsSource = new[] { new Choice(L.T("规则"), "rule"), new Choice(L.ShortMode("global"), "global"), new Choice(L.ShortMode("direct"), "direct") };
         theme.SelectedValue = Session.Theme; language.SelectedValue = L.ResolvedLanguage;
         mode.SelectedValue = runtime.Text("mode"); applying = false;
@@ -457,13 +460,18 @@ public sealed class SettingsPage : NativePage
         applying = true;
         theme.SelectedValue = Session.Theme; language.SelectedValue = L.ResolvedLanguage;
         SetToggle(autostart, status.Bool("autostart")); SetToggle(systemProxy, status.Bool("systemProxy")); SetToggle(tun, status.Bool("tun"));
+        SetToggle(allowLan, pendingLan ?? runtime.Bool("allow-lan"));
         if (!probeDraft) probeUrl.Text = Session.TestUrl;
         applying = false;
         theme.IsEnabled = language.IsEnabled = !Session.IsUpdating;
         autostart.IsEnabled = !DesktopBusy && capability.Bool("autostart");
         systemProxy.IsEnabled = !DesktopBusy && capability.Bool("systemProxy");
         tun.IsEnabled = !DesktopBusy && !Session.IsDirty && capability.Bool("tun");
-        mode.IsEnabled = allowLan.IsEnabled = RuntimeEditable;
+        mode.IsEnabled = RuntimeEditable;
+        // The reference LAN switch stays visually enabled during its own
+        // request. Further input is guarded until the existing write/readback
+        // finishes; the other controls still use the normal busy gate.
+        allowLan.IsEnabled = pendingLan.HasValue || RuntimeEditable;
         foreach (var port in ports.Values) port.IsEnabled = RuntimeEditable;
         installService.Visibility = installed ? Visibility.Collapsed : Visibility.Visible;
         uninstallService.Visibility = installed ? Visibility.Visible : Visibility.Collapsed;
@@ -505,7 +513,7 @@ public sealed class SettingsPage : NativePage
     private void ApplyRuntime(bool force = false)
     {
         applying = true;
-        mode.SelectedValue = runtime.Text("mode"); SetToggle(allowLan, runtime.Bool("allow-lan"));
+        mode.SelectedValue = runtime.Text("mode"); SetToggle(allowLan, pendingLan ?? runtime.Bool("allow-lan"));
         foreach (var (key, input) in ports)
         {
             if (force || !portDrafts.Contains(key)) input.Text = runtime.Number(key).ToString("0", CultureInfo.InvariantCulture);
@@ -522,6 +530,32 @@ public sealed class SettingsPage : NativePage
             await RunAsync(() => ChangeDesktop(method, new { enabled })); ApplyStatus();
         };
         toggle.Checked += change; toggle.Unchecked += change;
+    }
+    private async Task ChangeLanAsync()
+    {
+        if (applying) return;
+        if (pendingLan is bool requested)
+        {
+            // UI Automation can toggle an enabled control again while an
+            // asynchronous write is pending. Restore its requested state
+            // without submitting or overlapping another mutation.
+            applying = true;
+            try { SetToggle(allowLan, requested); }
+            finally { applying = false; }
+            return;
+        }
+        bool enabled = allowLan.IsChecked == true;
+        pendingLan = enabled;
+        allowLan.Content = L.T(enabled ? "开" : "关");
+        try { await RunAsync(() => ChangeRuntime(new() { ["allow-lan"] = enabled })); }
+        finally
+        {
+            // Only the display is optimistic. ChangeRuntime still persists
+            // the configuration and reads the controller back before returning;
+            // failure restores the last actual value instead of claiming success.
+            pendingLan = null;
+            ApplyRuntime(); ApplyStatus();
+        }
     }
     private async Task ChangeDesktop(string method, object? arguments = null)
     {

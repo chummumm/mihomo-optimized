@@ -159,6 +159,9 @@ public abstract class NativePage : UserControl
     }
     protected virtual void OnStatusChanged() { }
     protected virtual void OnLanguageChanged() => OnStatusChanged();
+    // Connected navigation keeps the outgoing surface visible until target
+    // data is ready, then starts entrance motion and measures the live target.
+    internal virtual Task PrepareNavigationAsync(NavigationTarget target) => Task.CompletedTask;
     public virtual Task NavigateToAsync(NavigationTarget target) => Task.CompletedTask;
     public abstract Task RefreshAsync();
     protected virtual Task LiveAsync(CancellationToken cancellationToken) => Task.CompletedTask;

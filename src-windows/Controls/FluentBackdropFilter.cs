@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
@@ -10,6 +11,11 @@ namespace Mihomo.Desktop.Controls;
 /// <summary>A local backdrop sampled only from explicitly supplied lower visual layers.</summary>
 internal sealed class FluentBackdropFilter : Grid, IDisposable
 {
+    // Compile once during normal application startup, before the first flyout
+    // needs it. Only the frozen PixelShader crosses back to the UI thread.
+    internal static void Prewarm() => SaturationEffect.Prewarm();
+    internal static object DescribeCompilation() => SaturationEffect.DescribeCompilation();
+
     internal static readonly DependencyProperty TintBrushProperty = DependencyProperty.Register(nameof(TintBrush), typeof(Brush), typeof(FluentBackdropFilter), new PropertyMetadata(null, Changed));
     internal static readonly DependencyProperty BaseBrushProperty = DependencyProperty.Register(nameof(BaseBrush), typeof(Brush), typeof(FluentBackdropFilter), new PropertyMetadata(null, Changed));
     internal static readonly DependencyProperty CornerRadiusProperty = DependencyProperty.Register(nameof(CornerRadius), typeof(CornerRadius), typeof(FluentBackdropFilter), new PropertyMetadata(new CornerRadius(), Changed), value => value is CornerRadius corners && new[] { corners.TopLeft, corners.TopRight, corners.BottomRight, corners.BottomLeft }.All(number => double.IsFinite(number) && number >= 0));
@@ -251,9 +257,14 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
 
     private sealed class SaturationEffect : ShaderEffect
     {
-        internal sealed record Compilation(PixelShader? Shader, string Diagnostic);
+        internal sealed record Compilation(PixelShader? Shader, string Diagnostic, double ElapsedMs = 0);
         private static readonly Lazy<Compilation> compilation = new(Compile);
+        private static readonly Lazy<Task> warming = new(() => Task.Run(() => { _ = Compiled; }));
         internal static Compilation Compiled => compilation.Value;
+        internal static void Prewarm() { _ = warming.Value; }
+        internal static object DescribeCompilation() => compilation.IsValueCreated
+            ? new { completed = true, available = Compiled.Shader is not null, diagnostic = Compiled.Diagnostic, elapsedMs = (double?)Compiled.ElapsedMs }
+            : new { completed = false, available = false, diagnostic = "pending", elapsedMs = (double?)null };
         private static readonly DependencyProperty InputProperty = RegisterPixelShaderSamplerProperty("Input", typeof(SaturationEffect), 0, SamplingMode.Bilinear);
         private static readonly DependencyProperty AmountProperty = DependencyProperty.Register(nameof(Amount), typeof(double), typeof(SaturationEffect), new UIPropertyMetadata(1.5d, PixelShaderConstantCallback(0)));
         internal double Amount { get => (double)GetValue(AmountProperty); set => SetValue(AmountProperty, value); }
@@ -263,6 +274,12 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         }
         protected override Freezable CreateInstanceCore() => new SaturationEffect(PixelShader);
         private static Compilation Compile()
+        {
+            var started = Stopwatch.GetTimestamp();
+            var result = CompileShader();
+            return result with { ElapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds };
+        }
+        private static Compilation CompileShader()
         {
             IBlob? code = null, errors = null;
             try

@@ -42,6 +42,7 @@ internal static class NativeMotionCapture
         private long started;
         private int frameCount;
         private string error = "";
+        private object? diagnostics;
         private volatile bool finished;
         public bool Finished => finished;
         internal Recording(Window owner, string directory, string name, string trigger, string surface)
@@ -96,6 +97,8 @@ internal static class NativeMotionCapture
                     images.Add((file, captured.Bitmap));
                     Volatile.Write(ref frameCount, frames.Count);
                 }
+                if (owner is MainWindow main)
+                    diagnostics = await owner.Dispatcher.InvokeAsync(main.DescribeMotionDiagnostics, DispatcherPriority.Background);
                 // Encoding is deferred until the interaction is finished, so
                 // compression does not compete with the real UI's rendering.
                 foreach (var image in images)
@@ -110,7 +113,7 @@ internal static class NativeMotionCapture
         private void SaveReport()
         {
             var report = new { name, trigger, surface, captureKind = "screen-pixels", drivenBy = "independent-windows-uia",
-                recordedBy = "background-desktop-capture", reducedMotion, screen = bounds, frames, error,
+                recordedBy = "background-desktop-capture", reducedMotion, screen = bounds, frames, error, diagnostics,
                 caveat = "Only the visible desktop rectangle contains screen pixels; off-desktop areas are black. No WPF layout or render is requested by the recorder." };
             try { File.WriteAllText(Path.Combine(directory, name + ".json"), JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true })); }
             catch (Exception exception) { error = exception.GetType().Name; }

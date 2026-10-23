@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -22,6 +23,7 @@ namespace Mihomo.Desktop;
 
 internal sealed class SearchWindow : Window
 {
+    private static readonly long templatesStarted = Stopwatch.GetTimestamp();
     private static readonly ResourceDictionary templates = (ResourceDictionary)XamlReader.Parse("""
         <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
           <Style x:Key="Results" TargetType="ListBox">
@@ -48,6 +50,7 @@ internal sealed class SearchWindow : Window
           </Style>
         </ResourceDictionary>
         """);
+    private static readonly double templatesMilliseconds = Stopwatch.GetElapsedTime(templatesStarted).TotalMilliseconds;
     private sealed class ResultItem : ListBoxItem
     {
         internal required Func<Task> Execute { get; init; }
@@ -82,6 +85,10 @@ internal sealed class SearchWindow : Window
 
     private const int MaximumVisibleResults = 8;
     private const double ShadowInset = 16;
+    private readonly Stopwatch openClock = Stopwatch.StartNew();
+    private double constructorStartedMilliseconds, constructorCompletedMilliseconds;
+    private double? sourceInitializedMilliseconds, sourceInitializedCompletedMilliseconds, loadedMilliseconds,
+        attachOwnerCompletedMilliseconds, suggestionsStartedMilliseconds, coreEntriesCompletedMilliseconds;
     private readonly AppSession session;
     private readonly GlobalSearchBox inputBox;
     private readonly int instance;
@@ -118,6 +125,7 @@ internal sealed class SearchWindow : Window
 
     public SearchWindow(AppSession session, GlobalSearchBox inputBox)
     {
+        constructorStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         this.session = session; this.inputBox = inputBox; search = inputBox.Input;
         instance = inputBox.PaletteCreated();
         L.Bind(this, TitleProperty, "搜索"); this.Id("GlobalSearchWindow");
@@ -149,6 +157,7 @@ internal sealed class SearchWindow : Window
         search.TextChanged += QueryChanged;
         SourceInitialized += (_, _) =>
         {
+            sourceInitializedMilliseconds = openClock.Elapsed.TotalMilliseconds;
             var handle = new WindowInteropHelper(this).Handle;
             // The title-bar input owns keyboard focus even while the pointer is over suggestions.
             _ = SetWindowLongPtr(handle, -20, new IntPtr(GetWindowLongPtr(handle, -20).ToInt64() | 0x08000000));
@@ -158,11 +167,16 @@ internal sealed class SearchWindow : Window
                 if (source.CompositionTarget is { } target) target.BackgroundColor = Colors.Transparent;
             }
             PositionFlyout();
+            sourceInitializedCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         };
         Loaded += async (_, _) =>
         {
-            AttachOwner(); PositionFlyout(); FocusInput(); EnterSuggestions();
+            loadedMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            AttachOwner();
+            attachOwnerCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            PositionFlyout(); FocusInput(); EnterSuggestions();
             await LoadCoreEntries();
+            coreEntriesCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         };
         Closed += (_, _) =>
         {
@@ -180,6 +194,7 @@ internal sealed class SearchWindow : Window
         };
         session.StatusChanged += OnStatusChanged; session.ThemeChanged += OnThemeChanged; L.Changed += OnLanguageChanged;
         RebuildEntries();
+        constructorCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
     }
 
     private bool IsDark => TryFindResource("AppBackgroundBrush") is SolidColorBrush brush && brush.Color.R < 128;
@@ -189,6 +204,7 @@ internal sealed class SearchWindow : Window
     }
     private void EnterSuggestions()
     {
+        suggestionsStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         if (!FluentMotion.Enabled) return;
         var movement = new TranslateTransform(); suggestionBorder.RenderTransform = movement;
         SettingsSegments.Animate(movement, TranslateTransform.YProperty, -12, 0, 250);
@@ -200,7 +216,16 @@ internal sealed class SearchWindow : Window
         if (closing || closed) return;
         inputBox.FocusInput();
     }
-    internal object Describe() => new { instance, visible = IsVisible, closing, closed, choosing, resultCount = results.Items.Count };
+    internal object Describe() => new
+    {
+        instance, visible = IsVisible, closing, closed, choosing, resultCount = results.Items.Count,
+        // Relative timings only: no search text, entry names or controller data.
+        lifecycleMilliseconds = new { templates = templatesMilliseconds, constructorStarted = constructorStartedMilliseconds,
+            constructorCompleted = constructorCompletedMilliseconds, sourceInitialized = sourceInitializedMilliseconds,
+            sourceInitializedCompleted = sourceInitializedCompletedMilliseconds, loaded = loadedMilliseconds,
+            attachOwnerCompleted = attachOwnerCompletedMilliseconds, suggestionsStarted = suggestionsStartedMilliseconds,
+            coreEntriesCompleted = coreEntriesCompletedMilliseconds }
+    };
     protected override void OnClosing(CancelEventArgs e)
     {
         // Destroying an active HWND can synchronously raise Deactivated before

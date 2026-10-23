@@ -40,7 +40,7 @@ public static partial class L
             ("设置为系统代理", "Set as system proxy"),
             ("让遵循系统代理设置的应用经过本机内核", "Apps that follow the system proxy setting go through the local core"),
             ("规则模式按分流规则选择出口；全局模式全部走代理；直连模式不经过代理", "Rule mode picks an exit per rule; global sends everything through the proxy; direct bypasses it"),
-            ("允许来自局域网的连接", "Allow connect from LAN"),
+            ("允许来自局域网的连接", "Allow connect from Lan"),
             ("其他设备可以通过本机的代理端口连接", "Other devices can connect through this computer’s proxy ports"),
             ("修改后立即应用到运行中的内核", "Changes apply to the running core immediately"),
             ("用于手动节点测速，留空使用默认地址。", "Used for manual node speed tests. Empty uses the default."),

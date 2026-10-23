@@ -68,6 +68,10 @@ public sealed class ProxiesPage : NativePage
     private CancellationToken refreshToken;
     private string refreshController = "";
     private long refreshGeneration;
+    private long preparationGeneration;
+    private bool? preparationCacheHit;
+    private double? preparationElapsedMs;
+    private bool preparationPending;
     private string lastPhase = "";
     private CancellationTokenSource? topologyLifetime;
     private NavigationTarget? pendingNavigation;
@@ -404,6 +408,33 @@ public sealed class ProxiesPage : NativePage
         // works. MeasureAll still rejects a second concurrent batch.
         testAll.IsEnabled = IsRunning;
     }
+
+    internal override async Task PrepareNavigationAsync(NavigationTarget target)
+    {
+        var generation = ++preparationGeneration;
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        preparationCacheHit = null; preparationElapsedMs = null; preparationPending = true;
+        try
+        {
+            preparationCacheHit = TryPresentRuntimeSnapshot();
+            if (preparationCacheHit != true) await RefreshAsync();
+        }
+        finally
+        {
+            if (generation == preparationGeneration)
+            {
+                preparationElapsedMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                preparationPending = false;
+            }
+        }
+    }
+
+    internal object DescribeNavigationPreparation() => new
+    {
+        cacheHit = preparationCacheHit,
+        elapsedMs = preparationElapsedMs,
+        pending = preparationPending
+    };
 
     public override async Task NavigateToAsync(NavigationTarget target)
     {

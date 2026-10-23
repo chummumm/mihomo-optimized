@@ -1406,6 +1406,7 @@ class Acceptance:
         capture("windows-config-unsaved.png")
         driver.ui("ConfigKeepEditing", "invoke")
         require(marker in found("ConfigEditor").get("value", ""), "native_keep_editing_lost_draft")
+        found("SaveConfig", enabled=True)
         driver.ui("SaveConfig", "context")
         found("SaveOnlyConfig", enabled=True)
         driver.ui("SaveOnlyConfig", "invoke")

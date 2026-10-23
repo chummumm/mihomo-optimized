@@ -22,9 +22,12 @@ internal sealed class ConfigImportDialog
     private static readonly HashSet<Window> pending = [];
     private readonly AppSession session;
     private readonly Action<JsonElement, bool> imported;
+    private readonly Action<bool>? modalPreviewChanged;
     private readonly CancellationTokenSource lifetime = new();
     private readonly FluentDialog dialog;
-    private readonly SettingsSegments modes = new() { HorizontalAlignment = HorizontalAlignment.Left };
+    // The original grid stretches the track; its three options keep their
+    // natural widths (SettingsSegments.Stretch would instead divide the row).
+    private readonly SettingsSegments modes = new() { HorizontalAlignment = HorizontalAlignment.Stretch };
     private readonly TextBox preview = new()
     {
         AcceptsReturn = true, AcceptsTab = false, TextWrapping = TextWrapping.NoWrap,
@@ -54,7 +57,7 @@ internal sealed class ConfigImportDialog
     private bool HasDraft => content.Length > 0 || url.Text.Length > 0;
     private bool Busy => saving || choosingFile;
 
-    internal static async Task ShowAsync(Window owner, AppSession session, ConfigImportSeed seed, int maxBytes, Action<JsonElement, bool> imported)
+    internal static async Task ShowAsync(Window owner, AppSession session, ConfigImportSeed seed, int maxBytes, Action<JsonElement, bool> imported, Action<bool>? modalPreviewChanged = null)
     {
         if (!pending.Add(owner)) return;
         ConfigImportDialog? view = null;
@@ -65,7 +68,7 @@ internal sealed class ConfigImportDialog
             if (!owner.IsLoaded) return;
             if (session.IsUpdating) throw new DesktopException("update_in_progress", L.T("正在安装应用更新，请等待更新完成后再编辑、保存或导入配置。"));
             if (session.IsDirty) throw new DesktopException("config_busy", L.T("请先保存或放弃当前配置草稿。"));
-            view = new ConfigImportDialog(owner, session, seed, maxBytes, imported);
+            view = new ConfigImportDialog(owner, session, seed, maxBytes, imported, modalPreviewChanged);
             view.dialog.ShowDialog();
         }
         finally
@@ -113,9 +116,9 @@ internal sealed class ConfigImportDialog
         }
     }
 
-    private ConfigImportDialog(Window owner, AppSession session, ConfigImportSeed seed, int maximumBytes, Action<JsonElement, bool> imported)
+    private ConfigImportDialog(Window owner, AppSession session, ConfigImportSeed seed, int maximumBytes, Action<JsonElement, bool> imported, Action<bool>? modalPreviewChanged)
     {
-        this.session = session; this.imported = imported;
+        this.session = session; this.imported = imported; this.modalPreviewChanged = modalPreviewChanged;
         maxBytes = Math.Clamp(maximumBytes, 1, MaximumConfigBytes);
         mode = seed.Mode is "file" or "text" or "url" ? seed.Mode : "file";
         body.Children.Add(Spaced(Ui.Hint("导入会替换当前主配置。现有文件会备份；配置中的控制接口由桌面程序统一管理。")));
@@ -185,6 +188,7 @@ internal sealed class ConfigImportDialog
 
         dialog = new FluentDialog(owner, "导入完整 YAML 配置", body, [], large: true).Id("ConfigImportDialog");
         dialog.CanDismiss = CanDismiss;
+        dialog.IsVisibleChanged += (_, _) => UpdateState();
         dialog.Loaded += async (_, _) => await InitializeAsync();
         dialog.Closed += (_, _) => Stop();
         session.StatusChanged += OnStatusChanged;
@@ -377,6 +381,10 @@ internal sealed class ConfigImportDialog
         string label = saving ? "正在导入…" : "替换并应用";
         replace.Content = saving ? savingContent : replaceContent;
         L.Bind(replace, AutomationProperties.NameProperty, label);
+        // Match the original inert background during a preview without
+        // releasing the real modal HWND or the page's import/busy guard.
+        // Reads, file pickers and writes retain the busy visual state.
+        modalPreviewChanged?.Invoke(dialog.IsVisible && enabled && !loading && !readingFile && !choosingFile);
     }
     private static JsonElement ValidateDocument(JsonElement document)
     {
@@ -406,6 +414,7 @@ internal sealed class ConfigImportDialog
     private void Stop()
     {
         if (!active) return;
+        modalPreviewChanged?.Invoke(false);
         active = false; ++fileRead; lifetime.Cancel(); lifetime.Dispose();
         session.StatusChanged -= OnStatusChanged; L.Changed -= TranslateState;
     }

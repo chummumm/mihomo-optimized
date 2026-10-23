@@ -19,12 +19,13 @@ public sealed class RulesPage : NativePage
     private readonly TextBlock count = Ui.Muted("");
     private readonly TextBlock empty = Ui.Hint("没有符合筛选条件的规则。", 14);
     private readonly TextBlock providerCount = Ui.Text("", 13);
-    private readonly StackPanel providerSection = new() { Margin = new Thickness(0, 0, 0, 28) };
+    private readonly StackPanel providerSection = new() { Margin = new Thickness(0, 0, 0, 28), Visibility = Visibility.Collapsed };
     private readonly Dictionary<string, string> policyColors = new(StringComparer.Ordinal);
     private List<RuleRow> rows = [];
     private JsonElement providerData;
     private readonly HashSet<string> updating = new(StringComparer.Ordinal);
     private bool compactProviders;
+    private bool showProviders;
 
     public RulesPage(AppSession session) : base(session, "rules", "规则", "")
     {
@@ -80,12 +81,15 @@ public sealed class RulesPage : NativePage
     {
         if (!IsRunning) { Message(InactiveMessage); return; }
         var controller = ControllerIdentity;
-        var rulesTask = Get("rules"); var providerTask = Get("providers/rules"); var proxiesTask = Get("proxies"); await Task.WhenAll(rulesTask, providerTask, proxiesTask);
+        var rulesTask = Get("rules"); var providerTask = Get("providers/rules"); var proxiesTask = Get("proxies"); var versionTask = Get("version"); await Task.WhenAll(rulesTask, providerTask, proxiesTask, versionTask);
         if (!IsActive || !IsRunning || controller != ControllerIdentity) return;
         var proxyData = (await proxiesTask).Get("proxies"); policyColors.Clear();
         foreach (var name in proxyData.Get("GLOBAL").Get("all").Items().Select(item => item.Text()).Where(name => name != "GLOBAL" && proxyData.Get(name).Get("all").ValueKind == JsonValueKind.Array))
             policyColors.TryAdd(name, "Line" + policyColors.Count % 9 + "Brush");
         rows = (await rulesTask).Get("rules").Items().Select((item, index) => new RuleRow(index + 1, item.Text("type"), item.Text("payload"), item.Text("proxy"), PolicyBrush(item.Text("proxy")))).ToList(); ApplyFilter();
+        // Keep the real provider model available, while following the reference
+        // UI's /version.premium capability gate for the visible section.
+        showProviders = (await versionTask).Bool("premium");
         providerData = (await providerTask).Get("providers"); RenderProviders(); Message("");
     }
     private void RenderProviders()
@@ -111,7 +115,7 @@ public sealed class RulesPage : NativePage
             meta.Children.Add(update); for (int index = 0; index < meta.Children.Count; index++) if (meta.Children[index] is FrameworkElement item) { item.VerticalAlignment = VerticalAlignment.Center; item.Margin = new Thickness(0, 0, index == meta.Children.Count - 1 ? 0 : compactProviders ? 8 : 16, compactProviders ? 8 : 0); } meta.Margin = new Thickness(0, 0, 0, compactProviders ? -8 : 0); row.Children.Add(meta);
             var line = new Border { Child = row, BorderThickness = new Thickness(0, providers.Children.Count == 0 ? 0 : 1, 0, 0) }; line.SetResourceReference(Border.BorderBrushProperty, "DividerBrush"); providers.Children.Add(line);
         }
-        providerSection.Visibility = providers.Children.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+        providerSection.Visibility = showProviders && providers.Children.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
         providerCount.Text = providers.Children.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
     private string PolicyBrush(string name) => name switch { "GLOBAL" => "LineSystemBrush", "DIRECT" => "TextTertiaryBrush", "REJECT" or "REJECT-DROP" => "DangerBrush", _ => policyColors.GetValueOrDefault(name, "TextTertiaryBrush") };
@@ -134,7 +138,7 @@ public sealed class RulesPage : NativePage
         if (rows.Count == 0 && IsRunning) await RunAsync(RefreshAsync);
     }
     protected override void OnLanguageChanged() { ApplyFilter(); RenderProviders(); base.OnLanguageChanged(); }
-    protected override void OnStatusChanged() { if (!IsRunning) { rows.Clear(); providerData = default; table.ItemsSource = null; providers.Children.Clear(); count.Text = ""; empty.Visibility = Visibility.Collapsed; providerSection.Visibility = Visibility.Collapsed; Message(InactiveMessage); } }
+    protected override void OnStatusChanged() { if (!IsRunning) { rows.Clear(); providerData = default; showProviders = false; table.ItemsSource = null; providers.Children.Clear(); count.Text = ""; empty.Visibility = Visibility.Collapsed; providerSection.Visibility = Visibility.Collapsed; Message(InactiveMessage); } }
     private void ApplyFilter()
     {
         var term = search.Text.Trim(); var selected = rows.Where(row => (row.Type + " " + row.Payload + " " + row.Proxy).Contains(term, StringComparison.CurrentCultureIgnoreCase)).ToArray();

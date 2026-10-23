@@ -112,19 +112,50 @@ switch ($Action) {
         $result.selected = $true
     }
     'context' {
+        $script:operationStage = 'context_focus'
         $element.SetFocus()
         Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 public static class NativeMenuInput {
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code, uint mapType);
 }
 '@
         $ancestor = $element
         while ($ancestor -and -not $ancestor.Current.NativeWindowHandle) { $ancestor = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($ancestor) }
         if (-not $ancestor -or $ancestor.Current.ProcessId -ne $ApplicationProcessId) { throw 'The focused element has no owned window.' }
         $handle = [IntPtr]$ancestor.Current.NativeWindowHandle
-        if (-not [NativeMenuInput]::PostMessage($handle, 0x007B, $handle, [IntPtr](-1))) { throw 'Context menu input failed.' }
+        # WPF PopupControlService opens a keyboard context menu on Key.Apps
+        # KeyUp. Posting WM_CONTEXTMENU directly does not enter that input path.
+        # Route the actual menu key to the focused application's HWND, with its
+        # scan code, extended-key flag, repeat count and key-up transition bits.
+        $script:operationStage = 'context_input'
+        $scan = [NativeMenuInput]::MapVirtualKey(0x5D, 0)
+        if (-not $scan) { throw 'The context menu key is not mapped.' }
+        $down = (([long]$scan -band 0xFF) -shl 16) -bor 0x01000001L
+        $up = $down -bor 0xC0000000L
+        if (-not [NativeMenuInput]::PostMessage($handle, 0x0100, [IntPtr]0x5D, [IntPtr]$down) -or
+            -not [NativeMenuInput]::PostMessage($handle, 0x0101, [IntPtr]0x5D, [IntPtr]$up)) { throw 'Context menu input failed.' }
+        $script:operationStage = 'context_open'
+        $menuCondition = [System.Windows.Automation.AndCondition]::new(
+            [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Menu),
+            [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::IsOffscreenProperty, $false))
+        $menu = $null
+        $deadline = [DateTime]::UtcNow.AddSeconds(3)
+        do {
+            # ContextMenu has a separate popup HWND, created after input. Do
+            # not reuse the top-level window snapshot from before the keypress.
+            $menuWindows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+                [System.Windows.Automation.TreeScope]::Children, $processCondition)
+            foreach ($window in $menuWindows) {
+                $menu = $window.FindFirst([System.Windows.Automation.TreeScope]::Subtree, $menuCondition)
+                if ($menu) { break }
+            }
+            if ($menu) { break }
+            Start-Sleep -Milliseconds 50
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if (-not $menu) { throw 'The requested context menu did not open.' }
         $result.opened = $true
     }
     'escape' {

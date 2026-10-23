@@ -112,7 +112,7 @@
     <Setter Property="c:FluentControlState.Kind" Value="Input"/>
     <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="TextBox">
       <Border x:Name="PART_Frame" CornerRadius="4" BorderThickness="{TemplateBinding BorderThickness}" BorderBrush="{TemplateBinding BorderBrush}" Background="{TemplateBinding Background}">
-        <Grid><ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"/>
+        <Grid><ScrollViewer x:Name="PART_ContentHost"/>
           <Border x:Name="PART_Underline" Height="1" Margin="1,0,1,0" CornerRadius="0,0,2,2" VerticalAlignment="Bottom" Background="{DynamicResource ControlStrongBrush}"/>
         </Grid>
       </Border>

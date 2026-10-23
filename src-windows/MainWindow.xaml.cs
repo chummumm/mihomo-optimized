@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Automation;
@@ -46,6 +47,17 @@ public partial class MainWindow : Window
     private bool shellCommandBusy;
     private double pillTop = double.NaN;
     private string lastCoreError = "";
+    private sealed class NavigationTiming
+    {
+        internal long Started { get; } = Stopwatch.GetTimestamp();
+        internal double? PageConstructionMs, ActivationMs, PreparationMs, TargetMs, PlayMs;
+        internal double? CompletedMs;
+        internal bool Connected;
+        internal object Describe() => new { connected = Connected, pageConstructionMs = PageConstructionMs,
+            activationMs = ActivationMs, preparationMs = PreparationMs, targetMs = TargetMs,
+            playMs = PlayMs, completedMs = CompletedMs };
+    }
+    private NavigationTiming? navigationTiming;
 
     public MainWindow(AppSession session)
     {
@@ -101,10 +113,12 @@ public partial class MainWindow : Window
     {
         if (navigating || target.Page is not ("home" or "proxies" or "connections" or "dns" or "rules" or "logs" or "profiles" or "settings")) return false;
         NativePage page;
+        bool connected = false;
         bool changed = activePage is null || target.Page != currentPage;
         if (changed && EditorOpen) return false;
         navigating = true;
         long revision = ++navigationRevision;
+        var timing = new NavigationTiming(); navigationTiming = timing;
         try
         {
             if (changed && activePage is not null && !await activePage.CanLeaveAsync()) { SelectNavigation(currentPage); return false; }
@@ -113,13 +127,19 @@ public partial class MainWindow : Window
                 if (activePage is IPageBackNavigation previousBack) previousBack.BackStateChanged -= UpdateBackButton;
                 if (remember && activePage is not null) history.Add(location with { Action = null });
                 activePage?.Deactivate();
+                var stage = Stopwatch.GetTimestamp();
                 if (!pages.TryGetValue(target.Page, out page!)) { page = PageFactory.Create(target.Page, session); pages.Add(target.Page, page); }
+                timing.PageConstructionMs = Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
                 currentPage = target.Page; activePage = page;
                 if (page is IPageBackNavigation nextBack) nextBack.BackStateChanged += UpdateBackButton;
+                stage = Stopwatch.GetTimestamp();
                 SelectNavigation(target.Page); CloseOverlay(true); UpdatePageActivity();
-                if (ConnectedNavigation.HasPending(this, target.Target)) ConnectedNavigation.Hold(this, ConnectedOverlay, page, target.Target);
+                timing.ActivationMs = Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+                connected = !RecoveryRequired && ConnectedNavigation.HasPending(this, target.Target);
+                timing.Connected = connected;
+                if (connected) ConnectedNavigation.Hold(this, ConnectedOverlay, page, target.Target);
                 else ConnectedNavigation.Cancel(this);
-                FluentMotion.Enter(RecoveryRequired ? recovery : page.TransitionSurface, back);
+                if (!connected) FluentMotion.Enter(RecoveryRequired ? recovery : page.TransitionSurface, back);
             }
             else { page = activePage!; CloseOverlay(true); }
             location = target with { Action = null }; UpdateBackButton();
@@ -131,9 +151,22 @@ public partial class MainWindow : Window
             if (RecoveryRequired) { ConnectedNavigation.Cancel(this); return true; }
             // Target operations (focus, search or testing) do not hold the shell's
             // navigation lock. A slow latency test must not trap the current page.
+            if (connected)
+            {
+                var preparationStarted = Stopwatch.GetTimestamp();
+                await page.PrepareNavigationAsync(target);
+                timing.PreparationMs = Stopwatch.GetElapsedTime(preparationStarted).TotalMilliseconds;
+                if (revision != navigationRevision || !ReferenceEquals(page, activePage)) return false;
+                FluentMotion.Enter(page.TransitionSurface, back);
+            }
+            var targetStarted = Stopwatch.GetTimestamp();
             await page.NavigateToAsync(target);
+            timing.TargetMs = Stopwatch.GetElapsedTime(targetStarted).TotalMilliseconds;
             if (revision != navigationRevision || !ReferenceEquals(page, activePage)) return false;
+            var playStarted = Stopwatch.GetTimestamp();
             ConnectedNavigation.Play(this, ConnectedOverlay, page, target.Target, page.TransitionSurface);
+            timing.PlayMs = Stopwatch.GetElapsedTime(playStarted).TotalMilliseconds;
+            timing.CompletedMs = Stopwatch.GetElapsedTime(timing.Started).TotalMilliseconds;
             UpdateBackButton(); return true;
         }
         catch (Exception error) { if (revision == navigationRevision) { ConnectedNavigation.Cancel(this); ShowNotice(error.Message, true); } return false; }
@@ -550,6 +583,17 @@ public partial class MainWindow : Window
         Notifications.Dispose();
         await session.DisposeAsync(); Close(); Application.Current.Shutdown();
     }
+
+    // Sampled only after an opt-in motion recording ends; no WPF layout or
+    // synchronous UI work is requested while the screen frames are recorded.
+    internal object DescribeMotionDiagnostics() => new
+    {
+        connected = ConnectedNavigation.Describe(),
+        navigation = navigationTiming?.Describe(),
+        preparation = pages.TryGetValue("proxies", out var page) && page is ProxiesPage proxies ? proxies.DescribeNavigationPreparation() : null,
+        search = searchWindow?.Describe(),
+        backdrop = FluentBackdropFilter.DescribeCompilation()
+    };
 
     public async Task<object?> AutomationAsync(string method, JsonElement args)
     {

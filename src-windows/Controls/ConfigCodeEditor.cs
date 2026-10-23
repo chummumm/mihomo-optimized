@@ -53,7 +53,7 @@ internal sealed class ConfigCodeEditor : UserControl
         Editor.Style = null; Editor.Background = Brushes.Transparent;
         Editor.Template = (ControlTemplate)XamlReader.Parse("""
             <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="TextBox">
-              <ScrollViewer x:Name="PART_ContentHost" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Margin="{TemplateBinding Padding}" Focusable="False" Background="Transparent"/>
+              <ScrollViewer x:Name="PART_ContentHost" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Focusable="False" Background="Transparent"/>
             </ControlTemplate>
             """);
         Editor.SetResourceReference(Control.ForegroundProperty, "TextPrimaryBrush");

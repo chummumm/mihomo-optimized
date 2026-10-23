@@ -35,6 +35,7 @@ public partial class App : Application
                 return;
             }
             if (e.Args.Contains("--quit")) { Shutdown(); return; }
+            Controls.FluentBackdropFilter.Prewarm();
             session = new AppSession();
             session.ApplyTheme();
             var window = new MainWindow(session);
