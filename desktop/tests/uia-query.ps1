@@ -6,6 +6,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$script:stageClock = [System.Diagnostics.Stopwatch]::StartNew()
 $script:operationStage = 'initialize'
 $script:textProbeActive = $false
 $script:stageMessageCount = 0
@@ -18,25 +19,43 @@ function Set-UiaStage {
         'text-start', 'text-end', 'context', 'escape', 'select_expand',
         'select_find_option', 'select_option', 'select_collapse', 'context_focus',
         'context_input', 'context_open', 'read_value', 'read_selection', 'read_toggle',
-        'read_scroll', 'read_bounds', 'serialize', 'complete')][string]$Stage)
+        'read_scroll', 'read_bounds', 'serialize', 'complete', 'exit_process')][string]$Stage)
     $script:operationStage = $Stage
     # Flush fixed markers so a killed helper still identifies the blocked API.
     # No control IDs, names, values, paths or exception messages enter stderr.
     if ($script:stageMessageCount -lt 64) {
         $script:stageMessageCount += 1
-        [Console]::Error.WriteLine('MIHOMO_UIA_STAGE:' + $Stage)
+        $milliseconds = $script:stageClock.ElapsedMilliseconds.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        [Console]::Error.WriteLine('MIHOMO_UIA_STAGE:' + $Stage + ':' + $milliseconds)
         [Console]::Error.Flush()
     }
+}
+function Finish-UiaResult {
+    param([Parameter(Mandatory=$true)][object]$Result,
+        [ValidateSet(0, 1)][int]$ExitCode = 0,
+        [ValidateSet(4, 6)][int]$Depth = 4)
+    # Each operation and its scoped cache disposal have finished before here.
+    # Write directly, then end this one-shot helper without PowerShell's normal
+    # runspace teardown. The caller still requires real exit and valid JSON;
+    # output from a timed-out helper is never accepted as a successful query.
+    Set-UiaStage 'serialize'
+    $json = ConvertTo-Json -InputObject $Result -Compress -Depth $Depth
+    [Console]::Out.WriteLine($json)
+    [Console]::Out.Flush()
+    Set-UiaStage 'complete'
+    Set-UiaStage 'exit_process'
+    [Console]::Error.Flush()
+    [Environment]::Exit($ExitCode)
 }
 trap {
     # Keep CI diagnostics useful without printing control values, YAML or URLs.
     $exception = $_.Exception
     while ($exception.InnerException) { $exception = $exception.InnerException }
     if ($script:textProbeActive) { $script:operationStage = [NativeTextViewportProbe]::Stage }
-    @{found=$false; error='uia_operation_failed'; stage=$script:operationStage;
+    $failure = @{found=$false; error='uia_operation_failed'; stage=$script:operationStage;
         exception=$exception.GetType().Name;
-        hresult=('0x{0:X8}' -f ([long]$exception.HResult -band 0xFFFFFFFFL))} | ConvertTo-Json -Compress
-    exit 1
+        hresult=('0x{0:X8}' -f ([long]$exception.HResult -band 0xFFFFFFFFL))}
+    Finish-UiaResult -Result $failure -ExitCode 1
 }
 Set-UiaStage 'initialize'
 switch ([System.Threading.Thread]::CurrentThread.GetApartmentState()) {
@@ -54,10 +73,7 @@ if ($Action -eq 'text-viewport') {
     Set-UiaStage 'read_text_uia3'
     $result = [NativeTextViewportProbe]::Read($ApplicationProcessId, $AutomationId)
     $script:textProbeActive = $false
-    Set-UiaStage 'serialize'
-    $result | ConvertTo-Json -Compress -Depth 6
-    Set-UiaStage 'complete'
-    exit 0
+    Finish-UiaResult -Result $result -Depth 6
 }
 Set-UiaStage 'load_automation_client'
 Add-Type -AssemblyName UIAutomationClient
@@ -70,10 +86,7 @@ else { Set-UiaStage 'list_windows' }
 $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
     [System.Windows.Automation.TreeScope]::Children, $processCondition)
 if ($windows.Count -eq 0) {
-    Set-UiaStage 'serialize'
-    @{found=$false} | ConvertTo-Json -Compress
-    Set-UiaStage 'complete'
-    exit 0
+    Finish-UiaResult -Result @{found=$false}
 }
 if ($AutomationId -eq '*') {
     # Fetch the complete raw subtree with its read-only properties in one
@@ -114,10 +127,7 @@ if ($AutomationId -eq '*') {
             $visible.Add($row)
         }
     }
-    Set-UiaStage 'serialize'
-    @{found=$true; elements=$visible.ToArray()} | ConvertTo-Json -Compress -Depth 4
-    Set-UiaStage 'complete'
-    exit 0
+    Finish-UiaResult -Result @{found=$true; elements=$visible.ToArray()}
 }
 $idCondition = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $AutomationId)
@@ -128,10 +138,7 @@ foreach ($window in $windows) {
     if ($element) { break }
 }
 if (-not $element) {
-    Set-UiaStage 'serialize'
-    @{found=$false} | ConvertTo-Json -Compress
-    Set-UiaStage 'complete'
-    exit 0
+    Finish-UiaResult -Result @{found=$false}
 }
 Set-UiaStage 'read_properties'
 $result = @{ found=$true; enabled=$element.Current.IsEnabled; offscreen=$element.Current.IsOffscreen;
@@ -336,6 +343,4 @@ public static class NativeEscapeInput {
         }
     }
 }
-Set-UiaStage 'serialize'
-$result | ConvertTo-Json -Compress -Depth 4
-Set-UiaStage 'complete'
+Finish-UiaResult -Result $result

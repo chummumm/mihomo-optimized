@@ -104,6 +104,7 @@ internal sealed class SearchWindow : Window
     private double? entranceFirstRenderedOpacity;
     private double? initialBackdropMilliseconds, backdropVerificationCompletedMilliseconds;
     private bool initialBackdropFromCache;
+    private bool entranceClockHasAdvanced;
     private bool? backdropVerificationSucceeded;
     private readonly AppSession session;
     private readonly GlobalSearchBox inputBox;
@@ -239,7 +240,12 @@ internal sealed class SearchWindow : Window
             }
             await coreLoad;
         };
-        ContentRendered += (_, _) => contentRenderedMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
+        ContentRendered += (_, _) =>
+        {
+            if (contentRenderedMilliseconds is not null) return;
+            contentRenderedMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            NativeMotionCapture.Mark(timingSession, "search-content-rendered");
+        };
         Closed += (_, _) =>
         {
             closed = true; inputBox.PaletteClosed(instance); lifetime.Cancel(); lifetime.Dispose();
@@ -287,8 +293,13 @@ internal sealed class SearchWindow : Window
         var fade = new DoubleAnimationUsingKeyFrames { Duration = TimeSpan.FromMilliseconds(250), FillBehavior = FillBehavior.Stop };
         fade.KeyFrames.Add(new LinearDoubleKeyFrame(0, KeyTime.FromPercent(0)));
         fade.KeyFrames.Add(new SplineDoubleKeyFrame(1, KeyTime.FromPercent(1), new KeySpline(0, 0, 0, 1)));
-        fade.CurrentTimeInvalidated += (_, _) =>
+        fade.CurrentTimeInvalidated += (sender, _) =>
         {
+            if (!entranceClockHasAdvanced && sender is Clock { CurrentState: ClockState.Active, CurrentProgress: > 0 })
+            {
+                entranceClockHasAdvanced = true;
+                NativeMotionCapture.Mark(timingSession, "search-animation-first-progress");
+            }
             if (entranceFirstTickMilliseconds is not null) return;
             entranceFirstTickMilliseconds = openClock.Elapsed.TotalMilliseconds;
             NativeMotionCapture.Mark(timingSession, "search-animation-first-tick");
@@ -321,7 +332,18 @@ internal sealed class SearchWindow : Window
         }
         if (initialBackdropFromCache)
         {
-            if (suggestionBorder.Opacity <= 0) return;
+            if (!backdropFilter.AwaitingFirstPresentationFrame)
+            {
+                CompositionTarget.Rendering -= EntranceRendering;
+                return;
+            }
+            // The base value is already 1 before WPF applies the new clock.
+            // Wait for the initial Window render queue to drain, then observe
+            // genuinely advanced animation at Rendering. Neither a pre-tick
+            // base value nor Loaded alone is an entrance frame. The filter's
+            // original 100 ms deadline still bounds this opportunity.
+            if (contentRenderedMilliseconds is null || (FluentMotion.Enabled && !entranceClockHasAdvanced)
+                || suggestionBorder.Opacity <= 0) return;
             backdropFilter.FirstPresentationFrameSubmitted();
             NativeMotionCapture.Mark(timingSession, "search-initial-cache-nonzero-rendering");
         }

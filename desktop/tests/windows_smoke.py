@@ -55,7 +55,7 @@ UIA_STAGES = frozenset({
     "text-start", "text-end", "context", "escape", "select_expand",
     "select_find_option", "select_option", "select_collapse", "context_focus",
     "context_input", "context_open", "read_value", "read_selection", "read_toggle",
-    "read_scroll", "read_bounds", "serialize", "complete",
+    "read_scroll", "read_bounds", "serialize", "complete", "exit_process",
 })
 
 
@@ -76,17 +76,20 @@ def safe_code(value: object) -> str:
     return value if isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9_. -]{1,100}", value) else "unspecified_error"
 
 
-def uia_stages(stderr: str | bytes | None) -> list[str]:
+def uia_progress(stderr: str | bytes | None) -> tuple[list[str], list[dict]]:
     """Extract only bounded, fixed markers; never preserve raw helper output."""
     text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr or ""
     stages = []
+    timings = []
     for line in text[:16384].splitlines():
-        prefix = "MIHOMO_UIA_STAGE:"
-        if line.startswith(prefix) and line[len(prefix):] in UIA_STAGES:
-            stages.append(line[len(prefix):])
+        marker = re.fullmatch(r"MIHOMO_UIA_STAGE:([a-z0-9_-]+)(?::([0-9]{1,6}))?", line)
+        if marker and marker[1] in UIA_STAGES:
+            stages.append(marker[1])
+            if marker[2] is not None:
+                timings.append({"stage": marker[1], "elapsedMilliseconds": int(marker[2])})
             if len(stages) == 64:
                 break
-    return stages
+    return stages, timings
 
 
 def wait_until(predicate, code: str, timeout: float = 45.0):
@@ -893,11 +896,12 @@ class NativeDriver:
                     encoding="utf-8", errors="replace", timeout=15,
                     creationflags=subprocess.CREATE_NO_WINDOW)
             except subprocess.TimeoutExpired as error:
-                stages = uia_stages(error.stderr)
+                stages, timings = uia_progress(error.stderr)
                 diagnostic = {"action": safe_code(action),
                     "automationId": identifier, "timedOut": True,
                     "stdoutLength": len(error.stdout or b""),
                     "stderrLength": len(error.stderr or b""), "stages": stages,
+                    "stageTimings": timings,
                     "lastStage": stages[-1] if stages else "not_reported",
                     "guiMessageProbe": self.gui_timeout_probe()}
                 raise SmokeFailure("native_uia_query_timeout_" + identifier,
@@ -921,12 +925,12 @@ class NativeDriver:
             # Preserve process-exit evidence even if the helper cannot emit JSON.
             # Counts and fixed markers are safe; stdout/stderr can contain text
             # from the editor or a configuration and must never enter artifacts.
-            stages = uia_stages(result.stderr)
+            stages, timings = uia_progress(result.stderr)
             diagnostic = {"action": safe_code(action),
                 "automationId": identifier, "returnCode": result.returncode,
                 "exitCodeHex": f"0x{result.returncode & 0xFFFFFFFF:08X}",
                 "stdoutLength": len(result.stdout), "stderrLength": len(result.stderr),
-                "jsonParsed": parsed, "stages": stages,
+                "jsonParsed": parsed, "stages": stages, "stageTimings": timings,
                 "lastStage": stages[-1] if stages else "not_reported",
                 "stderrIndicators": [marker for marker in (
                     "ParserError", "ParameterBindingValidationException", "AccessViolationException",

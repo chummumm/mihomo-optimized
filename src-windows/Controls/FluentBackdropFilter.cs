@@ -114,6 +114,8 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private double captureMilliseconds, compareMilliseconds, filterMilliseconds, retryAfterMilliseconds;
     private double queueMilliseconds, schedulingMilliseconds, convolutionMilliseconds, publishDispatchMilliseconds;
     private double lastCaptureAt = double.NegativeInfinity, preparationStartedAt, preparationReadyMilliseconds;
+    private double duplicateCaptureAfter, duplicateCaptureDelayMilliseconds;
+    private int duplicateCaptureDeferrals;
     private double? demandStartedAt;
     private double demandMilliseconds, captureQueueMilliseconds;
     private int demandCacheHits, captureQueuePromotions;
@@ -336,8 +338,25 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
 
     private void FirstPresentationDue(object? sender, EventArgs args)
     {
-        CancelFirstPresentationDelay();
+        firstPresentationTimer.Stop();
+        if (DeferCaptureForInitialPresentation()) return;
         QueueCapture();
+    }
+
+    private bool DeferCaptureForInitialPresentation()
+    {
+        if (firstPresentationGeneration != generation) return false;
+        // DispatcherTimer rounds through integer milliseconds/TickCount. It is
+        // a wake-up source, not proof that the Stopwatch deadline has passed.
+        // Recheck the same fixed deadline both here and immediately before RTB;
+        // neither an early tick nor previously queued work may skip the frame.
+        if (clock.Elapsed.TotalMilliseconds < firstPresentationCaptureAfter)
+        {
+            if (!firstPresentationTimer.IsEnabled) ScheduleFirstPresentationDelay();
+            return true;
+        }
+        CancelFirstPresentationDelay();
+        return false;
     }
 
     private void CancelFirstPresentationDelay()
@@ -417,6 +436,9 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         rasterHeight = raster.Source is BitmapSource bitmap2 ? bitmap2.PixelHeight : 0,
         sourceInvalidations, captures, identicalCaptures, filteredFrames, cancelledFrames, observerRearms,
         captureMilliseconds, compareMilliseconds, filterMilliseconds, firstBitmapMilliseconds,
+        duplicateCaptureDelayMilliseconds, duplicateCaptureDeferrals,
+        duplicateCaptureRemainingMilliseconds = !demanding && raster.Source is not null && publishedGeneration == generation
+            ? Math.Max(0, duplicateCaptureAfter - clock.Elapsed.TotalMilliseconds) : 0,
         queueMilliseconds, schedulingMilliseconds, convolutionMilliseconds, publishDispatchMilliseconds,
         preparationEnabled, presenting = Presenting, preparationReadyMilliseconds,
         demandMilliseconds, demandCacheHits, captureQueueMilliseconds, captureQueuePromotions,
@@ -473,6 +495,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private void InvalidateRaster(bool clear, string reason)
     {
         CancelFirstPresentationDelay();
+        preparationTimer.Stop(); duplicateCaptureAfter = duplicateCaptureDelayMilliseconds = 0;
         generation++; sourceRevision++; processing?.Cancel(); baseline = scratch = null; sourceDirty = true;
         lastInvalidationReason = reason; lastInvalidationAtMilliseconds = clock.Elapsed.TotalMilliseconds;
         if (demanding) readyRevision = sourceRevision;
@@ -600,14 +623,37 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         if (sourceDirty) QueueCapture();
     }
 
+    private bool DeferCaptureForBudget()
+    {
+        if (demanding || raster.Source is null || publishedGeneration != generation)
+        {
+            preparationTimer.Stop();
+            return false;
+        }
+        // A VisualBrush invalidates for its whole source, including animations
+        // outside the sampled rectangle. An identical real capture earns a
+        // bounded rendering interval; later dirty notifications cannot extend
+        // it. Hidden preparation retains its existing, later one-second due.
+        double now = clock.Elapsed.TotalMilliseconds;
+        double due = Presenting ? duplicateCaptureAfter : Math.Max(duplicateCaptureAfter, lastCaptureAt + 1000);
+        double remaining = due - now;
+        if (remaining <= 0)
+        {
+            preparationTimer.Stop();
+            return false;
+        }
+        if (Presenting && duplicateCaptureAfter > now) duplicateCaptureDeferrals++;
+        preparationTimer.Stop();
+        preparationTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(1, remaining));
+        preparationTimer.Start();
+        return true;
+    }
+
     private void QueueCapture()
     {
         if (disposed || !listening || !CanProcess || capturing || updatingGeometry || processing is not null || observer.Drawing is null || clock.Elapsed.TotalMilliseconds < retryAfterMilliseconds) return;
-        if (firstPresentationGeneration == generation)
-        {
-            if (clock.Elapsed.TotalMilliseconds < firstPresentationCaptureAfter) return;
-            CancelFirstPresentationDelay();
-        }
+        if (DeferCaptureForInitialPresentation()) return;
+        if (DeferCaptureForBudget()) return;
         // Initial presentation is urgent. Subsequent live sampling runs after
         // normal WPF presentation, so an RTB does not preempt the menu's next
         // animation frame. There is still only one queued/in-flight capture.
@@ -617,24 +663,13 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
             if (pending.Priority < priority) { pending.Priority = priority; captureQueuePromotions++; }
             return;
         }
-        if (!Presenting && !demanding && raster.Source is not null && publishedGeneration == generation)
-        {
-            // Hidden preparation is not a second render loop. Source changes
-            // coalesce into at most one capture per second when a valid frame
-            // already exists. A page/theme/geometry invalidation needs its first
-            // current-generation frame immediately; otherwise the budget can
-            // leave the next real opening without any legal prepared image.
-            double delay = Math.Max(0, lastCaptureAt + 1000 - clock.Elapsed.TotalMilliseconds);
-            if (delay > 0)
-            {
-                preparationTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(1, delay)); preparationTimer.Start(); return;
-            }
-        }
         long queued = Stopwatch.GetTimestamp();
         captureOperation = Dispatcher.BeginInvoke(priority, new Action(() =>
         {
             captureOperation = null;
             if (disposed || !listening || !CanProcess || processing is not null || !sourceDirty) return;
+            if (DeferCaptureForInitialPresentation()) return;
+            if (DeferCaptureForBudget()) return;
             capturing = true;
             long timingSession = 0, timingStarted = 0, timingRendered = 0, timingCopied = 0, timingGeneration = 0, timingRevision = 0;
             try
@@ -666,7 +701,15 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
                 long compareStarted = Stopwatch.GetTimestamp();
                 bool identical = baseline is not null && baseline.AsSpan().SequenceEqual(scratch);
                 compareMilliseconds = Stopwatch.GetElapsedTime(compareStarted).TotalMilliseconds;
-                if (identical) { identicalCaptures++; CompleteReady(revision, sampleStartedAt, sampleCompletedAt); return; }
+                if (identical)
+                {
+                    identicalCaptures++;
+                    duplicateCaptureDelayMilliseconds = Math.Clamp(3 * captureMilliseconds, 50, 125);
+                    duplicateCaptureAfter = sampleCompletedAt + duplicateCaptureDelayMilliseconds;
+                    CompleteReady(revision, sampleStartedAt, sampleCompletedAt);
+                    return;
+                }
+                duplicateCaptureAfter = duplicateCaptureDelayMilliseconds = 0;
                 // Only these two byte buffers are retained. While one is being
                 // processed no second capture can mutate it or build a queue.
                 (baseline, scratch) = (scratch, baseline);
