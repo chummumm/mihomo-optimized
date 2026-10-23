@@ -61,7 +61,7 @@ public partial class App : Application
         {
             // An installer waits for --quit's exit code; a hidden modal dialog
             // would leave that maintenance invocation blocked indefinitely.
-            if (!e.Args.Contains("--quit")) MessageBox.Show(error.Message, "Mihomo Optimized", MessageBoxButton.OK, MessageBoxImage.Error);
+            if (!e.Args.Contains("--quit")) MessageBox.Show(L.T(error.Message), "Mihomo Optimized", MessageBoxButton.OK, MessageBoxImage.Error);
             Shutdown(1);
         }
     }

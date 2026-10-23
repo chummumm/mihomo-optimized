@@ -19,14 +19,14 @@ public abstract class NativePage : UserControl
     protected bool IsActive => lifetime is { IsCancellationRequested: false };
     protected bool IsRunning => Session.Status.Text("phase") == "running";
     protected string ControllerIdentity => Session.Status.Get("controller").Text("url") + "\n" + Session.Status.Get("controller").Text("secret");
-    protected string InactiveMessage => Session.Status.Text("phase") switch
+    protected string InactiveMessage => L.T(Session.Status.Text("phase") switch
     {
         "connecting" => "正在连接本地服务，请稍候。",
         "starting" => "正在准备启动资源并确认内核就绪，请稍候。",
         "stopping" => "正在停止内核，请稍候。",
         "error" => Session.Status.Text("lastError", fallback: "内核需要处理，请在主页查看详细信息。"),
         _ => "内核未运行，可在主页启动。"
-    };
+    });
     public string Title { get; }
 
     protected NativePage(AppSession session, string key, string title, string subtitle)
@@ -37,10 +37,22 @@ public abstract class NativePage : UserControl
         layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         layout.RowDefinitions.Add(new RowDefinition());
         var header = new Grid { Margin = new Thickness(0, 0, 12, 20) };
+        header.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        header.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         header.ColumnDefinitions.Add(new ColumnDefinition());
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        header.Children.Add(Ui.Column(Ui.Text(title, 28, true), Ui.Muted(subtitle)));
+        var heading = Ui.Column(Ui.Label(title, 28, true), Ui.Hint(subtitle));
+        header.Children.Add(heading);
         Grid.SetColumn(Tools, 1); header.Children.Add(Tools);
+        header.SizeChanged += (_, _) =>
+        {
+            bool compact = header.ActualWidth < 700;
+            Grid.SetRow(Tools, compact ? 1 : 0); Grid.SetColumn(Tools, compact ? 0 : 1);
+            Grid.SetColumnSpan(Tools, compact ? 2 : 1); Grid.SetColumnSpan(heading, compact ? 2 : 1);
+            Tools.HorizontalAlignment = compact ? HorizontalAlignment.Left : HorizontalAlignment.Right;
+            Tools.MaxWidth = Math.Max(1, header.ActualWidth - (compact ? 0 : 240));
+            Tools.Margin = new Thickness(0, compact ? 12 : 0, 0, 0);
+        };
         layout.Children.Add(header);
         notice.Margin = new Thickness(0, 0, 12, 12); notice.Visibility = Visibility.Collapsed;
         notice.Id(key + "Notice"); Grid.SetRow(notice, 1); layout.Children.Add(notice);
@@ -50,14 +62,14 @@ public abstract class NativePage : UserControl
     public virtual void Activate()
     {
         if (IsActive) return;
-        lifetime = new CancellationTokenSource(); Session.StatusChanged += StatusChanged;
+        lifetime = new CancellationTokenSource(); Session.StatusChanged += StatusChanged; L.Changed += OnLanguageChanged;
         var token = lifetime.Token;
         controllerIdentity = ControllerIdentity;
         _ = RunAsync(async () => { await RunAsync(RefreshAsync); if (!token.IsCancellationRequested) await LiveAsync(token); });
     }
     public virtual void Deactivate()
     {
-        Session.StatusChanged -= StatusChanged; lifetime?.Cancel(); lifetime?.Dispose(); lifetime = null;
+        Session.StatusChanged -= StatusChanged; L.Changed -= OnLanguageChanged; lifetime?.Cancel(); lifetime?.Dispose(); lifetime = null;
     }
     private void StatusChanged(object? sender, EventArgs e)
     {
@@ -66,13 +78,15 @@ public abstract class NativePage : UserControl
         if (controllerIdentity != current) { controllerIdentity = current; if (IsRunning && IsActive) _ = RunAsync(RefreshAsync); }
     }
     protected virtual void OnStatusChanged() { }
+    protected virtual void OnLanguageChanged() => OnStatusChanged();
+    public virtual Task NavigateToAsync(NavigationTarget target) => Task.CompletedTask;
     public abstract Task RefreshAsync();
     protected virtual Task LiveAsync(CancellationToken cancellationToken) => Task.CompletedTask;
     public virtual Task<bool> CanLeaveAsync() => Task.FromResult(true);
     protected void SetBody(UIElement content) { Body.Children.Clear(); Body.Children.Add(content); }
     protected void Message(string text, bool error = false)
     {
-        notice.Text = text; notice.Visibility = string.IsNullOrEmpty(text) ? Visibility.Collapsed : Visibility.Visible;
+        L.Bind(notice, TextBlock.TextProperty, text); notice.Visibility = string.IsNullOrEmpty(text) ? Visibility.Collapsed : Visibility.Visible;
         notice.SetResourceReference(TextBlock.ForegroundProperty, error ? "DangerBrush" : "TextSecondaryBrush");
     }
     protected async Task RunAsync(Func<Task> operation, Button? button = null)
@@ -86,7 +100,8 @@ public abstract class NativePage : UserControl
     protected Button Action(string title, string id, Func<Task> operation, bool primary = false)
     {
         var button = new Button { Content = title, MinHeight = 34, Padding = new Thickness(14, 6, 14, 6), Margin = new Thickness(0, 0, 8, 8) }.Id(id);
-        System.Windows.Automation.AutomationProperties.SetName(button, title);
+        L.Bind(button, ContentControl.ContentProperty, title);
+        L.Bind(button, System.Windows.Automation.AutomationProperties.NameProperty, title);
         if (primary) { button.SetResourceReference(Control.BackgroundProperty, "AccentBrush"); button.SetResourceReference(Control.ForegroundProperty, "AccentTextBrush"); }
         button.Click += async (_, _) => { await RunAsync(operation, button); OnStatusChanged(); }; return button;
     }

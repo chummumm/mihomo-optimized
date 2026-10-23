@@ -56,6 +56,8 @@ def main():
     for name in ("mihomo-core", "mihomo-desktop-service", "mihomo-update-verify"):
         shutil.copy2(binaries / f"{name}-{TARGET}.exe", output / f"{name}.exe")
     shutil.copytree(ROOT / "src-tauri/resources", output / "resources")
+    shutil.copy2(ROOT / "public/licenses/Fluent-UI-System-Icons-MIT.txt",
+                 output / "resources/licenses/Fluent-UI-System-Icons-MIT.txt")
     shutil.copy2(ROOT / "desktop/README.zh-CN.md", output / "README.zh-CN.md")
     info_path = output / "resources/build-info.json"
     info = json.loads(info_path.read_text())

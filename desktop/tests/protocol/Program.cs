@@ -49,3 +49,20 @@ using (var reader = Reader("complete\nincomplete"))
 Console.WriteLine("Native client protocol: Unicode/escaped YAML, combined and split frames, exact limits, oversized and incomplete EOF passed.");
 await ProcessFixtures.TestHostAsync();
 if (OperatingSystem.IsWindows()) await ProcessFixtures.TestBrokerAsync();
+
+// Filtered DNS histories use atomic cursor boundaries, never guessed sequential IDs.
+static JsonElement PageFixture(object value) => JsonSerializer.SerializeToElement(value);
+var indexed = DnsPageIndex.Read(PageFixture(new { total = 101, retained = 400, anchor_id = "18446744073709551615", page_cursors = new[] { "", "500", "12" } }), 50);
+Equal(101, indexed!.Total); Equal("12", indexed.Cursors[2]);
+Equal(1, DnsPageIndex.Read(PageFixture(new { total = 0, retained = 400, anchor_id = "", page_cursors = new[] { "" } }), 100)!.Cursors.Length);
+foreach (var invalid in new object[] {
+    new { total = 101, retained = 100, anchor_id = "1000", page_cursors = new[] { "", "500", "12" } },
+    new { total = 101, retained = 400, anchor_id = "1000", page_cursors = new[] { "", "500", "500" } },
+    new { total = 101, retained = 400, anchor_id = "1000", page_cursors = new[] { "", "500", "600" } },
+    new { total = 101, retained = 400, anchor_id = "1000", page_cursors = new[] { "", "500", "012" } },
+    new { total = 101, retained = 400, anchor_id = "18446744073709551616", page_cursors = new[] { "", "500", "12" } },
+    new { total = 101, retained = 400, anchor_id = "1000", page_cursors = new[] { "", "500" } },
+    new { total = 101, retained = 400, anchor_id = "", page_cursors = new[] { "", "500", "12" } },
+    new { retained = 400, anchor_id = "1000", next_cursor = "500" }
+}) Equal<DnsPageIndex?>(null, DnsPageIndex.Read(PageFixture(invalid), 50));
+Console.WriteLine("Native DNS pagination: filtered totals, sparse IDs, 64-bit boundaries, empty pages and malformed/legacy metadata passed.");

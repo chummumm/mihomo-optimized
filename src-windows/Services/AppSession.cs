@@ -34,6 +34,10 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public JsonElement Status { get; private set; } = JsonSerializer.SerializeToElement(new { phase = "connecting" });
     public JsonElement Update { get; private set; } = JsonSerializer.SerializeToElement(new { available = false });
     public string Theme { get; private set; } = "system";
+    public string Language { get; private set; } = "zh-CN";
+    public string TestUrl { get; private set; } = "https://www.gstatic.com/generate_204";
+    public bool CloseConnectionsOnSwitch { get; private set; }
+    public bool ShowProxyProvider { get; private set; } = true;
     public bool Ready { get; private set; }
     public bool IsExiting => exiting;
     public bool IsUpdating { get; private set; }
@@ -42,6 +46,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public event Action<string, JsonElement>? HostEvent;
     public event Action<string, bool>? Notification;
     public event Action<string>? NavigateRequested;
+    public event Action<NavigationTarget>? NavigateTargetRequested;
     public event Action? ExitRequested;
     public event Action? ThemeChanged;
 
@@ -75,9 +80,19 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
                 using var saved = JsonDocument.Parse(File.ReadAllText(appearancePath));
                 string value = HostChannel.Text(saved.RootElement, "theme", "system");
                 if (value is "light" or "dark" or "system") Theme = value;
+                string language = HostChannel.Text(saved.RootElement, "language", "zh-CN");
+                if (language is "zh-CN" or "en-US" or "system") Language = language;
+                string testUrl = HostChannel.Text(saved.RootElement, "testUrl", TestUrl);
+                if (ValidTestUrl(testUrl)) TestUrl = testUrl;
+                if (saved.RootElement.ValueKind == JsonValueKind.Object)
+                {
+                    if (saved.RootElement.TryGetProperty("closeConnectionsOnSwitch", out var close)) CloseConnectionsOnSwitch = close.ValueKind == JsonValueKind.True;
+                    if (saved.RootElement.TryGetProperty("showProxyProvider", out var show)) ShowProxyProvider = show.ValueKind != JsonValueKind.False;
+                }
             }
         }
         catch (Exception error) when (error is IOException or JsonException or UnauthorizedAccessException) { }
+        L.SetLanguage(Language);
         SystemEvents.UserPreferenceChanged += OnSystemThemeChanged;
     }
 
@@ -246,7 +261,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             launchCheckConsumed = true;
             var update = await CheckUpdateAsync(lifetime.Token);
             if (update.TryGetProperty("available", out var available) && available.ValueKind == JsonValueKind.True)
-                Notify("发现新版本 " + HostChannel.Text(update, "version") + "，可在设置中更新。");
+                Notify(L.F("发现新版本 {0}，可在设置中更新。", HostChannel.Text(update, "version")));
         }
         catch (OperationCanceledException) { }
         catch (Exception) { /* Automatic checks do not interrupt offline startup; manual checks show their error. */ }
@@ -300,7 +315,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             {
                 string detail = "";
                 try { using var error = JsonDocument.Parse(data.ToArray()); detail = HostChannel.Text(error.RootElement, "message"); } catch (JsonException) { }
-                throw new DesktopException("api_failed", detail.Length is > 0 and < 500 ? detail : $"内核返回 HTTP {(int)response.StatusCode}");
+                throw new DesktopException("api_failed", detail.Length is > 0 and < 500 ? detail : L.F("内核返回 HTTP {0}", (int)response.StatusCode));
             }
             if (data.Length == 0) return JsonSerializer.SerializeToElement(new { });
             using var parsed = JsonDocument.Parse(data.ToArray());
@@ -346,14 +361,50 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         if (theme is not ("system" or "light" or "dark")) throw new ArgumentException("Unknown theme", nameof(theme));
         Theme = theme;
         ApplyTheme();
+        SavePreferences();
+    }
+
+    public void SetLanguage(string language)
+    {
+        if (language is not ("zh-CN" or "en-US" or "system")) throw new ArgumentException("Unknown language", nameof(language));
+        Language = language;
+        L.SetLanguage(language);
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Language)));
+        SavePreferences();
+    }
+
+    public void SetTestUrl(string url)
+    {
+        url = url.Trim();
+        if (!ValidTestUrl(url)) throw new ArgumentException(L.T("请输入有效的 HTTP 或 HTTPS 探测地址。"), nameof(url));
+        TestUrl = url;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(TestUrl)));
+        SavePreferences();
+    }
+    private static bool ValidTestUrl(string url) => url.Length <= 2048 && Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https" && uri.UserInfo.Length == 0 && !string.IsNullOrWhiteSpace(uri.Host);
+    public void SetCloseConnectionsOnSwitch(bool enabled)
+    {
+        CloseConnectionsOnSwitch = enabled;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CloseConnectionsOnSwitch)));
+        SavePreferences();
+    }
+    public void SetShowProxyProvider(bool enabled)
+    {
+        ShowProxyProvider = enabled;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ShowProxyProvider)));
+        SavePreferences();
+    }
+
+    private void SavePreferences()
+    {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(appearancePath)!);
             string temporary = appearancePath + ".tmp";
-            File.WriteAllText(temporary, JsonSerializer.Serialize(new { theme }));
+            File.WriteAllText(temporary, JsonSerializer.Serialize(new { theme = Theme, language = Language, testUrl = TestUrl, closeConnectionsOnSwitch = CloseConnectionsOnSwitch, showProxyProvider = ShowProxyProvider }));
             File.Move(temporary, appearancePath, true);
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { Notify("外观已切换，但未能保存偏好。", true); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { Notify("设置已生效，但未能保存偏好。", true); }
     }
 
     public void ApplyTheme()
@@ -364,21 +415,26 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         var palette = new Dictionary<string, string>
         {
             ["AppBackgroundBrush"] = dark ? "#202020" : "#F3F3F3",
-            ["SurfaceBrush"] = dark ? "#2D2D2D" : "#FFFFFF",
+            ["SurfaceBrush"] = dark ? "#2B2B2B" : "#FBFBFB",
             ["SubtleSurfaceBrush"] = dark ? "#272727" : "#F8F8F8",
             ["TextPrimaryBrush"] = dark ? "#FFFFFF" : "#1B1B1B",
             ["TextSecondaryBrush"] = dark ? "#C5C5C5" : "#616161",
             ["BorderBrush"] = dark ? "#454545" : "#E2E2E2",
             ["SuccessBrush"] = dark ? "#6CCB5F" : "#0F7B0F",
-            ["DangerBrush"] = dark ? "#FF99A4" : "#C42B1C"
+            ["DangerBrush"] = dark ? "#FF99A4" : "#C42B1C",
+            ["WarningBrush"] = dark ? "#FCE100" : "#9D5D00",
+            ["ChartUpBrush"] = dark ? "#9E9E9E" : "#8A8A8A"
         };
+        string[] lines = dark ? ["#60CDFF", "#C3A6F2", "#FF8FD0", "#4FD8B4", "#FFB36B", "#82A8FF", "#D6A3FF", "#5DD3D6", "#FF9A9A"] : ["#0063B1", "#6B4FAC", "#B0297A", "#00755E", "#A65200", "#1F5BD6", "#8A3FC2", "#00727A", "#B33A3A"];
+        for (int index = 0; index < lines.Length; index++) palette["Line" + index + "Brush"] = lines[index];
         foreach (var item in palette) app.Resources[item.Key] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(item.Value));
         app.Resources["AccentBrush"] = dark ? SystemColors.AccentColorLight2Brush : SystemColors.AccentColorDark1Brush;
         app.Resources["AccentTextBrush"] = dark ? Brushes.Black : Brushes.White;
         if (SystemParameters.HighContrast)
         {
             app.Resources["AppBackgroundBrush"] = app.Resources["SurfaceBrush"] = app.Resources["SubtleSurfaceBrush"] = SystemColors.WindowBrush;
-            app.Resources["TextPrimaryBrush"] = app.Resources["TextSecondaryBrush"] = app.Resources["SuccessBrush"] = app.Resources["DangerBrush"] = SystemColors.WindowTextBrush;
+            app.Resources["TextPrimaryBrush"] = app.Resources["TextSecondaryBrush"] = app.Resources["SuccessBrush"] = app.Resources["DangerBrush"] = app.Resources["WarningBrush"] = app.Resources["ChartUpBrush"] = SystemColors.WindowTextBrush;
+            for (int index = 0; index < lines.Length; index++) app.Resources["Line" + index + "Brush"] = SystemColors.HighlightBrush;
             app.Resources["BorderBrush"] = SystemColors.WindowTextBrush;
             app.Resources["AccentBrush"] = SystemColors.HighlightBrush;
             app.Resources["AccentTextBrush"] = SystemColors.HighlightTextBrush;
@@ -388,8 +444,9 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     }
 
     private void OnSystemThemeChanged(object sender, UserPreferenceChangedEventArgs e) => Dispatch(ApplyTheme);
-    public void Notify(string message, bool error = false) => Dispatch(() => Notification?.Invoke(message, error));
+    public void Notify(string message, bool error = false) => Dispatch(() => Notification?.Invoke(L.T(message), error));
     public void Navigate(string key) => Dispatch(() => NavigateRequested?.Invoke(key));
+    public void Navigate(NavigationTarget target) => Dispatch(() => NavigateTargetRequested?.Invoke(target));
     public void RequestExit() => Dispatch(() => ExitRequested?.Invoke());
     public void ExpectExit() { exiting = true; host.ExpectExit(); }
     private static void Dispatch(Action action)

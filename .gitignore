@@ -23,5 +23,6 @@ __pycache__/
 /desktop/generated/
 /src-windows/bin/
 /src-windows/obj/
+/src-windows/*_wpftmp.csproj
 /desktop/tests/protocol/bin/
 /desktop/tests/protocol/obj/

@@ -5,6 +5,7 @@ using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Media;
+using Mihomo.Desktop.Services;
 
 namespace Mihomo.Desktop.Controls;
 
@@ -38,6 +39,8 @@ internal static class Ui
     {
         var text = Text(value, size); text.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); return text;
     }
+    public static TextBlock Label(string value, double size = 14, bool strong = false) => L.Bind(Text(value, size, strong), TextBlock.TextProperty, value);
+    public static TextBlock Hint(string value, double size = 12) => L.Bind(Muted(value, size), TextBlock.TextProperty, value);
     public static StackPanel Column(params UIElement[] children)
     {
         var panel = new StackPanel(); foreach (var child in children) panel.Children.Add(child); return panel;
@@ -66,13 +69,18 @@ internal static class Ui
         VirtualizingPanel.SetIsVirtualizing(table, true); VirtualizingPanel.SetVirtualizationMode(table, VirtualizationMode.Recycling);
         ScrollViewer.SetCanContentScroll(table, true);
         foreach (var (header, path, width) in columns)
-            table.Columns.Add(new DataGridTextColumn { Header = header, Binding = new Binding(path), Width = width < 0 ? new DataGridLength(-width, DataGridLengthUnitType.Star) : new DataGridLength(width), MinWidth = 60 });
+        {
+            var column = new DataGridTextColumn { Binding = new Binding(path), Width = width < 0 ? new DataGridLength(-width, DataGridLengthUnitType.Star) : new DataGridLength(width), MinWidth = 60 };
+            L.Bind(column, DataGridColumn.HeaderProperty, header);
+            table.Columns.Add(column);
+        }
         return table;
     }
     public static TextBox SearchBox(string label, string id)
     {
         var input = new TextBox { MinWidth = 180, Height = 34, VerticalContentAlignment = VerticalAlignment.Center, ToolTip = label }.Id(id);
-        AutomationProperties.SetName(input, label); return input;
+        L.Bind(input, FrameworkElement.ToolTipProperty, label);
+        L.Bind(input, AutomationProperties.NameProperty, label); return input;
     }
     public static string Bytes(double value)
     {
@@ -81,6 +89,6 @@ internal static class Ui
         return $"{value.ToString(unit == 0 ? "0" : "0.##", CultureInfo.CurrentCulture)} {units[unit]}";
     }
     public static string Time(string value) => DateTimeOffset.TryParse(value, out var date) ? date.ToLocalTime().ToString("HH:mm:ss", CultureInfo.CurrentCulture) : value;
-    public static string Delay(double value) => value > 0 ? $"{value:0.#} ms" : "未测量";
+    public static string Delay(double value) => value > 0 ? $"{value:0.#} ms" : L.T("未测量");
     public static void Copy(string content) { if (!string.IsNullOrEmpty(content)) Clipboard.SetText(content); }
 }

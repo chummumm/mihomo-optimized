@@ -778,25 +778,27 @@ class NativeDriver:
         self.invoke("native_navigate", {"page": page}, timeout=10)
         wait_until(lambda: self.snapshot().get("page") == page, "native_navigation_failed", 10)
 
-    def ui(self, automation_id: str, action: str = "read") -> dict:
+    def ui(self, automation_id: str, action: str = "read", value: str = "") -> dict:
         script = Path(__file__).with_name("uia-query.ps1").resolve()
         result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
             "-File", str(script), "-ApplicationProcessId", str(self.identity.pid),
-            "-AutomationId", automation_id, "-Action", action],
+            "-AutomationId", automation_id, "-Action", action, "-Value", value],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW)
         require(result.returncode == 0, "native_uia_query_failed_" + safe_code(automation_id))
         return json.loads(result.stdout.lstrip("\ufeff"))
 
-    def screenshot(self, output: Path, secrets: set[str]) -> None:
-        self.navigate("settings")
+    def screenshot(self, output: Path, secrets: set[str], page: str | None = "settings", surface: str = "main") -> dict:
+        if page is not None:
+            self.navigate(page)
         visible = self.ui("*")
-        require(visible.get("found") is True, "native_settings_ui_not_found")
+        require(visible.get("found") is True, "native_screenshot_ui_not_found")
         text = json.dumps(visible, ensure_ascii=False)
         require(all(value not in text for value in secrets), "screenshot_would_expose_secret_or_editor")
-        self.invoke("native_screenshot", {"path": str(output.resolve())}, timeout=10)
+        capture = self.invoke("native_screenshot", {"path": str(output.resolve()), "surface": surface}, timeout=10)
         require(output.is_file() and output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"),
                 "native_screenshot_invalid")
+        return capture
 
     def close(self) -> None:
         if self.pipe is not None:
@@ -1063,7 +1065,19 @@ proxies:
     server: 127.0.0.1
     port: {socks}
     udp: false
-proxy-groups: []
+proxy-groups:
+  - name: Smoke Primary
+    type: select
+    proxies: [DIRECT, smoke-socks]
+  - name: Smoke Media
+    type: select
+    proxies: [DIRECT, smoke-socks]
+  - name: Smoke Work
+    type: select
+    proxies: [DIRECT, smoke-socks]
+  - name: Smoke Backup
+    type: select
+    proxies: [DIRECT, smoke-socks]
 rules:
   - IP-CIDR,{TUN_TARGET}/32,smoke-socks,no-resolve
   - MATCH,DIRECT
@@ -1107,6 +1121,220 @@ class Acceptance:
     def save_configuration(self, content: str) -> None:
         current = self.driver.invoke("desktop_read_config")
         self.driver.invoke("desktop_save_config", {"content": content, "expectedRevision": current["revision"]})
+
+    def runtime_json(self, path: str) -> dict:
+        """Read actual loopback state without exposing the controller credential."""
+        controller = self.status().get("controller") or {}
+        url = urlsplit(controller.get("url", ""))
+        require(url.hostname == "127.0.0.1" and url.port, "native_ui_controller_unavailable")
+        connection = http.client.HTTPConnection("127.0.0.1", url.port, timeout=5)
+        try:
+            connection.request("GET", "/" + path.lstrip("/"), headers={"Authorization": "Bearer " + controller["secret"], "Connection": "close"})
+            response = connection.getresponse()
+            payload = response.read(4 * 1024 * 1024 + 1)
+            require(response.status == 200 and len(payload) <= 4 * 1024 * 1024, "native_ui_runtime_read_failed")
+            return json.loads(payload)
+        finally:
+            connection.close()
+
+    def check_native_redesign_ui(self, valid: str, base: str) -> None:
+        """Exercise final-design controls through independent Windows UIA peers.
+
+        The local automation pipe is used for navigation, resizing and captures;
+        feature actions (search, switches, selections and saving) use UIA. Runtime
+        readback and the actual configuration file prove the action took effect.
+        """
+        self.stage = "native_redesign_ui"
+        evidence = {"checks": [], "captures": [], "framework": "WPF", "browserRuntime": False}
+        self.report["nativeRedesign"] = evidence
+        driver = self.driver
+
+        def found(identifier: str, *, enabled: bool = False) -> dict:
+            def probe():
+                result = driver.ui(identifier)
+                return result if result.get("found") and (not enabled or result.get("enabled")) else None
+            return wait_until(probe, "native_ui_missing_" + identifier.replace(" ", "_"), 20)
+
+        def checked(name: str) -> None:
+            evidence["checks"].append(name)
+            print("UI: " + name, flush=True)
+
+        def capture(name: str, page: str | None = None, surface: str = "main") -> None:
+            result = driver.screenshot(self.artifacts / name, self.secrets, page, surface)
+            evidence["captures"].append({"file": name, "surface": result.get("surface"), "kind": result.get("captureKind"), "material": result.get("material")})
+
+        def search(query: str, result_id: str, page: str, *, screenshot: bool = False) -> None:
+            driver.ui("GlobalSearch", "invoke")
+            found("SearchInput", enabled=True)
+            driver.ui("SearchInput", "set", query)
+            found(result_id, enabled=True)
+            if screenshot:
+                capture("windows-search.png", surface="search")
+            driver.ui(result_id, "invoke")
+            wait_until(lambda: driver.snapshot().get("page") == page and not driver.ui("GlobalSearchWindow").get("found"), "native_search_destination_failed", 15)
+
+        driver.invoke("native_show")
+        driver.invoke("native_resize", {"width": 1180, "height": 780})
+        driver.navigate("home")
+        for identifier in ("TitleBarBack", "TitleBarMinimize", "TitleBarMaximize", "TitleBarClose", "NavigationToggle", "CoreCard", "TrafficChart"):
+            found(identifier)
+        for group in ("Smoke Primary", "Smoke Media", "Smoke Work", "Smoke Backup"):
+            found("HomeExitSummary_" + group)
+        require(driver.snapshot().get("customTitleBar") is True, "native_custom_titlebar_missing")
+        capture("windows-home.png")
+        driver.ui("HomeExitSummary_Smoke Primary", "invoke")
+        wait_until(lambda: driver.snapshot().get("page") == "proxies", "native_home_exit_navigation_failed", 15)
+        found("ProxyGroup_Smoke Primary")
+        checked("home_four_exits_and_group_navigation")
+
+        found("TopologyGroup_Smoke Primary")
+        found("MeasureAllProxies")
+        found("BreakConnectionsOnSwitch", enabled=True)
+        driver.ui("BreakConnectionsOnSwitch", "toggle")
+        wait_until(lambda: json.loads((self.directory / "native-appearance.json").read_text(encoding="utf-8")).get("closeConnectionsOnSwitch") is True, "native_proxy_preference_not_saved")
+        driver.ui("BreakConnectionsOnSwitch", "toggle")
+        driver.ui("ProxySearch", "set", "smoke-socks")
+        found("ProxyNode_smoke-socks")
+        driver.ui("ProxySearch", "set", "")
+        # Return to the top without manufacturing graph data or sampled rates.
+        driver.ui("ProxiesScrollViewer", "scroll", "0")
+        capture("windows-proxies.png")
+        checked("proxy_topology_filter_and_persisted_preferences")
+
+        driver.navigate("settings")
+        found("AppLanguage", enabled=True)
+        driver.ui("AppLanguage", "select", "English")
+        wait_until(lambda: driver.snapshot().get("language") == "en-US", "native_language_not_applied")
+        require("Settings" in found("NavSettings").get("name", ""), "native_navigation_not_translated")
+        driver.ui("AppTheme", "select", "Dark")
+        wait_until(lambda: driver.snapshot().get("theme") == "dark", "native_theme_not_applied")
+        capture("windows-settings-dark-en.png")
+        driver.ui("AppTheme", "select", "Light")
+        driver.ui("AppLanguage", "select", "中文")
+        wait_until(lambda: driver.snapshot().get("language") == "zh-CN", "native_chinese_not_restored")
+        checked("live_language_and_theme")
+
+        search("theme", "SearchResult_setting-set-theme", "settings", screenshot=True)
+        require(not found("AppTheme").get("offscreen"), "native_search_setting_not_revealed")
+        search(TUN_TARGET, "SearchResult_rule-1", "rules")
+        require(TUN_TARGET in found("RuleSearch").get("value", ""), "native_search_rule_filter_missing")
+        capture("windows-rules.png")
+        search("Smoke Primary", "SearchResult_group-Smoke Primary", "proxies")
+        require(not found("ProxyGroup_Smoke Primary").get("offscreen"), "native_search_group_not_revealed")
+        search("smoke-socks", "SearchResult_node-smoke-socks", "proxies")
+        checked("global_search_settings_rules_groups_nodes")
+
+        driver.navigate("settings")
+        found("SettingsAllowLan", enabled=True)
+        driver.ui("SettingsAllowLan", "toggle")
+        wait_until(lambda: self.runtime_json("configs").get("allow-lan") is True, "native_lan_toggle_not_applied")
+        found("SettingsAllowLan", enabled=True)
+        driver.ui("SettingsAllowLan", "toggle")
+        wait_until(lambda: self.runtime_json("configs").get("allow-lan") is False, "native_lan_toggle_not_restored")
+        old_port = self.runtime_json("configs")["mixed-port"]
+        port = free_port()
+        while port in self.ports:
+            port = free_port()
+        self.ports.add(port)
+        found("SettingsMixedPort", enabled=True)
+        driver.ui("SettingsMixedPort", "set", str(port))
+        driver.navigate("home")  # The real leave guard commits pending port edits.
+        wait_until(lambda: self.runtime_json("configs").get("mixed-port") == port, "native_port_edit_not_applied")
+        driver.navigate("settings")
+        found("SettingsMixedPort", enabled=True)
+        driver.ui("SettingsMixedPort", "set", str(old_port))
+        driver.navigate("home")
+        wait_until(lambda: self.runtime_json("configs").get("mixed-port") == old_port, "native_port_edit_not_restored")
+        driver.navigate("settings")
+        probe = "http://127.0.0.1:9/native-probe"
+        driver.ui("SettingsProbeUrl", "set", probe)
+        driver.ui("SaveProbeUrl", "invoke")
+        wait_until(lambda: json.loads((self.directory / "native-appearance.json").read_text(encoding="utf-8")).get("testUrl") == probe, "native_probe_url_not_saved")
+        driver.ui("ResetProbeUrl", "invoke")
+        wait_until(lambda: driver.ui("SettingsProbeUrl").get("value") == "https://www.gstatic.com/generate_204", "native_probe_url_not_reset")
+        checked("settings_switch_ports_and_probe_writeback")
+
+        # Use the real credential-free fixture in the editor screenshot. The
+        # resource bootstrap document carries a per-run private URL token.
+        self.save_configuration(base)
+        self.driver.invoke("desktop_reload_config", {"force": True})
+        self.phase("running")
+        driver.navigate("profiles")
+        found("EditConfig", enabled=True)
+        capture("windows-profiles.png")
+        driver.ui("EditConfig", "invoke")
+        editor = found("ConfigEditor", enabled=True)
+        require(editor.get("readOnly") is False, "native_config_editor_readonly")
+        found("ConfigLineNumbers")
+        original = editor.get("value", "")
+        require("Smoke Primary" in original, "native_editor_wrong_document")
+        marker = "# native UIA save acceptance"
+        driver.ui("ConfigEditor", "set", original.rstrip("\r\n") + "\n" + marker + "\n")
+        found("SaveOnlyConfig", enabled=True)
+        capture("windows-config-editor.png")
+        driver.ui("SaveOnlyConfig", "invoke")
+        wait_until(lambda: marker in (self.directory / "config.yaml").read_text(encoding="utf-8"), "native_editor_save_not_written")
+        found("CloseEditor", enabled=True)
+        driver.ui("CloseEditor", "invoke")
+        wait_until(lambda: not driver.ui("ConfigEditor").get("found") or driver.ui("ConfigEditor").get("offscreen"), "native_editor_did_not_close", 15)
+        self.save_configuration(valid)
+        self.driver.invoke("desktop_reload_config", {"force": True})
+        self.phase("running")
+        checked("native_editor_line_numbers_edit_and_save")
+
+        driver.navigate("dns")
+        found("DnsTabs")
+        capture("windows-dns.png")
+        driver.ui("DnsQueriesTab", "select")
+        found("DnsPageNumber", enabled=True)
+        driver.ui("DnsPageSize", "select", "100")
+        found("DnsPageNumber", enabled=True)
+        # The following external UIA calls cross several normal status polls;
+        # the first visit must remain usable without a manual refresh.
+        for identifier in ("DnsQueries", "FirstDnsPage", "LastDnsPage", "ResetDnsFilter", "DnsLive"):
+            found(identifier)
+        require(found("DnsPageNumber").get("enabled"), "native_dns_froze_after_status_poll")
+        capture("windows-dns-queries.png")
+        driver.ui("DnsPageSize", "select", "50")
+        driver.ui("DnsUpstreamsTab", "select")
+        found("DnsUpstreams")
+        checked("dns_tabs_pagination_and_status_poll")
+
+        driver.navigate("logs")
+        found("LogLevel")
+        driver.ui("PauseLogs", "toggle")
+        found("ResumeLogs", enabled=True)
+        driver.ui("ResumeLogs", "invoke")
+        require(driver.ui("PauseLogs").get("toggleState") == "Off", "native_logs_did_not_resume")
+        capture("windows-logs.png")
+        driver.navigate("connections")
+        found("ConnectionTable")
+        found("ConnectionSource_all")
+        driver.ui("PauseConnections", "toggle")
+        driver.ui("PauseConnections", "toggle")
+        capture("windows-connections.png")
+        checked("logs_pause_resume_and_connections")
+
+        driver.navigate("home")
+        narrow = driver.invoke("native_resize", {"width": 640, "height": 700})
+        require(narrow.get("navigationMode") in ("minimal", "compact"), "native_narrow_navigation_mode_missing")
+        driver.ui("NavigationToggle", "invoke")
+        wait_until(lambda: driver.snapshot().get("navigationOverlay") is True, "native_navigation_overlay_did_not_open")
+        capture("windows-home-narrow.png")
+        driver.ui("NavigationToggle", "invoke")
+        driver.invoke("native_resize", {"width": 1180, "height": 780})
+        driver.invoke("native_show_tray")
+        found("TrayFlyout")
+        for identifier in ("TraySystemProxy", "TrayTun", "TrayAllowLan", "TrayOpenMain", "TrayPower"):
+            found(identifier)
+        for group in ("Smoke Primary", "Smoke Media", "Smoke Work"):
+            found("TrayExitSummary_" + group)
+        require(not driver.ui("TrayExitSummary_Smoke Backup").get("found"), "native_tray_exit_limit_wrong")
+        capture("windows-tray.png", surface="tray")
+        driver.ui("TrayOpenMain", "invoke")
+        wait_until(lambda: driver.snapshot().get("trayVisible") is False, "native_tray_did_not_close")
+        checked("narrow_navigation_and_three_exit_tray")
+        self.mark("native_redesign_ui")
 
     def launch_gui(self, artifacts: Path) -> dict:
         require(self.driver is None and self.gui is None, "previous_gui_session_not_closed")
@@ -1586,7 +1814,7 @@ class Acceptance:
                 "native_parent_rejection_changed_user_state")
         self.mark("native_host_parent_binding")
         self.directory.mkdir(parents=True, exist_ok=True)
-        for name in ("config.yaml", "config.yaml.bak", "preferences.json"):
+        for name in ("config.yaml", "config.yaml.bak", "preferences.json", "native-appearance.json", "native-proxies.json", "native-shell.json"):
             path = self.directory / name
             self.original_files[path] = path.read_bytes() if path.exists() else None
         require(not (self.directory / "system-proxy-recovery.json").exists(), "preexisting_proxy_recovery")
@@ -1725,6 +1953,8 @@ class Acceptance:
         self.driver.screenshot(self.artifacts / "windows-settings.png", self.secrets)
         self.report["screenshot"] = "windows-settings.png"
         self.mark("single_instance_and_native_ui")
+
+        self.check_native_redesign_ui(valid, base)
 
         self.stage = "tun_forwarding"
         self.driver.invoke("desktop_stop")
@@ -1922,6 +2152,13 @@ def main() -> int:
         print("FAIL: " + code, file=sys.stderr, flush=True)
         if acceptance:
             acceptance.report["diagnostics"].append({"stage": acceptance.stage, "code": code})
+            if acceptance.stage == "native_redesign_ui" and acceptance.driver:
+                try:
+                    acceptance.driver.screenshot(artifacts / "windows-ui-failure.png", acceptance.secrets, page=None)
+                    acceptance.report["nativeUiFailureCapture"] = "windows-ui-failure.png"
+                except Exception:
+                    # The normal credential guard also applies to diagnostics.
+                    pass
         else:
             if runner_allowed:
                 (artifacts / "verification.json").write_text(json.dumps({
@@ -1936,7 +2173,7 @@ def main() -> int:
             except Exception as error:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": "unexpected_" + type(error).__name__})
             required = {"native_host_parent_binding", "update_cache_cleanup", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
-                        "single_instance_and_native_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
+                        "single_instance_and_native_ui", "native_redesign_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
                         "resource_bootstrap_recovery", "system_proxy_service_recovery"}
             acceptance.report["passed"] = all(acceptance.report["tests"].get(name) is True for name in required) and not acceptance.report["diagnostics"]

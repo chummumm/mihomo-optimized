@@ -9,5 +9,6 @@
   <ItemGroup>
     <Compile Include="../../../src-windows/Services/HostChannel.cs" Link="HostChannel.cs" />
     <Compile Include="../../../src-windows/Services/InstanceBroker.cs" Link="InstanceBroker.cs" />
+    <Compile Include="../../../src-windows/Services/DnsPageIndex.cs" Link="DnsPageIndex.cs" />
   </ItemGroup>
 </Project>
