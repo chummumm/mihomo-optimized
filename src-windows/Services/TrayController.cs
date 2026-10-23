@@ -1,4 +1,5 @@
 using Icon = System.Drawing.Icon;
+using System.ComponentModel;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -64,16 +65,16 @@ internal sealed class TrayController : IDisposable
         icon.MouseClick += (_, e) =>
         {
             if (e.Button != Forms.MouseButtons.Left || DateTime.UtcNow < suppressClicksUntil) return;
-            if (IsFlyoutVisible || wasOpenAtMouseDown) { clickTimer.Stop(); flyout?.Hide(); return; }
+            if (IsFlyoutVisible || wasOpenAtMouseDown) { clickTimer.Stop(); flyout?.HideFlyout(); return; }
             clickTimer.Stop(); clickTimer.Start();
         };
         icon.MouseDoubleClick += (_, e) =>
         {
             if (e.Button != Forms.MouseButtons.Left) return;
             suppressClicksUntil = DateTime.UtcNow.AddMilliseconds(Forms.SystemInformation.DoubleClickTime);
-            clickTimer.Stop(); flyout?.Hide(); main.ShowMain();
+            clickTimer.Stop(); flyout?.HideFlyout(); main.ShowMain();
         };
-        menu.Opening += (_, _) => { clickTimer.Stop(); flyout?.Hide(); Refresh(); };
+        menu.Opening += (_, _) => { clickTimer.Stop(); flyout?.HideFlyout(); Refresh(); };
         L.Changed += Refresh; Refresh();
     }
     private bool IsRunning => session.Status.Text("phase") == "running";
@@ -90,7 +91,7 @@ internal sealed class TrayController : IDisposable
         if (commandBusy) return;
         if (enabled && !session.Status.Get("service").Bool("installed"))
         {
-            flyout?.Hide(); main.ShowMain();
+            flyout?.HideFlyout(); main.ShowMain();
             if (!TunConsentDialog.Confirm(main)) { Refresh(); return; }
         }
         await Run("desktop_set_tun", new { enabled });
@@ -190,6 +191,9 @@ internal sealed class TrayWindow : Window
     private bool changing;
     private bool runtimeReady;
     private bool allowLan;
+    private bool hiding;
+    private bool closing;
+    private bool closed;
     private long snapshotSequence;
     public Grid ClientArea { get; } = new();
     public string Material => backdrop.Material;
@@ -211,8 +215,8 @@ internal sealed class TrayWindow : Window
         header.Children.Add(new Image { Source = new BitmapImage(new Uri("pack://application:,,,/Assets/icon.ico")), Width = 32, Height = 32, Margin = new Thickness(0, 0, 12, 0) });
         var statusRow = new StackPanel { Orientation = Orientation.Horizontal }; state.TextWrapping = TextWrapping.NoWrap; state.TextTrimming = TextTrimming.CharacterEllipsis; state.Id("TrayCoreStatus"); statusRow.Children.Add(stateDot); statusRow.Children.Add(state);
         var identity = Ui.Column(Ui.Text("Mihomo Optimized", 14, true), statusRow); Grid.SetColumn(identity, 1); header.Children.Add(identity);
-        var settings = FluentControls.IconButton("nav-settings", "设置", "TrayOpenSettings"); settings.Click += async (_, _) => { Hide(); main.ShowMain(); await main.NavigateAsync("settings"); }; Grid.SetColumn(settings, 2); header.Children.Add(settings);
-        var open = FluentControls.IconButton("window-new", "打开主界面", "TrayOpenMain"); open.Click += (_, _) => { Hide(); main.ShowMain(); }; Grid.SetColumn(open, 3); header.Children.Add(open); ClientArea.Children.Add(header);
+        var settings = FluentControls.IconButton("nav-settings", "设置", "TrayOpenSettings"); settings.Click += async (_, _) => { HideFlyout(); main.ShowMain(); await main.NavigateAsync("settings"); }; Grid.SetColumn(settings, 2); header.Children.Add(settings);
+        var open = FluentControls.IconButton("window-new", "打开主界面", "TrayOpenMain"); open.Click += (_, _) => { HideFlyout(); main.ShowMain(); }; Grid.SetColumn(open, 3); header.Children.Add(open); ClientArea.Children.Add(header);
         mode.Margin = new Thickness(0, 0, 0, 12); mode.Selected += async value => await Run("desktop_patch_config", new { patch = new { mode = value } });
         var tiles = new UniformGrid { Columns = 3, Margin = new Thickness(-4, 0, -4, 12) };
         (proxy, var proxyTile) = MakeTile("nav-proxies", "系统代理", "TraySystemProxy");
@@ -221,7 +225,7 @@ internal sealed class TrayWindow : Window
         proxy.Checked += ProxyChanged; proxy.Unchecked += ProxyChanged;
         tun.Checked += TunChanged; tun.Unchecked += TunChanged;
         lan.Checked += LanChanged; lan.Unchecked += LanChanged;
-        exits.Selected += async (exit, _) => { Hide(); main.ShowMain(); await main.NavigateAsync(new NavigationTarget("proxies", Target: exit.Group, Action: "focus-group")); };
+        exits.Selected += async (exit, _) => { HideFlyout(); main.ShowMain(); await main.NavigateAsync(new NavigationTarget("proxies", Target: exit.Group, Action: "focus-group")); };
         var emptyGlyph = new Grid { Width = 40, Height = 40, Margin = new Thickness(0, 0, 0, 12) }; emptyGlyph.Children.Add(stoppedIcon); emptyGlyph.Children.Add(stoppedProgress);
         stopped = Ui.Column(emptyGlyph, stoppedTitle, stoppedHint); stopped.MinHeight = 174; stopped.VerticalAlignment = VerticalAlignment.Center; stopped.Margin = new Thickness(12, 12, 12, 0);
         foreach (FrameworkElement item in stopped.Children) item.HorizontalAlignment = HorizontalAlignment.Center;
@@ -243,11 +247,26 @@ internal sealed class TrayWindow : Window
             visible?.Cancel(); visible?.Dispose(); visible = null;
             if (IsVisible) { visible = new CancellationTokenSource(); _ = ObserveLiveAsync(visible.Token); }
         };
-        Deactivated += (_, _) => Hide();
-        PreviewKeyDown += (_, e) => { if (e.Key == Key.Escape) { Hide(); e.Handled = true; } };
+        Deactivated += (_, _) => HideFlyout();
+        PreviewKeyDown += (_, e) => { if (e.Key == Key.Escape) { HideFlyout(); e.Handled = true; } };
         L.Changed += LanguageChanged;
-        Closed += (_, _) => { L.Changed -= LanguageChanged; visible?.Cancel(); visible?.Dispose(); visible = null; backdrop.Dispose(); };
+        Closed += (_, _) => { closed = true; L.Changed -= LanguageChanged; visible?.Cancel(); visible?.Dispose(); visible = null; backdrop.Dispose(); };
         Refresh(false);
+    }
+    internal void HideFlyout()
+    {
+        if (hiding || closing || closed || !IsVisible) return;
+        hiding = true;
+        try { Hide(); }
+        finally { hiding = false; }
+    }
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        // Closing an active HWND can raise Deactivated before Closed. Do not
+        // change its visibility while WPF is already destroying the window.
+        closing = true;
+        base.OnClosing(e);
+        if (e.Cancel) closing = false;
     }
     private static (ToggleButton Button, FrameworkElement Tile) MakeTile(string icon, string label, string id)
     {
