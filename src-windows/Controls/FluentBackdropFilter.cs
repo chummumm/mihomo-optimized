@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -65,6 +66,11 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     // enumerating the owner's direct children), which would make a brush cycle.
     private sealed class PreparationPlane : Canvas
     {
+        internal static readonly DependencyProperty BaseBrushProperty = DependencyProperty.Register(nameof(BaseBrush), typeof(Brush), typeof(PreparationPlane));
+        internal static readonly DependencyProperty TintBrushProperty = DependencyProperty.Register(nameof(TintBrush), typeof(Brush), typeof(PreparationPlane));
+        internal Brush? BaseBrush { get => (Brush?)GetValue(BaseBrushProperty); set => SetValue(BaseBrushProperty, value); }
+        internal Brush? TintBrush { get => (Brush?)GetValue(TintBrushProperty); set => SetValue(TintBrushProperty, value); }
+
         internal PreparationPlane()
         {
             Width = Height = 0; IsHitTestVisible = false;
@@ -115,6 +121,10 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private object? lastPreparationUse;
     private int initialCachePresentations;
     private object? lastInitialPresentation;
+    private int initialPresentationAttempts;
+    private object? lastInitialPresentationAttempt;
+    private string lastInvalidationReason = "none";
+    private double lastInvalidationAtMilliseconds;
     private long firstPresentationGeneration = -1;
     private double firstPresentationCaptureAfter;
     private bool awaitingFirstPresentationFrame;
@@ -153,6 +163,16 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         if (preparationHost is not null) throw new InvalidOperationException("Backdrop preparation is already configured.");
         preparationHost = host; preparationViewport = viewport; presentationEnabled = false;
         sampling.Children.Remove(observer); preparationObserverHost.Children.Add(observer); host.Children.Add(preparationObserverHost);
+        // App resource invalidation walks attached window trees. The prepared
+        // filter itself is detached until its popup opens, so keeping its own
+        // DynamicResource would retain the old frozen theme brush and discard
+        // the just-prepared bitmap when attachment finally resolves the new one.
+        // This attached owner-side palette follows theme changes immediately;
+        // explicit-source bindings survive the filter's move into another HWND.
+        preparationObserverHost.SetResourceReference(PreparationPlane.BaseBrushProperty, "AppBackgroundBrush");
+        preparationObserverHost.SetResourceReference(PreparationPlane.TintBrushProperty, "AcrylicBrush");
+        SetBinding(BaseBrushProperty, new Binding { Source = preparationObserverHost, Path = new PropertyPath(PreparationPlane.BaseBrushProperty), Mode = BindingMode.OneWay });
+        SetBinding(TintBrushProperty, new Binding { Source = preparationObserverHost, Path = new PropertyPath(PreparationPlane.TintBrushProperty), Mode = BindingMode.OneWay });
         host.Loaded += PreparationHostChanged; host.Unloaded += PreparationHostChanged;
         host.IsVisibleChanged += PreparationVisibilityChanged; host.SizeChanged += PreparationSizeChanged;
         host.LayoutUpdated += PreparationLayoutChanged;
@@ -176,7 +196,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     internal void InvalidatePreparation()
     {
         if (disposed) return;
-        InvalidateRaster(clear: true);
+        InvalidateRaster(clear: true, "owner-preparation");
         if (CanProcess) { UpdateGeometry(); QueueCapture(); }
     }
 
@@ -206,28 +226,51 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
             var layer = new Layer(source); layer.Brush.Changed += SourceChanged; layers.Add(layer);
         }
         firstReady.TrySetResult(false); firstReady = NewReady();
-        InvalidateRaster(clear: true); UpdateSubscription();
+        InvalidateRaster(clear: true, "sources"); UpdateSubscription();
     }
 
     internal Task<PreparationTicket?> PrepareAsync() => PrepareCoreAsync(verifyPixels: true);
+
+    internal object DescribePreparedFrame() => new
+    {
+        generation, publishedGeneration, sourceRevision, publishedSourceRevision,
+        hasBitmap = raster.Source is not null, available = FilterAvailable, diagnostic = FilterDiagnostic,
+        sampleAgeMilliseconds = publishedGeneration >= 0 ? clock.Elapsed.TotalMilliseconds - publishedCaptureCompletedAtMilliseconds : (double?)null,
+        baseBrush = BrushDescription(BaseBrush), tintBrush = BrushDescription(TintBrush),
+        loaded = IsLoaded, visible = IsVisible, presenting = Presenting, preparing = Preparing,
+        actualWidth = ActualWidth, actualHeight = ActualHeight, dpiX, dpiY, drawingRevision,
+        lastInvalidationReason, millisecondsSinceInvalidation = clock.Elapsed.TotalMilliseconds - lastInvalidationAtMilliseconds,
+    };
+
+    private static string? BrushDescription(Brush? brush) => brush is SolidColorBrush solid ? solid.Color.ToString() : brush?.GetType().Name;
 
     // A prepared, full-resolution frame can be shown while this presentation's
     // real pixel verification continues. This is explicitly an initial cache,
     // not a claim that a dirty source has already been verified. UpdateGeometry
     // validates the actual HWND/DPI, viewport and all current lower layers;
     // any such invalidation gives the frame a different generation.
-    internal bool TryPresentPreparedFrame()
+    internal bool TryPresentPreparedFrame(bool allowPreparedViewport = false)
     {
         Dispatcher.VerifyAccess();
-        if (disposed || !Presenting) return false;
+        initialPresentationAttempts++;
+        var beforeGeometry = DescribePreparedFrame();
+        bool Reject(string reason)
+        {
+            lastInitialPresentationAttempt = new { accepted = false, reason, beforeGeometry, afterGeometry = DescribePreparedFrame() };
+            return false;
+        }
+        if (disposed) return Reject("disposed");
+        if (!Presenting && !(allowPreparedViewport && Preparing)) return Reject("not-presenting");
         UpdateGeometry();
         double now = clock.Elapsed.TotalMilliseconds;
         double age = now - publishedCaptureCompletedAtMilliseconds;
-        if (raster.Source is null || !FilterAvailable || publishedGeneration != generation
-            || FilterDiagnostic != "live-full-resolution-gaussian-srgb" || age is < 0 or > 1000)
-            return false;
+        if (raster.Source is null) return Reject("no-bitmap");
+        if (!FilterAvailable || FilterDiagnostic != "live-full-resolution-gaussian-srgb") return Reject("filter-unavailable");
+        if (publishedGeneration != generation) return Reject("generation-mismatch");
+        if (age is < 0 or > 1000) return Reject("cache-age-outside-budget");
 
         initialCachePresentations++;
+        lastInitialPresentationAttempt = new { accepted = true, reason = "current-generation-cache", beforeGeometry, afterGeometry = DescribePreparedFrame() };
         lastInitialPresentation = new
         {
             generation, frameRevision = publishedSourceRevision, currentSourceRevision = sourceRevision,
@@ -250,6 +293,29 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         preparationTimer.Stop();
         ScheduleFirstPresentationDelay();
         return true;
+    }
+
+    // Navigation can test its prepared viewport while collapsed. It must then
+    // arrange the real pane invisibly and pass this second check before showing
+    // it. This does not restart the original 100 ms first-frame deadline.
+    internal bool ValidateInitialPresentationFrame()
+    {
+        Dispatcher.VerifyAccess();
+        if (disposed || !Presenting || firstPresentationGeneration != generation) return false;
+        UpdateGeometry();
+        double age = clock.Elapsed.TotalMilliseconds - publishedCaptureCompletedAtMilliseconds;
+        return firstPresentationGeneration == generation && raster.Source is not null && FilterAvailable
+            && publishedGeneration == generation && age is >= 0 and <= 1000;
+    }
+
+    internal bool AwaitingFirstPresentationFrame => awaitingFirstPresentationFrame
+        && firstPresentationGeneration == generation && clock.Elapsed.TotalMilliseconds < firstPresentationCaptureAfter;
+
+    internal void CancelInitialPresentation()
+    {
+        Dispatcher.VerifyAccess();
+        CancelFirstPresentationDelay();
+        if (sourceDirty) QueueCapture();
     }
 
     internal void FirstPresentationFrameSubmitted()
@@ -355,6 +421,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         preparationEnabled, presenting = Presenting, preparationReadyMilliseconds,
         demandMilliseconds, demandCacheHits, captureQueueMilliseconds, captureQueuePromotions,
         preparedFrameReuses, lastPreparationUse, initialCachePresentations, lastInitialPresentation,
+        initialPresentationAttempts, lastInitialPresentationAttempt,
         firstPresentationCaptureDeferred = firstPresentationGeneration == generation,
         sourceRevision, publishedSourceRevision,
         processing = processing is not null, pendingSourceChange = sourceDirty,
@@ -369,7 +436,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         {
             filter.geometryDirty = true;
             if (args.Property == SigmaProperty) filter.sampleWindow = Rect.Empty;
-            filter.InvalidateRaster(clear: false);
+            filter.InvalidateRaster(clear: false, args.Property.Name);
         }
         filter.UpdateGeometry();
     }
@@ -399,14 +466,15 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         CancelFirstPresentationDelay();
         captureOperation?.Abort(); captureOperation = null;
         if (renderingSubscribed) { renderingSubscribed = false; CompositionTarget.Rendering -= Rendering; }
-        InvalidateRaster(clear: true); firstReady.TrySetResult(false);
+        InvalidateRaster(clear: true, "not-listening"); firstReady.TrySetResult(false);
         sampling.Visibility = Visibility.Collapsed;
     }
     private void Rendering(object? sender, EventArgs args) => UpdateGeometry();
-    private void InvalidateRaster(bool clear)
+    private void InvalidateRaster(bool clear, string reason)
     {
         CancelFirstPresentationDelay();
         generation++; sourceRevision++; processing?.Cancel(); baseline = scratch = null; sourceDirty = true;
+        lastInvalidationReason = reason; lastInvalidationAtMilliseconds = clock.Elapsed.TotalMilliseconds;
         if (demanding) readyRevision = sourceRevision;
         if (clear)
         {
@@ -418,7 +486,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     {
         CancelFirstPresentationDelay();
         if (raster.Source is not null || processing is not null || baseline is not null || FilterDiagnostic != reason)
-            InvalidateRaster(clear: true);
+            InvalidateRaster(clear: true, reason);
         else sourceDirty = true;
         FilterAvailable = false; FilterDiagnostic = reason;
         sampling.Visibility = Visibility.Collapsed; Background = BaseBrush ?? SystemColors.WindowBrush;
@@ -519,7 +587,7 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
                 }
                 observer.Drawing = drawing; observer.InvalidateVisual();
                 using (var context = captureVisual.RenderOpen()) context.DrawDrawing(drawing);
-                drawingRevision++; retryAfterMilliseconds = 0; InvalidateRaster(clear: true);
+                drawingRevision++; retryAfterMilliseconds = 0; InvalidateRaster(clear: true, "geometry");
             }
             Background = raster.Source is null ? BaseBrush ?? SystemColors.WindowBrush : Brushes.Transparent;
             sampling.Visibility = Visibility.Visible;
@@ -549,11 +617,13 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
             if (pending.Priority < priority) { pending.Priority = priority; captureQueuePromotions++; }
             return;
         }
-        if (!Presenting && !demanding)
+        if (!Presenting && !demanding && raster.Source is not null && publishedGeneration == generation)
         {
             // Hidden preparation is not a second render loop. Source changes
-            // coalesce into at most one capture per second; real input intent
-            // bypasses this budget and waits for a current source revision.
+            // coalesce into at most one capture per second when a valid frame
+            // already exists. A page/theme/geometry invalidation needs its first
+            // current-generation frame immediately; otherwise the budget can
+            // leave the next real opening without any legal prepared image.
             double delay = Math.Max(0, lastCaptureAt + 1000 - clock.Elapsed.TotalMilliseconds);
             if (delay > 0)
             {
@@ -733,6 +803,8 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         firstPresentationTimer.Tick -= FirstPresentationDue;
         if (preparationHost is not null)
         {
+            BindingOperations.ClearBinding(this, BaseBrushProperty); BindingOperations.ClearBinding(this, TintBrushProperty);
+            preparationObserverHost.ClearValue(PreparationPlane.BaseBrushProperty); preparationObserverHost.ClearValue(PreparationPlane.TintBrushProperty);
             preparationHost.Loaded -= PreparationHostChanged; preparationHost.Unloaded -= PreparationHostChanged;
             preparationHost.IsVisibleChanged -= PreparationVisibilityChanged; preparationHost.SizeChanged -= PreparationSizeChanged;
             preparationHost.LayoutUpdated -= PreparationLayoutChanged;

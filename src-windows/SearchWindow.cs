@@ -122,6 +122,7 @@ internal sealed class SearchWindow : Window
     private string renderedQuery = "";
     private readonly CancellationTokenSource lifetime = new();
     private readonly FluentBackdropFilter backdropFilter;
+    private readonly object backdropBeforeAttachment;
     private readonly bool ownsBackdrop;
     private readonly Grid suggestionContent;
     private readonly Grid flyoutSurface;
@@ -173,6 +174,7 @@ internal sealed class SearchWindow : Window
         // Status remains available to assistive technology; the original palette has no persistent footer.
         state.Visibility = Visibility.Collapsed; suggestions.Children.Add(state);
         suggestionScroll = new ScrollViewer { Content = suggestions, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Padding = new Thickness(4), CanContentScroll = false };
+        backdropBeforeAttachment = backdropFilter.DescribePreparedFrame();
         suggestionContent = new Grid(); suggestionContent.Children.Add(backdropFilter); suggestionContent.Children.Add(suggestionScroll);
         suggestionBorder = new Border { Child = suggestionContent, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), MaxHeight = 380, Margin = new Thickness(ShadowInset) };
         if (FluentMotion.Enabled) { suggestionBorder.Opacity = 0; suggestionBorder.RenderTransform = new TranslateTransform(0, -12); }
@@ -335,7 +337,7 @@ internal sealed class SearchWindow : Window
     {
         instance, visible = IsVisible, closing, closed, choosing, resultCount = results.Items.Count,
         renderingTier = RenderCapability.Tier >> 16, positionCount, positionMilliseconds, backdrop = backdropFilter.Describe(),
-        initialBackdropFromCache, backdropVerificationSucceeded,
+        initialBackdropFromCache, backdropVerificationSucceeded, backdropBeforeAttachment,
         // Relative timings only: no search text, entry names or controller data.
         lifecycleMilliseconds = new { templates = templatesMilliseconds, constructorStarted = constructorStartedMilliseconds,
             constructorCompleted = constructorCompletedMilliseconds, sourceInitialized = sourceInitializedMilliseconds,

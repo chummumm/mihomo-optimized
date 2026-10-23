@@ -52,6 +52,9 @@ public partial class MainWindow : Window
     private bool overlayClosing;
     private bool overlayPreparing;
     private long overlayAnimation;
+    private EventHandler? navigationEntranceRendering;
+    private bool navigationInitialBackdropFromCache;
+    private bool? navigationBackdropVerificationSucceeded;
     private bool shellCommandBusy;
     private double pillTop = double.NaN;
     private string lastCoreError = "";
@@ -398,14 +401,23 @@ public partial class MainWindow : Window
     private async void OpenOverlay()
     {
         if (overlayOpen || allowClose || EditorOpen) return;
+        long timingSession = NativeMotionCapture.TimingSession;
+        NativeMotionCapture.Mark(timingSession, "navigation-show-enter");
         long animation = ++overlayAnimation;
         bool interrupted = overlayClosing; overlayClosing = false; overlayOpen = true;
+        navigationInitialBackdropFromCache = false; navigationBackdropVerificationSucceeded = null;
         overlayPreparing = true; UpdateBackdropPreparation();
-        await navigationBackdrop.PrepareAsync();
-        if (animation != overlayAnimation || !overlayOpen || allowClose || !IsVisible || WindowState == WindowState.Minimized) return;
-        overlayPreparing = false;
+        var preparation = navigationBackdrop.PrepareAsync();
+        bool initialCache = navigationBackdrop.TryPresentPreparedFrame(allowPreparedViewport: true);
+        if (!initialCache) await preparation;
+        bool CurrentOpening() => animation == overlayAnimation && overlayOpen && !allowClose && !EditorOpen && IsVisible && WindowState != WindowState.Minimized;
+        if (!CurrentOpening()) return;
         double previousWidth = interrupted ? OverlayPaneHost.ActualWidth : 48;
         double previousX = interrupted && OverlayPaneHost.RenderTransform is TranslateTransform previous ? previous.X : -285.6;
+        StopNavigationEntranceObservation();
+        // Arrange the actual pane before consuming the future-viewport cache.
+        // No intermediate unverified background is shown or receives input.
+        OverlayPaneHost.Opacity = 0; OverlayPaneHost.IsHitTestVisible = false;
         if (NavigationDock.Children.Contains(NavigationPane)) NavigationDock.Children.Remove(NavigationPane);
         if (!navigationOverlaySurface.Children.Contains(NavigationPane)) navigationOverlaySurface.Children.Add(NavigationPane);
         navigationBackdrop.Visibility = Visibility.Visible;
@@ -414,10 +426,26 @@ public partial class MainWindow : Window
         bool dark = TryFindResource("AppBackgroundBrush") is SolidColorBrush background && background.Color.R < 128;
         // CSS box-shadow blur 16 uses sigma 8; WPF's Gaussian radius is 3 sigma.
         OverlayPaneHost.Effect = new System.Windows.Media.Effects.DropShadowEffect { Color = Colors.Black, BlurRadius = 24, ShadowDepth = 8, Direction = 270, Opacity = dark ? .26 : .14 };
-        OverlayPaneHost.Visibility = NavigationScrim.Visibility = Visibility.Visible;
-        navigationBackdrop.BeginPresentation();
-        ApplyNavigationContent(navigationMode == "compact");
+        OverlayPaneHost.Visibility = Visibility.Visible;
         OverlayPaneHost.RenderTransform = Transform.Identity;
+        OverlayPaneHost.UpdateLayout();
+        navigationBackdrop.BeginPresentation();
+        navigationInitialBackdropFromCache = initialCache && navigationBackdrop.ValidateInitialPresentationFrame();
+        if (!navigationInitialBackdropFromCache) navigationBackdrop.CancelInitialPresentation();
+        var verification = navigationBackdrop.CompletePreparationAsync(preparation);
+        if (!navigationInitialBackdropFromCache)
+        {
+            bool verified = await verification;
+            if (!CurrentOpening()) return;
+            navigationBackdropVerificationSucceeded = verified;
+            NativeMotionCapture.Mark(timingSession, verified ? "navigation-backdrop-ready" : "navigation-backdrop-unavailable");
+        }
+        else NativeMotionCapture.Mark(timingSession, "navigation-backdrop-initial-cache");
+        overlayPreparing = false;
+        OverlayPaneHost.Opacity = 1; OverlayPaneHost.IsHitTestVisible = true;
+        NavigationScrim.Visibility = Visibility.Visible;
+        ApplyNavigationContent(navigationMode == "compact");
+        NativeMotionCapture.Mark(timingSession, "navigation-animation-start");
         if (FluentMotion.Enabled && navigationMode == "compact")
             OverlayPaneHost.BeginAnimation(WidthProperty, new DoubleAnimation(previousWidth, 280, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate });
         else if (FluentMotion.Enabled)
@@ -425,11 +453,45 @@ public partial class MainWindow : Window
             var shift = new TranslateTransform(previousX, 0); OverlayPaneHost.RenderTransform = shift;
             shift.BeginAnimation(TranslateTransform.XProperty, new DoubleAnimation(0, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate });
         }
+        if (navigationInitialBackdropFromCache)
+            ObserveNavigationEntrance(animation, previousWidth, previousX, timingSession);
         _ = Dispatcher.InvokeAsync(() => UpdateNavigationIndicator(false), System.Windows.Threading.DispatcherPriority.Loaded);
+        if (navigationInitialBackdropFromCache)
+        {
+            bool verified = await verification;
+            if (!CurrentOpening()) return;
+            navigationBackdropVerificationSucceeded = verified;
+            NativeMotionCapture.Mark(timingSession, verified ? "navigation-backdrop-ready" : "navigation-backdrop-unavailable");
+        }
+    }
+    private void ObserveNavigationEntrance(long animation, double initialWidth, double initialX, long timingSession)
+    {
+        StopNavigationEntranceObservation();
+        navigationEntranceRendering = (_, _) =>
+        {
+            if (animation != overlayAnimation || !overlayOpen || allowClose || !IsVisible || WindowState == WindowState.Minimized
+                || !navigationBackdrop.AwaitingFirstPresentationFrame)
+            { StopNavigationEntranceObservation(); return; }
+            bool advanced = !FluentMotion.Enabled || (navigationMode == "compact"
+                ? Math.Abs(OverlayPaneHost.Width - initialWidth) > .01
+                : OverlayPaneHost.RenderTransform is TranslateTransform shift && Math.Abs(shift.X - initialX) > .01);
+            if (!advanced) return;
+            navigationBackdrop.FirstPresentationFrameSubmitted();
+            NativeMotionCapture.Mark(timingSession, "navigation-initial-cache-nonzero-rendering");
+            StopNavigationEntranceObservation();
+        };
+        CompositionTarget.Rendering += navigationEntranceRendering;
+    }
+    private void StopNavigationEntranceObservation()
+    {
+        if (navigationEntranceRendering is null) return;
+        CompositionTarget.Rendering -= navigationEntranceRendering; navigationEntranceRendering = null;
     }
     private void CloseOverlay(bool animate, bool restoreFocus = false)
     {
+        StopNavigationEntranceObservation();
         if (!overlayOpen && !overlayClosing) return;
+        navigationBackdrop.CancelInitialPresentation();
         long animation = ++overlayAnimation;
         bool wasPreparing = overlayPreparing; overlayPreparing = false;
         overlayOpen = false; overlayClosing = true; NavigationScrim.Visibility = Visibility.Collapsed;
@@ -438,6 +500,7 @@ public partial class MainWindow : Window
             if (animation != overlayAnimation) return;
             overlayClosing = false;
             OverlayPaneHost.BeginAnimation(WidthProperty, null); OverlayPaneHost.Width = 280;
+            OverlayPaneHost.Opacity = 1; OverlayPaneHost.IsHitTestVisible = true;
             navigationOverlaySurface.Children.Remove(NavigationPane);
             if (!NavigationDock.Children.Contains(NavigationPane)) NavigationDock.Children.Add(NavigationPane);
             OverlayPaneHost.Visibility = Visibility.Collapsed; OverlayPaneHost.RenderTransform = Transform.Identity;
@@ -638,6 +701,7 @@ public partial class MainWindow : Window
     public async Task FinishExitAsync()
     {
         if (allowClose) return; allowClose = true;
+        StopNavigationEntranceObservation();
         CancelProxiesPreparation();
         foreach (var page in pages.Values) page.Deactivate();
         L.Changed -= OnLanguageChanged; searchWindow?.Close(); backdrop.Dispose(); navigationBackdrop.Dispose(); searchBackdrop.Dispose(); titleBar.Dispose(); tray.Dispose();
@@ -654,6 +718,7 @@ public partial class MainWindow : Window
         preparation = pages.TryGetValue("proxies", out var page) && page is ProxiesPage proxies ? proxies.DescribeNavigationPreparation() : null,
         idleProxiesPreparation = DescribeProxiesPreparation(),
         search = searchWindow?.Describe(),
+        navigationInitialBackdropFromCache, navigationBackdropVerificationSucceeded,
         navigationBackdrop = navigationBackdrop.Describe(),
         backdrop = FluentBackdropFilter.DescribeCompilation()
     };
