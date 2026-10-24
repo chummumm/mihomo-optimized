@@ -28,3 +28,5 @@ __pycache__/
 /desktop/tests/protocol/obj/
 /desktop/tests/backdrop/bin/
 /desktop/tests/backdrop/obj/
+/desktop/tests/shell/bin/
+/desktop/tests/shell/obj/
