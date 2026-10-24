@@ -166,5 +166,8 @@
     </Grid>
     <Grid x:Name="PageOverlayHost" Grid.RowSpan="2" Panel.ZIndex="15" ClipToBounds="True"/>
     <Canvas x:Name="ConnectedOverlay" Grid.RowSpan="2" IsHitTestVisible="False" Panel.ZIndex="20"/>
+    <!-- A sibling of every sampled backdrop layer. Empty space stays pointer-transparent. -->
+    <Canvas x:Name="SearchOverlayHost" Grid.RowSpan="2" Panel.ZIndex="70" Background="{x:Null}"
+            shell:WindowChrome.IsHitTestVisibleInChrome="True"/>
   </Grid>
 </Window>

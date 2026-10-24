@@ -29,6 +29,12 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.402'
+      - name: Verify native backdrop snapshot pixels and cancellation
+        timeout-minutes: 3
+        run: dotnet run --project desktop/tests/backdrop/BackdropTests.csproj -c Release
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -59,9 +65,6 @@ jobs:
         with:
           node-version: '22'
           cache: pnpm
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.402'
       - name: Exercise native protocol boundaries and cancellation
         run: dotnet run --project desktop/tests/protocol/ProtocolTests.csproj -c Release
       - name: Install native Windows installer compiler

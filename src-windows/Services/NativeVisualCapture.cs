@@ -9,7 +9,7 @@ using Mihomo.Desktop.Pages;
 
 namespace Mihomo.Desktop.Services;
 
-/// <summary>Read-only evidence from real WPF visuals, including an owned search list at its actual position.</summary>
+/// <summary>Read-only evidence from real WPF visuals, including same-window search results and owned dialogs.</summary>
 internal static class NativeVisualCapture
 {
     internal sealed record Frame(BitmapSource Bitmap, int Width, int Height, double Dpi);
@@ -101,6 +101,7 @@ internal static class NativeVisualCapture
     {
         FrameworkElement target = Surface(owner, surface);
         target.UpdateLayout();
+        if (surface == "search" && !ContainsSearchFlyout(owner)) throw new InvalidOperationException("Open the real search flyout before capturing it.");
         var dpi = VisualTreeHelper.GetDpi(target);
         int width = (int)Math.Ceiling(target.ActualWidth * dpi.DpiScaleX), height = (int)Math.Ceiling(target.ActualHeight * dpi.DpiScaleY);
         if (width is < 1 or > 4000 || height is < 1 or > 3000) throw new InvalidOperationException("Capture bounds are invalid.");
@@ -111,7 +112,7 @@ internal static class NativeVisualCapture
         try { bitmap.Render(target); }
         finally { FluentBackdropFilter.RestoreLiveObservers(); }
         var overlays = owner.OwnedWindows.OfType<FluentDialog>().Where(window => window.IsVisible).Cast<Window>().ToList();
-        if (surface == "search") overlays.Add(Find("GlobalSearchWindow") ?? throw new InvalidOperationException("Open the real search flyout before capturing it."));
+        // Search is already in the owner's visual tree and presentation channel.
         if (surface == "tray") overlays.Clear();
         foreach (var flyout in overlays)
         {
@@ -170,6 +171,13 @@ internal static class NativeVisualCapture
         _ => throw new ArgumentException("Unknown capture surface.")
     };
     private static Window? Find(string id) => Application.Current.Windows.OfType<Window>().FirstOrDefault(window => window.IsVisible && AutomationProperties.GetAutomationId(window) == id);
+    private static bool ContainsSearchFlyout(DependencyObject node)
+    {
+        if (node is SearchFlyout { IsVisible: true }) return true;
+        for (int index = 0; index < VisualTreeHelper.GetChildrenCount(node); index++)
+            if (ContainsSearchFlyout(VisualTreeHelper.GetChild(node, index))) return true;
+        return false;
+    }
     private static string Hex(Color color) => $"#{color.R:X2}{color.G:X2}{color.B:X2}";
     private static object Appearance() => new
     {

@@ -23,9 +23,12 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         internal bool Rearming;
     }
     private static readonly ConditionalWeakTable<Dispatcher, ObserverScope> ObserverScopes = new();
-    internal static void PrewarmRendering() { if (FluentMotion.Enabled) FluentBackdropPixels.Prewarm(); }
-    // Keep the diagnostic entry point used by the opt-in motion recorder; the
-    // implementation has no shader/compiler or software-rendering STA anymore.
+    internal static void PrewarmRendering()
+    {
+        if (!FluentMotion.Enabled) return;
+        FluentBackdropScene.Prewarm(); FluentBackdropPixels.Prewarm();
+    }
+    // Retain the diagnostic entry point used by the opt-in motion recorder.
     internal static object DescribeCompilation() => new { completed = true, available = true, diagnostic = "full-resolution-simd-gaussian", renderer = FluentBackdropPixels.DescribeWarmup() };
 
     internal static readonly DependencyProperty TintBrushProperty = DependencyProperty.Register(nameof(TintBrush), typeof(Brush), typeof(FluentBackdropFilter), new PropertyMetadata(null, Changed));
@@ -112,6 +115,10 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
     private TaskCompletionSource<bool> firstReady = NewReady();
     private int drawingRevision, sourceInvalidations, captures, identicalCaptures, filteredFrames, cancelledFrames, observerRearms;
     private double captureMilliseconds, compareMilliseconds, filterMilliseconds, retryAfterMilliseconds;
+    private double snapshotMilliseconds, rasterMilliseconds, rasterQueueMilliseconds;
+    private int backgroundCaptures, synchronousCaptures;
+    private string captureExecution = "not-captured";
+    private string? lastSnapshotFallback;
     private double queueMilliseconds, schedulingMilliseconds, convolutionMilliseconds, publishDispatchMilliseconds;
     private double lastCaptureAt = double.NegativeInfinity, preparationStartedAt, preparationReadyMilliseconds;
     private double duplicateCaptureAfter, duplicateCaptureDelayMilliseconds;
@@ -435,7 +442,9 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         rasterWidth = raster.Source is BitmapSource bitmap ? bitmap.PixelWidth : 0,
         rasterHeight = raster.Source is BitmapSource bitmap2 ? bitmap2.PixelHeight : 0,
         sourceInvalidations, captures, identicalCaptures, filteredFrames, cancelledFrames, observerRearms,
-        captureMilliseconds, compareMilliseconds, filterMilliseconds, firstBitmapMilliseconds,
+        captureMilliseconds, snapshotMilliseconds, rasterMilliseconds, rasterQueueMilliseconds,
+        captureExecution, backgroundCaptures, synchronousCaptures, lastSnapshotFallback,
+        compareMilliseconds, filterMilliseconds, firstBitmapMilliseconds,
         duplicateCaptureDelayMilliseconds, duplicateCaptureDeferrals,
         duplicateCaptureRemainingMilliseconds = !demanding && raster.Source is not null && publishedGeneration == generation
             ? Math.Max(0, duplicateCaptureAfter - clock.Elapsed.TotalMilliseconds) : 0,
@@ -656,8 +665,8 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         if (DeferCaptureForBudget()) return;
         // Only a missing current-generation frame makes presentation urgent.
         // A real pixel verification can remain demanded while the prepared
-        // bitmap is shown; run it after normal WPF presentation so its RTB
-        // does not preempt the menu's next animation frame.
+        // bitmap is shown. Even the short immutable-scene copy belongs after
+        // normal WPF presentation unless the current-generation frame is absent.
         bool hasCurrentFrame = FilterAvailable && raster.Source is not null && publishedGeneration == generation;
         var priority = !hasCurrentFrame && (demanding || Presenting) ? DispatcherPriority.Render : DispatcherPriority.Background;
         if (captureOperation is { Status: DispatcherOperationStatus.Pending } pending)
@@ -675,72 +684,94 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         captureOperation = Dispatcher.BeginInvoke(priority, new Action(() =>
         {
             captureOperation = null;
-            if (disposed || !listening || !CanProcess || processing is not null || !sourceDirty) return;
-            if (DeferCaptureForInitialPresentation()) return;
-            if (DeferCaptureForBudget()) return;
-            capturing = true;
-            long timingSession = 0, timingStarted = 0, timingRendered = 0, timingCopied = 0, timingGeneration = 0, timingRevision = 0;
-            try
-            {
-                captureQueueMilliseconds = Stopwatch.GetElapsedTime(queued).TotalMilliseconds;
-                UpdateGeometry();
-                if (FilterDiagnostic is not ("preparing-full-resolution-backdrop" or "live-full-resolution-gaussian-srgb")) return;
-                sourceDirty = false;
-                long revision = sourceRevision;
-                int width = checked((int)Math.Round(sourceSize.Width * dpiX)), height = checked((int)Math.Round(sourceSize.Height * dpiY));
-                int stride = checked(width * 4), length = checked(stride * height);
-                if (width <= 0 || height <= 0) return;
-                long captureStarted = Stopwatch.GetTimestamp(); lastCaptureAt = clock.Elapsed.TotalMilliseconds;
-                double sampleStartedAt = lastCaptureAt;
-                timingSession = NativeMotionCapture.TimingSession;
-                if (timingSession != 0) { timingStarted = captureStarted; timingGeneration = generation; timingRevision = revision; }
-                var snapshot = new RenderTargetBitmap(width, height, dpiX * 96, dpiY * 96, PixelFormats.Pbgra32);
-                try { snapshot.Render(captureVisual); }
-                finally
-                {
-                    if (timingSession != 0) timingRendered = Stopwatch.GetTimestamp();
-                    RearmObservers();
-                }
-                if (scratch?.Length != length) scratch = new byte[length];
-                snapshot.CopyPixels(scratch, stride, 0); captures++;
-                if (timingSession != 0) timingCopied = Stopwatch.GetTimestamp();
-                captureMilliseconds = Stopwatch.GetElapsedTime(captureStarted).TotalMilliseconds;
-                double sampleCompletedAt = clock.Elapsed.TotalMilliseconds;
-                long compareStarted = Stopwatch.GetTimestamp();
-                bool identical = baseline is not null && baseline.AsSpan().SequenceEqual(scratch);
-                compareMilliseconds = Stopwatch.GetElapsedTime(compareStarted).TotalMilliseconds;
-                if (identical)
-                {
-                    identicalCaptures++;
-                    duplicateCaptureDelayMilliseconds = Math.Clamp(3 * captureMilliseconds, 50, 125);
-                    duplicateCaptureAfter = sampleCompletedAt + duplicateCaptureDelayMilliseconds;
-                    CompleteReady(revision, sampleStartedAt, sampleCompletedAt);
-                    return;
-                }
-                duplicateCaptureAfter = duplicateCaptureDelayMilliseconds = 0;
-                // Only these two byte buffers are retained. While one is being
-                // processed no second capture can mutate it or build a queue.
-                (baseline, scratch) = (scratch, baseline);
-                var cancellation = new CancellationTokenSource(); processing = cancellation;
-                _ = PublishAsync(baseline!, width, height, dpiX, dpiY, Sigma, Saturation, generation, revision, sampleStartedAt, sampleCompletedAt, cancellation);
-            }
-            catch (Exception error) when (error is COMException or NotSupportedException or InvalidOperationException or ArgumentException or OverflowException)
-            { Fallback("capture-unavailable-" + error.GetType().Name); }
-            finally
-            {
-                capturing = false;
-                if (timingSession != 0)
-                    NativeMotionCapture.BackdropCapture(timingSession, this, timingGeneration, timingRevision,
-                        timingStarted, timingRendered, timingCopied, Stopwatch.GetTimestamp());
-            }
+            _ = CaptureAndPublishAsync(queued);
         }));
     }
 
-    private async Task PublishAsync(byte[] pixels, int width, int height, double scaleX, double scaleY, double sigma, double saturation, long version, long revision,
-        double sampleStartedAt, double sampleCompletedAt, CancellationTokenSource cancellation)
+    private async Task CaptureAndPublishAsync(long queued)
     {
+        if (disposed || !listening || !CanProcess || processing is not null || !sourceDirty) return;
+        if (DeferCaptureForInitialPresentation() || DeferCaptureForBudget()) return;
+        CancellationTokenSource? cancellation = null;
+        bool filtering = false;
+        long version = generation, revision = sourceRevision;
+        long timingSession = 0, captureStarted = 0, sceneCopied = 0, rendered = 0, copied = 0, captureCompleted = 0;
+        string execution = "dispatcher-fallback";
         try
         {
+            capturing = true;
+            captureQueueMilliseconds = Stopwatch.GetElapsedTime(queued).TotalMilliseconds;
+            UpdateGeometry();
+            if (FilterDiagnostic is not ("preparing-full-resolution-backdrop" or "live-full-resolution-gaussian-srgb")) return;
+            version = generation; revision = sourceRevision; sourceDirty = false;
+            double scaleX = dpiX, scaleY = dpiY, sigma = Sigma, saturation = Saturation;
+            int width = checked((int)Math.Round(sourceSize.Width * scaleX)), height = checked((int)Math.Round(sourceSize.Height * scaleY));
+            int stride = checked(width * 4), length = checked(stride * height);
+            if (width <= 0 || height <= 0) return;
+            // This is the source observation time. The worker may render the
+            // frozen scene later; it must never make an old source appear fresh.
+            captureStarted = Stopwatch.GetTimestamp(); lastCaptureAt = clock.Elapsed.TotalMilliseconds;
+            double sampleStartedAt = lastCaptureAt;
+            timingSession = NativeMotionCapture.TimingSession;
+            var sceneLayers = layers.Where(layer => !layer.View.IsEmpty && layer.View.Width > 0 && layer.View.Height > 0
+                    && !layer.Port.IsEmpty && layer.Port.Width > 0 && layer.Port.Height > 0)
+                .Select(layer => new FluentBackdropScene.Layer(layer.Source, layer.View, layer.Port)).ToArray();
+            bool detached = FluentBackdropScene.TryCapture(BaseBrush ?? SystemColors.WindowBrush, sourceSize, clipBounds,
+                sceneLayers, out var scene, out var fallback);
+            sceneCopied = Stopwatch.GetTimestamp();
+            snapshotMilliseconds = Stopwatch.GetElapsedTime(captureStarted, sceneCopied).TotalMilliseconds;
+            double sampleCompletedAt = clock.Elapsed.TotalMilliseconds;
+            lastSnapshotFallback = fallback;
+            byte[] pixels = scratch is { } reusable && reusable.Length == length ? reusable : new byte[length];
+            cancellation = new CancellationTokenSource(); processing = cancellation;
+            if (detached)
+            {
+                execution = "background-sta";
+                // Only frozen drawing resources and value types cross threads.
+                // Dirty notifications remain live during the asynchronous RTB
+                // and Gaussian work; one in-flight pipeline bounds all buffers.
+                capturing = false;
+                var renderedScene = await FluentBackdropScene.RenderAsync(scene!, width, height, scaleX * 96, scaleY * 96,
+                    pixels, cancellation.Token);
+                rendered = renderedScene.RenderedAt; copied = renderedScene.CopiedAt;
+                rasterQueueMilliseconds = Stopwatch.GetElapsedTime(sceneCopied, renderedScene.RenderStartedAt).TotalMilliseconds;
+                rasterMilliseconds = Stopwatch.GetElapsedTime(renderedScene.RenderStartedAt, copied).TotalMilliseconds;
+                backgroundCaptures++;
+            }
+            else
+            {
+                // Unsupported live resources retain the exact existing WPF
+                // path. A partial scene is never substituted for real pixels.
+                long rasterStarted = Stopwatch.GetTimestamp();
+                var snapshot = new RenderTargetBitmap(width, height, scaleX * 96, scaleY * 96, PixelFormats.Pbgra32);
+                try { snapshot.Render(captureVisual); }
+                finally { rendered = Stopwatch.GetTimestamp(); RearmObservers(); }
+                snapshot.CopyPixels(pixels, stride, 0); copied = Stopwatch.GetTimestamp();
+                sampleCompletedAt = clock.Elapsed.TotalMilliseconds;
+                rasterQueueMilliseconds = 0;
+                rasterMilliseconds = Stopwatch.GetElapsedTime(rasterStarted, copied).TotalMilliseconds;
+                synchronousCaptures++; capturing = false;
+            }
+            captureCompleted = Stopwatch.GetTimestamp();
+            captureMilliseconds = Stopwatch.GetElapsedTime(captureStarted, captureCompleted).TotalMilliseconds;
+            captureExecution = execution;
+            if (disposed || !listening || !CanProcess || version != generation || cancellation.IsCancellationRequested)
+            { cancelledFrames++; return; }
+            captures++;
+            long compareStarted = Stopwatch.GetTimestamp();
+            bool identical = baseline is not null && baseline.AsSpan().SequenceEqual(pixels);
+            compareMilliseconds = Stopwatch.GetElapsedTime(compareStarted).TotalMilliseconds;
+            if (identical)
+            {
+                scratch = pixels; identicalCaptures++;
+                duplicateCaptureDelayMilliseconds = Math.Clamp(3 * captureMilliseconds, 50, 125);
+                duplicateCaptureAfter = clock.Elapsed.TotalMilliseconds + duplicateCaptureDelayMilliseconds;
+                CompleteReady(revision, sampleStartedAt, sampleCompletedAt);
+                return;
+            }
+            duplicateCaptureAfter = duplicateCaptureDelayMilliseconds = 0;
+            (baseline, scratch) = (pixels, baseline);
+            filtering = true;
             long started = Stopwatch.GetTimestamp();
             var result = await FluentBackdropPixels.ApplyMeasuredAsync(pixels, width, height, sigma * scaleX, sigma * scaleY, saturation, cancellation.Token);
             filterMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
@@ -756,12 +787,19 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         }
         catch (OperationCanceledException) { cancelledFrames++; }
         catch (Exception error) when (error is COMException or NotSupportedException or InvalidOperationException or ArgumentException or OverflowException)
-        { if (!disposed && version == generation) Fallback("filter-unavailable-" + error.GetType().Name); }
+        { if (!disposed && version == generation) Fallback((filtering ? "filter-unavailable-" : "capture-unavailable-") + error.GetType().Name); }
         finally
         {
-            if (ReferenceEquals(processing, cancellation)) processing = null;
-            cancellation.Dispose();
-            if (!disposed && sourceDirty) QueueCapture();
+            capturing = false;
+            if (timingSession != 0)
+                NativeMotionCapture.BackdropCapture(timingSession, this, version, revision, captureStarted,
+                    rendered, copied, captureCompleted == 0 ? Stopwatch.GetTimestamp() : captureCompleted, execution, sceneCopied);
+            if (cancellation is not null)
+            {
+                if (ReferenceEquals(processing, cancellation)) processing = null;
+                cancellation.Dispose();
+                if (!disposed && sourceDirty) QueueCapture();
+            }
         }
     }
 

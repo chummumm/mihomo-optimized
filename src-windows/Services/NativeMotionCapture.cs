@@ -26,8 +26,8 @@ internal static class NativeMotionCapture
     internal static bool SearchRendering(long session, int instance, double opacity, double translateY) =>
         current is { } recording && recording.Id == session && recording.SearchRendering(instance, opacity, translateY);
     internal static void BackdropCapture(long session, FrameworkElement filter, long generation, long revision,
-        long started, long rendered, long copied, long completed) => current?.BackdropCapture(session,
-            AutomationProperties.GetAutomationId(filter), generation, revision, started, rendered, copied, completed);
+        long started, long rendered, long copied, long completed, string execution, long sceneCopied) => current?.BackdropCapture(session,
+            AutomationProperties.GetAutomationId(filter), generation, revision, started, rendered, copied, completed, execution, sceneCopied);
     internal static object Arm(Window owner, JsonElement args)
     {
         if (current is { Finished: false }) throw new InvalidOperationException("A motion recording is already armed.");
@@ -106,17 +106,19 @@ internal static class NativeMotionCapture
             }
         }
         internal void BackdropCapture(long session, string filter, long generation, long revision,
-            long captureStarted, long rendered, long copied, long completed)
+            long captureStarted, long rendered, long copied, long completed, string execution, long sceneCopied)
         {
             if (finished || session != Id || started == 0 || captureStarted < started
                 || Stopwatch.GetElapsedTime(started, captureStarted).TotalMilliseconds > TimingWindowMilliseconds) return;
             lock (timingLock)
             {
                 if (captures.Count >= 16) return;
-                captures.Add(new { filter, generation, revision, startedTimestamp = captureStarted,
+                captures.Add(new { filter, generation, revision, execution, startedTimestamp = captureStarted,
+                    sceneCopiedTimestamp = sceneCopied == 0 ? (long?)null : sceneCopied,
                     renderedTimestamp = rendered == 0 ? (long?)null : rendered,
                     copiedTimestamp = copied == 0 ? (long?)null : copied, completedTimestamp = completed,
                     startedMilliseconds = Stopwatch.GetElapsedTime(started, captureStarted).TotalMilliseconds,
+                    sceneCopiedMilliseconds = sceneCopied == 0 ? (double?)null : Stopwatch.GetElapsedTime(started, sceneCopied).TotalMilliseconds,
                     renderedMilliseconds = rendered == 0 ? (double?)null : Stopwatch.GetElapsedTime(started, rendered).TotalMilliseconds,
                     copiedMilliseconds = copied == 0 ? (double?)null : Stopwatch.GetElapsedTime(started, copied).TotalMilliseconds,
                     completedMilliseconds = Stopwatch.GetElapsedTime(started, completed).TotalMilliseconds });

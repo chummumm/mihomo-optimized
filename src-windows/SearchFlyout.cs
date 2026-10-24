@@ -1,7 +1,5 @@
-using System.ComponentModel;
 using System.Diagnostics;
 using System.Net.Http;
-using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Automation;
@@ -10,7 +8,6 @@ using System.Windows.Automation.Provider;
 using System.Windows.Controls;
 using System.Windows.Documents;
 using System.Windows.Input;
-using System.Windows.Interop;
 using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
@@ -21,11 +18,14 @@ using Mihomo.Desktop.Services;
 
 namespace Mihomo.Desktop;
 
-internal sealed class SearchWindow : Window
+internal sealed class SearchFlyout : ContentControl
 {
     private static readonly long templatesStarted = Stopwatch.GetTimestamp();
     private static readonly ResourceDictionary templates = (ResourceDictionary)XamlReader.Parse("""
         <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+          <ControlTemplate x:Key="Flyout" TargetType="ContentControl">
+            <ContentPresenter Content="{TemplateBinding Content}" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+          </ControlTemplate>
           <Style x:Key="Results" TargetType="ListBox">
             <Setter Property="BorderThickness" Value="0"/><Setter Property="Padding" Value="0"/>
             <Setter Property="Background" Value="Transparent"/><Setter Property="Focusable" Value="False"/>
@@ -97,15 +97,18 @@ internal sealed class SearchWindow : Window
         return clock;
     }
     private double constructorStartedMilliseconds, constructorCompletedMilliseconds;
-    private double? sourceInitializedMilliseconds, sourceInitializedCompletedMilliseconds, loadedMilliseconds,
+    private double? loadedMilliseconds,
         attachOwnerCompletedMilliseconds, suggestionsStartedMilliseconds, coreRequestsStartedMilliseconds,
-        coreResponsesReadyMilliseconds, coreEntriesCompletedMilliseconds, backdropReadyMilliseconds, firstRenderingMilliseconds, contentRenderedMilliseconds,
+        coreResponsesReadyMilliseconds, coreEntriesCompletedMilliseconds, backdropReadyMilliseconds, firstRenderingMilliseconds,
         entranceFirstTickMilliseconds, entranceClockCompletedMilliseconds, entranceFirstRenderingMilliseconds;
     private double? entranceFirstRenderedOpacity;
     private double? initialBackdropMilliseconds, backdropVerificationCompletedMilliseconds;
     private bool initialBackdropFromCache;
     private bool entranceClockHasAdvanced;
+    private AnimationClock? entranceClock;
     private bool? backdropVerificationSucceeded;
+    private readonly Window owner;
+    private readonly Canvas overlayHost;
     private readonly AppSession session;
     private readonly GlobalSearchBox inputBox;
     private readonly int instance;
@@ -123,11 +126,11 @@ internal sealed class SearchWindow : Window
     private string renderedQuery = "";
     private readonly CancellationTokenSource lifetime = new();
     private readonly FluentBackdropFilter backdropFilter;
+    private readonly Task<FluentBackdropFilter.PreparationTicket?> preparedPixels;
     private readonly object backdropBeforeAttachment;
-    private readonly bool ownsBackdrop;
     private readonly Grid suggestionContent;
-    private readonly Grid flyoutSurface;
-    private Window? anchorOwner;
+    private bool shown;
+    private bool ownerAttached;
     private bool positioning;
     private bool positionQueued;
     private Rect positionedBounds = Rect.Empty;
@@ -148,21 +151,21 @@ internal sealed class SearchWindow : Window
     private string CommandState => string.Join("|", session.Ready, session.IsUpdating, session.IsDirty, session.Status.Text("phase"), session.Status.Bool("systemProxy"), session.Status.Bool("tun"),
         session.Status.Get("capabilities").ToString());
 
-    public SearchWindow(AppSession session, GlobalSearchBox inputBox, FluentBackdropFilter? preparedBackdrop = null,
-        Task<FluentBackdropFilter.PreparationTicket?>? preparedPixels = null)
+    public SearchFlyout(Window owner, Canvas overlayHost, AppSession session, GlobalSearchBox inputBox,
+        FluentBackdropFilter backdrop, Task<FluentBackdropFilter.PreparationTicket?> preparedPixels)
     {
         NativeMotionCapture.Mark(timingSession, "search-constructor-enter");
         constructorStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
+        this.owner = owner; this.overlayHost = overlayHost;
         this.session = session; this.inputBox = inputBox; search = inputBox.Input;
-        ownsBackdrop = preparedBackdrop is null;
-        backdropFilter = preparedBackdrop ?? new FluentBackdropFilter { CornerRadius = new CornerRadius(7) }.Id("SearchBackdrop");
+        backdropFilter = backdrop; this.preparedPixels = preparedPixels;
         instance = inputBox.PaletteCreated();
-        L.Bind(this, TitleProperty, "搜索"); this.Id("GlobalSearchWindow");
+        L.Bind(this, AutomationProperties.NameProperty, "搜索"); this.Id("GlobalSearchWindow");
         Width = 380; Height = 330; MinWidth = 0; MinHeight = 0;
-        WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize; AllowsTransparency = true;
-        WindowStartupLocation = WindowStartupLocation.Manual; ShowInTaskbar = false; ShowActivated = false; Focusable = false;
+        Focusable = false; HorizontalContentAlignment = HorizontalAlignment.Stretch; VerticalContentAlignment = VerticalAlignment.Stretch;
         FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Microsoft YaHei"); FontSize = 14;
-        Background = Brushes.Transparent; SetResourceReference(ForegroundProperty, "TextPrimaryBrush");
+        Background = null; Template = (ControlTemplate)templates["Flyout"];
+        SetResourceReference(ForegroundProperty, "TextPrimaryBrush");
         results.Id("SearchResults"); resultCount.Id("SearchResultCount");
         state.Id("SearchStatus"); empty.Id("SearchEmpty");
         AutomationProperties.SetLiveSetting(resultCount, AutomationLiveSetting.Polite);
@@ -177,96 +180,118 @@ internal sealed class SearchWindow : Window
         suggestionScroll = new ScrollViewer { Content = suggestions, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Padding = new Thickness(4), CanContentScroll = false };
         backdropBeforeAttachment = backdropFilter.DescribePreparedFrame();
         suggestionContent = new Grid(); suggestionContent.Children.Add(backdropFilter); suggestionContent.Children.Add(suggestionScroll);
-        suggestionBorder = new Border { Child = suggestionContent, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), MaxHeight = 380, Margin = new Thickness(ShadowInset) };
+        suggestionBorder = new Border { Child = suggestionContent, Background = Brushes.Transparent, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), MaxHeight = 380, Margin = new Thickness(ShadowInset) };
         if (FluentMotion.Enabled) { suggestionBorder.Opacity = 0; suggestionBorder.RenderTransform = new TranslateTransform(0, -12); }
         suggestionBorder.SetResourceReference(Border.BorderBrushProperty, "AcrylicStrokeBrush");
         suggestionBorder.Effect = new DropShadowEffect { Direction = 270, ShadowDepth = 8, BlurRadius = 24, Color = Colors.Black, Opacity = IsDark ? .26 : .14 };
-        flyoutSurface = new Grid { Background = Brushes.Transparent }; flyoutSurface.Children.Add(suggestionBorder);
+        // Only the result panel receives pointer input. Its shadow reservation
+        // overlaps the title bar and must let clicks reach the real input below.
+        var flyoutSurface = new Grid { Background = null }; flyoutSurface.Children.Add(suggestionBorder);
         Content = flyoutSurface;
         ScrollViewer.SetHorizontalScrollBarVisibility(results, ScrollBarVisibility.Disabled);
         ScrollViewer.SetVerticalScrollBarVisibility(results, ScrollBarVisibility.Auto);
-        search.TextChanged += QueryChanged;
-        SourceInitialized += (_, _) =>
-        {
-            NativeMotionCapture.Mark(timingSession, "search-source-initialized");
-            sourceInitializedMilliseconds = openClock.Elapsed.TotalMilliseconds;
-            var handle = new WindowInteropHelper(this).Handle;
-            // The title-bar input owns keyboard focus even while the pointer is over suggestions.
-            _ = SetWindowLongPtr(handle, -20, new IntPtr(GetWindowLongPtr(handle, -20).ToInt64() | 0x08000000));
-            if (HwndSource.FromHwnd(handle) is { } source)
-            {
-                source.AddHook(WindowMessage);
-                if (source.CompositionTarget is { } target) target.BackgroundColor = Colors.Transparent;
-            }
-            sourceInitializedCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
-            NativeMotionCapture.Mark(timingSession, "search-source-initialized-completed");
-        };
-        Loaded += async (_, _) =>
-        {
-            NativeMotionCapture.Mark(timingSession, "search-loaded");
-            loadedMilliseconds = openClock.Elapsed.TotalMilliseconds;
-            AttachOwner();
-            attachOwnerCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
-            PositionFlyout(); FocusInput();
-            backdropFilter.BeginPresentation();
-            CompositionTarget.Rendering += FirstRendering;
-            var coreLoad = LoadInitialEntries();
-            var verification = preparedPixels ?? backdropFilter.PrepareAsync();
-            initialBackdropFromCache = backdropFilter.TryPresentPreparedFrame();
-            if (initialBackdropFromCache)
-            {
-                initialBackdropMilliseconds = openClock.Elapsed.TotalMilliseconds;
-                NativeMotionCapture.Mark(timingSession, "search-backdrop-initial-cache");
-                EnterSuggestions();
-            }
-            NativeMotionCapture.Mark(timingSession, "search-await-backdrop");
-            bool verified = await backdropFilter.CompletePreparationAsync(verification);
-            backdropVerificationSucceeded = verified;
-            backdropVerificationCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
-            if (verified)
-            {
-                backdropReadyMilliseconds = backdropVerificationCompletedMilliseconds;
-                NativeMotionCapture.Mark(timingSession, "search-backdrop-ready");
-            }
-            else NativeMotionCapture.Mark(timingSession, "search-backdrop-unavailable");
-            if (closing || closed) return;
-            if (!initialBackdropFromCache)
-            {
-                // Search remains usable with the existing solid fallback when
-                // capture is unavailable. Its failed verification and filter
-                // diagnostic stay explicit; it is not reported as ready blur.
-                initialBackdropMilliseconds = openClock.Elapsed.TotalMilliseconds;
-                EnterSuggestions();
-            }
-            await coreLoad;
-        };
-        ContentRendered += (_, _) =>
-        {
-            if (contentRenderedMilliseconds is not null) return;
-            contentRenderedMilliseconds = openClock.Elapsed.TotalMilliseconds;
-            NativeMotionCapture.Mark(timingSession, "search-content-rendered");
-        };
-        Closed += (_, _) =>
-        {
-            closed = true; inputBox.PaletteClosed(instance); lifetime.Cancel(); lifetime.Dispose();
-            CompositionTarget.Rendering -= FirstRendering;
-            CompositionTarget.Rendering -= EntranceRendering;
-            search.TextChanged -= QueryChanged;
-            AutomationProperties.SetHelpText(search, "");
-            session.StatusChanged -= OnStatusChanged; session.ThemeChanged -= OnThemeChanged; L.Changed -= OnLanguageChanged;
-            if (anchorOwner is not null)
-            {
-                anchorOwner.LocationChanged -= CloseForOwnerChange; anchorOwner.SizeChanged -= CloseForOwnerSize;
-                anchorOwner.StateChanged -= CloseForOwnerChange; anchorOwner.IsVisibleChanged -= CloseForOwnerVisibility;
-                anchorOwner.PreviewMouseDown -= OwnerPointerDown;
-            }
-            if (ownsBackdrop) backdropFilter.Dispose();
-            else { backdropFilter.EndPresentation(); suggestionContent.Children.Remove(backdropFilter); }
-        };
-        session.StatusChanged += OnStatusChanged; session.ThemeChanged += OnThemeChanged; L.Changed += OnLanguageChanged;
         RebuildEntries();
         constructorCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         NativeMotionCapture.Mark(timingSession, "search-constructor-completed");
+    }
+
+    public event EventHandler? Closed;
+
+    public void Show()
+    {
+        Dispatcher.VerifyAccess();
+        if (closed) throw new InvalidOperationException("A closed search flyout cannot be shown again.");
+        if (shown) { FocusInput(); return; }
+        shown = true;
+        try
+        {
+            Loaded += OnLoaded; Unloaded += OnUnloaded;
+            search.TextChanged += QueryChanged;
+            session.StatusChanged += OnStatusChanged; session.ThemeChanged += OnThemeChanged; L.Changed += OnLanguageChanged;
+            AttachOwner();
+            PositionFlyout();
+            overlayHost.Children.Add(this);
+        }
+        catch { Close(); throw; }
+    }
+
+    public void Close()
+    {
+        Dispatcher.VerifyAccess();
+        if (closed) return;
+        closing = true; closed = true;
+        Loaded -= OnLoaded; Unloaded -= OnUnloaded;
+        CompositionTarget.Rendering -= FirstRendering;
+        CompositionTarget.Rendering -= EntranceRendering;
+        suggestionBorder.ApplyAnimationClock(OpacityProperty, null);
+        if (suggestionBorder.RenderTransform is TranslateTransform movement) movement.BeginAnimation(TranslateTransform.YProperty, null);
+        entranceClock = null;
+        search.TextChanged -= QueryChanged;
+        AutomationProperties.SetHelpText(search, "");
+        session.StatusChanged -= OnStatusChanged; session.ThemeChanged -= OnThemeChanged; L.Changed -= OnLanguageChanged;
+        if (ownerAttached)
+        {
+            owner.LocationChanged -= CloseForOwnerChange; owner.SizeChanged -= CloseForOwnerSize;
+            owner.StateChanged -= CloseForOwnerChange; owner.IsVisibleChanged -= CloseForOwnerVisibility;
+            owner.PreviewMouseDown -= OwnerPointerDown; owner.Closed -= CloseForOwnerClosed;
+            ownerAttached = false;
+        }
+        lifetime.Cancel(); lifetime.Dispose();
+        // The owner retains the prepared filter between openings. End this
+        // presentation before detaching it, and never dispose the shared cache.
+        backdropFilter.EndPresentation();
+        suggestionContent.Children.Remove(backdropFilter);
+        overlayHost.Children.Remove(this);
+        inputBox.PaletteClosed(instance);
+        Closed?.Invoke(this, EventArgs.Empty);
+    }
+
+    private async void OnLoaded(object sender, RoutedEventArgs args)
+    {
+        if (closed || loadedMilliseconds is not null) return;
+        NativeMotionCapture.Mark(timingSession, "search-loaded");
+        loadedMilliseconds = openClock.Elapsed.TotalMilliseconds;
+        PositionFlyout(); FocusInput();
+        backdropFilter.BeginPresentation();
+        CompositionTarget.Rendering += FirstRendering;
+        var coreLoad = LoadInitialEntries();
+        initialBackdropFromCache = backdropFilter.TryPresentPreparedFrame();
+        if (initialBackdropFromCache)
+        {
+            initialBackdropMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            NativeMotionCapture.Mark(timingSession, "search-backdrop-initial-cache");
+            EnterSuggestions();
+        }
+        NativeMotionCapture.Mark(timingSession, "search-await-backdrop");
+        bool verified = await backdropFilter.CompletePreparationAsync(preparedPixels);
+        if (closing || closed) return;
+        backdropVerificationSucceeded = verified;
+        backdropVerificationCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
+        if (verified)
+        {
+            backdropReadyMilliseconds = backdropVerificationCompletedMilliseconds;
+            NativeMotionCapture.Mark(timingSession, "search-backdrop-ready");
+        }
+        else NativeMotionCapture.Mark(timingSession, "search-backdrop-unavailable");
+        if (!initialBackdropFromCache)
+        {
+            // A failed capture keeps the existing usable solid fallback and
+            // explicit diagnostic; it is never reported as a ready blur.
+            initialBackdropMilliseconds = openClock.Elapsed.TotalMilliseconds;
+            EnterSuggestions();
+        }
+        await coreLoad;
+    }
+
+    private void OnUnloaded(object sender, RoutedEventArgs args) => Close();
+
+    protected override AutomationPeer OnCreateAutomationPeer() => new SearchFlyoutPeer(this);
+    private sealed class SearchFlyoutPeer(SearchFlyout owner) : FrameworkElementAutomationPeer(owner)
+    {
+        protected override AutomationControlType GetAutomationControlTypeCore() => AutomationControlType.Pane;
+        protected override string GetClassNameCore() => nameof(SearchFlyout);
+        protected override bool IsControlElementCore() => true;
+        protected override bool IsContentElementCore() => true;
     }
 
     private bool IsDark => TryFindResource("AppBackgroundBrush") is SolidColorBrush brush && brush.Color.R < 128;
@@ -276,6 +301,7 @@ internal sealed class SearchWindow : Window
     }
     private void EnterSuggestions()
     {
+        if (closing || closed || suggestionsStartedMilliseconds is not null) return;
         NativeMotionCapture.Mark(timingSession, "search-animation-start");
         suggestionsStartedMilliseconds = openClock.Elapsed.TotalMilliseconds;
         suggestionBorder.Opacity = 1;
@@ -289,11 +315,12 @@ internal sealed class SearchWindow : Window
         SettingsSegments.Animate(movement, TranslateTransform.YProperty, -12, 0, 250);
         // The same CSS keyframes as SettingsSegments.Animate. These callbacks
         // only identify WPF clock/render submission; screen pixels remain the
-        // independent evidence of when the window was actually presented.
+        // independent evidence of when the result panel was actually presented.
         var fade = new DoubleAnimationUsingKeyFrames { Duration = TimeSpan.FromMilliseconds(250), FillBehavior = FillBehavior.Stop };
         fade.KeyFrames.Add(new LinearDoubleKeyFrame(0, KeyTime.FromPercent(0)));
         fade.KeyFrames.Add(new SplineDoubleKeyFrame(1, KeyTime.FromPercent(1), new KeySpline(0, 0, 0, 1)));
-        fade.CurrentTimeInvalidated += (sender, _) =>
+        entranceClock = fade.CreateClock();
+        entranceClock.CurrentTimeInvalidated += (sender, _) =>
         {
             if (!entranceClockHasAdvanced && sender is Clock { CurrentState: ClockState.Active, CurrentProgress: > 0 })
             {
@@ -304,13 +331,13 @@ internal sealed class SearchWindow : Window
             entranceFirstTickMilliseconds = openClock.Elapsed.TotalMilliseconds;
             NativeMotionCapture.Mark(timingSession, "search-animation-first-tick");
         };
-        fade.Completed += (_, _) =>
+        entranceClock.Completed += (_, _) =>
         {
             entranceClockCompletedMilliseconds ??= openClock.Elapsed.TotalMilliseconds;
             NativeMotionCapture.Mark(timingSession, "search-animation-completed");
         };
         CompositionTarget.Rendering += EntranceRendering;
-        suggestionBorder.BeginAnimation(OpacityProperty, fade);
+        suggestionBorder.ApplyAnimationClock(OpacityProperty, entranceClock);
     }
     private void FirstRendering(object? sender, EventArgs args)
     {
@@ -338,11 +365,10 @@ internal sealed class SearchWindow : Window
                 return;
             }
             // The base value is already 1 before WPF applies the new clock.
-            // Wait for the initial Window render queue to drain, then observe
-            // genuinely advanced animation at Rendering. Neither a pre-tick
-            // base value nor Loaded alone is an entrance frame. The filter's
-            // original 100 ms deadline still bounds this opportunity.
-            if (contentRenderedMilliseconds is null || (FluentMotion.Enabled && !entranceClockHasAdvanced)
+            // The panel is already part of the owner's presentation channel.
+            // Observe an advanced clock at Rendering, not a pre-tick base
+            // value. The filter's original 100 ms deadline is unchanged.
+            if (!IsLoaded || (FluentMotion.Enabled && entranceClock is not { CurrentState: ClockState.Active, CurrentProgress: > 0 })
                 || suggestionBorder.Opacity <= 0) return;
             backdropFilter.FirstPresentationFrameSubmitted();
             NativeMotionCapture.Mark(timingSession, "search-initial-cache-nonzero-rendering");
@@ -357,18 +383,17 @@ internal sealed class SearchWindow : Window
     }
     internal object Describe() => new
     {
-        instance, visible = IsVisible, closing, closed, choosing, resultCount = results.Items.Count,
+        instance, visible = IsVisible, closing, closed, choosing, host = "main-window", resultCount = results.Items.Count,
         renderingTier = RenderCapability.Tier >> 16, positionCount, positionMilliseconds, backdrop = backdropFilter.Describe(),
         initialBackdropFromCache, backdropVerificationSucceeded, backdropBeforeAttachment,
         // Relative timings only: no search text, entry names or controller data.
         lifecycleMilliseconds = new { templates = templatesMilliseconds, constructorStarted = constructorStartedMilliseconds,
-            constructorCompleted = constructorCompletedMilliseconds, sourceInitialized = sourceInitializedMilliseconds,
-            sourceInitializedCompleted = sourceInitializedCompletedMilliseconds, loaded = loadedMilliseconds,
+            constructorCompleted = constructorCompletedMilliseconds, loaded = loadedMilliseconds,
             attachOwnerCompleted = attachOwnerCompletedMilliseconds, suggestionsStarted = suggestionsStartedMilliseconds,
             coreRequestsStarted = coreRequestsStartedMilliseconds, coreResponsesReady = coreResponsesReadyMilliseconds,
             coreEntriesCompleted = coreEntriesCompletedMilliseconds, backdropReady = backdropReadyMilliseconds, firstRendering = firstRenderingMilliseconds,
             initialBackdrop = initialBackdropMilliseconds, backdropVerificationCompleted = backdropVerificationCompletedMilliseconds,
-            contentRendered = contentRenderedMilliseconds, entranceFirstTick = entranceFirstTickMilliseconds,
+            entranceFirstTick = entranceFirstTickMilliseconds,
             entranceClockCompleted = entranceClockCompletedMilliseconds, entranceFirstRendering = entranceFirstRenderingMilliseconds,
             entranceFirstRenderedOpacity }
     };
@@ -376,14 +401,6 @@ internal sealed class SearchWindow : Window
     {
         await LoadCoreEntries();
         coreEntriesCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
-    }
-    protected override void OnClosing(CancelEventArgs e)
-    {
-        // Destroying an active HWND can synchronously raise Deactivated before
-        // Closed. Treat that interval as closing, including owner-driven exits.
-        closing = true;
-        base.OnClosing(e);
-        if (e.Cancel) closing = false;
     }
     private void ClosePalette(bool clearQuery = false, bool blur = false)
     {
@@ -397,25 +414,27 @@ internal sealed class SearchWindow : Window
     }
     private void AttachOwner()
     {
-        if (Owner is null || anchorOwner is not null) return;
-        anchorOwner = Owner;
-        if (ownsBackdrop && anchorOwner.Content is FrameworkElement content) backdropFilter.SetSources(content, content);
-        anchorOwner.LocationChanged += CloseForOwnerChange; anchorOwner.SizeChanged += CloseForOwnerSize;
-        anchorOwner.StateChanged += CloseForOwnerChange; anchorOwner.IsVisibleChanged += CloseForOwnerVisibility;
+        if (ownerAttached) return;
+        ownerAttached = true;
+        owner.LocationChanged += CloseForOwnerChange; owner.SizeChanged += CloseForOwnerSize;
+        owner.StateChanged += CloseForOwnerChange; owner.IsVisibleChanged += CloseForOwnerVisibility;
         // The supplied AutoSuggestBox closes for an outside pointer, resize or
         // explicit choice/Escape. A focus/activation transition alone is not a
-        // dismissal: assistive-technology clients may activate a provider HWND.
-        anchorOwner.PreviewMouseDown += OwnerPointerDown;
+        // dismissal: assistive-technology clients may move keyboard focus.
+        owner.PreviewMouseDown += OwnerPointerDown; owner.Closed += CloseForOwnerClosed;
+        attachOwnerCompletedMilliseconds = openClock.Elapsed.TotalMilliseconds;
     }
     private void QueryChanged(object sender, TextChangedEventArgs e) { if (!closing && !closed) Filter(); }
     private void OwnerPointerDown(object sender, MouseButtonEventArgs e)
     {
-        if (new Rect(inputBox.RenderSize).Contains(e.GetPosition(inputBox))) return;
+        if (new Rect(inputBox.RenderSize).Contains(e.GetPosition(inputBox))
+            || new Rect(suggestionBorder.RenderSize).Contains(e.GetPosition(suggestionBorder))) return;
         ClosePalette();
     }
     private void CloseForOwnerChange(object? sender, EventArgs e) => ClosePalette();
     private void CloseForOwnerSize(object sender, SizeChangedEventArgs e) => ClosePalette();
     private void CloseForOwnerVisibility(object sender, DependencyPropertyChangedEventArgs e) { if (e.NewValue is false) ClosePalette(); }
+    private void CloseForOwnerClosed(object? sender, EventArgs e) => Close();
     private void QueuePositionFlyout()
     {
         if (positionQueued || closing || closed || !IsLoaded) return;
@@ -428,45 +447,37 @@ internal sealed class SearchWindow : Window
             PositionFlyout();
         }));
     }
-    private readonly record struct Placement(double Left, double Top, double Width, double MaxHeight, DpiScale Dpi);
-    private static Placement Locate(Window owner, GlobalSearchBox anchor)
+    private readonly record struct Placement(double Left, double Top, double Width, double MaxHeight);
+    private static Placement Locate(GlobalSearchBox anchor, FrameworkElement host)
     {
-        Point origin = anchor.PointToScreen(new Point(0, anchor.ActualHeight));
-        Point ownerOrigin = owner.PointToScreen(new Point());
-        var dpi = VisualTreeHelper.GetDpi(anchor);
-        double scale = dpi.DpiScaleX, verticalScale = dpi.DpiScaleY;
-        var work = System.Windows.Forms.Screen.FromPoint(new System.Drawing.Point((int)origin.X, (int)origin.Y)).WorkingArea;
-        double availableWidth = Math.Max(1, Math.Min(owner.ActualWidth, work.Width / scale) - 16);
+        // Input and results share one presentation source and one DPI scale.
+        // Keep CSS-equivalent coordinates in the client host's logical pixels.
+        Point origin = anchor.TranslatePoint(new Point(0, anchor.ActualHeight), host);
+        double availableWidth = Math.Max(1, host.ActualWidth - 16);
         double width = Math.Min(Math.Max(anchor.ActualWidth, 320), availableWidth);
-        double minimumLeft = Math.Max(ownerOrigin.X, work.Left) + 8 * scale;
-        double maximumRight = Math.Min(ownerOrigin.X + owner.ActualWidth * scale, work.Right) - 8 * scale;
-        double left = Math.Clamp(origin.X, minimumLeft, Math.Max(minimumLeft, maximumRight - width * scale));
-        double top = origin.Y + 4 * verticalScale;
-        double maxHeight = Math.Min(380, Math.Max(40, (work.Bottom - top) / verticalScale - 8));
-        return new(left, top, width, maxHeight, dpi);
+        double left = Math.Clamp(origin.X, 8, Math.Max(8, host.ActualWidth - width - 8));
+        double top = origin.Y + 4;
+        double maxHeight = Math.Min(380, Math.Max(40, host.ActualHeight - top - 8));
+        return new(left, top, width, maxHeight);
     }
-    internal static Rect PreparationViewport(Window owner, GlobalSearchBox anchor, FrameworkElement root)
+    internal static Rect PreparationViewport(GlobalSearchBox anchor, FrameworkElement root)
     {
         if (anchor.ActualWidth <= 0 || anchor.ActualHeight <= 0) return Rect.Empty;
-        var placement = Locate(owner, anchor); var origin = root.PointToScreen(new Point());
+        var placement = Locate(anchor, root);
         // This is the real inside-border viewport. Reserving the legal maximum
         // height also covers later query results without rebuilding during entry.
-        return new Rect((placement.Left - origin.X) / placement.Dpi.DpiScaleX + 1,
-            (placement.Top - origin.Y) / placement.Dpi.DpiScaleY + 1,
+        return new Rect(placement.Left + 1, placement.Top + 1,
             Math.Max(1, placement.Width - 2), Math.Max(1, placement.MaxHeight - 2));
     }
     private void PositionFlyout()
     {
-        if (closing || closed || positioning || Owner is null) return;
-        var handle = new WindowInteropHelper(this).Handle;
-        if (handle == IntPtr.Zero) return;
+        if (closing || closed || positioning) return;
         var started = Stopwatch.GetTimestamp();
         positioning = true;
         try
         {
-            var placement = Locate(Owner, inputBox);
+            var placement = Locate(inputBox, overlayHost);
             double width = placement.Width, left = placement.Left, top = placement.Top;
-            double scale = placement.Dpi.DpiScaleX, verticalScale = placement.Dpi.DpiScaleY;
             var measure = new Size(Math.Max(1, width - 10), double.PositiveInfinity);
             // The reference renders at most eight ordinary rows. Measure those
             // actual containers directly so an earlier list/scroll extent can
@@ -488,30 +499,14 @@ internal sealed class SearchWindow : Window
             double panelHeight = Math.Min(maxHeight, contentHeight + 10);
             suggestionBorder.MaxHeight = maxHeight; suggestionBorder.Height = panelHeight;
             Width = width + 2 * ShadowInset; Height = panelHeight + 2 * ShadowInset;
-            // Physical coordinates keep the flyout on the owner's monitor at mixed DPI settings.
-            // A data refresh with the same six commands must not send another
-            // synchronous layered-window resize during the entrance animation.
-            var bounds = new Rect(Math.Round(left - ShadowInset * scale), Math.Round(top - ShadowInset * verticalScale),
-                Math.Round((width + 2 * ShadowInset) * scale), Math.Round((panelHeight + 2 * ShadowInset) * verticalScale));
+            var bounds = new Rect(left - ShadowInset, top - ShadowInset, Width, Height);
             if (positionedBounds != bounds)
             {
-                _ = SetWindowPos(handle, IntPtr.Zero, (int)bounds.X, (int)bounds.Y, (int)bounds.Width, (int)bounds.Height, 0x0014);
+                Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y);
                 positionedBounds = bounds; positionCount++;
             }
         }
         finally { positioning = false; positionMilliseconds += Stopwatch.GetElapsedTime(started).TotalMilliseconds; }
-    }
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
-    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
-    private static extern IntPtr GetWindowLongPtr(IntPtr window, int index);
-    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
-    private static extern IntPtr SetWindowLongPtr(IntPtr window, int index, IntPtr value);
-    private IntPtr WindowMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
-    {
-        if (message == 0x0021) { handled = true; return new IntPtr(3); } // WM_MOUSEACTIVATE: MA_NOACTIVATE
-        return IntPtr.Zero;
     }
 
     private void RebuildEntries()

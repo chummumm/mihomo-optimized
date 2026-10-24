@@ -26,3 +26,5 @@ __pycache__/
 /src-windows/*_wpftmp.csproj
 /desktop/tests/protocol/bin/
 /desktop/tests/protocol/obj/
+/desktop/tests/backdrop/bin/
+/desktop/tests/backdrop/obj/

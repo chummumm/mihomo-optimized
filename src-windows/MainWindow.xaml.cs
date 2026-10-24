@@ -37,7 +37,7 @@ public partial class MainWindow : Window
     internal TransientMessageHost Notifications { get; } = new();
     private readonly string shellPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Mihomo Optimized", "native-shell.json");
     private NativePage? activePage;
-    private SearchWindow? searchWindow;
+    private SearchFlyout? searchWindow;
     private NavigationTarget location = new("home");
     private string currentPage = "home";
     private string navigationMode = "expanded";
@@ -87,7 +87,7 @@ public partial class MainWindow : Window
         AttachNotifications(ClientArea);
         searchBackdrop.Id("SearchBackdrop");
         searchBackdrop.SetSources(ClientArea, TitleBar, ContentLayout, PageOverlayHost, ConnectedOverlay, Notifications);
-        searchBackdrop.ConfigurePreparation(ClientArea, () => SearchWindow.PreparationViewport(this, SearchButton, ClientArea));
+        searchBackdrop.ConfigurePreparation(ClientArea, () => SearchFlyout.PreparationViewport(SearchButton, ClientArea));
         SearchButton.OpenRequested += ShowSearch;
         SearchButton.MouseEnter += (_, _) => PrepareBackdropOnIntent(searchBackdrop);
         NavigationToggle.MouseEnter += (_, _) => PrepareBackdropOnIntent(navigationBackdrop);
@@ -627,16 +627,16 @@ public partial class MainWindow : Window
         if (EditorOpen) return;
         CloseOverlay(false);
         if (searchWindow is { IsVisible: true }) { searchWindow.FocusInput(); return; }
-        // Verify current lower-layer pixels before HWND creation and popup
-        // layout. Loaded checks the final viewport/revision again.
+        // Verify current lower-layer pixels before attaching and laying out the
+        // result panel. Loaded checks the final viewport/revision again.
         NativeMotionCapture.Mark("search-prepare-call");
         var preparation = searchBackdrop.PrepareAsync();
         NativeMotionCapture.Mark("search-prepare-return");
         NativeMotionCapture.Mark("search-new-before");
-        var dialog = new SearchWindow(session, SearchButton, searchBackdrop, preparation) { Owner = this }; searchWindow = dialog;
+        var flyout = new SearchFlyout(this, SearchOverlayHost, session, SearchButton, searchBackdrop, preparation); searchWindow = flyout;
         NativeMotionCapture.Mark("search-new-after");
-        dialog.Closed += (_, _) => { if (ReferenceEquals(searchWindow, dialog)) searchWindow = null; };
-        dialog.Show(); dialog.FocusInput();
+        flyout.Closed += (_, _) => { if (ReferenceEquals(searchWindow, flyout)) searchWindow = null; };
+        flyout.Show(); flyout.FocusInput();
     }
     private async void OnKey(object sender, KeyEventArgs e)
     {
