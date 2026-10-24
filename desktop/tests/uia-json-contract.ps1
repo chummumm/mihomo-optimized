@@ -50,7 +50,7 @@ try {
         $elements.Add(@{id = 'row-' + $index; name = $text; value = 'value-' + $index})
     }
     $fixture = @{found = $true; text = $text; wrapped = $wrapped; empty = @(); missing = $null;
-        flags = @($false, $true); numbers = @([long]::MinValue, [ulong]::MaxValue, 1.25, -0.5);
+        flags = @($false, $true); numbers = @([System.Int64]::MinValue, [System.UInt64]::MaxValue, 1.25, -0.5);
         native = $nativeDictionary; elements = $elements; rejected = 7}
     $stage = 'serialize'
     $json = [UiaResultJson]::Encode($fixture)
