@@ -100,13 +100,26 @@ def check_uia_json_contract() -> None:
             "-ExecutionPolicy", "Bypass", "-File", str(script)], capture_output=True,
             text=True, encoding="utf-8", errors="strict", timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW)
-    except subprocess.TimeoutExpired:
-        raise SmokeFailure("native_uia_json_contract_timeout") from None
-    require(result.returncode == 0, "native_uia_json_contract_failed")
+    except subprocess.TimeoutExpired as error:
+        raise SmokeFailure("native_uia_json_contract_timeout", uia={"timedOut": True,
+            "stdoutLength": len(error.stdout or b""),
+            "stderrLength": len(error.stderr or b"")}) from None
     try:
         fixture = json.loads(result.stdout)
     except (ValueError, TypeError):
-        raise SmokeFailure("native_uia_json_contract_invalid") from None
+        fixture = None
+    if result.returncode or not isinstance(fixture, dict):
+        diagnostic = {"returnCode": result.returncode, "stdoutLength": len(result.stdout),
+            "stderrLength": len(result.stderr), "jsonParsed": isinstance(fixture, dict),
+            "compilerCodes": sorted(set(re.findall(r"\bCS[0-9]{4}\b", result.stderr)))[:8],
+            # This separate helper reads only fixed fixtures and source, never
+            # UI/user data. Real UIA errors still retain fixed markers only.
+            "selfTestStderr": result.stderr[-4096:]}
+        if isinstance(fixture, dict):
+            diagnostic.update({key: safe_code(fixture[key]) for key in ("stage", "exception", "hresult") if key in fixture})
+            if type(fixture.get("line")) is int:
+                diagnostic["line"] = fixture["line"]
+        raise SmokeFailure("native_uia_json_contract_failed", uia=diagnostic)
     text = '\u4e2d\u6587"\\\0\t\n\r\U0001f680\ud800x\udc00'
     require(fixture.get("found") is True and fixture.get("text") == text
             and fixture.get("wrapped") == "wrapped" and fixture.get("empty") == []
@@ -2645,6 +2658,22 @@ class Acceptance:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--uia-json-contract"]:
+        report = {"passed": False, "platform": sys.platform}
+        try:
+            require(sys.platform == "win32", "windows_runner_required_for_uia_json_contract")
+            check_uia_json_contract()
+            report["passed"] = True
+        except Exception as error:
+            report["code"] = safe_code(str(error)) if isinstance(error, SmokeFailure) else "unexpected_" + type(error).__name__
+            if isinstance(error, SmokeFailure) and error.uia:
+                report["diagnostic"] = error.uia
+        if sys.platform == "win32":
+            output = Path("artifacts/verification/uia-json-contract.json")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, sort_keys=True), flush=True)
+        return 0 if report["passed"] else 1
     acceptance = None
     artifacts = Path("artifacts/verification")
     runner_allowed = sys.platform == "win32" and os.environ.get("GITHUB_ACTIONS") == "true"

@@ -654,13 +654,21 @@ internal sealed class FluentBackdropFilter : Grid, IDisposable
         if (disposed || !listening || !CanProcess || capturing || updatingGeometry || processing is not null || observer.Drawing is null || clock.Elapsed.TotalMilliseconds < retryAfterMilliseconds) return;
         if (DeferCaptureForInitialPresentation()) return;
         if (DeferCaptureForBudget()) return;
-        // Initial presentation is urgent. Subsequent live sampling runs after
-        // normal WPF presentation, so an RTB does not preempt the menu's next
-        // animation frame. There is still only one queued/in-flight capture.
-        var priority = demanding || Presenting && !FilterAvailable ? DispatcherPriority.Render : DispatcherPriority.Background;
+        // Only a missing current-generation frame makes presentation urgent.
+        // A real pixel verification can remain demanded while the prepared
+        // bitmap is shown; run it after normal WPF presentation so its RTB
+        // does not preempt the menu's next animation frame.
+        bool hasCurrentFrame = FilterAvailable && raster.Source is not null && publishedGeneration == generation;
+        var priority = !hasCurrentFrame && (demanding || Presenting) ? DispatcherPriority.Render : DispatcherPriority.Background;
         if (captureOperation is { Status: DispatcherOperationStatus.Pending } pending)
         {
-            if (pending.Priority < priority) { pending.Priority = priority; captureQueuePromotions++; }
+            // Keep the one queued capture aligned with current urgency in
+            // both directions; an earlier promotion must not outlive it.
+            if (pending.Priority != priority)
+            {
+                if (pending.Priority < priority) captureQueuePromotions++;
+                pending.Priority = priority;
+            }
             return;
         }
         long queued = Stopwatch.GetTimestamp();
