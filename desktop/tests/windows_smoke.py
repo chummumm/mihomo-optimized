@@ -1035,6 +1035,212 @@ class NativeDriver:
         self.process.close()
 
 
+class MouseInput(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_int32), ("dy", ctypes.c_int32),
+                ("mouseData", ctypes.c_uint32), ("flags", ctypes.c_uint32),
+                ("time", ctypes.c_uint32), ("extraInfo", ctypes.c_size_t)]
+
+
+class MouseEvent(ctypes.Structure):
+    # MOUSEINPUT is the largest member of INPUT's union on both Windows ABIs.
+    _fields_ = [("type", ctypes.c_uint32), ("mouse", MouseInput)]
+
+
+class NativePointer:
+    """Read UIA geometry, then exercise the real Windows mouse/hit-test path.
+
+    Only state reads are polled. Input is never retried or replaced with UIA
+    Invoke, posted mouse messages, or a direct application command.
+    """
+
+    def __init__(self, driver: NativeDriver, operations: list[dict]) -> None:
+        self.driver, self.operations = driver, operations
+        require(ctypes.sizeof(MouseEvent) == (40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28),
+                "native_pointer_input_layout_invalid")
+        self.api = ctypes.WinDLL("user32", use_last_error=True)
+        signatures = {
+            "SetThreadDpiAwarenessContext": ([wintypes.HANDLE], wintypes.HANDLE),
+            "GetPhysicalCursorPos": ([ctypes.POINTER(wintypes.POINT)], wintypes.BOOL),
+            "SetPhysicalCursorPos": ([ctypes.c_int, ctypes.c_int], wintypes.BOOL),
+            "GetWindowThreadProcessId": ([wintypes.HWND, ctypes.POINTER(wintypes.DWORD)], wintypes.DWORD),
+            "GetWindowRect": ([wintypes.HWND, ctypes.POINTER(wintypes.RECT)], wintypes.BOOL),
+            "GetForegroundWindow": ([], wintypes.HWND),
+            "GetAncestor": ([wintypes.HWND, wintypes.UINT], wintypes.HWND),
+            "WindowFromPoint": ([wintypes.POINT], wintypes.HWND),
+            "IsWindow": ([wintypes.HWND], wintypes.BOOL),
+            "IsWindowVisible": ([wintypes.HWND], wintypes.BOOL),
+            "IsIconic": ([wintypes.HWND], wintypes.BOOL),
+            "IsZoomed": ([wintypes.HWND], wintypes.BOOL),
+            "GetSystemMetrics": ([ctypes.c_int], ctypes.c_int),
+            "GetAsyncKeyState": ([ctypes.c_int], ctypes.c_short),
+            "SendInput": ([wintypes.UINT, ctypes.POINTER(MouseEvent), ctypes.c_int], wintypes.UINT),
+            "SendMessageTimeoutW": ([wintypes.HWND, wintypes.UINT, ctypes.c_size_t,
+                ctypes.c_ssize_t, wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)], ctypes.c_ssize_t),
+            "SetWindowPos": ([wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wintypes.UINT], wintypes.BOOL),
+        }
+        for name, (arguments, result) in signatures.items():
+            function = getattr(self.api, name)
+            function.argtypes, function.restype = arguments, result
+        self.button_down = False
+        self.window = 0
+        self.old_cursor = wintypes.POINT()
+
+    def __enter__(self):
+        # Match UIA's physical coordinates without changing other test threads.
+        self.old_dpi = self.api.SetThreadDpiAwarenessContext(wintypes.HANDLE(-4))
+        require(self.old_dpi, "native_pointer_dpi_context_failed")
+        try:
+            require(self.api.GetPhysicalCursorPos(ctypes.byref(self.old_cursor)), "native_pointer_cursor_read_failed")
+            main = self.driver.ui("MainWindow")
+            require(main.get("found") and main.get("windowProcessId") == self.driver.identity.pid,
+                    "native_pointer_main_window_missing")
+            self.window = main.get("windowHandle", 0)
+            self.check_owner()
+            return self
+        except BaseException:
+            self.api.SetThreadDpiAwarenessContext(self.old_dpi)
+            raise
+
+    def __exit__(self, _kind, _value, _traceback) -> None:
+        try:
+            if self.button_down:
+                # Release a partially delivered gesture on failure, never
+                # replay its press or turn cleanup into a successful action.
+                release = (MouseEvent * 1)(MouseEvent(0, MouseInput(0, 0, 0, 0x4, 0, 0)))
+                self.api.SendInput(1, release, ctypes.sizeof(MouseEvent))
+            self.api.SetPhysicalCursorPos(self.old_cursor.x, self.old_cursor.y)
+        finally:
+            self.api.SetThreadDpiAwarenessContext(self.old_dpi)
+
+    def check_owner(self) -> None:
+        require(self.driver.process.poll() is None and self.api.IsWindow(self.window),
+                "native_pointer_window_exited")
+        pid = wintypes.DWORD()
+        self.api.GetWindowThreadProcessId(self.window, ctypes.byref(pid))
+        require(pid.value == self.driver.identity.pid, "native_pointer_window_owner_changed")
+
+    def state(self) -> dict:
+        self.check_owner()
+        rect = wintypes.RECT()
+        require(self.api.GetWindowRect(self.window, ctypes.byref(rect)), "native_pointer_window_bounds_failed")
+        return {"visible": bool(self.api.IsWindowVisible(self.window)),
+                "minimized": bool(self.api.IsIconic(self.window)),
+                "maximized": bool(self.api.IsZoomed(self.window)),
+                "rect": [rect.left, rect.top, rect.right, rect.bottom]}
+
+    def bounds(self, identifier: str) -> dict:
+        result = self.driver.ui(identifier)
+        require(result.get("found") and result.get("enabled") and result.get("offscreen") is False,
+                "native_pointer_target_unavailable_" + identifier)
+        require(result.get("windowHandle") == self.window
+                and result.get("windowProcessId") == self.driver.identity.pid,
+                "native_pointer_target_owner_mismatch")
+        bounds = result.get("bounds") or {}
+        require(all(type(bounds.get(key)) in (int, float) and math.isfinite(bounds[key])
+                    for key in ("x", "y", "width", "height"))
+                and bounds["width"] > 8 and bounds["height"] > 8,
+                "native_pointer_target_bounds_invalid")
+        return bounds
+
+    def send(self, events: list[MouseEvent], operation: dict) -> None:
+        buffer = (MouseEvent * len(events))(*events)
+        inserted = self.api.SendInput(len(events), buffer, ctypes.sizeof(MouseEvent))
+        operation["requestedEvents"] += len(events)
+        operation["insertedEvents"] += inserted
+        require(inserted == len(events), "native_pointer_send_input_failed")
+
+    def move(self, point: tuple[int, int], operation: dict) -> None:
+        left, top, width, height = (self.api.GetSystemMetrics(metric) for metric in (76, 77, 78, 79))
+        x, y = point
+        require(width > 1 and height > 1 and left <= x < left + width and top <= y < top + height,
+                "native_pointer_point_outside_desktop")
+        dx, dy = round((x - left) * 65535 / (width - 1)), round((y - top) * 65535 / (height - 1))
+        # MOVE | ABSOLUTE | VIRTUALDESK: includes monitors left/above the origin.
+        self.send([MouseEvent(0, MouseInput(dx, dy, 0, 0xC001, 0, 0))], operation)
+
+    def prepare(self, name: str, kind: str, point: tuple[int, int]) -> dict:
+        before = self.state()
+        operation = {"target": name, "kind": kind, "point": list(point), "before": before,
+                     "requestedEvents": 0, "insertedEvents": 0, "passed": False}
+        self.operations.append(operation)
+        require(before["visible"] and not before["minimized"], "native_pointer_window_not_visible")
+        require(self.api.GetForegroundWindow() == self.window, "native_pointer_window_not_foreground")
+        require(not any(self.api.GetAsyncKeyState(key) & 0x8000 for key in (1, 2, 4, 16, 17, 18, 91, 92)),
+                "native_pointer_other_input_pressed")
+        target = self.api.WindowFromPoint(wintypes.POINT(*point))
+        require(target and self.api.GetAncestor(target, 2) == self.window, "native_pointer_target_occluded")
+        self.move(point, operation)
+
+        def positioned():
+            cursor = wintypes.POINT()
+            if not self.api.GetPhysicalCursorPos(ctypes.byref(cursor)):
+                return False
+            operation["actualPoint"] = [cursor.x, cursor.y]
+            # Normalized absolute mouse coordinates can round by one pixel.
+            return abs(cursor.x - point[0]) <= 1 and abs(cursor.y - point[1]) <= 1
+
+        wait_until(positioned, "native_pointer_cursor_did_not_move", 2)
+        self.check_owner()
+        require(self.api.GetForegroundWindow() == self.window, "native_pointer_foreground_changed")
+        actual = operation["actualPoint"]
+        require(all(-32768 <= value <= 32767 for value in actual), "native_pointer_hit_test_point_out_of_range")
+        target = self.api.WindowFromPoint(wintypes.POINT(*actual))
+        require(target and self.api.GetAncestor(target, 2) == self.window, "native_pointer_target_became_occluded")
+        packed = ((actual[1] & 0xFFFF) << 16) | (actual[0] & 0xFFFF)
+        hit = ctypes.c_size_t()
+        responded = self.api.SendMessageTimeoutW(self.window, 0x84, 0, packed, 0x23, 1000, ctypes.byref(hit))
+        # Diagnostic only: HTCLIENT/HTCAPTION cannot stand in for the gesture.
+        operation["hitTest"] = ctypes.c_ssize_t(hit.value).value if responded else None
+        return operation
+
+    def click(self, identifier: str, *, horizontal: float = .5) -> dict:
+        bounds = self.bounds(identifier)
+        point = (round(bounds["x"] + bounds["width"] * horizontal), round(bounds["y"] + bounds["height"] * .5))
+        operation = self.prepare(identifier, "click", point)
+        operation["bounds"] = bounds
+        self.button_down = True
+        self.send([MouseEvent(0, MouseInput(0, 0, 0, flag, 0, 0)) for flag in (0x2, 0x4)], operation)
+        self.button_down = False
+        return operation
+
+    def title_point(self) -> tuple[int, int]:
+        navigation, search = self.bounds("NavigationToggle"), self.bounds("GlobalSearch")
+        left, right = navigation["x"] + navigation["width"], search["x"]
+        require(right - left >= 24, "native_pointer_title_drag_region_missing")
+        return round((left + right) / 2), round(navigation["y"] + navigation["height"] / 2)
+
+    def double_click_title(self) -> dict:
+        operation = self.prepare("title-drag-region", "double-click", self.title_point())
+        self.button_down = True
+        self.send([MouseEvent(0, MouseInput(0, 0, 0, flag, 0, 0))
+                   for flag in (0x2, 0x4, 0x2, 0x4)], operation)
+        self.button_down = False
+        return operation
+
+    def drag_title(self, dx: int, dy: int) -> dict:
+        point = self.title_point()
+        operation = self.prepare("title-drag-region", "drag", point)
+        operation["delta"] = [dx, dy]
+        self.button_down = True
+        try:
+            self.send([MouseEvent(0, MouseInput(0, 0, 0, 0x2, 0, 0))], operation)
+            # Give Windows' native move loop successive held-pointer positions.
+            time.sleep(.05)
+            for step in range(1, 6):
+                self.move((point[0] + round(dx * step / 5), point[1] + round(dy * step / 5)), operation)
+                time.sleep(.03)
+        finally:
+            self.send([MouseEvent(0, MouseInput(0, 0, 0, 0x4, 0, 0))], operation)
+            self.button_down = False
+        return operation
+
+    def restore_position(self, rect: list[int]) -> None:
+        self.check_owner()
+        require(self.api.SetWindowPos(self.window, None, rect[0], rect[1], 0, 0, 0x15),
+                "native_pointer_position_restore_failed")  # NOSIZE | NOZORDER | NOACTIVATE
+
+
 def receive_exact(stream: socket.socket, count: int) -> bytes:
     result = bytearray()
     while len(result) < count:
@@ -1365,6 +1571,146 @@ class Acceptance:
             return json.loads(payload)
         finally:
             connection.close()
+
+    def check_native_titlebar_pointer(self) -> None:
+        """Caption controls must work through Windows input, not just UIA peers."""
+        self.stage = "native_titlebar_pointer"
+        evidence = {"input": "SendInput", "operations": [], "passed": False}
+        self.report["nativeTitlebarPointer"] = evidence
+        driver = self.driver
+        driver.invoke("native_show")
+        size = driver.invoke("native_resize", {"width": 1180, "height": 780})
+        require(size.get("width", 0) >= 1008, "native_pointer_expanded_layout_unavailable")
+        driver.navigate("home")
+        hosts = self.processes.at_paths([self.host])
+        require(len(hosts) == 1, "native_pointer_host_identity_missing")
+
+        with NativePointer(driver, evidence["operations"]) as pointer:
+            original_rect = pointer.state()["rect"]
+            completed = False
+
+            def shell_matches(**expected):
+                snapshot = driver.snapshot()
+                observed = {key: snapshot.get(key) for key in expected}
+                return observed if observed == expected else None
+
+            def window_matches(**expected):
+                observed = pointer.state()
+                return observed if all(observed[key] == value for key, value in expected.items()) else None
+
+            def verify(operation: dict, predicate, code: str) -> None:
+                # The action has already been sent exactly once. Never show or
+                # capture the window while waiting: those helpers restore it.
+                try:
+                    operation["after"] = wait_until(predicate, code, 10)
+                except SmokeFailure as error:
+                    operation["error"] = safe_code(str(error))
+                    try:
+                        operation["windowAfter"] = pointer.state()
+                    except SmokeFailure as state_error:
+                        operation["windowStateError"] = safe_code(str(state_error))
+                    raise
+                else:
+                    operation["windowAfter"] = pointer.state()
+                    operation["passed"] = True
+
+            try:
+                driver.navigate("settings")
+                wait_until(lambda: driver.snapshot().get("canGoBack") is True,
+                           "native_pointer_back_not_enabled", 10)
+                operation = pointer.click("TitleBarBack")
+                verify(operation, lambda: shell_matches(page="home"), "native_pointer_back_did_not_navigate")
+                operation["passed"] = False
+                home = driver.ui("TrafficChart")
+                operation["homeVisible"] = home.get("found") and home.get("offscreen") is False
+                require(operation["homeVisible"], "native_pointer_home_not_visible")
+                operation["passed"] = True
+
+                operation = pointer.click("SearchInput")
+                verify(operation, lambda: shell_matches(searchVisible=True), "native_pointer_search_did_not_open")
+                initial_mode = driver.snapshot().get("navigationMode")
+                require(initial_mode in ("expanded", "compact"), "native_pointer_wide_navigation_invalid")
+                changed_mode = "compact" if initial_mode == "expanded" else "expanded"
+                operation = pointer.click("NavigationToggle")
+                verify(operation, lambda: shell_matches(navigationMode=changed_mode, searchVisible=False),
+                       "native_pointer_wide_navigation_did_not_toggle")
+                operation = pointer.click("NavigationToggle", horizontal=.2)
+                verify(operation, lambda: shell_matches(navigationMode=initial_mode),
+                       "native_pointer_wide_navigation_did_not_restore")
+
+                for width, mode in ((800, "compact"), (640, "minimal")):
+                    resized = driver.invoke("native_resize", {"width": width, "height": 700})
+                    require(resized.get("navigationMode") == mode, "native_pointer_layout_missing_" + mode)
+                    operation = pointer.click("NavigationToggle")
+                    operation["layout"] = mode
+                    verify(operation, lambda: shell_matches(navigationOverlay=True),
+                           "native_pointer_navigation_did_not_open_" + mode)
+                    operation = pointer.click("NavigationToggle", horizontal=.2)
+                    operation["layout"] = mode
+                    verify(operation, lambda: shell_matches(navigationOverlay=False),
+                           "native_pointer_navigation_did_not_close_" + mode)
+
+                driver.invoke("native_resize", {"width": 1180, "height": 780})
+                operation = pointer.click("TitleBarMaximize")
+                verify(operation, lambda: window_matches(maximized=True, minimized=False),
+                       "native_pointer_maximize_failed")
+                operation = pointer.click("TitleBarMaximize", horizontal=.2)
+                verify(operation, lambda: window_matches(maximized=False, minimized=False),
+                       "native_pointer_restore_failed")
+
+                operation = pointer.click("TitleBarMinimize", horizontal=.2)
+                verify(operation, lambda: window_matches(minimized=True), "native_pointer_minimize_failed")
+                driver.invoke("native_show")  # Restore only after IsIconic proved success.
+                wait_until(lambda: window_matches(visible=True, minimized=False), "native_pointer_minimize_cleanup_failed", 10)
+
+                operation = pointer.click("TitleBarClose", horizontal=.2)
+                verify(operation, lambda: window_matches(visible=False), "native_pointer_close_did_not_hide")
+                operation["passed"] = False
+                operation["guiAlive"] = self.processes.identity(driver.identity.pid) == driver.identity
+                operation["hostAlive"] = self.processes.identity(hosts[0].pid) == hosts[0]
+                require(operation["guiAlive"] and operation["hostAlive"], "native_pointer_close_terminated_process")
+                require(driver.snapshot().get("visible") is False and self.status().get("phase") == "running",
+                        "native_pointer_close_did_not_preserve_host")
+                operation["hostRunning"] = True
+                operation["passed"] = True
+                driver.invoke("native_show")  # Close means hide to tray, not process exit.
+                wait_until(lambda: window_matches(visible=True, minimized=False), "native_pointer_close_cleanup_failed", 10)
+
+                operation = pointer.drag_title(64, 48)
+                before = operation["before"]["rect"]
+
+                def dragged():
+                    state = pointer.state()
+                    rect = state["rect"]
+                    return state if (not state["maximized"] and not state["minimized"]
+                        and abs(rect[0] - before[0] - 64) <= 2 and abs(rect[1] - before[1] - 48) <= 2
+                        and rect[2] - rect[0] == before[2] - before[0]
+                        and rect[3] - rect[1] == before[3] - before[1]) else None
+
+                verify(operation, dragged, "native_pointer_title_drag_failed")
+                operation = pointer.double_click_title()
+                verify(operation, lambda: window_matches(maximized=True, minimized=False),
+                       "native_pointer_title_double_click_maximize_failed")
+                operation = pointer.double_click_title()
+                verify(operation, lambda: window_matches(maximized=False, minimized=False),
+                       "native_pointer_title_double_click_restore_failed")
+                completed = True
+            finally:
+                # Preserve a failed assertion even if restoring the disposable
+                # desktop also fails. No cleanup action marks a test as passed.
+                try:
+                    driver.invoke("native_show")
+                    driver.invoke("native_resize", {"width": 1180, "height": 780})
+                    pointer.restore_position(original_rect)
+                    driver.navigate("home")
+                    evidence["restored"] = True
+                except Exception as error:
+                    evidence["restored"] = False
+                    evidence["cleanupError"] = type(error).__name__
+                    if completed:
+                        raise
+        evidence["passed"] = True
+        self.mark("native_titlebar_pointer")
 
     def check_native_redesign_ui(self, valid: str, base: str) -> None:
         """Exercise final-design controls through independent Windows UIA peers.
@@ -2479,6 +2825,7 @@ class Acceptance:
         self.report["screenshot"] = "windows-settings.png"
         self.mark("single_instance_and_native_ui")
 
+        self.check_native_titlebar_pointer()
         self.check_native_redesign_ui(valid, base)
 
         self.stage = "tun_forwarding"
@@ -2748,7 +3095,7 @@ def main() -> int:
             except Exception as error:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": "unexpected_" + type(error).__name__})
             required = {"native_uia_json_contract", "native_host_parent_binding", "update_cache_cleanup", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
-                        "single_instance_and_native_ui", "native_redesign_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
+                        "single_instance_and_native_ui", "native_titlebar_pointer", "native_redesign_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
                         "resource_bootstrap_recovery", "system_proxy_service_recovery"}
             acceptance.report["passed"] = all(acceptance.report["tests"].get(name) is True for name in required) and not acceptance.report["diagnostics"]

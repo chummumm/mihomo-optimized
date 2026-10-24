@@ -157,6 +157,17 @@ Set-UiaStage 'read_properties'
 $result = @{ found=$true; enabled=$element.Current.IsEnabled; offscreen=$element.Current.IsOffscreen;
     name=$element.Current.Name; focused=$element.Current.HasKeyboardFocus;
     controlType=$element.Current.ControlType.ProgrammaticName }
+if ($Action -eq 'read') {
+    # UIA supplies physical screen coordinates. Pointer acceptance only reads
+    # this geometry; Windows receives the actual mouse input independently.
+    # WPF buttons have no HWND, so retain their owning top-level window.
+    $result.windowHandle = ([long]$window.Current.NativeWindowHandle -band 0xFFFFFFFFL)
+    $result.windowProcessId = $window.Current.ProcessId
+    $bounds = $element.Current.BoundingRectangle
+    if (-not $bounds.IsEmpty) {
+        $result.bounds = @{x=$bounds.X; y=$bounds.Y; width=$bounds.Width; height=$bounds.Height}
+    }
+}
 Set-UiaStage $Action
 switch ($Action) {
     'invoke' {

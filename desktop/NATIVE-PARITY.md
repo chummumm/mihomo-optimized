@@ -2,6 +2,12 @@
 
 设计依据是用户提供的 `mihomo-fluent-redesign(1).zip` 中 `files/` 的最终源文件及 patch。本表记录原生实现入口和验收路径；网页端文件仍作为设计依据，不参与 Windows 运行。Windows 使用 C# WPF，系统集成保留现有 Rust host 和固定 Go 内核。
 
+## 0.2.2 标题栏鼠标输入
+
+`ShellVisuals.Background` 区分未设置背景和显式透明背景，确保首次设置透明背景时初始化真实的 `Border.Background`，图标按钮的整个可点击区域均能接收鼠标。返回、导航、最小化、关闭使用原有 WPF 事件；最大化保留原有 Windows 非客户区消息和贴靠行为。
+
+验收分别检查透明背景的实际命中结果，以及安装后标题栏按钮的真实鼠标操作、窗口拖动和双击。UIA 在鼠标回归中仅提供控件位置，不调用 `InvokePattern` 代替点击；窗口最小化和隐藏通过 Windows 窗口状态核对，恢复操作在断言之后执行。
+
 ## 0.2.1 视觉校准
 
 原稿的完整前端通过 `visual-reference.json` 固定到基础提交和补丁 SHA-256，包含压缩包没有重复携带的 Logs 等基础页面。Windows 验收在同一 runner 上分别渲染原稿和安装后的 WPF 程序，使用同样的窗口尺寸、DPI、语言、主题强调色和无凭据测试数据。原稿仅作为测试基准，不进入安装包或便携包。
@@ -35,13 +41,14 @@
 
 ## 验收
 
+- `desktop/tests/shell`：在真实 WPF 窗口中检查透明背景首次设置、未设置背景的穿透、以及悬停和主题状态往返后的鼠标命中区域。
 - `desktop/tests/protocol`：stdio 边界、取消/并发、退出、Windows 单实例身份校验，以及 DNS 原子分页索引的稀疏 ID、UInt64 边界、空页、非法/旧版元数据。
 - `desktop/tests/backdrop`：以原始 UI 视觉的 VisualBrush/RTB 为基准，逐像素检查后台场景的变换、裁剪、透明度、效果、文本和不同 DPI，并验证冻结后的来源隔离、取消和不支持资源回退。
 - `desktop/tests/windows_smoke.py` 与 `uia-query.ps1`：实际安装程序、普通权限 WPF 界面、原生 UIA 控件操作及截图；验证空连接表能实际横向滚到末列、首列保持冻结并恢复起点，同时保留系统代理、TUN、服务身份、资源引导和异常退出恢复检查。
 - `desktop/tests/prepare-visual-reference.py` 与 `capture-reference.cjs`：恢复并渲染固定原稿，使用安装验收导出的安全数据和实际页面滚动位置；输出实际尺寸、DPI、主题、字体及关键元素几何信息。测试浏览器禁止访问本地夹具以外的网络目标。
 - `NativeMotionCapture`：由独立 Windows UIA 操作触发真实控件事件，后台读取实际桌面像素，保存页面、选中项、开关、搜索、编辑器和窄窗导航的连续帧、实际采样时间、采集耗时与屏幕可见区域。录制不调用 WPF 布局或渲染，PNG 编码延后到交互结束；它只录制，不替代或驱动控件行为。静态图与动画帧是人工对照证据，生成图片本身不等于逐像素一致性判定。
 - `desktop/tests/upgrade_smoke.py`：真实旧发行升级、卸载残留修复、配置和所有者保留、安装/便携逐文件一致性。
-- `.github/workflows/windows-desktop.yml`：通过全部 Windows 检查后，由 `clash-dashboard` 受信工作流生成构建证明并发布 `mihomo-desktop-v0.2.1`。PR 构建不发布正式 Release。
+- `.github/workflows/windows-desktop.yml`：通过全部 Windows 检查后，由 `clash-dashboard` 受信工作流生成构建证明并发布对应的 `mihomo-desktop-v*` 版本。PR 构建不发布正式 Release。
 
 WPF 视觉树截图来自实际运行的控件。系统合成的 Mica/Acrylic 需在支持透明效果的 Windows 11 桌面观察；不支持材料的系统使用原稿规定的实色回退。YAML 编辑器依照原稿的纯文本编辑模型实现，不将原稿没有的代码补全列作已实现功能。
 

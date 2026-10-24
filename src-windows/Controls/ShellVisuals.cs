@@ -9,16 +9,18 @@ namespace Mihomo.Desktop.Controls;
 /// <summary>CSS-equivalent color transitions without replacing dynamic theme resources.</summary>
 public static class ShellVisuals
 {
+    // An explicit transparent brush must initialize Border.Background too: a
+    // null background has no hit surface, even when the control draws an icon.
     public static readonly DependencyProperty BackgroundProperty = DependencyProperty.RegisterAttached(
-        "Background", typeof(Brush), typeof(ShellVisuals), new PropertyMetadata(Brushes.Transparent, BackgroundChanged));
+        "Background", typeof(Brush), typeof(ShellVisuals), new PropertyMetadata(null, BackgroundChanged));
     public static readonly DependencyProperty DurationProperty = DependencyProperty.RegisterAttached(
         "Duration", typeof(double), typeof(ShellVisuals), new PropertyMetadata(83d));
     public static readonly DependencyProperty ForegroundProperty = DependencyProperty.RegisterAttached(
         "Foreground", typeof(Brush), typeof(ShellVisuals), new PropertyMetadata(Brushes.Black, ForegroundChanged));
     public static readonly DependencyProperty PressedProperty = DependencyProperty.RegisterAttached("Pressed", typeof(bool), typeof(ShellVisuals), new PropertyMetadata(false));
     public static readonly DependencyProperty TrackPressProperty = DependencyProperty.RegisterAttached("TrackPress", typeof(bool), typeof(ShellVisuals), new PropertyMetadata(false, TrackPressChanged));
-    public static Brush GetBackground(DependencyObject target) => (Brush)target.GetValue(BackgroundProperty);
-    public static void SetBackground(DependencyObject target, Brush value) => target.SetValue(BackgroundProperty, value);
+    public static Brush? GetBackground(DependencyObject target) => (Brush?)target.GetValue(BackgroundProperty);
+    public static void SetBackground(DependencyObject target, Brush? value) => target.SetValue(BackgroundProperty, value);
     public static double GetDuration(DependencyObject target) => (double)target.GetValue(DurationProperty);
     public static void SetDuration(DependencyObject target, double value) => target.SetValue(DurationProperty, value);
     public static Brush GetForeground(DependencyObject target) => (Brush)target.GetValue(ForegroundProperty);
