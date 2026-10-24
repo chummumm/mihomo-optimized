@@ -1,11 +1,29 @@
 # Exercise the exact Windows PowerShell 5.1 encoder used by uia-query.ps1.
 # Output contains only fixed fixtures; never read a window or user data here.
 $ErrorActionPreference = 'Stop'
+$script:stageClock = [System.Diagnostics.Stopwatch]::StartNew()
+$script:stage = 'initialize'
+function Set-ContractStage {
+    param([ValidateSet('initialize', 'resolve_encoder', 'compile', 'compiled', 'reject_object', 'reject_nonfinite',
+        'reject_key', 'reject_cycle', 'reject_output_size', 'create_text', 'wrap_string',
+        'create_dictionary', 'create_tree', 'serialize', 'write_result', 'flush_result',
+        'exit_process')][string]$Stage)
+    $script:stage = $Stage
+    # Keep a killed process diagnosable without using its encoder or PowerShell
+    # object formatting. These markers contain fixed stages and elapsed time only.
+    $milliseconds = $script:stageClock.ElapsedMilliseconds.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    [Console]::Error.WriteLine('MIHOMO_UIA_STAGE:' + $Stage + ':' + $milliseconds)
+    [Console]::Error.Flush()
+}
+Set-ContractStage 'initialize'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$stage = 'compile'
 try {
-    Add-Type -Path (Join-Path $PSScriptRoot 'UiaResultJson.cs') -ReferencedAssemblies @(
+    Set-ContractStage 'resolve_encoder'
+    $encoderPath = Join-Path $PSScriptRoot 'UiaResultJson.cs'
+    Set-ContractStage 'compile'
+    Add-Type -Path $encoderPath -ReferencedAssemblies @(
         'System.dll', 'System.Core.dll', [System.Management.Automation.PSObject].Assembly.Location)
+    Set-ContractStage 'compiled'
     function Assert-Rejected {
         param([object]$Value)
         try { $null = [UiaResultJson]::Encode($Value) }
@@ -18,33 +36,33 @@ try {
         throw 'The encoder accepted an unsupported fixture.'
     }
 
-    $stage = 'reject_object'
+    Set-ContractStage 'reject_object'
     Assert-Rejected ([System.Version]::new(1, 2, 3))
-    $stage = 'reject_nonfinite'
+    Set-ContractStage 'reject_nonfinite'
     Assert-Rejected ([double]::NaN)
     Assert-Rejected ([double]::PositiveInfinity)
     Assert-Rejected ([float]::NegativeInfinity)
-    $stage = 'reject_key'
+    Set-ContractStage 'reject_key'
     Assert-Rejected @{1 = 'nonstring-key'}
-    $stage = 'reject_cycle'
+    Set-ContractStage 'reject_cycle'
     $cycle = [System.Collections.ArrayList]::new()
     [void]$cycle.Add($cycle)
     Assert-Rejected $cycle
-    $stage = 'reject_output_size'
+    Set-ContractStage 'reject_output_size'
     Assert-Rejected ([string]::new([char]'x', 16 * 1024 * 1024))
 
     # The decimal separator must not follow the helper's current culture.
-    $stage = 'create_text'
+    Set-ContractStage 'create_text'
     [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('fr-FR')
     $text = [string]::new([char[]]@(0x4e2d, 0x6587, 0x22, 0x5c, 0, 9, 10, 13, 0xd83d, 0xde80, 0xd800, 0x78, 0xdc00))
-    $stage = 'wrap_string'
+    Set-ContractStage 'wrap_string'
     [psobject]$wrapped = 'wrapped'
     $wrapped.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new('ignored', [System.Version]::new(1, 2)))
-    $stage = 'create_dictionary'
+    Set-ContractStage 'create_dictionary'
     $nativeDictionary = [System.Collections.Generic.Dictionary[string, object]]::new()
     $nativeDictionary.Add('offsets', [int[]]@(0, 942))
     $nativeDictionary.Add('visible', $true)
-    $stage = 'create_tree'
+    Set-ContractStage 'create_tree'
     $elements = [System.Collections.Generic.List[object]]::new()
     for ($index = 0; $index -lt 4096; $index++) {
         $elements.Add(@{id = 'row-' + $index; name = $text; value = 'value-' + $index})
@@ -52,11 +70,13 @@ try {
     $fixture = @{found = $true; text = $text; wrapped = $wrapped; empty = @(); missing = $null;
         flags = @($false, $true); numbers = @([System.Int64]::MinValue, [System.UInt64]::MaxValue, 1.25, -0.5);
         native = $nativeDictionary; elements = $elements; rejected = 7}
-    $stage = 'serialize'
+    Set-ContractStage 'serialize'
     $json = [UiaResultJson]::Encode($fixture)
-    $stage = 'write_result'
+    Set-ContractStage 'write_result'
     [Console]::Out.WriteLine($json)
+    Set-ContractStage 'flush_result'
     [Console]::Out.Flush()
+    Set-ContractStage 'exit_process'
     [Environment]::Exit(0)
 } catch {
     $failureRecord = $_

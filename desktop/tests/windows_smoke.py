@@ -58,6 +58,12 @@ UIA_STAGES = frozenset({
     "read_scroll", "read_bounds", "load_result_encoder", "serialize",
     "write_result", "flush_result", "complete", "exit_process",
 })
+UIA_JSON_STAGES = frozenset({
+    "initialize", "resolve_encoder", "compile", "compiled", "reject_object", "reject_nonfinite", "reject_key",
+    "reject_cycle", "reject_output_size", "create_text", "wrap_string",
+    "create_dictionary", "create_tree", "serialize", "write_result",
+    "flush_result", "exit_process",
+})
 
 
 class SmokeFailure(Exception):
@@ -77,14 +83,15 @@ def safe_code(value: object) -> str:
     return value if isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9_. -]{1,100}", value) else "unspecified_error"
 
 
-def uia_progress(stderr: str | bytes | None) -> tuple[list[str], list[dict]]:
+def uia_progress(stderr: str | bytes | None, *,
+                 allowed_stages: frozenset[str] = UIA_STAGES) -> tuple[list[str], list[dict]]:
     """Extract only bounded, fixed markers; never preserve raw helper output."""
     text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr or ""
     stages = []
     timings = []
     for line in text[:16384].splitlines():
         marker = re.fullmatch(r"MIHOMO_UIA_STAGE:([a-z0-9_-]+)(?::([0-9]{1,6}))?", line)
-        if marker and marker[1] in UIA_STAGES:
+        if marker and marker[1] in allowed_stages:
             stages.append(marker[1])
             if marker[2] is not None:
                 timings.append({"stage": marker[1], "elapsedMilliseconds": int(marker[2])})
@@ -93,23 +100,29 @@ def uia_progress(stderr: str | bytes | None) -> tuple[list[str], list[dict]]:
     return stages, timings
 
 
-def check_uia_json_contract() -> None:
+def check_uia_json_contract() -> dict:
     script = Path(__file__).with_name("uia-json-contract.ps1").resolve()
+    started = time.monotonic()
     try:
         result = subprocess.run(["powershell.exe", "-Mta", "-NoProfile", "-NonInteractive",
             "-ExecutionPolicy", "Bypass", "-File", str(script)], capture_output=True,
             text=True, encoding="utf-8", errors="strict", timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW)
     except subprocess.TimeoutExpired as error:
+        stages, timings = uia_progress(error.stderr, allowed_stages=UIA_JSON_STAGES)
         raise SmokeFailure("native_uia_json_contract_timeout", uia={"timedOut": True,
             "stdoutLength": len(error.stdout or b""),
-            "stderrLength": len(error.stderr or b"")}) from None
+            "stderrLength": len(error.stderr or b""), "stages": stages, "timings": timings,
+            "elapsedMilliseconds": round((time.monotonic() - started) * 1000, 2)}) from None
+    stages, timings = uia_progress(result.stderr, allowed_stages=UIA_JSON_STAGES)
+    progress = {"stages": stages, "timings": timings,
+        "elapsedMilliseconds": round((time.monotonic() - started) * 1000, 2)}
     try:
         fixture = json.loads(result.stdout)
     except (ValueError, TypeError):
         fixture = None
     if result.returncode or not isinstance(fixture, dict):
-        diagnostic = {"returnCode": result.returncode, "stdoutLength": len(result.stdout),
+        diagnostic = {**progress, "returnCode": result.returncode, "stdoutLength": len(result.stdout),
             "stderrLength": len(result.stderr), "jsonParsed": isinstance(fixture, dict),
             "compilerCodes": sorted(set(re.findall(r"\bCS[0-9]{4}\b", result.stderr)))[:8],
             # This separate helper reads only fixed fixtures and source, never
@@ -132,6 +145,7 @@ def check_uia_json_contract() -> None:
     require(isinstance(elements, list) and len(elements) == 4096
             and all(row == {"id": f"row-{index}", "name": text, "value": f"value-{index}"}
                     for index, row in enumerate(elements)), "native_uia_json_contract_tree_truncated")
+    return progress
 
 
 def wait_until(predicate, code: str, timeout: float = 45.0):
@@ -2301,7 +2315,7 @@ class Acceptance:
             evidence["logDiagnosticError"] = type(error).__name__
 
     def run(self) -> None:
-        check_uia_json_contract()
+        self.report["uiaJsonContract"] = check_uia_json_contract()
         self.mark("native_uia_json_contract")
         require(self.core.is_file() and self.helper.is_file(), "installed_sidecars_missing")
         require(not self.processes.at_paths([self.app, self.host, self.core, self.helper]), "preexisting_mihomo_process")
@@ -2662,7 +2676,7 @@ def main() -> int:
         report = {"passed": False, "platform": sys.platform}
         try:
             require(sys.platform == "win32", "windows_runner_required_for_uia_json_contract")
-            check_uia_json_contract()
+            report["progress"] = check_uia_json_contract()
             report["passed"] = True
         except Exception as error:
             report["code"] = safe_code(str(error)) if isinstance(error, SmokeFailure) else "unexpected_" + type(error).__name__
