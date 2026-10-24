@@ -19,7 +19,8 @@ function Set-UiaStage {
         'text-start', 'text-end', 'context', 'escape', 'select_expand',
         'select_find_option', 'select_option', 'select_collapse', 'context_focus',
         'context_input', 'context_open', 'read_value', 'read_selection', 'read_toggle',
-        'read_scroll', 'read_bounds', 'serialize', 'complete', 'exit_process')][string]$Stage)
+        'read_scroll', 'read_bounds', 'load_result_encoder', 'serialize',
+        'write_result', 'flush_result', 'complete', 'exit_process')][string]$Stage)
     $script:operationStage = $Stage
     # Flush fixed markers so a killed helper still identifies the blocked API.
     # No control IDs, names, values, paths or exception messages enter stderr.
@@ -32,15 +33,16 @@ function Set-UiaStage {
 }
 function Finish-UiaResult {
     param([Parameter(Mandatory=$true)][object]$Result,
-        [ValidateSet(0, 1)][int]$ExitCode = 0,
-        [ValidateSet(4, 6)][int]$Depth = 4)
+        [ValidateSet(0, 1)][int]$ExitCode = 0)
     # Each operation and its scoped cache disposal have finished before here.
     # Write directly, then end this one-shot helper without PowerShell's normal
     # runspace teardown. The caller still requires real exit and valid JSON;
     # output from a timed-out helper is never accepted as a successful query.
     Set-UiaStage 'serialize'
-    $json = ConvertTo-Json -InputObject $Result -Compress -Depth $Depth
+    $json = [UiaResultJson]::Encode($Result)
+    Set-UiaStage 'write_result'
     [Console]::Out.WriteLine($json)
+    Set-UiaStage 'flush_result'
     [Console]::Out.Flush()
     Set-UiaStage 'complete'
     Set-UiaStage 'exit_process'
@@ -63,6 +65,17 @@ switch ([System.Threading.Thread]::CurrentThread.GetApartmentState()) {
     'STA' { Set-UiaStage 'client_sta' }
     default { Set-UiaStage 'client_unknown' }
 }
+Set-UiaStage 'load_result_encoder'
+try {
+    Add-Type -Path (Join-Path $PSScriptRoot 'UiaResultJson.cs') -ReferencedAssemblies @(
+        'System.dll', 'System.Core.dll', [System.Management.Automation.PSObject].Assembly.Location)
+} catch {
+    # The encoder is not available to the normal exception path yet. Emit only
+    # a fixed failure; never let PowerShell serialize compiler/exception objects.
+    [Console]::Out.WriteLine('{"found":false,"error":"uia_result_encoder_unavailable","stage":"load_result_encoder"}')
+    [Console]::Out.Flush()
+    [Environment]::Exit(1)
+}
 if ($Action -eq 'text-viewport') {
     # This dedicated probe uses native UIA3 COM from one MTA apartment. Keep
     # all ordinary reads and actor actions on their existing, proven path.
@@ -73,7 +86,7 @@ if ($Action -eq 'text-viewport') {
     Set-UiaStage 'read_text_uia3'
     $result = [NativeTextViewportProbe]::Read($ApplicationProcessId, $AutomationId)
     $script:textProbeActive = $false
-    Finish-UiaResult -Result $result -Depth 6
+    Finish-UiaResult -Result $result
 }
 Set-UiaStage 'load_automation_client'
 Add-Type -AssemblyName UIAutomationClient

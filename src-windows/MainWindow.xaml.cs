@@ -446,15 +446,20 @@ public partial class MainWindow : Window
         NavigationScrim.Visibility = Visibility.Visible;
         ApplyNavigationContent(navigationMode == "compact");
         NativeMotionCapture.Mark(timingSession, "navigation-animation-start");
+        AnimationClock? entranceClock = null;
         if (FluentMotion.Enabled && navigationMode == "compact")
-            OverlayPaneHost.BeginAnimation(WidthProperty, new DoubleAnimation(previousWidth, 280, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate });
+        {
+            entranceClock = new DoubleAnimation(previousWidth, 280, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate }.CreateClock();
+            OverlayPaneHost.ApplyAnimationClock(WidthProperty, entranceClock);
+        }
         else if (FluentMotion.Enabled)
         {
             var shift = new TranslateTransform(previousX, 0); OverlayPaneHost.RenderTransform = shift;
-            shift.BeginAnimation(TranslateTransform.XProperty, new DoubleAnimation(0, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate });
+            entranceClock = new DoubleAnimation(0, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate }.CreateClock();
+            shift.ApplyAnimationClock(TranslateTransform.XProperty, entranceClock);
         }
         if (navigationInitialBackdropFromCache)
-            ObserveNavigationEntrance(animation, previousWidth, previousX, timingSession);
+            ObserveNavigationEntrance(animation, previousWidth, previousX, entranceClock, timingSession);
         _ = Dispatcher.InvokeAsync(() => UpdateNavigationIndicator(false), System.Windows.Threading.DispatcherPriority.Loaded);
         if (navigationInitialBackdropFromCache)
         {
@@ -464,7 +469,7 @@ public partial class MainWindow : Window
             NativeMotionCapture.Mark(timingSession, verified ? "navigation-backdrop-ready" : "navigation-backdrop-unavailable");
         }
     }
-    private void ObserveNavigationEntrance(long animation, double initialWidth, double initialX, long timingSession)
+    private void ObserveNavigationEntrance(long animation, double initialWidth, double initialX, AnimationClock? entranceClock, long timingSession)
     {
         StopNavigationEntranceObservation();
         navigationEntranceRendering = (_, _) =>
@@ -472,7 +477,11 @@ public partial class MainWindow : Window
             if (animation != overlayAnimation || !overlayOpen || allowClose || !IsVisible || WindowState == WindowState.Minimized
                 || !navigationBackdrop.AwaitingFirstPresentationFrame)
             { StopNavigationEntranceObservation(); return; }
-            bool advanced = !FluentMotion.Enabled || (navigationMode == "compact"
+            // Width's base value is already 280 for layout. Before the first
+            // animation tick it must not be mistaken for a presented expansion
+            // from 48, releasing synchronous backdrop work ahead of that frame.
+            bool clockAdvanced = entranceClock is { CurrentState: ClockState.Active, CurrentProgress: > 0 };
+            bool advanced = !FluentMotion.Enabled || clockAdvanced && (navigationMode == "compact"
                 ? Math.Abs(OverlayPaneHost.Width - initialWidth) > .01
                 : OverlayPaneHost.RenderTransform is TranslateTransform shift && Math.Abs(shift.X - initialX) > .01);
             if (!advanced) return;

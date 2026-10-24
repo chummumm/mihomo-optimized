@@ -136,7 +136,7 @@ public sealed class HomePage : NativePage
         SizeChanged += (_, _) => ApplyResponsiveLayout(PageContainerWidth);
         TransitionSurface.SizeChanged += (_, args) => { if (args.WidthChanged) ApplyResponsiveLayout(PageContainerWidth); };
         Loaded += (_, _) => ApplyResponsiveLayout(PageContainerWidth);
-        SetScrollableBody(body); UpdateStatus();
+        SetScrollableBody(body).Id("HomeScrollViewer"); UpdateStatus();
     }
     private static FrameworkElement Legend(string name, string brush)
     {

@@ -21,7 +21,7 @@ const targets = [0, 16, 40, 83, 125, 167, 220, 250, 300, 333, 460, 700, 900, 140
 const requiredScenarios = ['home', 'proxies', 'settings-dark-en', 'search', 'rules', 'profiles',
     'config-editor', 'config-unsaved', 'import-config', 'tun-consent', 'dns', 'dns-queries', 'logs', 'connections', 'home-narrow', 'tray']
 const requiredMotions = ['home-to-proxies', 'settings-language', 'search-open', 'settings-switch',
-    'editor-open', 'narrow-navigation']
+    'editor-open', 'compact-navigation', 'narrow-navigation']
 const report = {
     schema: 1, kind: 'unmodified-frontend-reference', source: path.relative(root, source),
     fixtureSHA256: '', browser: null, scenarios: [], motions: [], errors: [], partial,
@@ -694,6 +694,7 @@ function actionLocator (page, scenario) {
             return { locator: page.locator('#set-lan [role="switch"]'), selector: '#set-lan [role="switch"]', event: 'click' }
         case 'editor-open':
             return { locator: page.locator('.profile-current-actions button').first(), selector: '.profile-current-actions button', event: 'click' }
+        case 'compact-navigation':
         case 'narrow-navigation':
             return { locator: page.locator('.titlebar-left > button').nth(1), selector: '.titlebar-left > button', event: 'click' }
         default: throw new Error('Unmapped reference motion')
@@ -807,7 +808,7 @@ async function main () {
         const motionNames = (fixture.motions || []).map(item => item.name)
         assert.equal(new Set(motionNames).size, motionNames.length, 'Duplicate reference motion')
         assert.ok(motionNames.every(name => requiredMotions.includes(name)), 'Unknown reference motion')
-        if (!partial) assert.deepEqual([...motionNames].sort(), [...requiredMotions].sort(), 'The full six-interaction motion capture is required')
+        if (!partial) assert.deepEqual([...motionNames].sort(), [...requiredMotions].sort(), 'The full seven-interaction motion capture is required')
         for (const scenario of fixture.motions || []) await captureMotion(scenario, origin)
     } else report.motionSkipped = 'Explicit REFERENCE_SKIP_MOTION=1; this run is not complete motion evidence.'
     report.completed = !partial && report.scenarios.length === requiredScenarios.length && report.motions.length === requiredMotions.length

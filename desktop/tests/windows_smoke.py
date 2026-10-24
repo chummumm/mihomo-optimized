@@ -55,7 +55,8 @@ UIA_STAGES = frozenset({
     "text-start", "text-end", "context", "escape", "select_expand",
     "select_find_option", "select_option", "select_collapse", "context_focus",
     "context_input", "context_open", "read_value", "read_selection", "read_toggle",
-    "read_scroll", "read_bounds", "serialize", "complete", "exit_process",
+    "read_scroll", "read_bounds", "load_result_encoder", "serialize",
+    "write_result", "flush_result", "complete", "exit_process",
 })
 
 
@@ -90,6 +91,34 @@ def uia_progress(stderr: str | bytes | None) -> tuple[list[str], list[dict]]:
             if len(stages) == 64:
                 break
     return stages, timings
+
+
+def check_uia_json_contract() -> None:
+    script = Path(__file__).with_name("uia-json-contract.ps1").resolve()
+    try:
+        result = subprocess.run(["powershell.exe", "-Mta", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(script)], capture_output=True,
+            text=True, encoding="utf-8", errors="strict", timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        raise SmokeFailure("native_uia_json_contract_timeout") from None
+    require(result.returncode == 0, "native_uia_json_contract_failed")
+    try:
+        fixture = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        raise SmokeFailure("native_uia_json_contract_invalid") from None
+    text = '\u4e2d\u6587"\\\0\t\n\r\U0001f680\ud800x\udc00'
+    require(fixture.get("found") is True and fixture.get("text") == text
+            and fixture.get("wrapped") == "wrapped" and fixture.get("empty") == []
+            and "missing" in fixture and fixture["missing"] is None
+            and fixture.get("flags") == [False, True]
+            and fixture.get("numbers") == [-9223372036854775808, 18446744073709551615, 1.25, -0.5]
+            and fixture.get("native") == {"offsets": [0, 942], "visible": True}
+            and fixture.get("rejected") == 7, "native_uia_json_contract_values_changed")
+    elements = fixture.get("elements")
+    require(isinstance(elements, list) and len(elements) == 4096
+            and all(row == {"id": f"row-{index}", "name": text, "value": f"value-{index}"}
+                    for index, row in enumerate(elements)), "native_uia_json_contract_tree_truncated")
 
 
 def wait_until(predicate, code: str, timeout: float = 45.0):
@@ -295,7 +324,18 @@ class Processes:
             require(self.identity(expected.pid) is None, "process_open_for_termination_failed")
             return
         try:
-            require(self.from_handle(handle, expected.pid) == expected, "process_identity_changed_before_termination")
+            # The enumerated process can finish while OpenProcess is opening
+            # it. A signaled handle needs no termination or live image query.
+            # Never act on a different live process which has reused the PID.
+            if self.api.WaitForSingleObject(handle, 0) == 0:
+                return
+            observed = self.from_handle(handle, expected.pid)
+            if observed != expected:
+                # Image metadata can disappear during exit. Only this same
+                # handle becoming signaled proves that no cleanup is needed.
+                require(self.api.WaitForSingleObject(handle, 0) == 0,
+                        "process_identity_changed_before_termination")
+                return
             # Normal host/GUI shutdown can finish after identity verification.
             # Only the same verified process handle proves that cleanup is done;
             # path disappearance or ERROR_ACCESS_DENIED alone is not enough.
@@ -1496,6 +1536,11 @@ class Acceptance:
         driver.ui("CancelTunInstall", "invoke")
         wait_until(lambda: not driver.ui("TunConsentDialog").get("found"), "native_tun_consent_did_not_close")
         require(not self.status().get("tun") and not service_installed(), "native_cancelled_tun_installed_service")
+        # UIA Invoke can act on an offscreen peer; the reference browser click
+        # scrolls it into view first. Record both from the same visible target.
+        driver.ui("HomeScrollViewer", "scroll", "100")
+        wait_until(lambda: driver.ui("HomeExitSummary_Smoke Primary").get("offscreen") is False,
+                   "native_home_motion_target_offscreen")
         record_motion("home-to-proxies", "HomeExitSummary_Smoke Primary")
         wait_until(lambda: driver.snapshot().get("page") == "proxies", "native_home_exit_navigation_failed", 15)
         found("ProxyGroup_Smoke Primary")
@@ -1585,6 +1630,9 @@ class Acceptance:
         driver.ui("ConfigImportDiscard", "invoke")
         wait_until(lambda: not driver.ui("ConfigImportDialog").get("found"), "native_import_preview_did_not_close")
         require(self.driver.invoke("desktop_read_config").get("content") == base, "native_cancelled_import_changed_config")
+        driver.ui("ProfilesScrollViewer", "scroll", "0")
+        wait_until(lambda: driver.ui("EditConfig").get("offscreen") is False,
+                   "native_editor_motion_target_offscreen")
         record_motion("editor-open", "EditConfig")
         editor = found("ConfigEditor", enabled=True)
         require(editor.get("readOnly") is False, "native_config_editor_readonly")
@@ -1744,6 +1792,12 @@ class Acceptance:
         checked("logs_pause_resume_and_connections")
 
         driver.navigate("home")
+        compact = driver.invoke("native_resize", {"width": 800, "height": 700})
+        require(compact.get("navigationMode") == "compact", "native_compact_navigation_mode_missing")
+        record_motion("compact-navigation", "NavigationToggle")
+        wait_until(lambda: driver.snapshot().get("navigationOverlay") is True, "native_compact_navigation_did_not_open")
+        driver.ui("NavigationToggle", "invoke")
+        wait_until(lambda: driver.snapshot().get("navigationOverlay") is False, "native_compact_navigation_did_not_close")
         narrow = driver.invoke("native_resize", {"width": 640, "height": 700})
         require(narrow.get("navigationMode") in ("minimal", "compact"), "native_narrow_navigation_mode_missing")
         record_motion("narrow-navigation", "NavigationToggle")
@@ -2234,6 +2288,8 @@ class Acceptance:
             evidence["logDiagnosticError"] = type(error).__name__
 
     def run(self) -> None:
+        check_uia_json_contract()
+        self.mark("native_uia_json_contract")
         require(self.core.is_file() and self.helper.is_file(), "installed_sidecars_missing")
         require(not self.processes.at_paths([self.app, self.host, self.core, self.helper]), "preexisting_mihomo_process")
         require(not service_installed(), "preexisting_mihomo_service")
@@ -2648,7 +2704,7 @@ def main() -> int:
                 acceptance.cleanup()
             except Exception as error:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": "unexpected_" + type(error).__name__})
-            required = {"native_host_parent_binding", "update_cache_cleanup", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
+            required = {"native_uia_json_contract", "native_host_parent_binding", "update_cache_cleanup", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
                         "single_instance_and_native_ui", "native_redesign_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
                         "resource_bootstrap_recovery", "system_proxy_service_recovery"}
