@@ -29,6 +29,17 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.402'
+      - name: Verify native backdrop snapshot pixels and cancellation
+        timeout-minutes: 3
+        run: dotnet run --project desktop/tests/backdrop/BackdropTests.csproj -c Release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify Windows PowerShell UIA result contract
+        run: python desktop/tests/windows_smoke.py --uia-json-contract
       - name: Read pinned core source
         id: core
         shell: pwsh
@@ -54,19 +65,33 @@ jobs:
         with:
           node-version: '22'
           cache: pnpm
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.402'
       - name: Exercise native protocol boundaries and cancellation
         run: dotnet run --project desktop/tests/protocol/ProtocolTests.csproj -c Release
       - name: Install native Windows installer compiler
-        run: choco install nsis --version=3.11 --yes --no-progress
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'nsis-3.11.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'mihomo-nsis-3.11'
+          # Published SHA-256: https://sourceforge.net/projects/nsis/files/NSIS%203/3.11/nsis-3.11.zip/download
+          $expectedSha256 = 'C7D27F780DDB6CFFB4730138CD1591E841F4B7EDB155856901CDF5F214394FA1'
+          curl.exe --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --connect-timeout 20 --max-time 60 --retry 2 --retry-delay 2 --retry-all-errors --output $archive 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip'
+          if ($LASTEXITCODE -ne 0) { throw "NSIS 3.11 download failed with exit code $LASTEXITCODE" }
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -cne $expectedSha256) { throw 'NSIS 3.11 archive SHA-256 mismatch' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $nsisDirectory = Join-Path $destination 'nsis-3.11'
+          $compiler = Join-Path $nsisDirectory 'makensis.exe'
+          $version = & $compiler /VERSION
+          if ($LASTEXITCODE -ne 0 -or ([string]$version).Trim() -cne 'v3.11') { throw "Unexpected NSIS compiler version: $version" }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $nsisDirectory -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "NSISDIR=$nsisDirectory" -Encoding utf8
+          Write-Host "Verified NSIS $version ($expectedSha256)"
       - name: Install Windows acceptance API bindings
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311
+          python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311 pyflakes==3.4.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pyflakes desktop/tests/windows_smoke.py
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
       - name: Verify the unchanged web dashboard
@@ -78,9 +103,23 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           pnpm build
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build the pinned original design for visual comparison
+        shell: pwsh
+        run: |
+          python desktop/tests/prepare-visual-reference.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Push-Location artifacts/reference-source
+          try {
+            pnpm install --frozen-lockfile
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            pnpm exec vite build --mode desktop --outDir dist-desktop
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
       - name: Exercise managed core and resource bootstrap on Windows
         working-directory: core-src
-        run: go test -tags with_gvisor -count=1 -timeout=5m ./component/desktop ./component/resource ./component/http ./component/dialer ./component/resolver ./component/profile/cachefile ./adapter/provider ./adapter/outboundgroup ./config ./hub/executor ./hub/route . -run 'Desktop|ResourceBootstrap|ReadSelectedSnapshot'
+        # Reduce contention around the pinned tests' short wall-clock deadlines.
+        # Keep every package, assertion, deadline and uncached execution intact.
+        run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./component/desktop ./component/resource ./component/http ./component/dialer ./component/resolver ./component/profile/cachefile ./adapter/provider ./adapter/outboundgroup ./config ./hub/executor ./hub/route . -run 'Desktop|ResourceBootstrap|ReadSelectedSnapshot'
       - name: Install pinned Rust compiler
         run: rustup toolchain install 1.99.1 --profile minimal
       - name: Cache Rust dependencies
@@ -128,6 +167,20 @@ jobs:
         run: ./desktop/tests/setup-windows.ps1
       - name: Test installed native UI, system proxy, TUN forwarding and cleanup
         run: python desktop/tests/windows_smoke.py
+      - name: Render original design with the same Windows fixtures and dimensions
+        if: ${{ !cancelled() && (success() || failure()) }}
+        env:
+          REFERENCE_SOURCE: artifacts/reference-source
+          REFERENCE_FIXTURE: artifacts/verification/visual-fixture.json
+          REFERENCE_OUTPUT: artifacts/verification/reference
+          REFERENCE_ALLOW_PARTIAL: ${{ job.status == 'failure' && '1' || '0' }}
+        run: |
+          if (Test-Path artifacts/verification/visual-fixture.json) {
+            node desktop/tests/capture-reference.cjs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } elseif ($env:REFERENCE_ALLOW_PARTIAL -ne '1') {
+            throw 'The successful native acceptance run did not export its visual fixture.'
+          }
       - name: Upload Windows verification evidence
         if: always()
         uses: actions/upload-artifact@v4

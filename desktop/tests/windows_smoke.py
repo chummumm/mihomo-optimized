@@ -23,6 +23,7 @@ import hashlib
 import http.client
 import http.server
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -45,10 +46,32 @@ TUN_BODY = b"mihomo-windows-tun-socks-forwarded\n"
 BAD_CONFIG = "mixed-port: [unterminated\n"
 FIREWALL_RULE_PREFIX = "com.chummumm.mihomo-optimized.tun.tcp."
 FIREWALL_GROUP = "Mihomo Optimized TUN"
+UIA_STAGES = frozenset({
+    "initialize", "client_mta", "client_sta", "client_unknown",
+    "read_text_uia3_compile", "read_text_uia3", "load_automation_client",
+    "load_automation_types", "list_windows", "visible_list_windows",
+    "visible_snapshot", "visible_materialize", "find_element", "read_properties",
+    "read", "invoke", "set", "select", "toggle", "scroll", "scroll-horizontal",
+    "text-start", "text-end", "context", "escape", "select_expand",
+    "select_find_option", "select_option", "select_collapse", "context_focus",
+    "context_input", "context_open", "read_value", "read_selection", "read_toggle",
+    "read_scroll", "read_bounds", "load_result_encoder", "serialize",
+    "write_result", "flush_result", "complete", "exit_process",
+})
+UIA_JSON_STAGES = frozenset({
+    "initialize", "resolve_encoder", "compile", "compiled", "reject_object", "reject_nonfinite", "reject_key",
+    "reject_cycle", "reject_output_size", "create_text", "wrap_string",
+    "create_dictionary", "create_tree", "serialize", "write_result",
+    "flush_result", "exit_process",
+})
 
 
 class SmokeFailure(Exception):
     """An intentionally bounded diagnostic code, never a native error payload."""
+
+    def __init__(self, code: str, *, uia: dict | None = None) -> None:
+        super().__init__(code)
+        self.uia = uia
 
 
 def require(condition: object, code: str) -> None:
@@ -58,6 +81,71 @@ def require(condition: object, code: str) -> None:
 
 def safe_code(value: object) -> str:
     return value if isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9_. -]{1,100}", value) else "unspecified_error"
+
+
+def uia_progress(stderr: str | bytes | None, *,
+                 allowed_stages: frozenset[str] = UIA_STAGES) -> tuple[list[str], list[dict]]:
+    """Extract only bounded, fixed markers; never preserve raw helper output."""
+    text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr or ""
+    stages = []
+    timings = []
+    for line in text[:16384].splitlines():
+        marker = re.fullmatch(r"MIHOMO_UIA_STAGE:([a-z0-9_-]+)(?::([0-9]{1,6}))?", line)
+        if marker and marker[1] in allowed_stages:
+            stages.append(marker[1])
+            if marker[2] is not None:
+                timings.append({"stage": marker[1], "elapsedMilliseconds": int(marker[2])})
+            if len(stages) == 64:
+                break
+    return stages, timings
+
+
+def check_uia_json_contract() -> dict:
+    script = Path(__file__).with_name("uia-json-contract.ps1").resolve()
+    started = time.monotonic()
+    try:
+        result = subprocess.run(["powershell.exe", "-Mta", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(script)], capture_output=True,
+            text=True, encoding="utf-8", errors="strict", timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired as error:
+        stages, timings = uia_progress(error.stderr, allowed_stages=UIA_JSON_STAGES)
+        raise SmokeFailure("native_uia_json_contract_timeout", uia={"timedOut": True,
+            "stdoutLength": len(error.stdout or b""),
+            "stderrLength": len(error.stderr or b""), "stages": stages, "timings": timings,
+            "elapsedMilliseconds": round((time.monotonic() - started) * 1000, 2)}) from None
+    stages, timings = uia_progress(result.stderr, allowed_stages=UIA_JSON_STAGES)
+    progress = {"stages": stages, "timings": timings,
+        "elapsedMilliseconds": round((time.monotonic() - started) * 1000, 2)}
+    try:
+        fixture = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        fixture = None
+    if result.returncode or not isinstance(fixture, dict):
+        diagnostic = {**progress, "returnCode": result.returncode, "stdoutLength": len(result.stdout),
+            "stderrLength": len(result.stderr), "jsonParsed": isinstance(fixture, dict),
+            "compilerCodes": sorted(set(re.findall(r"\bCS[0-9]{4}\b", result.stderr)))[:8],
+            # This separate helper reads only fixed fixtures and source, never
+            # UI/user data. Real UIA errors still retain fixed markers only.
+            "selfTestStderr": result.stderr[-4096:]}
+        if isinstance(fixture, dict):
+            diagnostic.update({key: safe_code(fixture[key]) for key in ("stage", "exception", "hresult") if key in fixture})
+            if type(fixture.get("line")) is int:
+                diagnostic["line"] = fixture["line"]
+        raise SmokeFailure("native_uia_json_contract_failed", uia=diagnostic)
+    text = '\u4e2d\u6587"\\\0\t\n\r\U0001f680\ud800x\udc00'
+    require(fixture.get("found") is True and fixture.get("text") == text
+            and fixture.get("wrapped") == "wrapped" and fixture.get("empty") == []
+            and "missing" in fixture and fixture["missing"] is None
+            and fixture.get("flags") == [False, True]
+            and fixture.get("numbers") == [-9223372036854775808, 18446744073709551615, 1.25, -0.5]
+            and fixture.get("native") == {"offsets": [0, 942], "visible": True}
+            and fixture.get("rejected") == 7, "native_uia_json_contract_values_changed")
+    elements = fixture.get("elements")
+    require(isinstance(elements, list) and len(elements) == 4096
+            and all(row == {"id": f"row-{index}", "name": text, "value": f"value-{index}"}
+                    for index, row in enumerate(elements)), "native_uia_json_contract_tree_truncated")
+    return progress
 
 
 def wait_until(predicate, code: str, timeout: float = 45.0):
@@ -263,8 +351,28 @@ class Processes:
             require(self.identity(expected.pid) is None, "process_open_for_termination_failed")
             return
         try:
-            require(self.from_handle(handle, expected.pid) == expected, "process_identity_changed_before_termination")
-            require(self.api.TerminateProcess(handle, 87), "exact_process_termination_failed")
+            # The enumerated process can finish while OpenProcess is opening
+            # it. A signaled handle needs no termination or live image query.
+            # Never act on a different live process which has reused the PID.
+            if self.api.WaitForSingleObject(handle, 0) == 0:
+                return
+            observed = self.from_handle(handle, expected.pid)
+            if observed != expected:
+                # Image metadata can disappear during exit. Only this same
+                # handle becoming signaled proves that no cleanup is needed.
+                require(self.api.WaitForSingleObject(handle, 0) == 0,
+                        "process_identity_changed_before_termination")
+                return
+            # Normal host/GUI shutdown can finish after identity verification.
+            # Only the same verified process handle proves that cleanup is done;
+            # path disappearance or ERROR_ACCESS_DENIED alone is not enough.
+            if self.api.WaitForSingleObject(handle, 0) == 0:
+                return
+            if not self.api.TerminateProcess(handle, 87):
+                failure = ctypes.get_last_error()
+                require(self.api.WaitForSingleObject(handle, 0) == 0,
+                        "exact_process_termination_failed_winerror_" + str(failure))
+                return
             require(self.api.WaitForSingleObject(handle, 10000) == 0, "exact_process_did_not_exit")
         finally:
             self.api.CloseHandle(handle)
@@ -696,7 +804,8 @@ class NativeDriver:
         self.buffer = bytearray()
         self.next_id = 0
         self.pipe_name = "mihomo-acceptance-" + secrets.token_hex(20)
-        self.process = desktop.spawn([str(app), "--automation-pipe", self.pipe_name], app.parent)
+        self.process = desktop.spawn([str(app), "--automation-pipe", self.pipe_name,
+            "--automation-diagnostics", str((artifacts / "native-fault.json").resolve())], app.parent)
         self.identity = processes.identity(self.process.pid)
         try:
             require(self.identity and self.identity.path == os.path.normcase(str(app.resolve())),
@@ -778,23 +887,133 @@ class NativeDriver:
         self.invoke("native_navigate", {"page": page}, timeout=10)
         wait_until(lambda: self.snapshot().get("page") == page, "native_navigation_failed", 10)
 
+    def gui_timeout_probe(self) -> dict:
+        """One bounded WM_NULL probe, independent of UIA and the command pipe."""
+        started = time.monotonic()
+        deadline = started + 1.0
+        diagnostic = {"budgetMilliseconds": 1000, "enumeratedWindows": 0,
+            "windowFound": False, "messageAttempted": False}
+        try:
+            diagnostic["processRunning"] = self.process.poll() is None
+            if not diagnostic["processRunning"]:
+                return diagnostic
+            api = ctypes.WinDLL("user32", use_last_error=True)
+            callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, ctypes.c_ssize_t)
+            api.EnumWindows.argtypes = [callback_type, ctypes.c_ssize_t]
+            api.EnumWindows.restype = wintypes.BOOL
+            api.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            api.GetWindowThreadProcessId.restype = wintypes.DWORD
+            api.IsWindowVisible.argtypes = [wintypes.HWND]
+            api.IsWindowVisible.restype = wintypes.BOOL
+            api.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT,
+                ctypes.c_size_t, ctypes.c_ssize_t, wintypes.UINT, wintypes.UINT,
+                ctypes.POINTER(ctypes.c_size_t)]
+            api.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+            owned_window = None
+
+            @callback_type
+            def visit(window, _parameter):
+                nonlocal owned_window
+                if time.monotonic() >= deadline or diagnostic["enumeratedWindows"] >= 256:
+                    return False
+                diagnostic["enumeratedWindows"] += 1
+                pid = wintypes.DWORD()
+                api.GetWindowThreadProcessId(window, ctypes.byref(pid))
+                if pid.value == self.identity.pid and api.IsWindowVisible(window):
+                    owned_window = window
+                    return False
+                return True
+
+            api.EnumWindows(visit, 0)
+            diagnostic["windowFound"] = owned_window is not None
+            # The exact process handle is still owned. Recheck it and the HWND
+            # owner immediately before sending a message with no input payload.
+            if owned_window is not None and time.monotonic() < deadline and self.process.poll() is None:
+                pid = wintypes.DWORD()
+                api.GetWindowThreadProcessId(owned_window, ctypes.byref(pid))
+                remaining = int((deadline - time.monotonic()) * 1000)
+                if pid.value == self.identity.pid and remaining > 0:
+                    diagnostic["messageAttempted"] = True
+                    result = ctypes.c_size_t()
+                    ctypes.set_last_error(0)
+                    # BLOCK | ABORTIFHUNG | ERRORONEXIT; never broadcast and
+                    # never use NOTIMEOUTIFNOTHUNG, which can exceed the budget.
+                    responded = api.SendMessageTimeoutW(owned_window, 0, 0, 0,
+                        0x1 | 0x2 | 0x20, remaining, ctypes.byref(result))
+                    diagnostic["wmNullResponded"] = bool(responded)
+                    diagnostic["winerror"] = 0 if responded else ctypes.get_last_error()
+        except Exception:
+            # Diagnostic failure must not replace the original blocking UIA error.
+            diagnostic["probeFailed"] = True
+        finally:
+            diagnostic["elapsedMilliseconds"] = round((time.monotonic() - started) * 1000, 1)
+        return diagnostic
+
     def ui(self, automation_id: str, action: str = "read", value: str = "") -> dict:
         script = Path(__file__).with_name("uia-query.ps1").resolve()
-        result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        identifier = "all_elements" if automation_id == "*" else safe_code(automation_id)
+        # Windows PowerShell 5.1 defaults to STA. UIA's headless client should
+        # use an MTA apartment; this does not establish the cause of a timeout.
+        arguments = ["powershell.exe", "-Mta", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
             "-File", str(script), "-ApplicationProcessId", str(self.identity.pid),
-            "-AutomationId", automation_id, "-Action", action, "-Value", value],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW)
-        try:
-            response = json.loads(result.stdout.lstrip("\ufeff"))
-        except (ValueError, TypeError):
-            response = {}
+            "-AutomationId", automation_id, "-Action", action, "-Value", value]
+        for attempt in range(3):
+            try:
+                result = subprocess.run(arguments, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=15,
+                    creationflags=subprocess.CREATE_NO_WINDOW)
+            except subprocess.TimeoutExpired as error:
+                stages, timings = uia_progress(error.stderr)
+                diagnostic = {"action": safe_code(action),
+                    "automationId": identifier, "timedOut": True,
+                    "stdoutLength": len(error.stdout or b""),
+                    "stderrLength": len(error.stderr or b""), "stages": stages,
+                    "stageTimings": timings,
+                    "lastStage": stages[-1] if stages else "not_reported",
+                    "guiMessageProbe": self.gui_timeout_probe()}
+                raise SmokeFailure("native_uia_query_timeout_" + identifier,
+                                   uia=diagnostic) from None
+            try:
+                response = json.loads(result.stdout.lstrip("\ufeff"))
+                parsed = True
+            except (ValueError, TypeError):
+                response = {}
+                parsed = False
+            # Closing a popup or rebuilding a page can invalidate a peer while
+            # the read-only tree walk is in flight (UIA_E_ELEMENTNOTAVAILABLE).
+            # Restart the complete read with fresh peers, including the secret
+            # check before screenshots. Never replay actions or hide other errors.
+            if (result.returncode and action == "read" and isinstance(response, dict)
+                    and response.get("hresult") == "0x80040201" and attempt < 2):
+                time.sleep(.1)
+                continue
+            break
+        if result.returncode or not (isinstance(response, dict) and "found" in response):
+            # Preserve process-exit evidence even if the helper cannot emit JSON.
+            # Counts and fixed markers are safe; stdout/stderr can contain text
+            # from the editor or a configuration and must never enter artifacts.
+            stages, timings = uia_progress(result.stderr)
+            diagnostic = {"action": safe_code(action),
+                "automationId": identifier, "returnCode": result.returncode,
+                "exitCodeHex": f"0x{result.returncode & 0xFFFFFFFF:08X}",
+                "stdoutLength": len(result.stdout), "stderrLength": len(result.stderr),
+                "jsonParsed": parsed, "stages": stages, "stageTimings": timings,
+                "lastStage": stages[-1] if stages else "not_reported",
+                "stderrIndicators": [marker for marker in (
+                    "ParserError", "ParameterBindingValidationException", "AccessViolationException",
+                    "TypeNotFound", "COMException", "Add-Type") if marker in result.stderr]}
+            if isinstance(response, dict):
+                diagnostic.update({key: safe_code(response[key])
+                    for key in ("stage", "exception", "hresult") if key in response})
         if result.returncode:
-            # The helper emits only a bounded operation stage and exception type.
+            # The helper emits only a bounded operation stage, exception type and HRESULT.
             # Never include raw PowerShell stderr or user-controlled UI values.
-            detail = "_".join(safe_code(response.get(key, "unknown")) for key in ("stage", "exception"))
-            raise SmokeFailure("native_uia_query_failed_" + safe_code(automation_id) + "_" + detail)
-        require(isinstance(response, dict) and "found" in response, "native_uia_response_invalid")
+            error_fields = response if isinstance(response, dict) else {}
+            detail = "_".join(safe_code(error_fields.get(key, "unknown")) for key in ("stage", "exception", "hresult"))
+            raise SmokeFailure("native_uia_query_failed_" + identifier + "_" + detail,
+                               uia=diagnostic)
+        if not (isinstance(response, dict) and "found" in response):
+            raise SmokeFailure("native_uia_response_invalid", uia=diagnostic)
         return response
 
     def screenshot(self, output: Path, secrets: set[str], page: str | None = "settings", surface: str = "main") -> dict:
@@ -1120,6 +1339,7 @@ class Acceptance:
         self.secrets: set[str] = set()
         self.mutations_started = False
         self.service_owned = False
+        self.animation_before: bool | None = None
         self.stage = "preflight"
         self.report = {"passed": False, "platform": "windows", "tests": {}, "diagnostics": []}
 
@@ -1157,6 +1377,62 @@ class Acceptance:
         evidence = {"checks": [], "captures": [], "framework": "WPF", "browserRuntime": False}
         self.report["nativeRedesign"] = evidence
         driver = self.driver
+        visual_fixture = {"schema": 1, "scenarios": [], "motions": []}
+        fixture_path = self.artifacts / "visual-fixture.json"
+
+        def reference_state(name: str, result: dict) -> dict:
+            """Only acceptance-owned, credential-free data is exported to the reference renderer."""
+            snapshot = driver.snapshot()
+            scroll_offset = snapshot.get("routeScrollOffset")
+            require(type(scroll_offset) in (int, float) and math.isfinite(scroll_offset) and scroll_offset >= 0,
+                    "native_ui_scroll_observation_invalid")
+            status = self.status()
+            status = {key: status[key] for key in ("appVersion", "phase", "systemProxy", "tun", "autostart", "coreVersion", "configPath", "logPath", "service", "capabilities") if key in status}
+            config = self.runtime_json("configs")
+            config = {key: config[key] for key in ("port", "socks-port", "mixed-port", "redir-port", "tproxy-port", "mode", "log-level", "allow-lan", "ipv6", "bind-address", "find-process-mode") if key in config}
+            proxies = self.runtime_json("proxies")
+            allowed_proxy = ("name", "type", "now", "all", "history", "udp", "alive", "hidden", "icon")
+            proxies = {"proxies": {key: {field: value[field] for field in allowed_proxy if field in value} for key, value in proxies.get("proxies", {}).items()}}
+            api = {"/configs": config, "/proxies": proxies}
+            for endpoint in ("version", "rules", "connections", "upgrade/check", "dns/observability", "dns/observability/stats", "dns/observability/upstreams"):
+                api["/" + endpoint] = self.runtime_json(endpoint)
+            api["/dns/observability/queries"] = self.runtime_json("dns/observability/queries?limit=" + ("100" if name == "dns-queries" else "50"))
+            for endpoint in ("providers/proxies", "providers/rules"):
+                providers = self.runtime_json(endpoint).get("providers", {})
+                fields = ("name", "type", "vehicleType", "behavior", "ruleCount", "updatedAt", "subscriptionInfo", "proxies")
+                api["/" + endpoint] = {"providers": {key: {field: value[field] for field in fields if field in value} for key, value in providers.items()}}
+            dpi = result.get("dpi", 96)
+            row = {"name": name, "page": snapshot.get("page", "home"), "width": round(result["width"] * 96 / dpi), "height": round(result["height"] * 96 / dpi), "dpi": dpi,
+                "theme": snapshot.get("theme", "light"), "language": snapshot.get("language", "zh-CN"), "appearance": result.get("appearance"), "capturedAt": result.get("capturedAt"), "canGoBack": snapshot.get("canGoBack", False), "routeScrollOffset": scroll_offset,
+                "status": status, "api": api, "streams": result.get("streams", {}), "update": result.get("update", {}),
+                "config": {"path": status.get("configPath", "config.yaml"), "content": base, "revision": "fixture", "max_size": 4194304, "writable": True}}
+            if name == "search": row["searchQuery"] = "theme"
+            if name == "rules": row["ruleQuery"] = driver.ui("RuleSearch").get("value", "")
+            if name == "home-narrow": row["navigationOverlay"] = True
+            if name in ("config-editor", "config-unsaved"): row["editor"] = {"content": base.rstrip("\r\n") + "\n# native UIA save acceptance\n"}
+            if name == "import-config": row["import"] = {"mode": "text", "content": base}
+            serialized = json.dumps(row, ensure_ascii=False)
+            require(all(value not in serialized for value in self.secrets), "visual_fixture_would_expose_secret")
+            return row
+
+        def save_reference_fixture() -> None:
+            fixture_path.write_text(json.dumps(visual_fixture, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        def record_motion(name: str, identifier: str, action: str = "invoke", value: str = "", surface: str = "main") -> None:
+            directory = self.artifacts / "motion"
+            directory.mkdir(exist_ok=True)
+            # Capture and inspect the actual pre-action surface before arming.
+            before = driver.screenshot(directory / (name + "-before.png"), self.secrets, page=None)
+            state = reference_state(name, before)
+            state["action"] = {"automationId": identifier, "kind": action, "value": value, "surface": surface}
+            visual_fixture["motions"].append(state)
+            save_reference_fixture()
+            armed = driver.invoke("native_arm_motion", {"directory": str(directory.resolve()), "name": name, "trigger": identifier, "surface": surface})
+            require(armed.get("armed") and not armed.get("reducedMotion"), "native_motion_animation_not_enabled")
+            driver.ui(identifier, action, value)
+            result = wait_until(lambda: (current if (current := driver.invoke("native_motion_status")).get("finished") else None), "native_motion_capture_timeout", 25)
+            require(not result.get("error") and result.get("frames", 0) >= 10, "native_motion_capture_failed")
+            evidence.setdefault("motions", []).append({"name": name, "manifest": "motion/" + name + ".json", "frames": result["frames"]})
 
         def found(identifier: str, *, enabled: bool = False) -> dict:
             def probe():
@@ -1171,18 +1447,106 @@ class Acceptance:
         def capture(name: str, page: str | None = None, surface: str = "main") -> None:
             result = driver.screenshot(self.artifacts / name, self.secrets, page, surface)
             evidence["captures"].append({"file": name, "surface": result.get("surface"), "kind": result.get("captureKind"), "material": result.get("material")})
+            scenario = name.removeprefix("windows-").removesuffix(".png")
+            visual_fixture["scenarios"].append(reference_state(scenario, result))
+            metadata = {key: value for key, value in result.items() if key not in ("path", "streams")}
+            (self.artifacts / ("windows-" + scenario + ".json")).write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+            save_reference_fixture()
 
         def search(query: str, result_id: str, page: str, *, screenshot: bool = False) -> None:
-            driver.ui("GlobalSearch", "invoke")
+            if screenshot:
+                record_motion("search-open", "GlobalSearch", surface="search")
+            else:
+                driver.ui("GlobalSearch", "invoke")
             found("SearchInput", enabled=True)
+
+            def ready_backdrop():
+                window = driver.snapshot().get("search", {}).get("window") or {}
+                state = window.get("backdrop") or {}
+                return window if state.get("available") and state.get("cachedAtNativeResolution") else None
+
+            before = wait_until(ready_backdrop, "native_search_backdrop_not_ready", 10) if screenshot else None
             driver.ui("SearchInput", "set", query)
             found(result_id, enabled=True)
             if screenshot:
+                previous = before["backdrop"]
+                required_revision = None
+
+                def refreshed_backdrop():
+                    nonlocal required_revision
+                    window = ready_backdrop()
+                    if not window or window.get("instance") != before.get("instance"):
+                        return None
+                    state = window["backdrop"]
+                    # Typing updates the real title-bar source. A live observer
+                    # must capture it again; an identical cropped raster may
+                    # legitimately avoid a second convolution.
+                    if state.get("sourceInvalidations", 0) <= previous.get("sourceInvalidations", 0):
+                        return None
+                    # Fix the observed post-input revision once. A continuously
+                    # animated lower layer need not become idle to prove that
+                    # this real update has been sampled and published.
+                    if required_revision is None:
+                        required_revision = state["sourceRevision"]
+                    if state.get("captures", 0) <= previous.get("captures", 0) or \
+                            state.get("publishedSourceRevision", -1) < required_revision:
+                        return None
+                    completed = state.get("filteredFrames", 0) + state.get("identicalCaptures", 0)
+                    prior_completed = previous.get("filteredFrames", 0) + previous.get("identicalCaptures", 0)
+                    return state if completed > prior_completed else None
+
+                refreshed = wait_until(refreshed_backdrop, "native_search_backdrop_did_not_refresh", 10)
+                fields = ("sourceInvalidations", "captures", "identicalCaptures", "filteredFrames", "available", "cachedAtNativeResolution", "sourceRevision", "publishedSourceRevision")
+                evidence["searchBackdropRefresh"] = {
+                    "requiredRevision": required_revision,
+                    "before": {key: previous[key] for key in fields},
+                    "after": {key: refreshed[key] for key in fields}}
                 capture("windows-search.png", surface="search")
             driver.ui(result_id, "invoke")
-            wait_until(lambda: driver.snapshot().get("page") == page and not driver.ui("GlobalSearchWindow").get("found"), "native_search_destination_failed", 15)
+            last_snapshot = {}
+            last_window = {}
+
+            def arrived() -> bool:
+                nonlocal last_snapshot, last_window
+                last_snapshot = driver.snapshot()
+                if last_snapshot.get("page") != page:
+                    return False
+                last_window = driver.ui("GlobalSearchWindow")
+                return not last_window.get("found")
+
+            try:
+                # The pipe's state is diagnostic; success still requires the
+                # independently queried UIA window to have actually disappeared.
+                wait_until(arrived, "native_search_destination_failed", 15)
+            except SmokeFailure as failure:
+                if str(failure) == "native_search_destination_failed":
+                    try:
+                        diagnostic = {"expectedPage": page, "resultId": safe_code(result_id),
+                            "snapshot": {key: last_snapshot[key] for key in
+                                ("ready", "visible", "phase", "page", "busy", "searchVisible") if key in last_snapshot},
+                            "uiaWindow": {key: last_window[key] for key in ("found", "enabled", "offscreen") if key in last_window}}
+                        search_state = last_snapshot.get("search") or {}
+                        fields = {"input": ("inputFocused", "queryLength", "suppressOpen", "openRequests", "suppressedRequests", "lastOpenReason", "palettesCreated", "palettesClosed", "activePalette"),
+                            "window": ("instance", "visible", "closing", "closed", "choosing", "resultCount")}
+                        diagnostic["snapshot"]["search"] = {
+                            part: {key: search_state[part][key] for key in keys if key in search_state[part]}
+                            if isinstance(search_state.get(part), dict) else None for part, keys in fields.items()}
+                        # Never serialize the snapshot's general error payload,
+                        # query text, controller endpoint, or host credentials.
+                        serialized = json.dumps(diagnostic, indent=2, ensure_ascii=False) + "\n"
+                        require(all(secret not in serialized for secret in self.secrets), "search_diagnostic_would_expose_secret")
+                        filename = "native-search-failure.json"
+                        (self.artifacts / filename).write_text(serialized, encoding="utf-8")
+                        evidence["searchFailureDiagnostic"] = filename
+                    except Exception as diagnostic_error:
+                        evidence["searchFailureDiagnosticError"] = type(diagnostic_error).__name__
+                raise
 
         driver.invoke("native_show")
+        # Match the reference browser's neutral pointer position; an arbitrary
+        # runner cursor over the topology must not add an unrelated hover state.
+        import win32api
+        win32api.SetCursorPos((0, 0))
         driver.invoke("native_resize", {"width": 1180, "height": 780})
         driver.navigate("home")
         for identifier in ("TitleBarBack", "TitleBarMinimize", "TitleBarMaximize", "TitleBarClose", "NavigationToggle", "CoreCard", "TrafficChart"):
@@ -1191,7 +1555,20 @@ class Acceptance:
             found("HomeExitSummary_" + group)
         require(driver.snapshot().get("customTitleBar") is True, "native_custom_titlebar_missing")
         capture("windows-home.png")
-        driver.ui("HomeExitSummary_Smoke Primary", "invoke")
+        require(not self.status().get("service", {}).get("installed"), "native_tun_consent_prerequisite_missing")
+        driver.ui("tun", "toggle")
+        found("TunConsentDialog")
+        found("CancelTunInstall", enabled=True)
+        capture("windows-tun-consent.png")
+        driver.ui("CancelTunInstall", "invoke")
+        wait_until(lambda: not driver.ui("TunConsentDialog").get("found"), "native_tun_consent_did_not_close")
+        require(not self.status().get("tun") and not service_installed(), "native_cancelled_tun_installed_service")
+        # UIA Invoke can act on an offscreen peer; the reference browser click
+        # scrolls it into view first. Record both from the same visible target.
+        driver.ui("HomeScrollViewer", "scroll", "100")
+        wait_until(lambda: driver.ui("HomeExitSummary_Smoke Primary").get("offscreen") is False,
+                   "native_home_motion_target_offscreen")
+        record_motion("home-to-proxies", "HomeExitSummary_Smoke Primary")
         wait_until(lambda: driver.snapshot().get("page") == "proxies", "native_home_exit_navigation_failed", 15)
         found("ProxyGroup_Smoke Primary")
         checked("home_four_exits_and_group_navigation")
@@ -1212,7 +1589,7 @@ class Acceptance:
 
         driver.navigate("settings")
         found("AppLanguage", enabled=True)
-        driver.ui("AppLanguage", "select", "English")
+        record_motion("settings-language", "AppLanguage", "select", "English")
         wait_until(lambda: driver.snapshot().get("language") == "en-US", "native_language_not_applied")
         require("Settings" in found("NavSettings").get("name", ""), "native_navigation_not_translated")
         driver.ui("AppTheme", "select", "Dark")
@@ -1235,7 +1612,7 @@ class Acceptance:
 
         driver.navigate("settings")
         found("SettingsAllowLan", enabled=True)
-        driver.ui("SettingsAllowLan", "toggle")
+        record_motion("settings-switch", "SettingsAllowLan", "toggle")
         wait_until(lambda: self.runtime_json("configs").get("allow-lan") is True, "native_lan_toggle_not_applied")
         found("SettingsAllowLan", enabled=True)
         driver.ui("SettingsAllowLan", "toggle")
@@ -1271,7 +1648,19 @@ class Acceptance:
         driver.navigate("profiles")
         found("EditConfig", enabled=True)
         capture("windows-profiles.png")
-        driver.ui("EditConfig", "invoke")
+        driver.ui("PasteConfig", "invoke")
+        found("ConfigImportText", enabled=True)
+        driver.ui("ConfigImportText", "set", base)
+        capture("windows-import-config.png")
+        driver.ui("CancelConfigImport", "invoke")
+        found("ConfigImportDiscard", enabled=True)
+        driver.ui("ConfigImportDiscard", "invoke")
+        wait_until(lambda: not driver.ui("ConfigImportDialog").get("found"), "native_import_preview_did_not_close")
+        require(self.driver.invoke("desktop_read_config").get("content") == base, "native_cancelled_import_changed_config")
+        driver.ui("ProfilesScrollViewer", "scroll", "0")
+        wait_until(lambda: driver.ui("EditConfig").get("offscreen") is False,
+                   "native_editor_motion_target_offscreen")
+        record_motion("editor-open", "EditConfig")
         editor = found("ConfigEditor", enabled=True)
         require(editor.get("readOnly") is False, "native_config_editor_readonly")
         found("ConfigLineNumbers")
@@ -1279,8 +1668,78 @@ class Acceptance:
         require("Smoke Primary" in original, "native_editor_wrong_document")
         marker = "# native UIA save acceptance"
         driver.ui("ConfigEditor", "set", original.rstrip("\r\n") + "\n" + marker + "\n")
-        found("SaveOnlyConfig", enabled=True)
+        editor = found("ConfigEditor", enabled=True)
+        draft = editor["value"]
+        require(editor.get("scroll", {}).get("verticalScrollable"), "native_editor_has_no_vertical_scroll_extent")
+
+        def editor_view(*, endpoint: str, percent: float | None = None, caret: str | None = None):
+            state = driver.ui("ConfigEditor", "text-viewport")
+            viewport = state.get("textViewport", {})
+            # Retain numeric positions before asserting. Prefix/suffix reads
+            # cross-check native UIA3 comparisons against true UTF-16 offsets;
+            # no document text or copied ranges enter the evidence.
+            evidence["editorTextRangeProbe"] = {
+                "valueUtf16Length": len(state.get("value", "").encode("utf-16-le")) // 2,
+                **viewport,
+            }
+            length = viewport.get("documentTextLength", 0)
+            require(length > 0 and viewport.get("documentRangeValid") is True
+                    and viewport.get("documentOffsets") == [0, length, length]
+                    and viewport.get("documentMatchesValue") is True,
+                    "native_editor_textpattern_document_degenerate")
+            visible = viewport.get("visibleOffsets", [])
+            require(viewport.get("visibleRangesValid") is True
+                    and len(visible) == viewport.get("ranges", 0)
+                    and any(offsets[2] > 0 for offsets in visible),
+                    "native_editor_textpattern_visible_offsets_invalid")
+            require(viewport.get("selectionRangesValid") is True
+                    and len(viewport.get("selectionOffsets", [])) == 1,
+                    "native_editor_textpattern_selection_offsets_invalid")
+            require(not (viewport.get("caretAtStart") and viewport.get("caretAtEnd")),
+                    "native_editor_textpattern_caret_at_both_ends")
+            opposite = "startsDocument" if endpoint == "endsDocument" else "endsDocument"
+            if not viewport.get(endpoint) or viewport.get(opposite) or caret and not viewport.get(caret):
+                return None
+            if percent is not None and abs(state.get("scroll", {}).get("verticalPercent", -1) - percent) > .01:
+                return None
+            return state
+
+        def editor_scroll_evidence(state: dict) -> dict:
+            return {"verticalPercent": state["scroll"]["verticalPercent"], **state["textViewport"]}
+
+        try:
+            # The padding is part of the real scrolling document. Exercise both
+            # ScrollPattern and WPF's independent caret/BringIntoView path, which
+            # may scroll the underlying TextBoxView directly.
+            driver.ui("ConfigEditor", "scroll", "100")
+            bottom = wait_until(lambda: editor_view(endpoint="endsDocument", percent=100),
+                                "native_editor_bottom_not_visible", 10)
+            driver.ui("ConfigEditor", "text-start")
+            start = wait_until(lambda: editor_view(endpoint="startsDocument", caret="caretAtStart"),
+                               "native_editor_caret_start_not_visible", 10)
+            driver.ui("ConfigEditor", "text-end")
+            end = wait_until(lambda: editor_view(endpoint="endsDocument", caret="caretAtEnd"),
+                             "native_editor_caret_end_not_visible", 10)
+            require(all(state.get("value") == draft for state in (bottom, start, end)),
+                    "native_editor_scrolling_changed_document")
+            evidence["editorVerticalScroll"] = {"bottom": editor_scroll_evidence(bottom),
+                "caretStart": editor_scroll_evidence(start), "caretEnd": editor_scroll_evidence(end)}
+        finally:
+            driver.ui("ConfigEditor", "text-start")
+            driver.ui("ConfigEditor", "scroll", "0")
+        restored = wait_until(lambda: editor_view(endpoint="startsDocument", percent=0, caret="caretAtStart"),
+                              "native_editor_vertical_scroll_did_not_restore", 10)
+        require(restored.get("value") == draft, "native_editor_scroll_restore_changed_document")
+        evidence["editorVerticalScroll"]["restored"] = editor_scroll_evidence(restored)
         capture("windows-config-editor.png")
+        driver.ui("CloseEditor", "invoke")
+        found("ConfigKeepEditing", enabled=True)
+        capture("windows-config-unsaved.png")
+        driver.ui("ConfigKeepEditing", "invoke")
+        require(marker in found("ConfigEditor").get("value", ""), "native_keep_editing_lost_draft")
+        found("SaveConfig", enabled=True)
+        driver.ui("SaveConfig", "context")
+        found("SaveOnlyConfig", enabled=True)
         driver.ui("SaveOnlyConfig", "invoke")
         wait_until(lambda: marker in (self.directory / "config.yaml").read_text(encoding="utf-8"), "native_editor_save_not_written")
         found("CloseEditor", enabled=True)
@@ -1319,15 +1778,56 @@ class Acceptance:
         driver.navigate("connections")
         found("ConnectionTable")
         found("ConnectionSource_all")
+        driver.ui("ConnectionTable", "context")
         driver.ui("PauseConnections", "toggle")
+        driver.ui("ConnectionTable", "context")
         driver.ui("PauseConnections", "toggle")
+        driver.ui("ConnectionTable", "escape")
+        def horizontal_table_ready():
+            state = driver.ui("ConnectionTable")
+            return state if state.get("scroll", {}).get("horizontalScrollable") else None
+        table_before = wait_until(horizontal_table_ready, "native_empty_connection_headers_have_no_scroll_extent", 10)
+        require(table_before.get("rowCount") == 0, "native_empty_connection_scroll_fixture_has_rows")
+        first_header = next((item for item in table_before.get("headers", []) if item.get("name") == "域名"), None)
+        require(first_header and not first_header.get("offscreen"), "native_connection_first_header_missing")
+        try:
+            driver.ui("ConnectionTable", "scroll-horizontal", "100")
+            def table_at_right():
+                state = driver.ui("ConnectionTable")
+                return state if state.get("scroll", {}).get("horizontalPercent", -1) >= 99 else None
+            table_after = wait_until(table_at_right, "native_connection_horizontal_scroll_did_not_move", 10)
+            frozen_header = next((item for item in table_after.get("headers", []) if item.get("name") == "域名"), None)
+            last_header = next((item for item in table_after.get("headers", []) if item.get("name") == "连接时间"), None)
+            require(frozen_header and not frozen_header.get("offscreen") and
+                    abs(frozen_header["x"] - first_header["x"]) <= 1,
+                    "native_connection_frozen_header_moved")
+            bounds = table_after["bounds"]
+            require(last_header and not last_header.get("offscreen") and last_header["width"] > 0 and
+                    last_header["x"] >= bounds["x"] and
+                    last_header["x"] + last_header["width"] <= bounds["x"] + bounds["width"] + 1,
+                    "native_connection_last_header_not_visible_after_scroll")
+            evidence["connectionHorizontalScroll"] = {
+                "rowCount": table_before["rowCount"], "beforePercent": table_before["scroll"]["horizontalPercent"],
+                "afterPercent": table_after["scroll"]["horizontalPercent"],
+                "firstHeaderBefore": first_header, "firstHeaderAfter": frozen_header, "lastHeaderAfter": last_header}
+        finally:
+            driver.ui("ConnectionTable", "scroll-horizontal", "0")
+        wait_until(lambda: driver.ui("ConnectionTable").get("scroll", {}).get("horizontalPercent", -1) == 0,
+                   "native_connection_horizontal_scroll_did_not_restore", 10)
+        checked("empty_connection_header_horizontal_scroll")
         capture("windows-connections.png")
         checked("logs_pause_resume_and_connections")
 
         driver.navigate("home")
+        compact = driver.invoke("native_resize", {"width": 800, "height": 700})
+        require(compact.get("navigationMode") == "compact", "native_compact_navigation_mode_missing")
+        record_motion("compact-navigation", "NavigationToggle")
+        wait_until(lambda: driver.snapshot().get("navigationOverlay") is True, "native_compact_navigation_did_not_open")
+        driver.ui("NavigationToggle", "invoke")
+        wait_until(lambda: driver.snapshot().get("navigationOverlay") is False, "native_compact_navigation_did_not_close")
         narrow = driver.invoke("native_resize", {"width": 640, "height": 700})
         require(narrow.get("navigationMode") in ("minimal", "compact"), "native_narrow_navigation_mode_missing")
-        driver.ui("NavigationToggle", "invoke")
+        record_motion("narrow-navigation", "NavigationToggle")
         wait_until(lambda: driver.snapshot().get("navigationOverlay") is True, "native_navigation_overlay_did_not_open")
         capture("windows-home-narrow.png")
         driver.ui("NavigationToggle", "invoke")
@@ -1398,7 +1898,10 @@ class Acceptance:
         require(not self.driver.snapshot().get("error"), "automatic_startup_ui_reported_failure")
         visible = self.driver.ui("*")
         preparing_text = "\n".join(item.get("name", "") for item in visible.get("elements", []))
-        require(visible.get("found") and "正在准备启动资源" in preparing_text,
+        recovery_hint = self.driver.ui("RecoveryHint")
+        recovery_start = self.driver.ui("RecoveryStartCore")
+        require(visible.get("found") and recovery_hint.get("found") and "准备所需资源" in recovery_hint.get("name", "")
+                and recovery_start.get("found") and not recovery_start.get("enabled"),
                 "automatic_startup_proxy_preparation_message_missing")
         require(not re.search(r"请先.*启动内核|内核尚未运行|没有代理策略组|导入订阅", preparing_text),
                 "automatic_startup_proxy_stopped_hint_visible")
@@ -1812,6 +2315,8 @@ class Acceptance:
             evidence["logDiagnosticError"] = type(error).__name__
 
     def run(self) -> None:
+        self.report["uiaJsonContract"] = check_uia_json_contract()
+        self.mark("native_uia_json_contract")
         require(self.core.is_file() and self.helper.is_file(), "installed_sidecars_missing")
         require(not self.processes.at_paths([self.app, self.host, self.core, self.helper]), "preexisting_mihomo_process")
         require(not service_installed(), "preexisting_mihomo_service")
@@ -1833,6 +2338,12 @@ class Acceptance:
             self.original_files[path] = path.read_bytes() if path.exists() else None
         require(not (self.directory / "system-proxy-recovery.json").exists(), "preexisting_proxy_recovery")
         self.mutations_started = True
+        animation = wintypes.BOOL()
+        require(ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(animation), 0), "client_animation_read_failed")
+        self.animation_before = bool(animation.value)
+        # The disposable runner must exercise the real animation branch. Restore
+        # the original accessibility preference in cleanup, like proxy settings.
+        require(ctypes.windll.user32.SystemParametersInfoW(0x1043, 0, ctypes.c_void_p(1), 2), "client_animation_enable_failed")
         # Make the negative prerequisite explicit, including PAC/autodetection.
         # The runner's original per-user settings are restored in cleanup.
         self.wininet.restore({"flags": 1, "server": "", "bypass": "", "pac": ""})
@@ -2087,12 +2598,22 @@ class Acceptance:
         if not self.mutations_started:
             return
         errors = []
+        failure_details = []
 
         def attempt(code: str, operation) -> None:
             try:
                 operation()
-            except Exception:
+            except Exception as error:
                 errors.append(code)
+                # Fixed codes and numeric OS errors only; exception messages
+                # from native APIs can contain paths or configuration data.
+                detail = safe_code(str(error)) if isinstance(error, SmokeFailure) else "unexpected_" + type(error).__name__
+                failure = {"stage": "cleanup", "code": code, "detail": detail}
+                for key in ("winerror", "errno"):
+                    number = getattr(error, key, None)
+                    if isinstance(number, int):
+                        failure[key] = number
+                failure_details.append(failure)
                 print("CLEANUP error: " + code, flush=True)
 
         if self.driver:
@@ -2126,6 +2647,8 @@ class Acceptance:
             attempt("update_cache_fixture_cleanup", self.update_cache.close)
         attempt("proxy_restore", lambda: self.wininet.restore(self.proxy_before))
         attempt("autostart_restore", lambda: restore_autostart(self.autostart_before))
+        if self.animation_before is not None:
+            attempt("client_animation_restore", lambda: require(ctypes.windll.user32.SystemParametersInfoW(0x1043, 0, ctypes.c_void_p(int(self.animation_before)), 2), "client_animation_restore_failed"))
         for path, original in self.original_files.items():
             def restore_file(path=path, original=original):
                 if original is None:
@@ -2144,11 +2667,27 @@ class Acceptance:
         if self.desktop:
             attempt("restricted_token_close", self.desktop.close)
         self.report["tests"]["final_cleanup"] = not errors
-        self.report["diagnostics"].extend({"stage": "cleanup", "code": code} for code in errors)
+        self.report["diagnostics"].extend(failure_details)
         print("FAIL: final_cleanup" if errors else "PASS: final_cleanup", flush=True)
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--uia-json-contract"]:
+        report = {"passed": False, "platform": sys.platform}
+        try:
+            require(sys.platform == "win32", "windows_runner_required_for_uia_json_contract")
+            report["progress"] = check_uia_json_contract()
+            report["passed"] = True
+        except Exception as error:
+            report["code"] = safe_code(str(error)) if isinstance(error, SmokeFailure) else "unexpected_" + type(error).__name__
+            if isinstance(error, SmokeFailure) and error.uia:
+                report["diagnostic"] = error.uia
+        if sys.platform == "win32":
+            output = Path("artifacts/verification/uia-json-contract.json")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, sort_keys=True), flush=True)
+        return 0 if report["passed"] else 1
     acceptance = None
     artifacts = Path("artifacts/verification")
     runner_allowed = sys.platform == "win32" and os.environ.get("GITHUB_ACTIONS") == "true"
@@ -2166,6 +2705,13 @@ def main() -> int:
         print("FAIL: " + code, file=sys.stderr, flush=True)
         if acceptance:
             diagnostic = {"stage": acceptance.stage, "code": code}
+            if isinstance(error, SmokeFailure) and error.uia:
+                # Keep the original probe failure even if finally blocks make
+                # successful UIA calls to restore the editor before this catch.
+                diagnostic["uia"] = error.uia
+            if acceptance.driver:
+                with contextlib.suppress(Exception):
+                    diagnostic["guiExitCode"] = acceptance.driver.process.poll()
             if not isinstance(error, SmokeFailure):
                 # Retain locations and numeric Win32 failures, never exception
                 # text or locals (which may contain configuration credentials).
@@ -2180,9 +2726,6 @@ def main() -> int:
                 function = getattr(error, "funcname", None)
                 if isinstance(function, str):
                     diagnostic["function"] = safe_code(function)
-                if acceptance.driver:
-                    with contextlib.suppress(Exception):
-                        diagnostic["guiExitCode"] = acceptance.driver.process.poll()
             acceptance.report["diagnostics"].append(diagnostic)
             if acceptance.stage == "native_redesign_ui" and acceptance.driver:
                 try:
@@ -2204,7 +2747,7 @@ def main() -> int:
                 acceptance.cleanup()
             except Exception as error:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": "unexpected_" + type(error).__name__})
-            required = {"native_host_parent_binding", "update_cache_cleanup", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
+            required = {"native_uia_json_contract", "native_host_parent_binding", "update_cache_cleanup", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
                         "single_instance_and_native_ui", "native_redesign_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
                         "resource_bootstrap_recovery", "system_proxy_service_recovery"}

@@ -4,8 +4,12 @@ using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Automation.Peers;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Markup;
 using Mihomo.Desktop.Services;
 
 namespace Mihomo.Desktop.Controls;
@@ -13,14 +17,23 @@ namespace Mihomo.Desktop.Controls;
 /// <summary>A native, plain-text YAML surface with a virtual line-number gutter.</summary>
 internal sealed class ConfigCodeEditor : UserControl
 {
-    public TextBox Editor { get; } = new()
+    public TextBox Editor { get; } = new TextAreaTextBox()
     {
         AcceptsReturn = true, AcceptsTab = false, TextWrapping = TextWrapping.NoWrap,
         VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-        FontFamily = new FontFamily("Cascadia Mono, Consolas"), FontSize = 13,
-        Padding = new Thickness(14, 12, 14, 12), BorderThickness = new Thickness(0), UndoLimit = 100
+        FontSize = 12,
+        // WPF reserves another 2 DIP on each side for its bidi caret. Its
+        // line box places this font's ink 2 DIP below the reference textarea.
+        Padding = new Thickness(12, 10, 12, 14), BorderThickness = new Thickness(0), UndoLimit = 100
     };
     private readonly LineNumberGutter gutter;
+    private readonly Border frame;
+    private readonly Border underline = new() { Height = 1, VerticalAlignment = VerticalAlignment.Bottom, IsHitTestVisible = false };
+    private readonly Grid empty = new() { Margin = new Thickness(46, 0, 0, 0), IsHitTestVisible = false, Visibility = Visibility.Collapsed };
+    private readonly FluentIcon emptyIcon = new("edit", 22);
+    private readonly TextBlock emptyTitle = Ui.Label("配置编辑区", 14, true);
+    private readonly TextBlock emptyHint = Ui.Hint("读取成功后，可在这里编辑当前内核的配置文件。");
+    private bool held;
     private readonly WrapPanel findBar = new() { Visibility = Visibility.Collapsed, Margin = new Thickness(8) };
     private readonly TextBox find = Ui.SearchBox("在配置中查找", "ConfigFindInput");
     private readonly TextBlock findStatus = Ui.Muted("");
@@ -41,10 +54,17 @@ internal sealed class ConfigCodeEditor : UserControl
     {
         this.Id("ConfigCodeSurface"); Editor.Id("ConfigEditor");
         L.Bind(Editor, AutomationProperties.NameProperty, "配置文件编辑器");
-        Editor.SetResourceReference(Control.BackgroundProperty, "SurfaceBrush");
+        Editor.Style = null; Editor.Background = Brushes.Transparent;
+        Editor.Template = (ControlTemplate)XamlReader.Parse("""
+            <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="TextBox">
+              <ScrollViewer x:Name="PART_ContentHost" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Focusable="False" Background="Transparent"/>
+            </ControlTemplate>
+            """);
         Editor.SetResourceReference(Control.ForegroundProperty, "TextPrimaryBrush");
-        TextBlock.SetLineHeight(Editor, 22);
+        Editor.SetResourceReference(Control.FontFamilyProperty, "MonoFont");
+        TextBlock.SetLineHeight(Editor, 20.4); TextBlock.SetLineStackingStrategy(Editor, LineStackingStrategy.BlockLineHeight);
         SpellCheck.SetIsEnabled(Editor, false);
+        Editor.Loaded += (_, _) => BindScrollViewport();
         gutter = new LineNumberGutter(this).Id("ConfigLineNumbers");
         var grid = new Grid(); grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); grid.RowDefinitions.Add(new RowDefinition());
         L.Bind(matchCase, ContentControl.ContentProperty, "区分大小写");
@@ -57,8 +77,16 @@ internal sealed class ConfigCodeEditor : UserControl
         grid.Children.Add(findBar);
         var surface = new Grid(); surface.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); surface.ColumnDefinitions.Add(new ColumnDefinition());
         surface.Children.Add(gutter); Grid.SetColumn(Editor, 1); surface.Children.Add(Editor); Grid.SetRow(surface, 1); grid.Children.Add(surface);
-        var frame = new Border { Child = grid, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(4), ClipToBounds = true };
-        frame.SetResourceReference(Border.BorderBrushProperty, "BorderBrush"); frame.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush"); Content = frame;
+        var emptyCopy = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(24) };
+        emptyIcon.SetResourceReference(Control.ForegroundProperty, "AccentLinkBrush"); emptyIcon.Margin = new Thickness(0, 0, 0, 8); emptyCopy.Children.Add(emptyIcon);
+        emptyTitle.HorizontalAlignment = emptyHint.HorizontalAlignment = HorizontalAlignment.Center; emptyTitle.Margin = new Thickness(0, 0, 0, 8); emptyCopy.Children.Add(emptyTitle); emptyCopy.Children.Add(emptyHint); empty.Children.Add(emptyCopy); Grid.SetColumnSpan(empty, 2); surface.Children.Add(empty);
+        var frameLayers = new Grid(); frameLayers.Children.Add(grid); underline.SetResourceReference(Border.BackgroundProperty, "ControlStrongBrush"); frameLayers.Children.Add(underline);
+        frame = new Border { Child = frameLayers, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(4), ClipToBounds = true };
+        frame.SetResourceReference(Border.BorderBrushProperty, "ControlStrokeBrush"); frame.SetResourceReference(Border.BackgroundProperty, "ControlBrush"); Content = frame;
+        IsKeyboardFocusWithinChanged += (_, _) =>
+        {
+            frame.SetResourceReference(Border.BackgroundProperty, IsKeyboardFocusWithin ? "ControlFocusBrush" : "ControlBrush"); underline.Height = IsKeyboardFocusWithin ? 2 : 1; underline.SetResourceReference(Border.BackgroundProperty, IsKeyboardFocusWithin ? "AccentBrush" : "ControlStrongBrush");
+        };
         Editor.TextChanged += TextChanged;
         Editor.SelectionChanged += (_, _) => { gutter.InvalidateVisual(); PositionChanged?.Invoke(); };
         Editor.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler((_, _) => gutter.InvalidateVisual()));
@@ -68,6 +96,65 @@ internal sealed class ConfigCodeEditor : UserControl
         matchCase.Checked += (_, _) => FindMatch(includeCurrent: true); matchCase.Unchecked += (_, _) => FindMatch(includeCurrent: true);
         find.PreviewKeyDown += (_, e) => { if (e.Key == Key.Enter) { FindMatch((Keyboard.Modifiers & ModifierKeys.Shift) != 0); e.Handled = true; } };
         L.Changed += () => { gutter.InvalidateVisual(); if (findBar.Visibility == Visibility.Visible) UpdateFindStatus(false); };
+        empty.Loaded += (_, _) => { if (empty.Visibility == Visibility.Visible) AnimateEmpty(); };
+    }
+
+    private void BindScrollViewport()
+    {
+        Editor.ApplyTemplate();
+        if (Editor.Template.FindName("PART_ContentHost", Editor) is not ScrollViewer viewer) return;
+        viewer.ApplyTemplate();
+        Bind("PART_HorizontalScrollBar", nameof(ScrollViewer.ViewportWidth));
+        void Bind(string name, string viewport)
+        {
+            if (viewer.Template.FindName(name, viewer) is not ScrollBar bar) return;
+            var binding = new MultiBinding { Mode = BindingMode.OneWay, Converter = new HorizontalViewport() };
+            binding.Bindings.Add(new Binding(viewport) { Source = viewer });
+            binding.Bindings.Add(new Binding(nameof(Control.Padding)) { Source = Editor });
+            // TextAreaViewport already exposes the full real vertical viewport.
+            // Horizontal padding still follows WPF's native TextBoxView layout.
+            BindingOperations.SetBinding(bar, ScrollBar.ViewportSizeProperty, binding);
+        }
+    }
+
+    private sealed class HorizontalViewport : IMultiValueConverter
+    {
+        public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (values.Length != 2 || values[0] is not double viewport || !double.IsFinite(viewport) || viewport < 0 || values[1] is not Thickness padding)
+                return Binding.DoNothing;
+            // Horizontal content also excludes TextBoxView's two 2-DIP bidi
+            // caret margins. All measurements remain DIPs at every monitor DPI.
+            return viewport + padding.Left + padding.Right + 4;
+        }
+        public object[] ConvertBack(object value, Type[] targetTypes, object parameter, CultureInfo culture) => throw new NotSupportedException();
+    }
+
+    internal void SetAvailability(bool loaded, bool loading)
+    {
+        var wasVisible = empty.Visibility == Visibility.Visible; empty.Visibility = loaded ? Visibility.Collapsed : Visibility.Visible;
+        L.Bind(emptyTitle, TextBlock.TextProperty, loading ? "正在读取…" : "配置编辑区");
+        L.Bind(emptyHint, TextBlock.TextProperty, loading ? "正在读取当前控制器的配置文件。" : "读取成功后，可在这里编辑当前内核的配置文件。"); emptyIcon.Kind = loading ? "update" : "edit";
+        empty.Margin = new Thickness((Window.GetWindow(this)?.ActualWidth ?? 1000) <= 768 ? 40 : 46, 0, 0, 0);
+        if (loaded) { empty.BeginAnimation(OpacityProperty, null); empty.Opacity = 1; }
+        else if (!wasVisible && IsLoaded) AnimateEmpty();
+    }
+    private void AnimateEmpty()
+    {
+        if (!ProxyVisuals.Animate) return;
+        var move = new TranslateTransform(0, 28); empty.RenderTransform = move; empty.BeginAnimation(OpacityProperty, null); empty.Opacity = 0;
+        move.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(28, 0, TimeSpan.FromMilliseconds(300)) { BeginTime = TimeSpan.FromMilliseconds(80), EasingFunction = FluentMotion.Decelerate });
+        empty.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(300)) { BeginTime = TimeSpan.FromMilliseconds(80), EasingFunction = FluentMotion.Decelerate });
+    }
+    internal void SetHeld(bool value)
+    {
+        if (held == value) return; held = value;
+        var opacity = value ? .45 : 1;
+        foreach (var element in new UIElement[] { Editor, gutter })
+        {
+            var before = element.Opacity; element.BeginAnimation(OpacityProperty, null); element.Opacity = opacity;
+            if (ProxyVisuals.Animate) element.BeginAnimation(OpacityProperty, new DoubleAnimation(before, opacity, TimeSpan.FromMilliseconds(167)));
+        }
     }
 
     private Button FindButton(string title, string id, Action action)
@@ -172,16 +259,27 @@ internal sealed class ConfigCodeEditor : UserControl
     {
         private int firstLine;
         private int lastLine;
-        protected override Size MeasureOverride(Size availableSize) => new(Math.Max(46, 22 + owner.lineStarts.Length.ToString(CultureInfo.InvariantCulture).Length * 8), 0);
+        protected override Size MeasureOverride(Size availableSize)
+        {
+            var glyph = new FormattedText("0", CultureInfo.InvariantCulture, FlowDirection.LeftToRight, new Typeface(owner.Editor.FontFamily, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal), owner.Editor.FontSize, Brushes.Black, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+            return new Size(23 + Math.Max(2, owner.lineStarts.Length.ToString(CultureInfo.InvariantCulture).Length) * glyph.WidthIncludingTrailingWhitespace, 0);
+        }
         protected override void OnRender(DrawingContext drawing)
         {
             base.OnRender(drawing);
-            var border = (Brush?)TryFindResource("BorderBrush") ?? Brushes.Gray;
+            var border = (Brush?)TryFindResource("DividerBrush") ?? Brushes.Gray;
             drawing.DrawLine(new Pen(border, 1), new Point(ActualWidth - .5, 0), new Point(ActualWidth - .5, ActualHeight));
             var text = owner.Editor;
             if (!text.IsVisible || text.ActualHeight <= 0) return;
-            firstLine = Math.Max(0, text.GetFirstVisibleLineIndex()); lastLine = Math.Min(owner.lineStarts.Length - 1, Math.Max(firstLine, text.GetLastVisibleLineIndex()));
-            var foreground = (Brush?)TryFindResource("TextSecondaryBrush") ?? Brushes.Gray;
+            if (text is not TextAreaTextBox area || !area.TryGetTextViewport(out var offset, out var viewport)) return;
+            // TextBox's visible-line helpers divide its public scroll offset
+            // by font metrics. Our public offset includes document padding;
+            // use the actual text view and this editor's fixed line advance.
+            var lineHeight = TextBlock.GetLineHeight(text);
+            firstLine = Math.Clamp((int)Math.Floor(offset / lineHeight + .0001), 0, owner.lineStarts.Length - 1);
+            lastLine = Math.Clamp((int)Math.Ceiling((offset + viewport.Height) / lineHeight) - 1, firstLine, owner.lineStarts.Length - 1);
+            var foreground = (Brush?)TryFindResource("TextTertiaryBrush") ?? Brushes.Gray;
+            drawing.PushClip(new RectangleGeometry(new Rect(0, viewport.Top, ActualWidth, viewport.Height)));
             for (var line = firstLine; line <= lastLine; line++)
             {
                 var rect = text.GetRectFromCharacterIndex(owner.lineStarts[line]);
@@ -189,6 +287,7 @@ internal sealed class ConfigCodeEditor : UserControl
                 var number = new FormattedText((line + 1).ToString(CultureInfo.InvariantCulture), CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, new Typeface(text.FontFamily, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal), text.FontSize, foreground, VisualTreeHelper.GetDpi(this).PixelsPerDip);
                 drawing.DrawText(number, new Point(ActualWidth - 11 - number.Width, rect.Y + Math.Max(0, (rect.Height - number.Height) / 2)));
             }
+            drawing.Pop();
             AutomationProperties.SetName(this, L.F("行号 {0}–{1}", firstLine + 1, lastLine + 1));
         }
         protected override AutomationPeer OnCreateAutomationPeer() => new GutterPeer(this);

@@ -14,6 +14,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
 using Microsoft.Win32;
+using Mihomo.Desktop.Controls;
 
 namespace Mihomo.Desktop.Services;
 
@@ -24,6 +25,15 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     private readonly CancellationTokenSource lifetime = new();
     private CancellationTokenSource controllerLifetime = new();
     private string controllerIdentity = "";
+    private const long RuntimeSnapshotMaximumBytes = 4 * 1024 * 1024;
+    private const long RuntimeSnapshotLifetimeMilliseconds = 10_000;
+    private readonly object runtimeSnapshotGate = new();
+    private readonly Dictionary<string, RuntimeSnapshot> runtimeSnapshots = new(StringComparer.Ordinal);
+    private long runtimeSnapshotGeneration;
+    private string runtimeSnapshotController = "";
+    private bool runtimeSnapshotsRunning;
+    private int runtimeSnapshotWrites;
+    private sealed record RuntimeSnapshot(JsonElement Value, string Controller, long Generation, long Timestamp);
     private readonly string appearancePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Mihomo Optimized", "native-appearance.json");
     private Task dirtySync = Task.CompletedTask;
     private bool dirty;
@@ -33,18 +43,21 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     private Task<JsonElement>? updateCheck;
     public JsonElement Status { get; private set; } = JsonSerializer.SerializeToElement(new { phase = "connecting" });
     public JsonElement Update { get; private set; } = JsonSerializer.SerializeToElement(new { available = false });
+    public string? UpdateDismissedVersion { get; private set; }
+    public string? BusyCommand { get; private set; }
     public string Theme { get; private set; } = "system";
     public string Language { get; private set; } = "zh-CN";
     public string TestUrl { get; private set; } = "https://www.gstatic.com/generate_204";
     public bool CloseConnectionsOnSwitch { get; private set; }
     public bool ShowProxyProvider { get; private set; } = true;
+    public string RuntimeMode { get; private set; } = "";
     public bool Ready { get; private set; }
     public bool IsExiting => exiting;
     public bool IsUpdating { get; private set; }
     public event PropertyChangedEventHandler? PropertyChanged;
     public event EventHandler? StatusChanged;
     public event Action<string, JsonElement>? HostEvent;
-    public event Action<string, bool>? Notification;
+    public event Action<string, TransientMessageKind>? Notification;
     public event Action<string>? NavigateRequested;
     public event Action<NavigationTarget>? NavigateTargetRequested;
     public event Action? ExitRequested;
@@ -69,6 +82,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         {
             if (exiting) return;
             Ready = false;
+            SetRuntimeSnapshotState(false, "");
             Status = JsonSerializer.SerializeToElement(new { phase = "error", lastError = error.Message });
             StatusChanged?.Invoke(this, EventArgs.Empty);
             Notify(error.Message, true);
@@ -99,13 +113,24 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public async Task StartAsync()
     {
         if (started) return;
-        host.Start();
-        started = true;
-        ApplyTheme();
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-        ApplyStatus(await host.CallAsync("desktop_status", null, timeout.Token));
-        _ = PollAsync();
-        _ = CheckUpdateOnLaunchAsync();
+        try
+        {
+            host.Start();
+            started = true;
+            ApplyTheme();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            ApplyStatus(await host.CallAsync("desktop_status", null, timeout.Token));
+            _ = PollAsync();
+            _ = CheckUpdateOnLaunchAsync();
+        }
+        catch (Exception error)
+        {
+            Ready = false;
+            SetRuntimeSnapshotState(false, "");
+            Status = JsonSerializer.SerializeToElement(new { phase = "error", lastError = error.Message });
+            StatusChanged?.Invoke(this, EventArgs.Empty);
+            throw;
+        }
     }
 
     public async Task<JsonElement> CommandAsync(string method, object? args = null, CancellationToken cancellationToken = default)
@@ -127,10 +152,28 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             launchCheckConsumed = true;
             return await CheckUpdateAsync(cancellationToken);
         }
-        JsonElement result = await host.CallAsync(method, args, cancellationToken);
-        if (result.ValueKind == JsonValueKind.Object && result.TryGetProperty("phase", out _)) ApplyStatus(result);
-        if (method == "desktop_exit" && result.ValueKind == JsonValueKind.Object && result.TryGetProperty("exiting", out var leaving) && leaving.ValueKind == JsonValueKind.True) ExpectExit();
-        return result;
+        bool runtimeAction = method is "desktop_start" or "desktop_stop" or "desktop_restart" or "desktop_reload_config"
+            or "desktop_set_tun" or "desktop_set_system_proxy" or "desktop_install_service" or "desktop_uninstall_service";
+        if (runtimeAction)
+        {
+            if (BusyCommand is not null) throw new DesktopException("desktop_busy", "另一项桌面操作正在进行中，请稍候。");
+            BusyCommand = method;
+            StatusChanged?.Invoke(this, EventArgs.Empty);
+        }
+        bool runtimeWrite = runtimeAction || method is "desktop_patch_config" or "desktop_save_config" or "desktop_import_config" or "desktop_import_config_url";
+        if (runtimeWrite) ChangeRuntimeSnapshotWrites(1);
+        try
+        {
+            JsonElement result = await host.CallAsync(method, args, cancellationToken);
+            if (result.ValueKind == JsonValueKind.Object && result.TryGetProperty("phase", out _)) ApplyStatus(result);
+            if (method == "desktop_exit" && result.ValueKind == JsonValueKind.Object && result.TryGetProperty("exiting", out var leaving) && leaving.ValueKind == JsonValueKind.True) ExpectExit();
+            return result;
+        }
+        finally
+        {
+            if (runtimeWrite) ChangeRuntimeSnapshotWrites(-1);
+            if (runtimeAction) { BusyCommand = null; StatusChanged?.Invoke(this, EventArgs.Empty); }
+        }
     }
 
     private void RejectDuringUpdate(string method)
@@ -200,11 +243,13 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             if (identity != controllerIdentity)
             {
                 controllerIdentity = identity;
+                RuntimeMode = "";
                 var previous = controllerLifetime;
                 controllerLifetime = new CancellationTokenSource();
                 previous.Cancel();
                 previous.Dispose();
             }
+            SetRuntimeSnapshotState(!exiting && HostChannel.Text(Status, "phase") == "running", identity);
             Ready = true;
             StatusChanged?.Invoke(this, EventArgs.Empty);
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Status)));
@@ -214,9 +259,11 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     private void OnHostEvent(string name, JsonElement data)
     {
         if (name == "desktop-status") ApplyStatus(data);
+        if (name == "desktop-config-changed") InvalidateRuntimeSnapshots();
         if (name == "desktop-exit-requested" && HostChannel.Text(data, "reason") == "update")
         {
             exiting = true;
+            SetRuntimeSnapshotState(false, "");
             host.ExpectExit();
         }
         Dispatch(() => HostEvent?.Invoke(name, data));
@@ -241,10 +288,16 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
 
     private async Task<JsonElement> CheckUpdateAsync(CancellationToken cancellationToken)
     {
+        if (updateCheck is null)
+        {
+            Update = JsonSerializer.SerializeToElement(new { available = false });
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Update)));
+        }
         Task<JsonElement> check = updateCheck ??= host.CallAsync("desktop_check_update", null, lifetime.Token);
         try
         {
             Update = await check.WaitAsync(cancellationToken);
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Update)));
             return Update;
         }
         finally { if (check.IsCompleted && ReferenceEquals(updateCheck, check)) updateCheck = null; }
@@ -259,12 +312,103 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
                 await Task.Delay(TimeSpan.FromSeconds(2), lifetime.Token);
             if (launchCheckConsumed) return;
             launchCheckConsumed = true;
-            var update = await CheckUpdateAsync(lifetime.Token);
-            if (update.TryGetProperty("available", out var available) && available.ValueKind == JsonValueKind.True)
-                Notify(L.F("发现新版本 {0}，可在设置中更新。", HostChannel.Text(update, "version")));
+            await CheckUpdateAsync(lifetime.Token);
         }
         catch (OperationCanceledException) { }
         catch (Exception) { /* Automatic checks do not interrupt offline startup; manual checks show their error. */ }
+    }
+
+    public void DismissUpdate()
+    {
+        var version = HostChannel.Text(Update, "version");
+        if (version.Length == 0) return;
+        UpdateDismissedVersion = version;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(UpdateDismissedVersion)));
+    }
+
+    /// <summary>Recent display data only. ApiAsync always performs a real request.</summary>
+    public bool TryGetRuntimeSnapshot(string path, out JsonElement snapshot)
+    {
+        snapshot = default;
+        string? key = RuntimeSnapshotKey(path);
+        if (key is null) return false;
+        lock (runtimeSnapshotGate)
+        {
+            if (!runtimeSnapshotsRunning || runtimeSnapshotWrites != 0 || !runtimeSnapshots.TryGetValue(key, out var value)) return false;
+            long age = Environment.TickCount64 - value.Timestamp;
+            if (value.Controller != runtimeSnapshotController || value.Generation != runtimeSnapshotGeneration || age < 0 || age > RuntimeSnapshotLifetimeMilliseconds)
+            {
+                runtimeSnapshots.Remove(key);
+                return false;
+            }
+            // The element is an owned, immutable clone from a successful GET.
+            snapshot = value.Value;
+            return true;
+        }
+    }
+
+    internal bool TryGetProxyRuntimeSnapshot(out JsonElement proxies, out JsonElement providers, out JsonElement configs)
+    {
+        // Read the display model atomically; a host config event may invalidate
+        // the generation on its reader thread between individual lookups.
+        lock (runtimeSnapshotGate)
+        {
+            proxies = providers = configs = default;
+            return TryGetRuntimeSnapshot("proxies", out proxies)
+                && TryGetRuntimeSnapshot("providers/proxies", out providers)
+                && TryGetRuntimeSnapshot("configs", out configs);
+        }
+    }
+
+    private static string? RuntimeSnapshotKey(string path) => path switch
+    {
+        "proxies" or "/proxies" => "proxies",
+        "providers/proxies" or "/providers/proxies" => "providers/proxies",
+        "configs" or "/configs" => "configs",
+        _ => null
+    };
+
+    private void SetRuntimeSnapshotState(bool running, string controller)
+    {
+        lock (runtimeSnapshotGate)
+        {
+            if (running != runtimeSnapshotsRunning || controller != runtimeSnapshotController || !running && runtimeSnapshots.Count != 0)
+            {
+                runtimeSnapshotGeneration++;
+                runtimeSnapshots.Clear();
+            }
+            runtimeSnapshotsRunning = running;
+            runtimeSnapshotController = controller;
+        }
+    }
+
+    private void InvalidateRuntimeSnapshots()
+    {
+        lock (runtimeSnapshotGate) { runtimeSnapshotGeneration++; runtimeSnapshots.Clear(); }
+    }
+
+    private void ChangeRuntimeSnapshotWrites(int change)
+    {
+        lock (runtimeSnapshotGate)
+        {
+            runtimeSnapshotWrites += change;
+            runtimeSnapshotGeneration++;
+            runtimeSnapshots.Clear();
+        }
+    }
+
+    private void StoreRuntimeSnapshot(string? key, JsonElement snapshot, long bytes, string controller, long generation)
+    {
+        if (key is null) return;
+        lock (runtimeSnapshotGate)
+        {
+            if (!runtimeSnapshotsRunning || runtimeSnapshotWrites != 0 || controller != runtimeSnapshotController || generation != runtimeSnapshotGeneration) return;
+            bool valid = snapshot.ValueKind == JsonValueKind.Object && (key == "configs" || snapshot.Get(key == "proxies" ? "proxies" : "providers").ValueKind == JsonValueKind.Object);
+            // Three fixed keys, at most 4 MiB each. Large valid responses still
+            // reach the caller; they simply do not become shared display data.
+            if (!valid || bytes > RuntimeSnapshotMaximumBytes) { runtimeSnapshots.Remove(key); return; }
+            runtimeSnapshots[key] = new RuntimeSnapshot(snapshot, controller, generation, Environment.TickCount64);
+        }
     }
 
     private (Uri Uri, string Secret) Endpoint(string path)
@@ -285,8 +429,14 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     {
         var (uri, secret) = Endpoint(path);
         var controllerToken = controllerLifetime.Token;
+        string requestController = controllerIdentity;
+        long snapshotGeneration;
+        lock (runtimeSnapshotGate) snapshotGeneration = runtimeSnapshotGeneration;
+        string? snapshotKey = method == HttpMethod.Get && uri.Query.Length == 0 ? RuntimeSnapshotKey(uri.AbsolutePath) : null;
+        bool runtimeWrite = method != HttpMethod.Get;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken, controllerToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(45));
+        if (runtimeWrite) ChangeRuntimeSnapshotWrites(1);
         try
         {
             using var request = new HttpRequestMessage(method, uri);
@@ -313,18 +463,36 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             timeout.Token.ThrowIfCancellationRequested();
             if (!response.IsSuccessStatusCode)
             {
+                if (snapshotKey is not null) InvalidateRuntimeSnapshots();
                 string detail = "";
                 try { using var error = JsonDocument.Parse(data.ToArray()); detail = HostChannel.Text(error.RootElement, "message"); } catch (JsonException) { }
                 throw new DesktopException("api_failed", detail.Length is > 0 and < 500 ? detail : L.F("内核返回 HTTP {0}", (int)response.StatusCode));
             }
             if (data.Length == 0) return JsonSerializer.SerializeToElement(new { });
             using var parsed = JsonDocument.Parse(data.ToArray());
-            return parsed.RootElement.Clone();
+            if (method == HttpMethod.Get && uri.AbsolutePath == "/configs")
+            {
+                var mode = HostChannel.Text(parsed.RootElement, "mode");
+                if (mode is "rule" or "global" or "direct" or "script") Dispatch(() =>
+                {
+                    if (controllerToken.IsCancellationRequested || RuntimeMode == mode) return;
+                    RuntimeMode = mode;
+                    PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(RuntimeMode)));
+                });
+            }
+            timeout.Token.ThrowIfCancellationRequested();
+            var result = parsed.RootElement.Clone();
+            StoreRuntimeSnapshot(snapshotKey, result, data.Length, requestController, snapshotGeneration);
+            return result;
         }
         catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && !cancellationToken.IsCancellationRequested && !controllerToken.IsCancellationRequested)
         {
+            InvalidateRuntimeSnapshots();
             throw new DesktopException("request_timeout", "请求超时，请刷新状态后重试。");
         }
+        catch (HttpRequestException) { InvalidateRuntimeSnapshots(); throw; }
+        catch (IOException) { InvalidateRuntimeSnapshots(); throw; }
+        finally { if (runtimeWrite) ChangeRuntimeSnapshotWrites(-1); }
     }
 
     public async IAsyncEnumerable<JsonElement> StreamAsync(string path, [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -373,13 +541,17 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         SavePreferences();
     }
 
-    public void SetTestUrl(string url)
+    public bool SetTestUrl(string url)
     {
         url = url.Trim();
         if (!ValidTestUrl(url)) throw new ArgumentException(L.T("请输入有效的 HTTP 或 HTTPS 探测地址。"), nameof(url));
+        // Publish the new value only after the atomic preferences write has
+        // succeeded. A failed save must leave both the active URL and the
+        // editor's draft intact, without a second success notification.
+        if (!SavePreferences(testUrl: url)) return false;
         TestUrl = url;
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(TestUrl)));
-        SavePreferences();
+        return true;
     }
     private static bool ValidTestUrl(string url) => url.Length <= 2048 && Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https" && uri.UserInfo.Length == 0 && !string.IsNullOrWhiteSpace(uri.Host);
     public void SetCloseConnectionsOnSwitch(bool enabled)
@@ -395,16 +567,21 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         SavePreferences();
     }
 
-    private void SavePreferences()
+    private bool SavePreferences(string? testUrl = null)
     {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(appearancePath)!);
             string temporary = appearancePath + ".tmp";
-            File.WriteAllText(temporary, JsonSerializer.Serialize(new { theme = Theme, language = Language, testUrl = TestUrl, closeConnectionsOnSwitch = CloseConnectionsOnSwitch, showProxyProvider = ShowProxyProvider }));
+            File.WriteAllText(temporary, JsonSerializer.Serialize(new { theme = Theme, language = Language, testUrl = testUrl ?? TestUrl, closeConnectionsOnSwitch = CloseConnectionsOnSwitch, showProxyProvider = ShowProxyProvider }));
             File.Move(temporary, appearancePath, true);
+            return true;
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { Notify("设置已生效，但未能保存偏好。", true); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            Notify(testUrl is null ? "设置已生效，但未能保存偏好。" : "未能保存测速地址，原设置未变。", true);
+            return false;
+        }
     }
 
     public void ApplyTheme()
@@ -412,43 +589,18 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         var app = Application.Current;
         app.ThemeMode = Theme switch { "dark" => ThemeMode.Dark, "light" => ThemeMode.Light, _ => ThemeMode.System };
         bool dark = Theme == "dark" || (Theme == "system" && Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme", 1) is int setting && setting == 0);
-        var palette = new Dictionary<string, string>
-        {
-            ["AppBackgroundBrush"] = dark ? "#202020" : "#F3F3F3",
-            ["SurfaceBrush"] = dark ? "#2B2B2B" : "#FBFBFB",
-            ["SubtleSurfaceBrush"] = dark ? "#272727" : "#F8F8F8",
-            ["TextPrimaryBrush"] = dark ? "#FFFFFF" : "#1B1B1B",
-            ["TextSecondaryBrush"] = dark ? "#C5C5C5" : "#616161",
-            ["BorderBrush"] = dark ? "#454545" : "#E2E2E2",
-            ["SuccessBrush"] = dark ? "#6CCB5F" : "#0F7B0F",
-            ["DangerBrush"] = dark ? "#FF99A4" : "#C42B1C",
-            ["WarningBrush"] = dark ? "#FCE100" : "#9D5D00",
-            ["ChartUpBrush"] = dark ? "#9E9E9E" : "#8A8A8A"
-        };
-        string[] lines = dark ? ["#60CDFF", "#C3A6F2", "#FF8FD0", "#4FD8B4", "#FFB36B", "#82A8FF", "#D6A3FF", "#5DD3D6", "#FF9A9A"] : ["#0063B1", "#6B4FAC", "#B0297A", "#00755E", "#A65200", "#1F5BD6", "#8A3FC2", "#00727A", "#B33A3A"];
-        for (int index = 0; index < lines.Length; index++) palette["Line" + index + "Brush"] = lines[index];
-        foreach (var item in palette) app.Resources[item.Key] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(item.Value));
-        app.Resources["AccentBrush"] = dark ? SystemColors.AccentColorLight2Brush : SystemColors.AccentColorDark1Brush;
-        app.Resources["AccentTextBrush"] = dark ? Brushes.Black : Brushes.White;
-        if (SystemParameters.HighContrast)
-        {
-            app.Resources["AppBackgroundBrush"] = app.Resources["SurfaceBrush"] = app.Resources["SubtleSurfaceBrush"] = SystemColors.WindowBrush;
-            app.Resources["TextPrimaryBrush"] = app.Resources["TextSecondaryBrush"] = app.Resources["SuccessBrush"] = app.Resources["DangerBrush"] = app.Resources["WarningBrush"] = app.Resources["ChartUpBrush"] = SystemColors.WindowTextBrush;
-            for (int index = 0; index < lines.Length; index++) app.Resources["Line" + index + "Brush"] = SystemColors.HighlightBrush;
-            app.Resources["BorderBrush"] = SystemColors.WindowTextBrush;
-            app.Resources["AccentBrush"] = SystemColors.HighlightBrush;
-            app.Resources["AccentTextBrush"] = SystemColors.HighlightTextBrush;
-        }
+        Controls.DesignTokens.Apply(dark);
         ThemeChanged?.Invoke();
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Theme)));
     }
 
     private void OnSystemThemeChanged(object sender, UserPreferenceChangedEventArgs e) => Dispatch(ApplyTheme);
-    public void Notify(string message, bool error = false) => Dispatch(() => Notification?.Invoke(L.T(message), error));
+    public void Notify(string message, bool error = false) => Dispatch(() => { if (!exiting) Notification?.Invoke(L.T(message), error ? TransientMessageKind.Error : TransientMessageKind.Info); });
+    public void NotifySuccess(string message) => Dispatch(() => { if (!exiting) Notification?.Invoke(L.T(message), TransientMessageKind.Success); });
     public void Navigate(string key) => Dispatch(() => NavigateRequested?.Invoke(key));
     public void Navigate(NavigationTarget target) => Dispatch(() => NavigateTargetRequested?.Invoke(target));
     public void RequestExit() => Dispatch(() => ExitRequested?.Invoke());
-    public void ExpectExit() { exiting = true; host.ExpectExit(); }
+    public void ExpectExit() { exiting = true; SetRuntimeSnapshotState(false, ""); host.ExpectExit(); }
     private static void Dispatch(Action action)
     {
         if (Application.Current.Dispatcher.CheckAccess()) action();
@@ -458,6 +610,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         exiting = true;
+        SetRuntimeSnapshotState(false, "");
         lifetime.Cancel();
         controllerLifetime.Cancel();
         SystemEvents.UserPreferenceChanged -= OnSystemThemeChanged;

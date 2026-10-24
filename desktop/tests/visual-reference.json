@@ -1,0 +1,8 @@
+{
+  "baseCommit": "32a5fc0d70a772627fdca2c5d85e891c03f28331",
+  "patch": "visual-reference.patch",
+  "patchSha256": "8f2da2bddd60fe6b827283de3c15a6a235a7b5b782bbb93d245099b19e35aef0",
+  "originalArchive": "mihomo-fluent-redesign(1).zip",
+  "originalArchiveSha256": "8d1cf67059caf3dfd5a0a753f6c8e176c14dcca15c777509558f345bd1eeec3d",
+  "purpose": "Render the supplied final design as a test reference on the same Windows runner. Never shipped in the native application."
+}

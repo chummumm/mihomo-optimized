@@ -3,10 +3,13 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Shapes;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
+using System.Windows.Documents;
 using Mihomo.Desktop.Controls;
 using Mihomo.Desktop.Services;
 
@@ -14,6 +17,9 @@ namespace Mihomo.Desktop.Pages;
 
 public sealed class ProxiesPage : NativePage
 {
+    private readonly long constructionStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+    private double constructionFieldsMs, constructionControlsMs, constructionTopologyMs, constructionSnapshotMs, constructionTotalMs;
+    private object? lastRenderTiming, constructionRenderTiming, lastNavigationGeometry;
     private readonly StackPanel content = new();
     private readonly StackPanel groupList = new();
     private readonly StackPanel providerList = new();
@@ -21,16 +27,31 @@ public sealed class ProxiesPage : NativePage
     private readonly ProxyTopologyControl topology = new();
     private readonly ProxyTopologyModelBuilder topologyModel = new();
     private readonly ProxyPreferences preferences = new();
-    private readonly TextBox search = Ui.SearchBox("筛选策略组、节点或类型", "ProxySearch", "filter");
-    private readonly TextBlock summary = Ui.Muted("");
-    private readonly TextBlock flow = Ui.Muted("");
-    private readonly TextBlock idleMap = Ui.Hint("暂无活动连接，显示当前策略组出口");
-    private readonly CheckBox breakConnections = new() { VerticalAlignment = VerticalAlignment.Center };
-    private readonly ProgressBar progress = new() { Height = 3, Margin = new Thickness(0, 0, 0, 12), Visibility = Visibility.Collapsed, Maximum = 100 };
+    private readonly TextBox search = Ui.SearchBox("筛选节点", "ProxySearch", "filter", rightIcon: true);
+    private readonly WrapPanel summary = new();
+    private readonly TextBlock flowDown = Ui.Muted(""), flowUp = Ui.Muted(""), flowCount = Ui.Muted("");
+    private readonly TextBlock idleMap = Ui.Hint("当前没有活动连接。");
+    private readonly ToggleButton breakConnections = new() { VerticalAlignment = VerticalAlignment.Center, Style = FluentControls.Style("Switch") };
+    private readonly TextBlock breakLabel = Ui.Hint("切换时打断包含策略组的连接");
+    private readonly Dictionary<string, string> pendingSelections = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, bool> providersBusy = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ProxyTilePanel> providerPanels = new(StringComparer.Ordinal);
+    private readonly ProxyTilePanel nodesPanel = new();
+    private readonly LivePing liveDot = new() { Margin = new Thickness(0, 0, 14, 0), VerticalAlignment = VerticalAlignment.Center };
+    private readonly Border topologyReveal = new() { ClipToBounds = true };
+    private readonly FluentIcon topologyCaret = new("chevron-up", 12);
+    private readonly TextBlock topologyToggleLabel = Ui.Label("收起拓扑");
+    private readonly TextBlock topologyRoute = Ui.Hint("SOURCE → POLICY → EXIT");
+    private readonly TextBlock topologyHint = Ui.Hint("悬停查看链路，点击策略组跳到它。");
+    private long topologyTransition;
+    private readonly ProgressBar progress = new() { Height = 3, Margin = new Thickness(0, 0, 0, 16), Visibility = Visibility.Collapsed, Maximum = 100 };
     private readonly Button testAll;
+    private readonly FluentIcon testIcon = new("speed", 16) { Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center };
+    private readonly TextBlock testLabel = Ui.Text("");
     private readonly Button toggleTopology;
     private readonly Grid topologyBody = new();
     private readonly ScrollViewer scroll;
+    private CancellationTokenSource? scrollLifetime;
     private readonly Dictionary<string, ProxyNodeInfo> nodes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ProxyNodeInfo> measured = new(StringComparer.Ordinal);
     private readonly Dictionary<(string Section, string Name), ProxyNodeTile> tiles = [];
@@ -42,6 +63,7 @@ public sealed class ProxiesPage : NativePage
     private readonly DispatcherTimer filterTimer = new() { Interval = TimeSpan.FromMilliseconds(130) };
     private readonly DispatcherTimer renderTimer = new() { Interval = TimeSpan.FromMilliseconds(200) };
     private JsonElement providerData;
+    private JsonElement presentedProxies, presentedProviders, presentedConfigs;
     private string[] order = [];
     private string mode = "rule";
     private string lastController = "";
@@ -49,6 +71,14 @@ public sealed class ProxiesPage : NativePage
     private CancellationToken refreshToken;
     private string refreshController = "";
     private long refreshGeneration;
+    private long preparationGeneration;
+    private bool? preparationCacheHit;
+    private double? preparationElapsedMs;
+    private double? preparationSnapshotMs, preparationGroupMs, preparationLayoutMs, preparationLayoutWaitMs;
+    private int unchangedReadbacks;
+    private bool preparationPending;
+    private NavigationTarget? preparedNavigation;
+    private string preparedController = "";
     private string lastPhase = "";
     private CancellationTokenSource? topologyLifetime;
     private NavigationTarget? pendingNavigation;
@@ -60,24 +90,44 @@ public sealed class ProxiesPage : NativePage
     private double down;
     private bool applyingPreferences;
     private bool shownProviders;
+    private string renderedLanguage = "";
 
     public ProxiesPage(AppSession session) : base(session, "proxies", "代理", "策略组、代理节点与实时流量路径")
     {
-        search.Width = 200; search.Margin = new Thickness(0, 0, 8, 8); Tools.Children.Add(search);
-        testAll = Action("全部测速", "MeasureAllProxies", MeasureAll, true); L.Bind(testAll, ToolTipProperty, "全部测速 (Ctrl+T)"); Tools.Children.Add(testAll);
-        Tools.Children.Add(Action("刷新", "RefreshProxies", RefreshAsync));
-        summary.Margin = new Thickness(0, 0, 0, 16); summary.Id("ProxySummary"); content.Children.Add(summary); progress.Id("ProxyTestProgress"); content.Children.Add(progress);
-        var topologyHeader = new DockPanel();
-        toggleTopology = Action("隐藏", "ToggleProxyTopology", () => { preferences.TopologyOpen = !preferences.TopologyOpen; preferences.Save(); ApplyTopologyVisibility(); return Task.CompletedTask; });
-        toggleTopology.Margin = new Thickness(0); DockPanel.SetDock(toggleTopology, Dock.Right); topologyHeader.Children.Add(toggleTopology);
-        topologyHeader.Children.Add(Ui.Row(Ui.Label("流量拓扑", 16, true), Ui.Hint("来源 → 策略组 → 出口")));
-        var legend = Ui.Row(flow, Ui.Hint("代理"), Ui.Hint("直连"), Ui.Hint("点击策略组或出口可定位")); legend.Margin = new Thickness(0, 12, 0, 6);
-        topologyBody.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); topologyBody.RowDefinitions.Add(new RowDefinition()); topologyBody.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        topologyBody.Children.Add(legend); Grid.SetRow(topology, 1); topologyBody.Children.Add(topology); Grid.SetRow(idleMap, 2); idleMap.HorizontalAlignment = HorizontalAlignment.Center; idleMap.Margin = new Thickness(0, 4, 0, 0); topologyBody.Children.Add(idleMap);
-        content.Children.Add(Ui.Card(Ui.Column(topologyHeader, topologyBody), 16));
+        constructionFieldsMs = System.Diagnostics.Stopwatch.GetElapsedTime(constructionStarted).TotalMilliseconds;
+        var constructionStage = System.Diagnostics.Stopwatch.GetTimestamp();
+        search.Width = 200; search.Margin = new Thickness(0, 0, 8, 0); Tools.Children.Add(search);
+        testAll = Action("测速", "MeasureAllProxies", MeasureAll, true);
+        testAll.Margin = new Thickness(0);
+        var testContent = new StackPanel { Orientation = Orientation.Horizontal }; testContent.Children.Add(testIcon); testContent.Children.Add(testLabel); testAll.Content = testContent; testLabel.Text = L.T("测速");
+        L.Bind(testAll, ToolTipProperty, "全部测速 (Ctrl+T)"); Tools.Children.Add(testAll);
+        var refreshMenu = new ContextMenu(); var refresh = L.Bind(new MenuItem().Id("RefreshProxies"), HeaderedItemsControl.HeaderProperty, "刷新"); refresh.Click += async (_, _) => await RunAsync(RefreshAsync); refreshMenu.Items.Add(refresh); ContextMenu = refreshMenu;
+        summary.Id("ProxySummary"); SetHeaderMeta(summary); progress.Id("ProxyTestProgress"); content.Children.Add(progress);
+        var topologyHeader = new DockPanel { MinHeight = 40, Margin = new Thickness(16, 8, 8, 8) };
+        toggleTopology = Action("收起拓扑", "ToggleProxyTopology", () => { preferences.TopologyOpen = !preferences.TopologyOpen; preferences.Save(); ApplyTopologyVisibility(); return Task.CompletedTask; });
+        toggleTopology.Style = FluentControls.Style("Ghost"); toggleTopology.Padding = new Thickness(11, 0, 11, 0); toggleTopology.Height = 32; toggleTopology.Margin = new Thickness(0); DockPanel.SetDock(toggleTopology, Dock.Right);
+        var toggleCopy = new StackPanel { Orientation = Orientation.Horizontal }; toggleCopy.Children.Add(topologyToggleLabel); topologyCaret.Margin = new Thickness(8, 0, 0, 0); toggleCopy.Children.Add(topologyCaret); toggleTopology.Content = toggleCopy; topologyHeader.Children.Add(toggleTopology);
+        topologyRoute.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); topologyRoute.Margin = new Thickness(12, 0, 0, 0);
+        var topologyTitle = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center }; topologyTitle.Children.Add(Ui.Label("实时流量拓扑", 14, true)); topologyTitle.Children.Add(topologyRoute); topologyHeader.Children.Add(topologyTitle);
+        var bar = new Grid { Margin = new Thickness(16, 12, 16, 0) }; bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); bar.ColumnDefinitions.Add(new ColumnDefinition());
+        var live = new StackPanel { Orientation = Orientation.Horizontal }; live.Children.Add(liveDot);
+        foreach (var reading in new[] { flowDown, flowUp, flowCount }) { reading.LineHeight = 12 * 1.43; reading.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; live.Children.Add(reading); }
+        flowDown.Margin = new Thickness(0, 0, 14, 0); flowUp.Margin = new Thickness(0, 0, 14, 0); bar.Children.Add(live);
+        var legend = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(20, 0, 0, 0) }; legend.Children.Add(Legend("代理流量", "AccentBrush")); legend.Children.Add(Legend("直连", "FaintBrush")); Grid.SetColumn(legend, 1); bar.Children.Add(legend);
+        topologyHint.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); topologyHint.HorizontalAlignment = HorizontalAlignment.Right; topologyHint.Margin = new Thickness(20, 0, 0, 0); Grid.SetColumn(topologyHint, 2); bar.Children.Add(topologyHint);
+        topologyBody.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); topologyBody.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); topologyBody.Children.Add(bar);
+        var stage = new Grid { Margin = new Thickness(16, 8, 16, 16) }; stage.Children.Add(topology); idleMap.VerticalAlignment = VerticalAlignment.Bottom; idleMap.HorizontalAlignment = HorizontalAlignment.Center; idleMap.Margin = new Thickness(0, 0, 0, 6); idleMap.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); idleMap.IsHitTestVisible = false; stage.Children.Add(idleMap); Grid.SetRow(stage, 1); topologyBody.Children.Add(stage);
+        topologyReveal.Child = topologyBody; topologyReveal.BorderThickness = new Thickness(0, 1, 0, 0); topologyReveal.SetResourceReference(Border.BorderBrushProperty, "DividerBrush");
+        var topologyCard = Ui.Card(Ui.Column(topologyHeader, topologyReveal), 0); topologyCard.CornerRadius = new CornerRadius(4); topologyCard.Margin = new Thickness(0); content.Children.Add(topologyCard);
+        topologyCard.SizeChanged += (_, _) =>
+        {
+            var compact = PageContainerWidth <= 640; topology.SetCompact(compact); search.Width = compact ? Math.Max(1, Body.ActualWidth) : 200; topologyHeader.Margin = new Thickness(compact ? 12 : 16, 8, 8, 8);
+            topologyRoute.Visibility = topologyHint.Visibility = compact ? Visibility.Collapsed : Visibility.Visible;
+            bar.Margin = compact ? new Thickness(12, 10, 12, 0) : new Thickness(16, 12, 16, 0); stage.Margin = compact ? new Thickness(10, 8, 10, 12) : new Thickness(16, 8, 16, 16);
+        };
         content.Children.Add(groupList); content.Children.Add(providerList); content.Children.Add(nodeSection);
-        scroll = Ui.Scroll(content).Id("ProxiesScrollViewer"); scroll.ScrollChanged += (_, _) => UpdateMapAnimation(); SetBody(scroll);
-        L.Bind(breakConnections, ContentControl.ContentProperty, "切换节点时断开关联连接"); breakConnections.Id("BreakConnectionsOnSwitch");
+        scroll = Ui.Scroll(content).Id("ProxiesScrollViewer"); scroll.ScrollChanged += (_, _) => UpdateMapAnimation(); scroll.Content = null; SetScrollableBody(content, scroll); SetHeaderBottomMargin(4);
+        breakConnections.Id("BreakConnectionsOnSwitch"); L.Bind(breakConnections, AutomationProperties.NameProperty, "切换时打断包含策略组的连接");
         breakConnections.Checked += (_, _) => { if (!applyingPreferences) Session.SetCloseConnectionsOnSwitch(true); };
         breakConnections.Unchecked += (_, _) => { if (!applyingPreferences) Session.SetCloseConnectionsOnSwitch(false); };
         search.TextChanged += (_, _) => { filterTimer.Stop(); filterTimer.Start(); };
@@ -87,8 +137,22 @@ public sealed class ProxiesPage : NativePage
         PreviewKeyDown += (_, e) => { if (e.Key == Key.T && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; _ = RunAsync(MeasureAll); } };
         topology.Picked += (action, name) => _ = RunAsync(() => NavigateToAsync(new NavigationTarget("proxies", name, Action: action)));
         Session.ThemeChanged += topology.RefreshPalette;
-        Session.HostEvent += (name, data) => { if (name == "desktop-config-changed" && IsActive) _ = RunAsync(RefreshAsync); };
+        Session.HostEvent += (name, data) =>
+        {
+            if (name != "desktop-config-changed") return;
+            InvalidateRefresh();
+            if (IsActive) _ = RunAsync(RefreshAsync);
+        };
+        groupList.SizeChanged += (_, _) => breakLabel.Visibility = PageContainerWidth <= 640 ? Visibility.Collapsed : Visibility.Visible;
+        constructionControlsMs = System.Diagnostics.Stopwatch.GetElapsedTime(constructionStage).TotalMilliseconds;
+        constructionStage = System.Diagnostics.Stopwatch.GetTimestamp();
         ApplyTopologyVisibility();
+        constructionTopologyMs = System.Diagnostics.Stopwatch.GetElapsedTime(constructionStage).TotalMilliseconds;
+        constructionStage = System.Diagnostics.Stopwatch.GetTimestamp();
+        TryPresentRuntimeSnapshot();
+        constructionSnapshotMs = System.Diagnostics.Stopwatch.GetElapsedTime(constructionStage).TotalMilliseconds;
+        constructionRenderTiming = lastRenderTiming;
+        constructionTotalMs = System.Diagnostics.Stopwatch.GetElapsedTime(constructionStarted).TotalMilliseconds;
     }
 
     public override Task RefreshAsync()
@@ -97,14 +161,55 @@ public sealed class ProxiesPage : NativePage
         refreshToken = PageToken; refreshController = ControllerIdentity;
         return refreshing = RefreshCore(++refreshGeneration, refreshToken, refreshController);
     }
+    private void InvalidateRefresh() { refreshGeneration++; refreshing = null; }
     private async Task RefreshCore(long generation, CancellationToken token, string controller)
     {
         if (!IsRunning) { ClearInactive(); return; }
-        if (lastController != controller) { lastController = controller; measured.Clear(); tiles.Clear(); topologyModel.Clear(); up = down = 0; }
+        ResetControllerData(controller);
         var proxyTask = Get("proxies", token); var providerTask = Get("providers/proxies", token); var configTask = Get("configs", token);
         await Task.WhenAll(proxyTask, providerTask, configTask);
         if (!IsRunning || controller != ControllerIdentity || generation != refreshGeneration || token.IsCancellationRequested) return;
-        var all = (await proxyTask).Get("proxies"); providerData = (await providerTask).Get("providers"); mode = (await configTask).Text("mode").ToLowerInvariant();
+        PresentRuntimeData(await proxyTask, await providerTask, await configTask);
+        await ApplyPendingNavigation(); StartTopology();
+    }
+    private void ResetControllerData(string controller)
+    {
+        if (lastController == controller) return;
+        lastController = controller; measured.Clear(); tiles.Clear(); topologyModel.Clear(); up = down = 0;
+        presentedProxies = presentedProviders = presentedConfigs = default;
+    }
+    private bool TryPresentRuntimeSnapshot()
+    {
+        if (!IsRunning || !Session.TryGetProxyRuntimeSnapshot(out var proxies, out var providers, out var configs)) return false;
+        ResetControllerData(ControllerIdentity);
+        if (!proxies.Equals(presentedProxies) || !providers.Equals(presentedProviders) || !configs.Equals(presentedConfigs) ||
+            shownProviders != Session.ShowProxyProvider || breakConnections.IsChecked != Session.CloseConnectionsOnSwitch ||
+            renderedLanguage != L.ResolvedLanguage)
+            PresentRuntimeData(proxies, providers, configs);
+        return true;
+    }
+    // Called only by the shell's one-time, inactive Home -> Proxies preparation.
+    // It consumes existing read-only snapshots and never creates a page lifetime.
+    internal bool TryPrepareIdleSnapshot() => !IsActive && TryPresentRuntimeSnapshot();
+    private void PresentRuntimeData(JsonElement proxies, JsonElement providers, JsonElement configs)
+    {
+        // Activation still requests authoritative data. A new JSON document
+        // with identical content need not rebuild the just-realized controls
+        // while their connected entrance is running. Preference/language
+        // changes on a cached, inactive page still require a fresh rendering.
+        if (presentedProxies.ValueKind != JsonValueKind.Undefined &&
+            shownProviders == Session.ShowProxyProvider &&
+            breakConnections.IsChecked == Session.CloseConnectionsOnSwitch &&
+            renderedLanguage == L.ResolvedLanguage &&
+            JsonElement.DeepEquals(proxies, presentedProxies) &&
+            JsonElement.DeepEquals(providers, presentedProviders) &&
+            JsonElement.DeepEquals(configs, presentedConfigs))
+        {
+            presentedProxies = proxies; presentedProviders = providers; presentedConfigs = configs;
+            unchangedReadbacks++;
+            Message(""); return;
+        }
+        var all = proxies.Get("proxies"); providerData = providers.Get("providers"); mode = configs.Text("mode").ToLowerInvariant();
         nodes.Clear();
         foreach (var item in all.Fields()) nodes[item.Name] = ProxyNodeInfo.From(item.Name, item.Value);
         foreach (var provider in VisibleProviderData()) foreach (var item in provider.Value.Get("proxies").Items())
@@ -115,7 +220,8 @@ public sealed class ProxiesPage : NativePage
         order = all.Get("GLOBAL").Get("all").Items().Select(item => item.Text()).ToArray();
         if (order.Length == 0) order = nodes.Keys.ToArray();
         foreach (var key in tiles.Keys.Where(key => !nodes.ContainsKey(key.Name)).ToArray()) tiles.Remove(key);
-        Message(""); Render(); await ApplyPendingNavigation(); StartTopology();
+        Message(""); Render();
+        presentedProxies = proxies; presentedProviders = providers; presentedConfigs = configs;
     }
     private IEnumerable<JsonProperty> VisibleProviderData() => providerData.Fields().Where(item => item.Name != "default" && item.Value.Text("vehicleType") != "Compatible");
     private IEnumerable<ProxyNodeInfo> Groups(bool withGlobal = true)
@@ -129,60 +235,56 @@ public sealed class ProxiesPage : NativePage
     {
         applyingPreferences = true; breakConnections.IsChecked = Session.CloseConnectionsOnSwitch; applyingPreferences = false;
         shownProviders = Session.ShowProxyProvider;
-        RenderGroups(); RenderProviders(); RenderNodes(); RefreshMap(); UpdateSummary(); ApplyTestControls();
+        renderedLanguage = L.ResolvedLanguage;
+        var stage = System.Diagnostics.Stopwatch.GetTimestamp();
+        RenderGroups(); var groupsMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+        stage = System.Diagnostics.Stopwatch.GetTimestamp();
+        RenderProviders(); var providersMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+        stage = System.Diagnostics.Stopwatch.GetTimestamp();
+        RenderNodes(); var nodesMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+        stage = System.Diagnostics.Stopwatch.GetTimestamp();
+        RefreshMap(); var topologyMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+        stage = System.Diagnostics.Stopwatch.GetTimestamp();
+        UpdateSummary(); ApplyTestControls();
+        lastRenderTiming = new { groupsMs, providersMs, nodesMs, topologyMs, summaryMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds };
     }
     private void UpdateSummary()
     {
         var all = StandaloneNodes().Concat(VisibleProviderData().SelectMany(provider => provider.Value.Get("proxies").Items()).Select(item => nodes.GetValueOrDefault(item.Text("name"))).OfType<ProxyNodeInfo>()).ToArray();
-        summary.Text = L.F("{0} 个策略组    {1} 个节点    {2} 个可用", Groups(false).Count(), all.Length, all.Count(item => !item.Failed && item.Delay > 0));
+        summary.Children.Clear();
+        foreach (var (number, label) in new[] { (Groups(false).Count(), "个策略组"), (all.Length, "个节点"), (all.Count(item => !item.Failed && item.Delay > 0), "个可用") })
+        {
+            var item = Ui.Muted("", 13); item.Margin = new Thickness(0, 0, 14, 0); var reading = new Run(number.ToString()); reading.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); item.Inlines.Add(reading); item.Inlines.Add(" " + L.T(label)); summary.Children.Add(item);
+        }
+    }
+    private static FrameworkElement Legend(string label, string resource)
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 16, 0) };
+        var swatch = new Border { Width = 16, Height = 3, CornerRadius = new CornerRadius(2), Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center }; swatch.SetResourceReference(Border.BackgroundProperty, resource); row.Children.Add(swatch); row.Children.Add(Ui.Hint(label)); return row;
     }
     private void RenderGroups()
     {
-        groupList.Children.Clear(); groupCards.Clear(); expanders.Clear(); var groups = Groups().ToArray();
-        if (groups.Length == 0) { if (IsRunning && nodes.Count == 0) groupList.Children.Add(Ui.Hint("当前配置没有代理节点，可在配置页导入订阅。")); return; }
-        var sectionHeader = new DockPanel { Margin = new Thickness(0, 8, 0, 12) };
-        Detach(breakConnections); DockPanel.SetDock(breakConnections, Dock.Right); sectionHeader.Children.Add(breakConnections); sectionHeader.Children.Add(Ui.Text(L.F("策略组  {0}", groups.Length), 18, true)); groupList.Children.Add(sectionHeader);
+        var groups = Groups().ToArray();
+        var names = groups.Select(group => group.Name).ToHashSet(StringComparer.Ordinal);
+        foreach (var stale in groupCards.Keys.Where(name => !names.Contains(name)).ToArray()) { groupList.Children.Remove(groupCards[stale]); groupCards.Remove(stale); expanders.Remove(stale); }
+        if (groups.Length == 0) { groupList.Children.Clear(); if (IsRunning && nodes.Count == 0) groupList.Children.Add(Ui.Hint("当前配置没有代理节点，可在配置页导入订阅。")); return; }
+        if (groupList.Children.Count == 0 || groupList.Children[0] is not DockPanel) { groupList.Children.Clear(); groupList.Children.Add(new DockPanel()); }
+        var sectionHeader = (DockPanel)groupList.Children[0]; sectionHeader.Children.Clear(); sectionHeader.Margin = new Thickness(0, 28, 0, 8);
+        Detach(breakConnections); Detach(breakLabel); var setting = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center }; breakLabel.Margin = new Thickness(0, 0, 12, 0); setting.Children.Add(breakLabel); setting.Children.Add(breakConnections); DockPanel.SetDock(setting, Dock.Right); sectionHeader.Children.Add(setting);
+        sectionHeader.Children.Add(SectionHeading("策略组", groups.Length));
         var open = preferences.OpenGroups ?? groups.Take(1).Select(item => item.Name).ToHashSet(StringComparer.Ordinal); var query = search.Text.Trim();
-        foreach (var group in groups)
+        for (var index = 0; index < groups.Length; index++)
         {
-            var exitName = ProxyNodeInfo.ResolveExit(group.Now, nodes); var exit = exitName is null ? null : nodes.GetValueOrDefault(exitName);
-            var via = exitName == "DIRECT" ? L.T("直接连接") : exitName is "REJECT" or "REJECT-DROP" ? L.T("拒绝连接") : exitName is not null && exitName != group.Now ? "→ " + exitName : exit is null ? "" : exit.Type + (exit.Udp ? " · UDP" : "");
-            var identity = Ui.Column(Ui.Text(group.Name, 14, true), Ui.Muted(group.Now + (via.Length > 0 ? "  " + via : "")));
-            foreach (TextBlock text in identity.Children) { text.TextWrapping = TextWrapping.NoWrap; text.TextTrimming = TextTrimming.CharacterEllipsis; text.ToolTip = text.Text; }
-            ConnectedNavigation.SetTarget(identity, group.Name);
-            var header = new Grid { MinHeight = 54, Margin = new Thickness(8, 0, 0, 0) };
-            header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(40) }); header.ColumnDefinitions.Add(new ColumnDefinition()); header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var icon = new FluentIcon { Kind = group.Type switch { "URLTest" => "top-speed", "Fallback" => "arrow-swap", "LoadBalance" => "data-area", _ => "nav-proxies" }, Width = 20, Height = 20, VerticalAlignment = VerticalAlignment.Center };
-            var colorIndex = Array.FindIndex(groups.Where(item => item.Name != "GLOBAL").ToArray(), item => item.Name == group.Name);
-            icon.SetResourceReference(Control.ForegroundProperty, group.Name == "GLOBAL" || colorIndex < 0 ? "TextSecondaryBrush" : "Line" + colorIndex % 9 + "Brush"); header.Children.Add(icon); Grid.SetColumn(identity, 1); header.Children.Add(identity);
-            var typeLabel = group.Type == "Selector" ? L.T("手动选择") : group.Type == "URLTest" ? L.T("自动选择") : group.Type;
-            var info = Ui.Column(Ui.Muted(typeLabel + " · " + L.F("{0} 个出口", group.Members.Count)), Ui.Muted(exit?.DelayLabel ?? "—"));
-            var test = Action("测速", "MeasureGroup_" + group.Name, () => Measure(group.Members)); test.Margin = new Thickness(8, 0, 0, 0); test.IsEnabled = IsRunning && group.Members.Any(name => nodes.GetValueOrDefault(name) is { CanTest: true, IsGroup: false });
-            var right = Ui.Row(info, test); right.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(right, 2); header.Children.Add(right);
-            var members = new ProxyTilePanel();
-            foreach (var memberName in group.Members)
+            var group = groups[index];
+            if (!groupCards.TryGetValue(group.Name, out var stored))
             {
-                var member = nodes.GetValueOrDefault(memberName); var matches = query.Length == 0 || group.Name.Contains(query, StringComparison.CurrentCultureIgnoreCase) || memberName == group.Now || (memberName + " " + member?.Type).Contains(query, StringComparison.CurrentCultureIgnoreCase);
-                if (!matches) continue;
-                var copy = Ui.Column(Ui.Text(memberName, 13, true), Ui.Muted((member?.Type ?? "") + "  ·  " + (member?.DelayLabel ?? "—"), 11));
-                foreach (TextBlock text in copy.Children) { text.TextWrapping = TextWrapping.NoWrap; text.TextTrimming = TextTrimming.CharacterEllipsis; }
-                if (member?.Failed == true) ((TextBlock)copy.Children[1]).SetResourceReference(TextBlock.ForegroundProperty, "DangerBrush");
-                var button = Action(memberName, "Proxy_" + group.Name + "_" + memberName, () => Select(group.Name, memberName));
-                AutomationProperties.SetName(button, memberName);
-                button.Content = copy; button.ToolTip = memberName + "\n" + (group.Type == "Selector" ? L.T("选用此节点") : L.T("此策略组由内核自动选择"));
-                button.MinHeight = 62; button.Margin = new Thickness(3); button.Padding = new Thickness(12, 8, 12, 8); button.HorizontalContentAlignment = HorizontalAlignment.Left;
-                button.IsEnabled = group.Type == "Selector" && !selecting.Contains(group.Name) && IsRunning;
-                if (memberName == group.Now) { button.BorderThickness = new Thickness(2); button.SetResourceReference(Control.BorderBrushProperty, "AccentBrush"); }
-                members.Children.Add(button);
+                var name = group.Name; var card = new ProxyGroupCard(name, member => _ = RunAsync(() => Select(name, member)), () => _ = RunAsync(() => Measure(nodes.GetValueOrDefault(name)?.Members ?? [])));
+                card.Expander.IsExpanded = open.Contains(name); card.OpenChanged += expanded => SaveOpen(name, expanded, Groups().ToArray());
+                groupCards[name] = stored = card; expanders[name] = card.Expander;
             }
-            var inner = new StackPanel();
-            var note = group.Type switch { "URLTest" => "自动选择延迟较低的出口。", "Fallback" => "当前出口不可用时，自动切换到后续可用节点。", "LoadBalance" => "连接由内核在多个节点之间分配。", _ => "" };
-            if (note.Length > 0) { var text = Ui.Hint(note); text.Margin = new Thickness(0, 0, 0, 8); inner.Children.Add(text); }
-            if (members.Children.Count == 0) inner.Children.Add(Ui.Hint("没有匹配的节点。")); else inner.Children.Add(members);
-            var well = new Border { Child = inner, Padding = new Thickness(12), BorderThickness = new Thickness(0, 1, 0, 0) }; well.SetResourceReference(Border.BackgroundProperty, "SubtleSurfaceBrush"); well.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
-            var expander = new Expander { Header = header, Content = well, IsExpanded = open.Contains(group.Name), HorizontalContentAlignment = HorizontalAlignment.Stretch }.Id("ProxyGroup_" + group.Name);
-            var name = group.Name; expander.Expanded += (_, _) => SaveOpen(name, true, groups); expander.Collapsed += (_, _) => SaveOpen(name, false, groups);
-            var card = Ui.Card(expander, 0); card.Margin = new Thickness(0, 0, 0, 4); groupList.Children.Add(card); groupCards[name] = card; expanders[name] = expander;
+            var view = (ProxyGroupCard)stored; if (view.Expander.IsExpanded != open.Contains(group.Name)) view.Expander.IsExpanded = open.Contains(group.Name);
+            view.Update(group, nodes, query, IsRunning, pendingSelections.GetValueOrDefault(group.Name));
+            var old = groupList.Children.IndexOf(view); if (old != index + 1) { if (old >= 0) groupList.Children.RemoveAt(old); groupList.Children.Insert(index + 1, view); }
         }
     }
     private void SaveOpen(string name, bool open, ProxyNodeInfo[] groups)
@@ -196,29 +298,84 @@ public sealed class ProxiesPage : NativePage
         providerList.Children.Clear(); providerList.Visibility = Session.ShowProxyProvider ? Visibility.Visible : Visibility.Collapsed;
         if (!Session.ShowProxyProvider) return;
         var providers = VisibleProviderData().ToArray(); if (providers.Length == 0) return;
-        var heading = Ui.Text(L.F("代理集合  {0}", providers.Length), 18, true); heading.Margin = new Thickness(0, 28, 0, 12); providerList.Children.Add(heading);
+        var heading = SectionHeading("代理集", providers.Length); heading.Margin = new Thickness(0, 28, 0, 8); providerList.Children.Add(heading);
         foreach (var provider in providers)
         {
             var name = provider.Name; var items = provider.Value.Get("proxies").Items().Select(item => nodes.GetValueOrDefault(item.Text("name"))).OfType<ProxyNodeInfo>().OrderBy(DelayOrder).ToArray();
-            var header = new DockPanel { Margin = new Thickness(0, 0, 0, 8) };
-            var actions = Ui.Row(Action("健康检查", "CheckProvider_" + name, async () => { await Get("providers/proxies/" + Uri.EscapeDataString(name) + "/healthcheck"); measured.Clear(); await RefreshAsync(); }), Action("更新", "UpdateProvider_" + name, async () => { await Session.ApiAsync(HttpMethod.Put, "providers/proxies/" + Uri.EscapeDataString(name), cancellationToken: PageToken); measured.Clear(); await RefreshAsync(); }));
+            var header = new DockPanel { Margin = new Thickness(0, 0, 0, 12) };
+            var actions = new WrapPanel { VerticalAlignment = VerticalAlignment.Center };
+            var updated = provider.Value.Text("updatedAt"); if (DateTimeOffset.TryParse(updated, out var time)) { var updatedText = Ui.Muted(L.F("最后更新于 {0}", UpdatedAgo(time)), 12); updatedText.Margin = new Thickness(0, 0, 8, 0); updatedText.VerticalAlignment = VerticalAlignment.Center; actions.Children.Add(updatedText); }
+            Button ProviderAction(string title, string id, string icon, bool check)
+            {
+                var button = Action(title, id, () => ChangeProvider(name, check)); button.Style = FluentControls.Style("Ghost"); button.Height = 28; button.FontSize = 13; button.Margin = new Thickness(0, 0, 4, 0); button.Padding = new Thickness(10, 0, 10, 0); button.IsEnabled = !providersBusy.ContainsKey(name);
+                var busy = providersBusy.TryGetValue(name, out var checking) && checking == check;
+                var glyph = new FluentIcon(icon, 14) { Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center }; ProxyVisuals.SetBusyIcon(glyph, busy);
+                var copy = new StackPanel { Orientation = Orientation.Horizontal }; copy.Children.Add(glyph); copy.Children.Add(Ui.Label(title, 13)); if (busy) copy.SetResourceReference(TextElement.ForegroundProperty, "TextSecondaryBrush"); button.Content = copy;
+                actions.Children.Add(button); return button;
+            }
+            ProviderAction("健康检查", "CheckProvider_" + name, "healthcheck", true); ProviderAction("更新", "UpdateProvider_" + name, "update", false);
             DockPanel.SetDock(actions, Dock.Right); header.Children.Add(actions);
-            var updated = provider.Value.Text("updatedAt");
-            header.Children.Add(Ui.Column(Ui.Text(name, 14, true), Ui.Muted(provider.Value.Text("vehicleType") + " · " + L.F("{0} 个节点", items.Length) + (updated.Length > 0 ? " · " + L.F("更新于 {0}", DateTimeOffset.TryParse(updated, out var time) ? time.ToLocalTime().ToString("g") : updated) : ""))));
-            var panel = new ProxyTilePanel(); foreach (var item in items) panel.Children.Add(Tile("provider:" + name, item));
-            var card = Ui.Card(Ui.Column(header, panel), 16); card.Margin = new Thickness(0, 0, 0, 4); providerList.Children.Add(card);
+            var identity = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var title = Ui.Text(name, 14, true); title.TextWrapping = TextWrapping.NoWrap; title.TextTrimming = TextTrimming.CharacterEllipsis; title.Margin = new Thickness(0, 0, 10, 0); identity.Children.Add(title);
+            var badge = new Border { Child = Ui.Muted(provider.Value.Text("vehicleType"), 12), Height = 20, Padding = new Thickness(6, 0, 6, 0), CornerRadius = new CornerRadius(4), Margin = new Thickness(0, 0, 10, 0), VerticalAlignment = VerticalAlignment.Center }; badge.SetResourceReference(Border.BackgroundProperty, "SubtleHoverBrush"); identity.Children.Add(badge); identity.Children.Add(Ui.Muted(items.Length.ToString(), 12)); header.Children.Add(identity);
+            if (!providerPanels.TryGetValue(name, out var panel)) providerPanels[name] = panel = new ProxyTilePanel();
+            Detach(panel); SetTiles(panel, "provider:" + name, items);
+            var body = new Grid(); body.Children.Add(new Border { Child = Ui.Column(header, panel), Padding = new Thickness(16) });
+            if (providersBusy.ContainsKey(name)) body.Children.Add(new ProxyProviderLoading().Id("ProviderProgress_" + name));
+            var card = Ui.Card(body, 0); card.CornerRadius = new CornerRadius(4); card.Margin = new Thickness(0, 0, 0, 4); providerList.Children.Add(card);
         }
+    }
+    private static StackPanel SectionHeading(string title, int count)
+    {
+        var label = Ui.Label(title, 14, true); label.LineHeight = 20; label.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; label.Margin = new Thickness(0, 0, 12, 0);
+        var heading = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center }; heading.Children.Add(label); heading.Children.Add(Ui.Muted(count.ToString(), 12)); return heading;
+    }
+    private static string UpdatedAgo(DateTimeOffset time)
+    {
+        var span = DateTimeOffset.UtcNow - time; var seconds = Math.Max(0, span.TotalSeconds);
+        if (seconds < 45) return L.T("几秒前");
+        if (seconds < 90) return L.T("1 分钟前");
+        if (seconds < 45 * 60) return L.F("{0} 分钟前", Math.Round(span.TotalMinutes));
+        if (seconds < 90 * 60) return L.T("1 小时前");
+        if (seconds < 22 * 3600) return L.F("{0} 小时前", Math.Round(span.TotalHours));
+        if (seconds < 36 * 3600) return L.T("1 天前");
+        if (seconds < 26 * 86400) return L.F("{0} 天前", Math.Round(span.TotalDays));
+        if (seconds < 45 * 86400) return L.T("1 个月前");
+        if (seconds < 320 * 86400) return L.F("{0} 个月前", Math.Round(span.TotalDays / 30));
+        return L.F("{0} 年前", Math.Max(1, Math.Round(span.TotalDays / 365)));
+    }
+    private async Task ChangeProvider(string name, bool check)
+    {
+        if (!providersBusy.TryAdd(name, check)) return; InvalidateRefresh(); RenderProviders();
+        try
+        {
+            if (check) await Get("providers/proxies/" + Uri.EscapeDataString(name) + "/healthcheck");
+            else await Session.ApiAsync(HttpMethod.Put, "providers/proxies/" + Uri.EscapeDataString(name), cancellationToken: PageToken);
+            InvalidateRefresh(); measured.Clear(); await RefreshAsync();
+        }
+        finally { providersBusy.Remove(name); RenderProviders(); }
     }
     private void RenderNodes()
     {
         nodeSection.Children.Clear(); var all = StandaloneNodes().ToArray(); if (all.Length == 0) return;
         var query = search.Text.Trim(); IEnumerable<ProxyNodeInfo> shown = all.Where(item => query.Length == 0 || (item.Name + " " + item.Type).Contains(query, StringComparison.CurrentCultureIgnoreCase));
         shown = sort switch { 0 => shown.OrderBy(DelayOrder), 1 => shown.OrderByDescending(DelayOrder), _ => shown };
-        var list = shown.ToArray(); var header = new DockPanel { Margin = new Thickness(0, 28, 0, 12) };
-        var sortButton = Action(sort == 0 ? "延迟从低到高" : sort == 1 ? "延迟从高到低" : "原始顺序", "SortProxyNodes", () => { sort = (sort + 1) % 3; RenderNodes(); return Task.CompletedTask; });
-        DockPanel.SetDock(sortButton, Dock.Right); header.Children.Add(sortButton); header.Children.Add(Ui.Row(Ui.Text(L.F("代理节点  {0}", list.Length), 18, true), Ui.Hint("点击节点可单独测速"))); nodeSection.Children.Add(header);
-        if (list.Length == 0) { nodeSection.Children.Add(Ui.Hint("没有匹配的节点。")); return; }
-        var panel = new ProxyTilePanel(); foreach (var node in list) panel.Children.Add(Tile("nodes", node)); nodeSection.Children.Add(panel);
+        var list = shown.ToArray(); var header = new DockPanel { Margin = new Thickness(0, 28, 0, 8) };
+        var sortButton = Action(sort == 0 ? "延迟从低到高" : sort == 1 ? "延迟从高到低" : "原始顺序", "SortProxyNodes", () => { sort = (sort + 1) % 3; RenderNodes(); return Task.CompletedTask; }); sortButton.Style = FluentControls.Style("Ghost"); sortButton.Margin = new Thickness(0); sortButton.Content = FluentControls.ButtonContent(sort == 2 ? "sort" : sort == 0 ? "sort-ascending" : "sort-descending", sort == 0 ? "延迟从低到高" : sort == 1 ? "延迟从高到低" : "原始顺序");
+        DockPanel.SetDock(sortButton, Dock.Right); header.Children.Add(sortButton);
+        var heading = Ui.Row(Ui.Label("节点", 14, true), Ui.Muted(list.Length.ToString(), 12)); var hint = Ui.Hint("点按节点单独测速"); hint.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); hint.Margin = new Thickness(10, 0, 0, 0); heading.Children.Add(hint); header.Children.Add(heading); header.SizeChanged += (_, _) => hint.Visibility = PageContainerWidth <= 640 ? Visibility.Collapsed : Visibility.Visible; nodeSection.Children.Add(header);
+        if (list.Length == 0) { var empty = Ui.Hint("没有符合筛选条件的节点。"); empty.Margin = new Thickness(16); nodeSection.Children.Add(empty); return; }
+        Detach(nodesPanel); SetTiles(nodesPanel, "nodes", list); nodeSection.Children.Add(nodesPanel);
+    }
+    private void SetTiles(ProxyTilePanel panel, string section, IReadOnlyList<ProxyNodeInfo> list)
+    {
+        var selected = list.Select(node => Tile(section, node)).ToArray();
+        foreach (var item in panel.Children.OfType<ProxyNodeTile>().Where(item => !selected.Contains(item)).ToArray()) panel.Children.Remove(item);
+        for (var index = 0; index < selected.Length; index++)
+        {
+            var item = selected[index]; var previous = panel.Children.IndexOf(item);
+            if (previous == index) continue; if (previous >= 0) panel.Children.RemoveAt(previous); else Detach(item); panel.Children.Insert(index, item);
+        }
     }
     private static double DelayOrder(ProxyNodeInfo node) => node.Failed || node.Delay <= 0 ? double.MaxValue : node.Delay;
     private ProxyNodeTile Tile(string section, ProxyNodeInfo node)
@@ -228,19 +385,21 @@ public sealed class ProxiesPage : NativePage
             tile = new ProxyNodeTile().Id(section == "nodes" ? "ProxyNode_" + node.Name : section.StartsWith("provider:", StringComparison.Ordinal) ? "ProviderNode_" + section[9..] + "_" + node.Name : "FocusedProxyNode_" + node.Name);
             var name = node.Name; tile.Click += async (_, _) => await RunAsync(() => Measure([name])); tiles[(section, node.Name)] = tile;
         }
-        Detach(tile); tile.Update(node, testing.Contains(node.Name)); return tile;
+        tile.SetProvider(section.StartsWith("provider:", StringComparison.Ordinal)); tile.Update(node, testing.Contains(node.Name)); return tile;
     }
     private static void Detach(UIElement item) { if (VisualTreeHelper.GetParent(item) is Panel panel) panel.Children.Remove(item); }
 
     private async Task Select(string group, string name)
     {
         if (!IsRunning || !nodes.TryGetValue(group, out var current) || current.Type != "Selector" || current.Now == name || !selecting.Add(group)) return;
-        RenderGroups();
+        InvalidateRefresh();
+        pendingSelections[group] = name; RenderGroups();
         var token = PageToken; var controller = ControllerIdentity;
         try
         {
             await Session.ApiAsync(HttpMethod.Put, "proxies/" + Uri.EscapeDataString(group), new { name }, token);
             if (controller != ControllerIdentity || token.IsCancellationRequested) return;
+            InvalidateRefresh();
             nodes[group] = current with { Now = name }; RenderGroups(); RefreshMap();
             if (Session.CloseConnectionsOnSwitch)
             {
@@ -250,7 +409,7 @@ public sealed class ProxiesPage : NativePage
             }
             await RefreshAsync();
         }
-        finally { selecting.Remove(group); RenderGroups(); }
+        finally { selecting.Remove(group); pendingSelections.Remove(group); RenderGroups(); }
     }
     private Task MeasureAll() => testing.Count > 0 ? Task.CompletedTask : Measure(nodes.Values.Where(item => !item.IsGroup && item.CanTest).Select(item => item.Name));
     private async Task Measure(IEnumerable<string> names)
@@ -291,17 +450,119 @@ public sealed class ProxiesPage : NativePage
     private void ApplyTestControls()
     {
         var busy = testing.Count > 0;
-        progress.Visibility = busy ? Visibility.Visible : Visibility.Collapsed; progress.Value = testTotal > 0 ? testDone * 100d / testTotal : 0;
-        if (busy) testAll.Content = L.F("正在测速 {0}/{1}", testDone, testTotal); else L.Bind(testAll, ContentControl.ContentProperty, "全部测速");
-        testAll.IsEnabled = IsRunning && !busy;
+        progress.Visibility = busy ? Visibility.Visible : Visibility.Collapsed; ProxyVisuals.Tween(progress, RangeBase.ValueProperty, progress.Value, testTotal > 0 ? testDone * 100d / testTotal : 0, 250);
+        testLabel.Text = busy ? L.F("正在测速 {0}/{1}", testDone, testTotal) : L.T("测速");
+        ProxyVisuals.SetBusyIcon(testIcon, busy);
+        // The reference keeps this accent action enabled while its speed icon
+        // works. MeasureAll still rejects a second concurrent batch.
+        testAll.IsEnabled = IsRunning;
     }
+
+    internal override async Task PrepareNavigationAsync(NavigationTarget target)
+    {
+        var generation = ++preparationGeneration;
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        preparationCacheHit = null; preparationElapsedMs = null; preparationPending = true;
+        preparationSnapshotMs = preparationGroupMs = preparationLayoutMs = preparationLayoutWaitMs = null;
+        double? snapshotMs = null, groupMs = null, layoutMs = null, layoutWaitMs = null;
+        preparedNavigation = null;
+        try
+        {
+            var stage = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool cacheHit = TryPresentRuntimeSnapshot();
+            preparationCacheHit = cacheHit;
+            snapshotMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+            if (!cacheHit) await RefreshAsync();
+            if (generation == preparationGeneration && target.Action == "focus-group" && target.Target is { Length: > 0 } name && IsActive && IsRunning && lastController == ControllerIdentity)
+            {
+                var controller = ControllerIdentity;
+                stage = System.Diagnostics.Stopwatch.GetTimestamp();
+                OpenNavigationGroup(name);
+                groupMs = System.Diagnostics.Stopwatch.GetElapsedTime(stage).TotalMilliseconds;
+                // Realize the target before Main starts its entrance clock.
+                // A cache hit is already attached to the live window: waiting
+                // at Loaded priority unnecessarily lets normal-priority network
+                // continuations rebuild it before this preparation can resume.
+                void RealizeTarget()
+                {
+                    if (generation != preparationGeneration || !IsActive || !IsRunning || controller != ControllerIdentity) return;
+                    var layoutStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                    scroll.UpdateLayout();
+                    layoutMs = System.Diagnostics.Stopwatch.GetElapsedTime(layoutStarted).TotalMilliseconds;
+                }
+                if (cacheHit) { layoutWaitMs = 0; RealizeTarget(); }
+                else
+                {
+                    var queued = System.Diagnostics.Stopwatch.GetTimestamp();
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        layoutWaitMs = System.Diagnostics.Stopwatch.GetElapsedTime(queued).TotalMilliseconds;
+                        RealizeTarget();
+                    }, DispatcherPriority.Loaded);
+                }
+                if (generation == preparationGeneration && IsActive && IsRunning && controller == ControllerIdentity && groupCards.ContainsKey(name))
+                {
+                    preparedNavigation = target;
+                    preparedController = controller;
+                }
+            }
+        }
+        finally
+        {
+            if (generation == preparationGeneration)
+            {
+                preparationElapsedMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                preparationSnapshotMs = snapshotMs; preparationGroupMs = groupMs;
+                preparationLayoutMs = layoutMs; preparationLayoutWaitMs = layoutWaitMs;
+                preparationPending = false;
+            }
+        }
+    }
+
+    internal object DescribeNavigationPreparation() => new
+    {
+        cacheHit = preparationCacheHit,
+        elapsedMs = preparationElapsedMs,
+        snapshotMs = preparationSnapshotMs,
+        openGroupMs = preparationGroupMs,
+        layoutMs = preparationLayoutMs,
+        layoutWaitMs = preparationLayoutWaitMs,
+        unchangedReadbacks,
+        pending = preparationPending,
+        construction = new { fieldsMs = constructionFieldsMs, controlsMs = constructionControlsMs, topologyMs = constructionTopologyMs, snapshotMs = constructionSnapshotMs, totalMs = constructionTotalMs, templateLoadMs = ProxyVisuals.TemplateLoadMilliseconds, render = constructionRenderTiming },
+        geometry = lastNavigationGeometry
+    };
 
     public override async Task NavigateToAsync(NavigationTarget target)
     {
+        if (preparedNavigation == target && preparedController == ControllerIdentity && IsActive && IsRunning && target.Target is { } preparedName && groupCards.TryGetValue(preparedName, out var preparedCard))
+        {
+            preparedNavigation = null; pendingNavigation = null;
+            await CenterAsync(preparedCard, false);
+            Flash(preparedCard);
+            return;
+        }
+        preparedNavigation = null;
         pendingNavigation = target;
         if (target.Query is not null) search.Text = target.Query;
         if (!IsRunning) { Message(InactiveMessage); return; }
-        await RefreshAsync();
+        bool snapshotReady = TryPresentRuntimeSnapshot();
+        var refresh = RefreshAsync();
+        bool targetReady = target.Action switch
+        {
+            "focus-group" => target.Target is { } group && groupCards.ContainsKey(group),
+            "focus-node" => target.Target is { } node && nodes.ContainsKey(node),
+            _ => true
+        };
+        if (snapshotReady && targetReady)
+        {
+            // Keep real network refreshes and their controller/page guards, but
+            // do not hold the connected transition behind a duplicate read.
+            _ = RunAsync(() => refresh);
+            await ApplyPendingNavigation();
+            return;
+        }
+        await refresh;
         if (pendingNavigation is not null) await ApplyPendingNavigation();
     }
     private async Task ApplyPendingNavigation()
@@ -309,39 +570,86 @@ public sealed class ProxiesPage : NativePage
         var target = pendingNavigation; pendingNavigation = null; if (target is null) return;
         if (target.Action == "test-all") { _ = RunAsync(MeasureAll); return; }
         if (target.Target is not { Length: > 0 } name) return;
-        search.Clear(); filterTimer.Stop();
         if (target.Action == "focus-group")
         {
-            preferences.OpenGroups ??= Groups().Take(1).Select(item => item.Name).ToHashSet(StringComparer.Ordinal); preferences.OpenGroups.Add(name); preferences.Save(); Render();
-            await Dispatcher.InvokeAsync(() => { if (groupCards.TryGetValue(name, out var card)) { card.BringIntoView(); expanders[name].Focus(); Flash(card); } }, DispatcherPriority.Loaded);
+            OpenNavigationGroup(name);
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Loaded);
+            if (IsActive && groupCards.TryGetValue(name, out var card))
+            {
+                // Search, Home and the topology all use the same short accent
+                // highlight. Programmatic navigation does not take keyboard focus.
+                Flash(card);
+                var connected = Window.GetWindow(this) is { } window && ConnectedNavigation.HasPending(window, name);
+                await CenterAsync(card, !connected);
+            }
         }
         else if (target.Action == "focus-node")
         {
+            search.Clear(); filterTimer.Stop();
             Render();
             await Dispatcher.InvokeAsync(() =>
             {
                 var match = tiles.FirstOrDefault(item => item.Key.Name == name && item.Value.IsVisible).Value;
                 if (match is null && nodes.TryGetValue(name, out var node))
                 {
-                    var temporary = new ProxyTilePanel(); match = Tile("focus", node); temporary.Children.Add(match); nodeSection.Children.Add(temporary);
+                    var temporary = new ProxyTilePanel(); match = Tile("focus", node); Detach(match); temporary.Children.Add(match); nodeSection.Children.Add(temporary);
                 }
                 match?.Reveal();
             }, DispatcherPriority.Loaded);
         }
     }
-    private static void Flash(Border card)
+    private void OpenNavigationGroup(string name)
     {
-        if (card.TryFindResource("AccentBrush") is not SolidColorBrush accent || card.TryFindResource("BorderBrush") is not SolidColorBrush border) return;
-        var brush = new SolidColorBrush(accent.Color); card.BorderBrush = brush;
-        if (!SystemParameters.ClientAreaAnimation) return;
-        var animation = new ColorAnimation(accent.Color, border.Color, TimeSpan.FromMilliseconds(1200));
-        animation.Completed += (_, _) => card.SetResourceReference(Border.BorderBrushProperty, "BorderBrush"); brush.BeginAnimation(SolidColorBrush.ColorProperty, animation);
+        bool filtered = search.Text.Length > 0;
+        search.Clear(); filterTimer.Stop();
+        var open = preferences.OpenGroups ?? Groups().Take(1).Select(item => item.Name).ToHashSet(StringComparer.Ordinal);
+        bool changed = open.Add(name);
+        if (changed) { preferences.OpenGroups = open; preferences.Save(); }
+        if (filtered) Render();
+        else if (changed) RenderGroups();
     }
+    private static void Flash(Border card) => ProxyVisuals.Attention(card);
+
+    private async Task CenterAsync(FrameworkElement element, bool smooth)
+    {
+        StopScrollNavigation(); scroll.UpdateLayout();
+        if (!IsActive || !element.IsVisible || scroll.ViewportHeight <= 0) return;
+        var bounds = element.TransformToAncestor(scroll).TransformBounds(new Rect(element.RenderSize));
+        var from = scroll.VerticalOffset;
+        var destination = Math.Clamp(from + bounds.Top + bounds.Height / 2 - scroll.ViewportHeight / 2, 0, scroll.ScrollableHeight);
+        lastNavigationGeometry = new { entranceTranslateY = TransitionSurface.RenderTransform.Value.OffsetY, viewportHeight = scroll.ViewportHeight, targetTop = bounds.Top, targetHeight = bounds.Height, scrollFrom = from, scrollDestination = destination };
+        if (!smooth || !ProxyVisuals.Animate || Math.Abs(destination - from) < 1) { scroll.ScrollToVerticalOffset(destination); scroll.UpdateLayout(); return; }
+        var lifetime = CancellationTokenSource.CreateLinkedTokenSource(PageToken); scrollLifetime = lifetime;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            while (IsActive && clock.Elapsed.TotalMilliseconds < 250)
+            {
+                lifetime.Token.ThrowIfCancellationRequested();
+                var progress = Math.Clamp(clock.Elapsed.TotalMilliseconds / 250, 0, 1);
+                var eased = FluentMotion.Decelerate.Ease(progress);
+                scroll.ScrollToVerticalOffset(from + (destination - from) * eased);
+                await Task.Delay(16, lifetime.Token);
+            }
+            if (IsActive && !lifetime.IsCancellationRequested) scroll.ScrollToVerticalOffset(destination);
+        }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
+        finally { if (ReferenceEquals(scrollLifetime, lifetime)) scrollLifetime = null; lifetime.Dispose(); }
+    }
+    private void StopScrollNavigation() { scrollLifetime?.Cancel(); scrollLifetime = null; }
 
     private void ApplyTopologyVisibility()
     {
-        topologyBody.Visibility = preferences.TopologyOpen ? Visibility.Visible : Visibility.Collapsed;
-        L.Bind(toggleTopology, ContentControl.ContentProperty, preferences.TopologyOpen ? "隐藏" : "显示");
+        var expanded = preferences.TopologyOpen; var generation = ++topologyTransition;
+        var from = topologyReveal.ActualHeight; topologyReveal.IsHitTestVisible = expanded;
+        topologyBody.Measure(new Size(Math.Max(0, topologyReveal.ActualWidth), double.PositiveInfinity)); var height = expanded ? topologyBody.DesiredSize.Height : 0;
+        if (!IsLoaded || !ProxyVisuals.Animate) { topologyReveal.BeginAnimation(HeightProperty, null); topologyReveal.Height = expanded ? double.NaN : 0; topologyReveal.Opacity = expanded ? 1 : 0; }
+        else
+        {
+            ProxyVisuals.Tween(topologyReveal, HeightProperty, from, height, 250, () => { if (generation == topologyTransition) topologyReveal.Height = expanded ? double.NaN : 0; });
+            ProxyVisuals.Tween(topologyReveal, OpacityProperty, topologyReveal.Opacity, expanded ? 1 : 0, 250);
+        }
+        L.Bind(topologyToggleLabel, TextBlock.TextProperty, preferences.TopologyOpen ? "收起拓扑" : "展开拓扑"); topologyCaret.Kind = preferences.TopologyOpen ? "chevron-up" : "chevron-down";
         if (preferences.TopologyOpen) StartTopology(); else StopTopology(); UpdateMapAnimation();
     }
     protected override Task LiveAsync(CancellationToken cancellationToken) { StartTopology(); return Task.CompletedTask; }
@@ -359,15 +667,26 @@ public sealed class ProxiesPage : NativePage
     {
         var model = topologyModel.Build(nodes, Groups(false)); activeConnections = model.Connections; topology.SetModel(model); idleMap.Visibility = model.Connections == 0 ? Visibility.Visible : Visibility.Collapsed; RefreshMapReadings();
     }
-    private void RefreshMapReadings() => flow.Text = $"↓ {Ui.Bytes(down)}/s    ↑ {Ui.Bytes(up)}/s    " + L.F("{0} 个连接", activeConnections);
+    private void RefreshMapReadings()
+    {
+        void Rate(TextBlock target, string arrow, double value)
+        {
+            target.Inlines.Clear(); target.Inlines.Add(new Run(arrow + " "));
+            var number = new Run(Ui.Bytes(value) + "/s") { FontFamily = new FontFamily("Cascadia Mono, Consolas") }; number.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); target.Inlines.Add(number);
+        }
+        Rate(flowDown, "↓", down); Rate(flowUp, "↑", up);
+        flowCount.Inlines.Clear(); var count = new Run(activeConnections.ToString()) { FontFamily = new FontFamily("Cascadia Mono, Consolas") }; count.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); flowCount.Inlines.Add(count); flowCount.Inlines.Add(new Run(L.F("{0} 个连接", "")));
+        var compact = PageContainerWidth <= 640; flowCount.Visibility = compact ? Visibility.Collapsed : Visibility.Visible; flowUp.Margin = new Thickness(0, 0, compact ? 0 : 14, 0);
+        liveDot.SetResourceReference(LivePing.FillProperty, activeConnections > 0 ? "SuccessBrush" : "FaintBrush");
+    }
     private void UpdateMapAnimation()
     {
         if (!IsActive || !preferences.TopologyOpen || !topology.IsVisible) { topology.SetActive(false); return; }
         try { var bounds = topology.TransformToAncestor(scroll).TransformBounds(new Rect(topology.RenderSize)); topology.SetActive(bounds.Bottom > 0 && bounds.Top < scroll.ViewportHeight); }
         catch (InvalidOperationException) { topology.SetActive(false); }
     }
-    public override void Activate() { base.Activate(); ApplyTopologyVisibility(); }
-    public override void Deactivate() { StopTopology(); filterTimer.Stop(); renderTimer.Stop(); base.Deactivate(); }
+    public override void Activate() { if (!IsActive) TryPresentRuntimeSnapshot(); base.Activate(); ApplyTopologyVisibility(); }
+    public override void Deactivate() { preparedNavigation = null; StopScrollNavigation(); StopTopology(); filterTimer.Stop(); renderTimer.Stop(); base.Deactivate(); }
     protected override void OnStatusChanged()
     {
         var phase = Session.Status.Text("phase"); var becameRunning = phase == "running" && lastPhase != "running"; lastPhase = phase;
@@ -379,7 +698,7 @@ public sealed class ProxiesPage : NativePage
     protected override void OnLanguageChanged() { Render(); if (!IsRunning) Message(InactiveMessage); }
     private void ClearInactive()
     {
-        StopTopology(); nodes.Clear(); providerData = default; order = []; topologyModel.Clear(); up = down = 0; activeConnections = 0;
+        StopTopology(); nodes.Clear(); providerData = default; presentedProxies = presentedProviders = presentedConfigs = default; order = []; topologyModel.Clear(); up = down = 0; activeConnections = 0;
         groupList.Children.Clear(); providerList.Children.Clear(); nodeSection.Children.Clear(); topology.SetModel(TopologyModel.Empty); UpdateSummary(); RefreshMapReadings(); Message(InactiveMessage);
     }
 }

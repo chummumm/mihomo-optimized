@@ -3,10 +3,13 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Shapes;
+using Path = System.IO.Path;
 using System.Windows.Threading;
-using Microsoft.Win32;
 using Mihomo.Desktop.Controls;
 using Mihomo.Desktop.Services;
 
@@ -15,7 +18,7 @@ namespace Mihomo.Desktop.Pages;
 public sealed class ProfilesPage : NativePage, IPageBackNavigation
 {
     private const int MaximumConfigBytes = 4 * 1024 * 1024;
-    private readonly TextBlock fileName = Ui.Text("—", 24, true);
+    private readonly TextBlock fileName = Ui.Text("—", 18, true);
     private readonly TextBlock path = Ui.Muted("");
     private readonly TextBlock counts = Ui.Muted("");
     private readonly TextBox importUrl = Ui.SearchBox("订阅地址", "ConfigImportUrlInput");
@@ -26,6 +29,20 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private readonly TextBlock editorNotice = Ui.Muted("").Id("ConfigEditorNotice");
     private readonly TextBlock editorPosition = Ui.Muted("").Id("ConfigEditorPosition");
     private readonly Grid editPane = new() { Visibility = Visibility.Collapsed };
+    private readonly Border editorOverlay = new()
+    {
+        Margin = new Thickness(-1, -1, 0, 0), BorderThickness = new Thickness(1, 1, 0, 0),
+        CornerRadius = new CornerRadius(8, 0, 0, 0), RenderTransformOrigin = new Point(.5, .3),
+    };
+    private readonly Grid editorContent = new();
+    private readonly Border editorHeader = new();
+    private readonly Border editorNoticeFrame = new();
+    private readonly Ellipse editorDot = new() { Width = 8, Height = 8, Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center };
+    private readonly Button editorCrumb = new() { Style = FluentControls.Style("Ghost"), Padding = new Thickness(2, 0, 2, 0), BorderThickness = new Thickness(0) };
+    private readonly FluentIcon editorSeparator = new("chevron-right", 12);
+    private readonly TextBlock editorTitle = Ui.Label("编辑配置", 28, true);
+    private long editorTransition;
+    private bool editorOpen;
     private readonly StackPanel overview = new();
     private readonly ScrollViewer overviewScroll;
     private readonly Grid editorFooter = new();
@@ -40,14 +57,19 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private readonly Button importUrlButton;
     private readonly Button readAgain;
     private readonly Button save;
-    private readonly Button saveOnly;
-    private readonly Button discard;
+    private readonly StackPanel saveContent = new() { Orientation = Orientation.Horizontal };
+    private readonly FluentIcon saveGlyph = new("save", 16) { Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center };
+    private readonly FluentProgressRing saveSpinner = new() { Width = 16, Height = 16, IsButtonSpinner = true, IsActive = false, Visibility = Visibility.Collapsed, Margin = new Thickness(0, 0, 8, 0) };
+    private readonly TextBlock saveLabel = Ui.Text("");
+    private readonly MenuItem saveOnly;
+    private readonly MenuItem discard;
     private readonly Button closeEditor;
     private readonly ResourceUpdatePanel resources;
     private readonly Border resourcesTarget;
     private string revision = "", originalContent = "", documentPath = "", problem = "", lastPhase = "";
     private bool applyingDocument, loaded, reading, saving, reloading, importing, dirty, conflict, saved, reloadPending, updateWasActive;
     private bool writable = true;
+    private bool importOpening, importPreviewVisible, leaveOpening;
     private long documentGeneration, draftGeneration, summaryReadAt;
     private int? groupCount, ruleCount;
     private int maxBytes = MaximumConfigBytes;
@@ -56,14 +78,16 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private Confirmation confirmation;
     private enum Confirmation { None, Close, Read }
     private bool Busy => reading || saving || importing;
-    public bool CanGoBack => editPane.Visibility == Visibility.Visible;
+    public bool CanGoBack => editorOpen;
+    internal bool HasEditorSurface => editorOverlay.Parent is not null;
     public event Action? BackStateChanged;
 
     public ProfilesPage(AppSession session) : base(session, "profiles", "配置", "管理当前 YAML，导入订阅并更新规则与 Geo 数据")
     {
-        importButton = IconAction("导入配置", "ImportConfig", "arrow-import", ChooseFile, true); Tools.Children.Add(importButton);
-        openEditor = IconAction("编辑配置", "EditConfig", "edit", OpenEditor);
-        reload = IconAction("重新加载", "ReloadConfig", "update", Reload);
+        importButton = IconAction("导入配置", "ImportConfig", "arrow-import", ChooseFile, true); importButton.Margin = new Thickness(0); Tools.Children.Add(importButton);
+        SetHeaderMeta(null);
+        openEditor = IconAction("编辑配置文件", "EditConfig", "edit", OpenEditor);
+        reload = IconAction("重新加载已保存配置", "ReloadConfig", "update", Reload);
         var more = FluentControls.IconButton("more", "更多配置操作", "ConfigMore"); var menu = new ContextMenu();
         AddDirectory("打开配置文件夹", "OpenConfigFolder", "config"); AddDirectory("打开日志文件夹", "OpenLogsFolder", "logs");
         more.ContextMenu = menu; more.Click += (_, _) => { menu.PlacementTarget = more; menu.IsOpen = true; };
@@ -72,45 +96,52 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
             var item = L.Bind(new MenuItem().Id(id), HeaderedItemsControl.HeaderProperty, title);
             item.Click += async (_, _) => await RunAsync(() => Command("desktop_open_directory", new { kind })); menu.Items.Add(item);
         }
-        var current = new Grid(); current.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); current.ColumnDefinitions.Add(new ColumnDefinition());
-        var iconWell = new Border { Child = new FluentIcon("document-text", 26), Padding = new Thickness(18), CornerRadius = new CornerRadius(8), Margin = new Thickness(0, 0, 16, 0), VerticalAlignment = VerticalAlignment.Top };
-        iconWell.SetResourceReference(Border.BackgroundProperty, "SubtleSurfaceBrush"); current.Children.Add(iconWell);
-        path.TextWrapping = TextWrapping.NoWrap; path.TextTrimming = TextTrimming.CharacterEllipsis; path.Margin = new Thickness(0, 6, 0, 0); path.Id("CurrentConfigPath");
-        fileName.TextWrapping = TextWrapping.NoWrap; fileName.TextTrimming = TextTrimming.CharacterEllipsis; fileName.Id("CurrentConfigName"); counts.Margin = new Thickness(0, 10, 0, 0);
-        var identity = Ui.Column(Ui.Hint("当前配置"), fileName, path, counts); Grid.SetColumn(identity, 1); current.Children.Add(identity);
-        var fileActions = Ui.Row(openEditor, reload, more); fileActions.Margin = new Thickness(0, 20, 0, 0); overview.Children.Add(Ui.Card(Ui.Column(current, fileActions), 24));
-        var importHeading = Ui.Row(Ui.Label("导入配置", 18, true), Ui.Hint("也可以将 YAML 文件拖入窗口")); importHeading.Margin = new Thickness(0, 12, 0, 4); overview.Children.Add(importHeading);
-        overview.Children.Add(ImportRow("file", "从文件导入", "选择本机 .yaml 或 .yml 文件，原配置会自动备份。", IconAction("选择文件", "ImportConfigFile", "folder-open", ChooseFile)));
-        importUrl.MinWidth = 100; importUrl.HorizontalAlignment = HorizontalAlignment.Stretch; importUrl.Margin = new Thickness(0, 0, 10, 0);
-        importUrlButton = IconAction("导入地址", "ImportConfigUrl", "arrow-import", ImportUrl); importUrlButton.Margin = new Thickness(0);
-        var urlRow = new Grid { Margin = new Thickness(0, 12, 0, 0) }; urlRow.ColumnDefinitions.Add(new ColumnDefinition()); urlRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        urlRow.Children.Add(importUrl); Grid.SetColumn(importUrlButton, 1); urlRow.Children.Add(importUrlButton);
-        overview.Children.Add(ImportRow("link", "从 URL 导入", "输入 HTTP 或 HTTPS 订阅地址。", null, urlRow));
-        overview.Children.Add(ImportRow("code", "粘贴 YAML", "粘贴完整配置内容，导入前会校验 YAML 格式。", IconAction("粘贴配置", "PasteConfig", "code", Paste)));
-        var resourceHeading = Ui.Label("规则与 Geo 数据", 18, true); resourceHeading.Margin = new Thickness(0, 24, 0, 12);
-        resources = new ResourceUpdatePanel(session);
-        resourcesTarget = new Border { Child = Ui.Column(resourceHeading, resources), BorderThickness = new Thickness(2), Padding = new Thickness(2), CornerRadius = new CornerRadius(6), Focusable = true }.Id("set-resources");
+        var current = new Grid(); current.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); current.ColumnDefinitions.Add(new ColumnDefinition()); current.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var fileIcon = new FluentIcon("document-text", 24); fileIcon.SetResourceReference(Control.ForegroundProperty, "AccentLinkBrush");
+        var iconWell = new Border { Child = fileIcon, Width = 48, Height = 48, CornerRadius = new CornerRadius(8), Margin = new Thickness(0, 0, 16, 0), VerticalAlignment = VerticalAlignment.Center }; iconWell.SetResourceReference(Border.BackgroundProperty, "ControlAltBrush"); current.Children.Add(iconWell);
+        path.TextWrapping = TextWrapping.NoWrap; path.TextTrimming = TextTrimming.CharacterEllipsis; path.SetResourceReference(TextBlock.FontFamilyProperty, "MonoFont"); path.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); path.LineHeight = 16; path.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; path.Id("CurrentConfigPath");
+        fileName.TextWrapping = TextWrapping.NoWrap; fileName.TextTrimming = TextTrimming.CharacterEllipsis; fileName.LineHeight = 24; fileName.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; fileName.Id("CurrentConfigName"); fileName.SetResourceReference(TextBlock.FontFamilyProperty, "DisplayFont");
+        var inUse = Ui.Hint("正在使用"); inUse.LineHeight = 16; inUse.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
+        var identity = Ui.Column(inUse, fileName, path); identity.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(identity, 1); current.Children.Add(identity);
+        var countsBadge = new Border { Child = counts, Padding = new Thickness(8, 2, 8, 2), CornerRadius = new CornerRadius(4), Margin = new Thickness(16, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center }; countsBadge.SetResourceReference(Border.BackgroundProperty, "ControlAltBrush"); Grid.SetColumn(countsBadge, 2); current.Children.Add(countsBadge);
+        var fileActions = new WrapPanel { Margin = new Thickness(0, 16, 0, 0) }; foreach (var button in new[] { openEditor, reload, more }) { button.Margin = new Thickness(0, 0, 8, 0); fileActions.Children.Add(button); }
+        var currentCard = Ui.Card(Ui.Column(current, fileActions), 0); currentCard.Padding = new Thickness(24, 20, 24, 20); currentCard.Margin = new Thickness(0); currentCard.CornerRadius = new CornerRadius(8); overview.Children.Add(currentCard);
+        var importHeading = new DockPanel { Margin = new Thickness(1, 28, 0, 8) }; var aside = Ui.Hint("替换当前主配置，原文件自动备份"); aside.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); DockPanel.SetDock(aside, Dock.Right); importHeading.Children.Add(aside); importHeading.Children.Add(Ui.Label("导入新配置", 14, true)); overview.Children.Add(importHeading);
+        overview.Children.Add(ImportRow("file", "从文件导入", "YAML / YML，最大 4 MiB。也可以把文件直接拖进窗口。", Action("选择文件", "ImportConfigFile", ChooseFile)));
+        importUrl.MinWidth = 0; importUrl.HorizontalAlignment = HorizontalAlignment.Stretch; importUrl.Margin = new Thickness(0, 0, 8, 0); importUrl.ToolTip = "https://";
+        importUrlButton = Action("导入", "ImportConfigUrl", ImportUrl); importUrlButton.Margin = new Thickness(0);
+        var urlRow = new Grid(); urlRow.ColumnDefinitions.Add(new ColumnDefinition()); urlRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); urlRow.Children.Add(importUrl); Grid.SetColumn(importUrlButton, 1); urlRow.Children.Add(importUrlButton);
+        overview.Children.Add(ImportRow("link", "从 URL 导入", "返回完整 YAML 配置的 HTTP / HTTPS 地址", null, urlRow));
+        var pasteRow = ImportRow("code", "粘贴 YAML", "把整份配置粘贴到文本框中", Action("粘贴 YAML", "PasteConfig", Paste)); pasteRow.Margin = new Thickness(0); overview.Children.Add(pasteRow);
+        var resourceHeading = Ui.Label("规则与 Geo 数据", 14, true); resourceHeading.Margin = new Thickness(1, 0, 0, 8); resources = new ResourceUpdatePanel(session);
+        resourcesTarget = new Border { Child = Ui.Column(resourceHeading, resources), BorderThickness = new Thickness(2), Padding = new Thickness(0), Margin = new Thickness(-2, 26, -2, -2), CornerRadius = new CornerRadius(4), Focusable = true }.Id("set-resources");
         resourcesTarget.BorderBrush = Brushes.Transparent; L.Bind(resourcesTarget, AutomationProperties.NameProperty, "规则与 Geo 数据"); overview.Children.Add(resourcesTarget);
-        readAgain = IconAction("重新读取", "ConfigReadAgain", "update", Reread);
-        closeEditor = IconAction("关闭编辑器", "CloseEditor", "close", CloseEditor);
-        saveOnly = IconAction("仅保存", "SaveOnlyConfig", "save", () => Save(false)); save = IconAction("保存并应用", "SaveConfig", "save", () => Save(true), true);
-        discard = IconAction("放弃修改", "DiscardConfig", "trash", Reread);
-        var leftActions = Ui.Row(readAgain, discard); var rightActions = Ui.Row(closeEditor, saveOnly, save); rightActions.HorizontalAlignment = HorizontalAlignment.Right;
-        editorFooter.ColumnDefinitions.Add(new ColumnDefinition()); editorFooter.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        editorFooter.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); editorFooter.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        editorFooter.Children.Add(leftActions); Grid.SetColumn(rightActions, 1); editorFooter.Children.Add(rightActions);
-        editorFooter.SizeChanged += (_, _) => { var compact = editorFooter.ActualWidth < 750; Grid.SetRow(rightActions, compact ? 1 : 0); Grid.SetColumn(rightActions, compact ? 0 : 1); Grid.SetColumnSpan(rightActions, compact ? 2 : 1); };
+        void AdaptOverview() { currentCard.Padding = PageContainerWidth <= 560 ? new Thickness(16) : new Thickness(24, 20, 24, 20); countsBadge.Visibility = PageContainerWidth <= 560 ? Visibility.Collapsed : Visibility.Visible; }
+        SizeChanged += (_, _) => { AdaptOverview(); UpdateEditorMetrics(); };
+        TransitionSurface.SizeChanged += (_, args) => { if (args.WidthChanged) AdaptOverview(); };
+        readAgain = IconAction("从文件重新读取", "ConfigReadAgain", "update", Reread);
+        closeEditor = IconAction("关闭", "CloseEditor", "close", CloseEditor);
+        save = IconAction("保存并重新加载", "SaveConfig", "save", () => Save(true), true);
+        saveContent.Children.Add(saveGlyph); saveContent.Children.Add(saveSpinner); saveContent.Children.Add(saveLabel); save.Content = saveContent;
+        saveOnly = L.Bind(new MenuItem().Id("SaveOnlyConfig"), HeaderedItemsControl.HeaderProperty, "仅保存"); saveOnly.Click += async (_, _) => await RunAsync(() => Save(false));
+        discard = L.Bind(new MenuItem().Id("DiscardConfig"), HeaderedItemsControl.HeaderProperty, "放弃修改"); discard.Click += async (_, _) => await RunAsync(Reread);
+        var editorCommands = new ContextMenu(); editorCommands.Items.Add(saveOnly); editorCommands.Items.Add(discard); save.ContextMenu = editorCommands; editorFooter.ContextMenu = editorCommands;
+        var rightActions = new WrapPanel { HorizontalAlignment = HorizontalAlignment.Right }; closeEditor.Margin = new Thickness(0, 0, 8, 0); save.Margin = new Thickness(0); rightActions.Children.Add(closeEditor); rightActions.Children.Add(save);
+        editorFooter.Margin = new Thickness(0, 4, 0, 0); editorFooter.ColumnDefinitions.Add(new ColumnDefinition()); editorFooter.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        editorFooter.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); editorFooter.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); editorFooter.Children.Add(readAgain); readAgain.HorizontalAlignment = HorizontalAlignment.Left; Grid.SetColumn(rightActions, 1); editorFooter.Children.Add(rightActions);
+        editorFooter.SizeChanged += (_, _) => { var compact = editorFooter.ActualWidth < readAgain.DesiredSize.Width + rightActions.DesiredSize.Width + 8; Grid.SetRow(rightActions, compact ? 1 : 0); Grid.SetColumn(rightActions, compact ? 0 : 1); Grid.SetColumnSpan(rightActions, compact ? 2 : 1); rightActions.Margin = new Thickness(0, compact ? 8 : 0, 0, 0); };
         keepEditing = IconAction("继续编辑", "ConfigKeepEditing", "edit", () => { SetConfirmation(Confirmation.None); Editor.Focus(); return Task.CompletedTask; });
-        confirmDiscard = IconAction("放弃修改", "ConfigConfirmDiscard", "trash", ConfirmDiscard); confirmDiscard.SetResourceReference(Control.ForegroundProperty, "DangerBrush");
-        var confirmationLayout = new Grid(); confirmationLayout.ColumnDefinitions.Add(new ColumnDefinition()); confirmationLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        confirmationLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); confirmationLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var confirmationCopy = Ui.Column(confirmationTitle, confirmationText); confirmationCopy.Margin = new Thickness(0, 0, 16, 8); confirmationLayout.Children.Add(confirmationCopy);
-        var confirmationActions = Ui.Row(keepEditing, confirmDiscard); Grid.SetColumn(confirmationActions, 1); confirmationLayout.Children.Add(confirmationActions);
-        confirmationLayout.SizeChanged += (_, _) => { var compact = confirmationLayout.ActualWidth < 640; Grid.SetRow(confirmationActions, compact ? 1 : 0); Grid.SetColumn(confirmationActions, compact ? 0 : 1); Grid.SetColumnSpan(confirmationActions, compact ? 2 : 1); };
-        confirmationPane = Ui.Card(confirmationLayout, 14); confirmationPane.Visibility = Visibility.Collapsed; confirmationPane.Margin = new Thickness(0); confirmationPane.Id("ConfigDiscardConfirmation"); confirmationPane.SetResourceReference(Border.BorderBrushProperty, "WarningBrush");
-        BuildEditor(); overviewScroll = Ui.Scroll(overview); var layer = new Grid(); layer.Children.Add(overviewScroll); layer.Children.Add(editPane); SetBody(layer);
+        confirmDiscard = IconAction("放弃修改", "ConfigConfirmDiscard", "trash", ConfirmDiscard); FluentControlState.SetKind(confirmDiscard, "Danger");
+        var confirmationLayout = new Grid(); confirmationLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(34) }); confirmationLayout.ColumnDefinitions.Add(new ColumnDefinition()); confirmationLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); confirmationLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); confirmationLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        var warning = new FluentIcon("warning", 20) { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Left }; warning.SetResourceReference(Control.ForegroundProperty, "WarningBrush"); confirmationLayout.Children.Add(warning);
+        confirmationTitle.LineHeight = confirmationText.LineHeight = 20; confirmationTitle.LineStackingStrategy = confirmationText.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; confirmationText.FontSize = 14; confirmationText.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush"); confirmationText.Margin = new Thickness(0, 2, 0, 0);
+        var confirmationCopy = Ui.Column(confirmationTitle, confirmationText); confirmationCopy.Margin = new Thickness(0, 0, 14, 0); Grid.SetColumn(confirmationCopy, 1); confirmationLayout.Children.Add(confirmationCopy);
+        var confirmationActions = new WrapPanel { HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center }; keepEditing.Margin = new Thickness(0, 0, 8, 0); confirmDiscard.Margin = new Thickness(0); confirmationActions.Children.Add(keepEditing); confirmationActions.Children.Add(confirmDiscard); Grid.SetColumn(confirmationActions, 2); confirmationLayout.Children.Add(confirmationActions);
+        confirmationLayout.SizeChanged += (_, _) => { var compact = confirmationLayout.ActualWidth < 34 + 260 + confirmationActions.DesiredSize.Width; Grid.SetRow(confirmationActions, compact ? 1 : 0); Grid.SetColumn(confirmationActions, compact ? 0 : 2); Grid.SetColumnSpan(confirmationActions, compact ? 3 : 1); confirmationActions.Margin = new Thickness(0, compact ? 12 : 0, 0, 0); };
+        confirmationPane = Ui.Card(confirmationLayout, 0); confirmationPane.Padding = new Thickness(14, 12, 12, 12); confirmationPane.CornerRadius = new CornerRadius(8); confirmationPane.Visibility = Visibility.Collapsed; confirmationPane.Margin = new Thickness(0); confirmationPane.Id("ConfigDiscardConfirmation"); confirmationPane.SetResourceReference(Border.BackgroundProperty, "WarningBackgroundBrush"); confirmationPane.SetResourceReference(Border.BorderBrushProperty, "CardStrokeBrush"); confirmationPane.RenderTransformOrigin = new Point(.5, 1);
+        BuildEditor(); overviewScroll = new ScrollViewer().Id("ProfilesScrollViewer"); SetScrollableBody(overview, overviewScroll);
         Editor.TextChanged += EditorChanged; code.PositionChanged += UpdatePosition;
-        PreviewKeyDown += (_, e) => { if (CanGoBack && e.Key == Key.S && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; _ = RunAsync(() => Save(true)); } };
+        editorOverlay.PreviewKeyDown += (_, e) => { if (CanGoBack && e.Key == Key.S && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; _ = RunAsync(() => Save(true)); } };
         code.SaveRequested += () => _ = RunAsync(() => Save(true)); code.CloseRequested += () => _ = RunAsync(CloseEditor);
         code.LimitExceeded += () => Dispatcher.BeginInvoke(new Action(() => { problem = "配置大小超过允许的上限，刚才的输入未被接受。"; UpdateEditorState(); }));
         importUrl.TextChanged += (_, _) => ApplyInteractionState(); importUrl.PreviewKeyDown += async (_, e) => { if (e.Key == Key.Enter && importUrlButton.IsEnabled) { e.Handled = true; await RunAsync(ImportUrl); } };
@@ -123,29 +154,74 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     }
     private Button IconAction(string title, string id, string icon, Func<Task> operation, bool primary = false)
     {
-        var button = Action(title, id, operation, primary); button.Style = FluentControls.Style("Button"); button.Content = FluentControls.ButtonContent(icon, title); return button;
+        var button = Action(title, id, operation, primary); button.Content = FluentControls.ButtonContent(icon, title); return button;
     }
-    private static Border ImportRow(string icon, string title, string description, UIElement? action, UIElement? footer = null)
+    private Border ImportRow(string icon, string title, string description, UIElement? action, UIElement? footer = null)
     {
-        var row = new Grid(); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); row.ColumnDefinitions.Add(new ColumnDefinition()); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var row = new Grid { VerticalAlignment = VerticalAlignment.Center }; row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); row.ColumnDefinitions.Add(new ColumnDefinition()); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        // SettingsCard keeps a fourth, empty chevron track and its 16 px gap.
+        var chevronGap = new ColumnDefinition { Width = new GridLength(16) }; row.ColumnDefinitions.Add(chevronGap);
+        row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         row.Children.Add(new FluentIcon(icon, 20) { Margin = new Thickness(0, 0, 16, 0), VerticalAlignment = VerticalAlignment.Center });
-        var copy = Ui.Column(Ui.Label(title, 14, true), Ui.Hint(description)); copy.Margin = new Thickness(0, 0, 16, 0); Grid.SetColumn(copy, 1); row.Children.Add(copy);
-        if (action is not null) { Grid.SetColumn(action, 2); row.Children.Add(action); }
-        var content = Ui.Column(row); if (footer is not null) content.Children.Add(footer);
-        var card = Ui.Card(content, 16); card.Margin = new Thickness(0, 0, 4, 4); card.CornerRadius = new CornerRadius(4); return card;
+        var label = Ui.Label(title); label.LineHeight = 20; label.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; var hint = Ui.Hint(description); hint.LineHeight = 16; hint.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
+        var copy = Ui.Column(label, hint); copy.Margin = new Thickness(0, 0, 16, 0); copy.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(copy, 1); row.Children.Add(copy);
+        if (action is not null) { Grid.SetColumn(action, 2); row.Children.Add(action); if (action is FrameworkElement element) { element.Margin = new Thickness(0); element.VerticalAlignment = VerticalAlignment.Center; } }
+        var rowFrame = new Border { Child = row, Padding = new Thickness(16, 12, 16, 12), MinHeight = 68 }; var content = Ui.Column(rowFrame);
+        Border? foot = null;
+        if (footer is not null) { foot = new Border { Child = footer, Padding = new Thickness(52, 12, 16, 16), BorderThickness = new Thickness(0, 1, 0, 0) }; foot.SetResourceReference(Border.BorderBrushProperty, "DividerBrush"); foot.SetResourceReference(Border.BackgroundProperty, "SubtleSurfaceBrush"); content.Children.Add(foot); }
+        var card = Ui.Card(content, 0); card.Margin = new Thickness(0, 0, 0, 4); card.CornerRadius = new CornerRadius(4);
+        card.SizeChanged += (_, _) => { var compact = PageContainerWidth <= 560; chevronGap.Width = new GridLength(compact ? 0 : 16); copy.Margin = new Thickness(0, 0, compact ? 0 : 16, 0); if (action is not null) { Grid.SetRow(action, compact ? 1 : 0); Grid.SetColumn(action, compact ? 1 : 2); if (action is FrameworkElement element) { element.HorizontalAlignment = compact ? HorizontalAlignment.Left : HorizontalAlignment.Right; element.Margin = new Thickness(0, compact ? 4 : 0, 0, 0); } } if (foot is not null) foot.Padding = new Thickness(compact ? 16 : 52, 12, 16, 16); }; return card;
     }
     private void BuildEditor()
     {
-        for (var index = 0; index < 5; index++) editPane.RowDefinitions.Add(new RowDefinition { Height = index == 2 ? new GridLength(1, GridUnitType.Star) : GridLength.Auto });
-        var bar = new Grid { Margin = new Thickness(0, 0, 12, 12) }; bar.ColumnDefinitions.Add(new ColumnDefinition()); bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        editorPath.TextWrapping = TextWrapping.NoWrap; editorPath.TextTrimming = TextTrimming.CharacterEllipsis; editorPath.Id("ConfigEditorPath");
-        var file = new DockPanel(); var icon = new FluentIcon("file", 16) { Margin = new Thickness(0, 0, 8, 0) }; DockPanel.SetDock(icon, Dock.Left); file.Children.Add(icon); file.Children.Add(editorPath); bar.Children.Add(file);
-        editorState.Margin = new Thickness(16, 0, 0, 0); Grid.SetColumn(editorState, 1); bar.Children.Add(editorState); editPane.Children.Add(bar);
-        editorNotice.Margin = new Thickness(0, 0, 12, 12); Grid.SetRow(editorNotice, 1); editPane.Children.Add(editorNotice);
-        code.Margin = new Thickness(0, 0, 12, 0); Grid.SetRow(code, 2); editPane.Children.Add(code);
-        var status = new Grid { Margin = new Thickness(0, 8, 12, 12) }; status.ColumnDefinitions.Add(new ColumnDefinition()); status.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        status.Children.Add(Ui.Hint("保存时校验 YAML，应用时检查内核配置。")); editorPosition.TextWrapping = TextWrapping.NoWrap; editorPosition.Margin = new Thickness(12, 0, 0, 0); Grid.SetColumn(editorPosition, 1); status.Children.Add(editorPosition); Grid.SetRow(status, 3); editPane.Children.Add(status);
-        var footer = new Grid { Margin = new Thickness(0, 0, 12, 0) }; footer.Children.Add(editorFooter); footer.Children.Add(confirmationPane); Grid.SetRow(footer, 4); editPane.Children.Add(footer);
+        editorOverlay.Child = editPane; editorOverlay.Id("ConfigEditorOverlay"); editorOverlay.SetResourceReference(Border.BorderBrushProperty, "LayerStrokeBrush");
+        KeyboardNavigation.SetTabNavigation(editorOverlay, KeyboardNavigationMode.Cycle);
+        editPane.SizeChanged += (_, _) => UpdateEditorClip();
+        editPane.SetResourceReference(Panel.BackgroundProperty, "SolidBaseBrush"); editPane.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); editPane.RowDefinitions.Add(new RowDefinition());
+        var layer = new Border(); layer.SetResourceReference(Border.BackgroundProperty, "LayerBrush"); Grid.SetRowSpan(layer, 2); editPane.Children.Add(layer);
+        var crumbs = new Grid(); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(48) }); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); crumbs.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); crumbs.ColumnDefinitions.Add(new ColumnDefinition());
+        var back = FluentControls.IconButton("arrow-left", "返回", "ConfigEditorBack", 40); back.Height = 36; back.HorizontalAlignment = HorizontalAlignment.Left; back.Click += async (_, _) => await RunAsync(CloseEditor); crumbs.Children.Add(back);
+        var parent = Ui.Label("配置", 28, true); parent.LineHeight = 36; parent.SetResourceReference(TextBlock.FontFamilyProperty, "DisplayFont"); parent.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); editorCrumb.Content = parent; editorCrumb.Click += async (_, _) => await RunAsync(CloseEditor); Grid.SetColumn(editorCrumb, 1); crumbs.Children.Add(editorCrumb);
+        editorSeparator.Margin = new Thickness(8, 0, 8, 0); editorSeparator.SetResourceReference(Control.ForegroundProperty, "TextSecondaryBrush"); Grid.SetColumn(editorSeparator, 2); crumbs.Children.Add(editorSeparator);
+        editorTitle.LineHeight = 36; editorTitle.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; editorTitle.SetResourceReference(TextBlock.FontFamilyProperty, "DisplayFont"); editorTitle.TextWrapping = TextWrapping.NoWrap; editorTitle.TextTrimming = TextTrimming.CharacterEllipsis; Grid.SetColumn(editorTitle, 3); crumbs.Children.Add(editorTitle); editorHeader.Child = crumbs; editPane.Children.Add(editorHeader);
+        for (var index = 0; index < 5; index++) editorContent.RowDefinitions.Add(new RowDefinition { Height = index == 2 ? new GridLength(1, GridUnitType.Star) : GridLength.Auto, MinHeight = index == 2 ? 120 : 0 }); Grid.SetRow(editorContent, 1); editPane.Children.Add(editorContent);
+        var bar = new Grid { Margin = new Thickness(0, 0, 0, 8) }; bar.ColumnDefinitions.Add(new ColumnDefinition()); bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        editorPath.SetResourceReference(TextBlock.FontFamilyProperty, "MonoFont"); editorPath.TextWrapping = TextWrapping.NoWrap; editorPath.TextTrimming = TextTrimming.CharacterEllipsis; editorPath.Id("ConfigEditorPath");
+        var file = new DockPanel { Height = 28 }; var icon = new FluentIcon("file", 14) { Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center }; icon.SetResourceReference(Control.ForegroundProperty, "AccentLinkBrush"); DockPanel.SetDock(icon, Dock.Left); file.Children.Add(icon); file.Children.Add(editorPath); bar.Children.Add(file);
+        var state = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(12, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center }; state.Children.Add(editorDot); state.Children.Add(editorState); Grid.SetColumn(state, 1); bar.Children.Add(state); editorContent.Children.Add(bar);
+        editorNotice.FontSize = 12; editorNotice.LineHeight = 16; editorNotice.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; editorNoticeFrame.Child = editorNotice; editorNoticeFrame.Padding = new Thickness(12, 8, 12, 8); editorNoticeFrame.BorderThickness = new Thickness(1); editorNoticeFrame.CornerRadius = new CornerRadius(4); editorNoticeFrame.Margin = new Thickness(0, 0, 0, 8); Grid.SetRow(editorNoticeFrame, 1); editorContent.Children.Add(editorNoticeFrame);
+        code.Margin = new Thickness(0, 0, 0, 8); Grid.SetRow(code, 2); editorContent.Children.Add(code);
+        var status = new Grid { Margin = new Thickness(0, 0, 0, 8) }; status.ColumnDefinitions.Add(new ColumnDefinition()); status.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); status.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var note = Ui.Hint("保存会校验 YAML 基本结构；完整配置校验在重新加载时进行。草稿仅留在内存中，关闭或切换控制器后清除。"); note.HorizontalAlignment = HorizontalAlignment.Left; note.LineHeight = 12 * 1.43; note.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; note.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); note.Margin = new Thickness(0, 0, 16, 0); status.Children.Add(note);
+        note.Loaded += (_, _) => note.MaxWidth = 65 * new FormattedText("0", System.Globalization.CultureInfo.InvariantCulture, FlowDirection.LeftToRight, new Typeface(note.FontFamily, note.FontStyle, note.FontWeight, note.FontStretch), note.FontSize, Brushes.Black, VisualTreeHelper.GetDpi(note).PixelsPerDip).WidthIncludingTrailingWhitespace;
+        editorPosition.TextWrapping = TextWrapping.NoWrap; editorPosition.LineHeight = 12 * 1.43; editorPosition.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; editorPosition.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); editorPosition.Margin = new Thickness(0, 0, 16, 0); Grid.SetColumn(editorPosition, 1); status.Children.Add(editorPosition); var encoding = Ui.Muted("YAML · UTF-8", 12); encoding.LineHeight = 12 * 1.43; encoding.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; encoding.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); Grid.SetColumn(encoding, 2); status.Children.Add(encoding); Grid.SetRow(status, 3); editorContent.Children.Add(status);
+        var footer = new Grid(); footer.Children.Add(editorFooter); footer.Children.Add(confirmationPane); Grid.SetRow(footer, 4); editorContent.Children.Add(footer); UpdateEditorMetrics();
+    }
+    private void UpdateEditorMetrics()
+    {
+        var width = Window.GetWindow(this)?.ActualWidth ?? 1000; var narrow = width <= 768;
+        editorOverlay.Margin = narrow ? new Thickness(0) : new Thickness(-1, -1, 0, 0);
+        editorOverlay.BorderThickness = narrow ? new Thickness(0) : new Thickness(1, 1, 0, 0);
+        editorOverlay.CornerRadius = narrow ? new CornerRadius(0) : new CornerRadius(8, 0, 0, 0);
+        editorHeader.Padding = narrow ? new Thickness(4, 8, 12, 8) : new Thickness(Math.Clamp(width * .02, 8, 28), 20, Math.Clamp(width * .03, 16, 36), 12);
+        var horizontal = narrow ? 12 : Math.Clamp(width * .03, 16, 36); editorContent.Margin = new Thickness(horizontal, 0, horizontal, narrow ? 12 : 20);
+        editorCrumb.Visibility = editorSeparator.Visibility = narrow ? Visibility.Collapsed : Visibility.Visible; editorTitle.FontSize = narrow ? 20 : 28; editorTitle.LineHeight = narrow ? 28 : 36;
+        UpdateEditorClip();
+    }
+    private void UpdateEditorClip()
+    {
+        var width = editPane.ActualWidth; var height = editPane.ActualHeight;
+        if (width <= 0 || height <= 0) return;
+        var radius = Math.Min(Math.Max(0, editorOverlay.CornerRadius.TopLeft - editorOverlay.BorderThickness.Left), Math.Min(width, height));
+        var geometry = new StreamGeometry();
+        using (var drawing = geometry.Open())
+        {
+            drawing.BeginFigure(new Point(radius, 0), true, true);
+            drawing.LineTo(new Point(width, 0), true, false); drawing.LineTo(new Point(width, height), true, false);
+            drawing.LineTo(new Point(0, height), true, false); drawing.LineTo(new Point(0, radius), true, false);
+            if (radius > 0) drawing.ArcTo(new Point(radius, 0), new Size(radius, radius), 0, false, SweepDirection.Clockwise, true, false);
+        }
+        geometry.Freeze(); editPane.Clip = geometry;
     }
     private void HostEvent(string name, JsonElement data)
     {
@@ -156,7 +232,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     }
     public override async Task RefreshAsync()
     {
-        if (!loaded && !dirty && !Session.IsUpdating) await ReadDocument();
+        if (!loaded && !dirty && !Busy && !importOpening && !Session.IsUpdating) await ReadDocument();
         resources.UpdateAvailability(PageToken); if (IsRunning) await Task.WhenAll(resources.RefreshAsync(PageToken), RefreshSummary());
     }
     protected override void OnStatusChanged()
@@ -233,18 +309,57 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         editorBytes = Encoding.UTF8.GetByteCount(ConfigCodeEditor.SaveText(Editor.Text, originalContent));
         if (!conflict) problem = ""; ApplyInteractionState(); UpdatePosition();
     }
-    private void UpdatePosition() => editorPosition.Text = L.F("第 {0} 行，第 {1} 列", code.Line, code.Column) + "   YAML · UTF-8   " + Ui.Bytes(editorBytes);
+    private void UpdatePosition() { editorPosition.Text = L.F("行 {0} · 列 {1}", code.Line, code.Column); editorPosition.ToolTip = Ui.Bytes(editorBytes); }
     private async Task OpenEditor()
     {
         EnsureNoUpdate();
         if (saving || importing) throw new InvalidOperationException(L.T("配置操作正在进行，请稍后重试。"));
-        SetEditorVisible(true); if (reading && readTask is not null) await readTask; else if (!loaded) await ReadDocument();
-        if (!Session.IsUpdating) Editor.Focus();
+        SetEditorVisible(true); var generation = editorTransition;
+        if (reading && readTask is not null) await readTask; else if (!loaded) await ReadDocument();
+        // The reference focuses after its drill-in content has mounted. A
+        // cached document can otherwise reach Focus before WPF has laid it out.
+        await Dispatcher.InvokeAsync(() =>
+        {
+            if (generation == editorTransition && editorOpen && IsActive && IsVisible && Editor.IsLoaded && Editor.IsEnabled && !Session.IsUpdating)
+                Editor.Focus();
+        }, DispatcherPriority.Loaded);
     }
-    private void SetEditorVisible(bool visible)
+    private void SetEditorVisible(bool visible, bool animate = true)
     {
-        editPane.Visibility = visible ? Visibility.Visible : Visibility.Collapsed; overviewScroll.Visibility = visible ? Visibility.Collapsed : Visibility.Visible;
-        Tools.Visibility = visible ? Visibility.Collapsed : Visibility.Visible; SetConfirmation(Confirmation.None); BackStateChanged?.Invoke(); if (visible) FluentMotion.Enter(editPane, true);
+        var wasOpen = editorOpen; editorOpen = visible; var generation = ++editorTransition;
+        if (visible)
+        {
+            editPane.Visibility = editorHeader.Visibility = editorContent.Visibility = Visibility.Visible;
+            editorOverlay.IsHitTestVisible = true; SetPageOverlay(editorOverlay); UpdateEditorMetrics();
+            var scale = new ScaleTransform(); editorOverlay.RenderTransform = scale;
+            ProxyVisuals.Tween(scale, ScaleTransform.ScaleXProperty, .94, 1, 300); ProxyVisuals.Tween(scale, ScaleTransform.ScaleYProperty, .94, 1, 300); ProxyVisuals.Tween(editorOverlay, OpacityProperty, 0, 1, 300);
+        }
+        else
+        {
+            if (editorOverlay.IsKeyboardFocusWithin) Keyboard.ClearFocus();
+            editorOverlay.IsHitTestVisible = false;
+            // SubPage releases its header/body immediately; only its surface
+            // fades out over the still-mounted overview during the short exit.
+            editorHeader.Visibility = editorContent.Visibility = Visibility.Collapsed;
+            void Complete()
+            {
+                if (generation != editorTransition) return;
+                editPane.Visibility = Visibility.Collapsed; SetPageOverlay(null); BackStateChanged?.Invoke();
+                if (wasOpen && animate)
+                    Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(() =>
+                    {
+                        if (generation == editorTransition && !editorOpen && IsActive && IsVisible && openEditor.IsEnabled && Keyboard.FocusedElement is null && Window.GetWindow(this) is { IsActive: true })
+                            openEditor.Focus();
+                    }));
+            }
+            if (wasOpen && animate && ProxyVisuals.Animate && IsLoaded)
+            {
+                var scale = editorOverlay.RenderTransform as ScaleTransform ?? new ScaleTransform(); editorOverlay.RenderTransform = scale;
+                ProxyVisuals.Tween(scale, ScaleTransform.ScaleXProperty, scale.ScaleX, .98, 83, new Point(1, 0), new Point(1, 1)); ProxyVisuals.Tween(scale, ScaleTransform.ScaleYProperty, scale.ScaleY, .98, 83, new Point(1, 0), new Point(1, 1)); ProxyVisuals.Tween(editorOverlay, OpacityProperty, editorOverlay.Opacity, 0, 83, Complete, new Point(1, 0), new Point(1, 1));
+            }
+            else Complete();
+        }
+        SetConfirmation(Confirmation.None); BackStateChanged?.Invoke();
     }
     public async Task<bool> GoBackAsync() { await CloseEditor(); return !CanGoBack; }
     private Task CloseEditor()
@@ -260,15 +375,20 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     }
     private void SetConfirmation(Confirmation value)
     {
-        confirmation = value; editorFooter.Visibility = value == Confirmation.None ? Visibility.Visible : Visibility.Collapsed; confirmationPane.Visibility = value == Confirmation.None ? Visibility.Collapsed : Visibility.Visible;
+        var previous = confirmation; confirmation = value; editorFooter.Visibility = value == Confirmation.None ? Visibility.Visible : Visibility.Collapsed; confirmationPane.Visibility = value == Confirmation.None ? Visibility.Collapsed : Visibility.Visible;
         if (value != Confirmation.None)
         {
-            confirmationTitle.Text = L.T(value == Confirmation.Close ? "放弃修改并关闭？" : "放弃修改并重新读取？"); confirmationText.Text = L.T("当前未保存的内容将丢失，磁盘上的配置不会被修改。");
-            confirmDiscard.Content = FluentControls.ButtonContent(value == Confirmation.Close ? "trash" : "update", value == Confirmation.Close ? "放弃并关闭" : "放弃并重新读取");
-            L.Bind(confirmDiscard, AutomationProperties.NameProperty, value == Confirmation.Close ? "放弃并关闭" : "放弃并重新读取");
-            FluentMotion.Enter(confirmationPane); Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(() => keepEditing.Focus()));
+            confirmationTitle.Text = L.T(value == Confirmation.Close ? "有尚未保存的修改" : "当前草稿尚未保存"); confirmationText.Text = L.T(confirmation == Confirmation.Close ? "关闭后将丢弃尚未保存的修改。确定关闭吗？" : "重新读取会丢弃当前草稿。确定从配置文件重新读取吗？");
+            confirmDiscard.Content = FluentControls.ButtonContent(value == Confirmation.Close ? "trash" : "update", value == Confirmation.Close ? "丢弃并关闭" : "丢弃并重新读取");
+            L.Bind(confirmDiscard, AutomationProperties.NameProperty, value == Confirmation.Close ? "丢弃并关闭" : "丢弃并重新读取");
+            var move = new TranslateTransform(); var scale = new ScaleTransform(); var motion = new TransformGroup(); motion.Children.Add(scale); motion.Children.Add(move); confirmationPane.RenderTransform = motion;
+            ProxyVisuals.Tween(move, TranslateTransform.YProperty, 14, 0, 167); ProxyVisuals.Tween(scale, ScaleTransform.ScaleXProperty, .97, 1, 167); ProxyVisuals.Tween(scale, ScaleTransform.ScaleYProperty, .97, 1, 167); ProxyVisuals.Tween(confirmationPane, OpacityProperty, 0, 1, 167); Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(() => keepEditing.Focus()));
         }
-        ApplyInteractionState();
+        else if (previous != Confirmation.None && IsLoaded && editorOpen)
+        {
+            var move = new TranslateTransform(); editorFooter.RenderTransform = move; ProxyVisuals.Tween(move, TranslateTransform.YProperty, -6, 0, 167); ProxyVisuals.Tween(editorFooter, OpacityProperty, 0, 1, 167);
+        }
+        code.SetHeld(value != Confirmation.None); ApplyInteractionState();
     }
     private async Task ConfirmDiscard()
     {
@@ -295,7 +415,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
             var document = ValidateDocument(await Command("desktop_save_config", new { content, expectedRevision = revision }));
             ApplyDocument(document, false); fileSaved = true; reloadPending = true; await Session.SetDirtyAsync(false);
             if (apply) { EnsureNoUpdate(); reloading = true; UpdateEditorState(); await Command("desktop_reload_config", new { force = true }); reloadPending = false; _ = RunAsync(RefreshSummary); }
-            saved = true; Message(apply ? IsRunning ? "配置已保存并应用。" : "配置已保存并校验，内核启动时将使用此配置。" : "配置已保存，可以稍后应用。");
+            saved = true; Message(apply ? IsRunning ? "配置文件已保存并重新加载。" : "配置已保存并校验，内核启动时将使用此配置。" : "配置已保存，可以稍后应用。");
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception error) { throw EditorFailure(error, fileSaved); }
@@ -325,9 +445,10 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private void ApplyInteractionState()
     {
         var updating = Session.IsUpdating; var available = !Busy && !updating;
-        overview.IsEnabled = available; AllowDrop = available; importButton.IsEnabled = available; openEditor.IsEnabled = available; reload.IsEnabled = available;
-        importUrlButton.IsEnabled = available && !string.IsNullOrWhiteSpace(importUrl.Text);
-        Editor.IsReadOnly = !loaded || !writable || Busy || updating || confirmation != Confirmation.None;
+        var overviewAvailable = available || (importing && importPreviewVisible && !reading && !saving && !updating);
+        overview.IsEnabled = overviewAvailable; AllowDrop = available; importButton.IsEnabled = overviewAvailable; openEditor.IsEnabled = overviewAvailable; reload.IsEnabled = overviewAvailable;
+        importUrlButton.IsEnabled = overviewAvailable && !string.IsNullOrWhiteSpace(importUrl.Text);
+        Editor.IsReadOnly = !loaded || !writable || Busy || updating || confirmation != Confirmation.None; Editor.IsEnabled = loaded && !reading; code.SetAvailability(loaded, reading);
         readAgain.IsEnabled = available; discard.IsEnabled = available && dirty; closeEditor.IsEnabled = !Busy; keepEditing.IsEnabled = !Busy; confirmDiscard.IsEnabled = available;
         save.IsEnabled = available && loaded && writable && !conflict && confirmation == Confirmation.None && (dirty || reloadPending);
         saveOnly.IsEnabled = available && loaded && writable && !conflict && confirmation == Confirmation.None && dirty;
@@ -337,14 +458,17 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     }
     private void UpdateEditorState()
     {
-        editorPath.Text = documentPath.Length > 0 ? documentPath : L.T("尚未读取配置文件"); editorPath.ToolTip = documentPath;
-        editorState.Text = L.T(reading ? "正在读取…" : saving ? reloading ? "正在应用…" : "正在保存…" : !writable ? "只读" : dirty ? "未保存" : reloadPending ? "等待应用" : loaded ? "YAML" : "不可用");
-        editorState.SetResourceReference(TextBlock.ForegroundProperty, loaded && !conflict && writable ? "AccentBrush" : "TextSecondaryBrush");
-        editorNotice.Text = L.T(problem.Length > 0 ? problem : !writable ? "当前配置仅供查看，重新读取可以重新检查写入权限。" : saved ? reloadPending ? "配置已保存，点击“保存并应用”使其生效。" : IsRunning ? "配置已保存并应用。" : "配置已保存并校验，内核启动时将使用此配置。" : "直接编辑当前 YAML 文件。Tab 缩进两个空格，Ctrl+S 保存并应用，Ctrl+F 查找。");
-        editorNotice.SetResourceReference(TextBlock.ForegroundProperty, problem.Length > 0 ? "DangerBrush" : saved ? "SuccessBrush" : "TextSecondaryBrush");
-        var title = saving ? reloading ? "正在应用…" : "正在保存…" : reloadPending && !dirty ? "重试应用" : "保存并应用";
-        save.Content = FluentControls.ButtonContent(saving ? "update" : "save", title); L.Bind(save, AutomationProperties.NameProperty, title);
-        readAgain.Content = FluentControls.ButtonContent("update", loaded ? "重新读取" : "重试读取"); L.Bind(readAgain, AutomationProperties.NameProperty, loaded ? "重新读取" : "重试读取");
+        editorPath.Text = documentPath.Length > 0 ? documentPath : L.T("配置文件"); editorPath.ToolTip = documentPath;
+        editorState.Text = L.T(reading ? "正在读取…" : saving ? reloading ? "正在重载…" : "正在保存…" : !writable ? "只读" : dirty ? "有未保存的修改" : reloadPending ? "已保存，待重载" : loaded ? "YAML" : "暂不可用");
+        editorState.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); editorDot.SetResourceReference(Shape.FillProperty, loaded && !conflict && writable ? "SuccessBrush" : "WarningBrush");
+        editorNotice.Text = L.T(problem.Length > 0 ? problem : !writable ? "内核当前无法写入此配置文件，已以只读方式打开。可以选择和复制内容；请检查文件及所在目录的权限，调整后重新读取以恢复编辑。" : saved ? reloadPending ? "配置已保存，点击“保存并重新加载”使其生效。" : IsRunning ? "配置文件已保存并重新加载。" : "配置已保存并校验，内核启动时将使用此配置。" : "保存并重新加载会先写入配置文件，再由内核校验并应用。控制器地址和密钥等启动配置需重启内核后生效。");
+        editorNotice.SetResourceReference(TextBlock.ForegroundProperty, problem.Length > 0 || saved ? "TextPrimaryBrush" : "TextSecondaryBrush"); editorNoticeFrame.SetResourceReference(Border.BackgroundProperty, problem.Length > 0 ? "WarningBackgroundBrush" : saved ? "SuccessBackgroundBrush" : "InfoBackgroundBrush"); if (problem.Length > 0 || saved) editorNoticeFrame.BorderBrush = Brushes.Transparent; else editorNoticeFrame.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
+        var title = saving ? reloading ? "正在重载…" : "正在保存…" : reloadPending && !dirty ? "重试重新加载" : "保存并重新加载";
+        saveLabel.Text = L.T(title); saveGlyph.Kind = reloading ? "update" : "save"; saveGlyph.Visibility = saving && !reloading ? Visibility.Collapsed : Visibility.Visible;
+        saveSpinner.IsActive = saving && !reloading; saveSpinner.Visibility = saveSpinner.IsActive ? Visibility.Visible : Visibility.Collapsed; ProxyVisuals.SetBusyIcon(saveGlyph, saving && reloading);
+        if (saving) saveContent.SetResourceReference(TextElement.ForegroundProperty, "TextSecondaryBrush"); else saveContent.ClearValue(TextElement.ForegroundProperty);
+        L.Bind(save, AutomationProperties.NameProperty, title);
+        readAgain.Content = FluentControls.ButtonContent("update", loaded ? "从文件重新读取" : "重新读取"); L.Bind(readAgain, AutomationProperties.NameProperty, loaded ? "从文件重新读取" : "重新读取");
     }
     private void EnsureNoUpdate() { if (Session.IsUpdating) throw new InvalidOperationException(L.T("正在安装应用更新，请等待更新完成后再编辑、保存或导入配置。")); }
     private void EnsureAvailable() { EnsureNoUpdate(); if (Busy) throw new InvalidOperationException(L.T("配置操作正在进行，请稍后重试。")); }
@@ -366,67 +490,81 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         if (Busy) { Message("配置操作正在进行，请完成后再离开此页。"); return false; }
         if (!dirty) { await Session.SetDirtyAsync(false); return true; }
         if (Session.IsUpdating) { Message("正在安装应用更新，请等待更新完成后再处理配置草稿。"); return false; }
-        SetConfirmation(Confirmation.None);
-        var choice = MessageBox.Show(Window.GetWindow(this), L.T("配置有未保存的修改，是否保存后继续？选择“否”将放弃这些修改。"), L.T("保存配置修改"), MessageBoxButton.YesNoCancel, MessageBoxImage.Question, MessageBoxResult.Cancel);
-        if (choice == MessageBoxResult.Cancel) return false;
-        try { if (choice == MessageBoxResult.Yes) { await Save(false); if (dirty) return false; } else await ResetDraft(); return true; }
-        catch (Exception error) { Message(error.Message, true); return false; }
+        if (!editorOpen) SetEditorVisible(true);
+        SetConfirmation(Confirmation.Close); return false;
     }
-    private async Task ChooseFile()
+    public async Task<bool> CanExitAsync()
     {
-        EnsureAvailable(); var dialog = new OpenFileDialog { Filter = L.T("YAML 配置|*.yaml;*.yml|所有文件|*.*"), CheckFileExists = true, Multiselect = false, Title = L.T("导入配置") };
-        if (dialog.ShowDialog(Window.GetWindow(this)) == true) await ImportFile(dialog.FileName);
+        if (leaveOpening) return false;
+        if (Busy) { Message("正在完成配置写入，请稍候。"); return false; }
+        if (!dirty) { await Session.SetDirtyAsync(false); return true; }
+        if (Session.IsUpdating) { Message("正在安装应用更新，请等待更新完成后再处理配置草稿。"); return false; }
+        if (Window.GetWindow(this) is not { } owner) return false;
+        leaveOpening = true;
+        try
+        {
+            var body = new StackPanel(); var hint = Ui.Label("退出会丢弃未保存内容，并停止本程序的代理连接。"); hint.LineHeight = 20; hint.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; body.Children.Add(hint);
+            var actions = new Grid { Margin = new Thickness(0, 24, 0, 0) }; actions.ColumnDefinitions.Add(new ColumnDefinition()); actions.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(8) }); actions.ColumnDefinitions.Add(new ColumnDefinition());
+            var accept = new Button { Content = FluentControls.ButtonContent("close", "丢弃修改并退出"), Height = 32, Padding = new Thickness(12, 0, 12, 0) }.Id("ConfigExitDiscard"); FluentControlState.SetKind(accept, "Danger"); L.Bind(accept, AutomationProperties.NameProperty, "丢弃修改并退出");
+            var cancel = new Button { Content = Ui.Label("继续编辑"), Height = 32, Padding = new Thickness(12, 0, 12, 0) }.Id("ConfigExitCancel"); L.Bind(cancel, AutomationProperties.NameProperty, "继续编辑");
+            actions.Children.Add(accept); Grid.SetColumn(cancel, 2); actions.Children.Add(cancel); body.Children.Add(actions);
+            var exiting = false; var dialog = new FluentDialog(owner, "退出前还有未保存的修改", body, []).Id("ConfigExitDialog"); dialog.CanDismiss = () => !exiting;
+            cancel.Click += (_, _) => dialog.Complete(false);
+            accept.Click += async (_, _) =>
+            {
+                if (exiting || Busy || Session.IsUpdating) return; exiting = true; accept.IsEnabled = cancel.IsEnabled = false;
+                var loading = new StackPanel { Orientation = Orientation.Horizontal }; loading.Children.Add(new FluentProgressRing { Width = 16, Height = 16, IsActive = true, IsButtonSpinner = true, Margin = new Thickness(0, 0, 8, 0) }); loading.Children.Add(Ui.Label("丢弃修改并退出")); loading.SetResourceReference(TextElement.ForegroundProperty, "TextSecondaryBrush"); accept.Content = loading;
+                try { await ResetDraft(); SetEditorVisible(false, false); dialog.Complete(true); }
+                catch (Exception error) { Session.Notify(error.Message, true); exiting = false; accept.IsEnabled = cancel.IsEnabled = true; accept.Content = FluentControls.ButtonContent("close", "丢弃修改并退出"); }
+            };
+            dialog.Loaded += (_, _) => cancel.Focus();
+            await Dispatcher.Yield(DispatcherPriority.Background);
+            if (Busy || Session.IsUpdating) return false;
+            return dialog.ShowDialog() == true;
+        }
+        finally { leaveOpening = false; }
     }
+    private Task ChooseFile() => OpenImport(new ConfigImportSeed("file"));
     private static bool IsYaml(string file) => Path.GetExtension(file).Equals(".yaml", StringComparison.OrdinalIgnoreCase) || Path.GetExtension(file).Equals(".yml", StringComparison.OrdinalIgnoreCase);
     private async Task ImportFile(string file)
     {
-        EnsureAvailable(); if (!IsYaml(file)) throw new InvalidOperationException(L.T("请导入 .yaml 或 .yml 配置文件。")); importing = true; ApplyInteractionState(); string content;
+        EnsureAvailable(); if (!IsYaml(file)) throw new InvalidOperationException(L.T("请导入 .yaml 或 .yml 配置文件。")); importing = true; ApplyInteractionState(); ConfigImportSeed seed;
         try
         {
-            // Bound the read itself: a file may grow after checking its initial length.
-            await using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 8192, FileOptions.Asynchronous);
-            if (stream.Length > maxBytes) throw new DesktopException("config_too_large", ""); var bytes = new byte[maxBytes + 1]; var length = 0;
-            while (length < bytes.Length) { var received = await stream.ReadAsync(bytes.AsMemory(length)); if (received == 0) break; length += received; }
-            if (length > maxBytes) throw new DesktopException("config_too_large", "");
-            var offset = length >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf ? 3 : 0; content = new UTF8Encoding(false, true).GetString(bytes, offset, length - offset);
+            seed = await ConfigImportDialog.ReadFileAsync(file, maxBytes);
         }
         catch (DesktopException error) { throw EditorFailure(error); }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or DecoderFallbackException or ArgumentException) { throw new InvalidOperationException(L.T("无法读取配置文件，请确认文件可访问且使用 UTF-8 编码。")); }
         finally { importing = false; ApplyInteractionState(); }
-        await Import(content, false);
+        await OpenImport(seed);
     }
     private async Task ImportUrl()
     {
-        var url = importUrl.Text.Trim();
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed) || parsed.Scheme is not ("http" or "https") || string.IsNullOrEmpty(parsed.Host) || parsed.UserInfo.Length > 0) throw new InvalidOperationException(L.T("请输入有效的 HTTP 或 HTTPS 订阅地址。"));
-        if (await Import(url, true)) importUrl.Clear();
+        if (await OpenImport(new ConfigImportSeed("url", Url: importUrl.Text.Trim()))) importUrl.Clear();
     }
-    private async Task Paste()
+    private Task Paste() => OpenImport(new ConfigImportSeed("text"));
+    private async Task<bool> OpenImport(ConfigImportSeed seed)
     {
-        EnsureAvailable(); var dialog = new Window { Owner = Window.GetWindow(this), Title = L.T("粘贴配置"), Width = 650, Height = 460, MinWidth = 440, MinHeight = 300, WindowStartupLocation = WindowStartupLocation.CenterOwner };
-        dialog.SetResourceReference(Control.BackgroundProperty, "AppBackgroundBrush"); dialog.SetResourceReference(Control.ForegroundProperty, "TextPrimaryBrush");
-        var input = new TextBox { AcceptsReturn = true, AcceptsTab = true, TextWrapping = TextWrapping.NoWrap, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(12), MaxLength = maxBytes, FontFamily = new FontFamily("Cascadia Mono, Consolas") }.Id("ConfigPasteInput");
-        var accept = L.Bind(new Button { Padding = new Thickness(18, 6, 18, 6), IsEnabled = false }.Id("ConfigPasteAccept"), ContentControl.ContentProperty, "导入配置"); FluentControls.Primary(accept);
-        var cancel = L.Bind(new Button { Padding = new Thickness(18, 6, 18, 6), IsCancel = true }.Id("ConfigPasteCancel"), ContentControl.ContentProperty, "取消");
-        var layout = new DockPanel { Margin = new Thickness(20) }; var hint = Ui.Hint("粘贴完整 YAML 配置，导入后可在当前配置中编辑。", 14); hint.Margin = new Thickness(0, 0, 0, 12); DockPanel.SetDock(hint, Dock.Top); layout.Children.Add(hint);
-        var actions = Ui.Row(cancel, accept); actions.HorizontalAlignment = HorizontalAlignment.Right; actions.Margin = new Thickness(0, 16, 0, 0); DockPanel.SetDock(actions, Dock.Bottom); layout.Children.Add(actions); layout.Children.Add(input); dialog.Content = layout;
-        input.TextChanged += (_, _) => accept.IsEnabled = !string.IsNullOrWhiteSpace(input.Text) && Encoding.UTF8.GetByteCount(input.Text) <= maxBytes;
-        accept.Click += (_, _) => dialog.DialogResult = true; dialog.Loaded += (_, _) => input.Focus(); if (dialog.ShowDialog() == true) await Import(input.Text, false);
-    }
-    private async Task<bool> Import(string value, bool url)
-    {
-        EnsureAvailable(); if (!url && Encoding.UTF8.GetByteCount(value) > maxBytes) throw new InvalidOperationException(L.T("配置大小超过允许的上限，请缩减内容后再保存。"));
-        if (!await CanLeaveAsync()) return false; EnsureAvailable();
-        if (MessageBox.Show(Window.GetWindow(this), L.T("导入将替换当前配置，原配置会由后台备份。继续导入？"), L.T("导入配置"), MessageBoxButton.OKCancel, MessageBoxImage.Question, MessageBoxResult.Cancel) != MessageBoxResult.OK) return false;
-        if (!loaded) await ReadDocument(); EnsureAvailable(); importing = true; ApplyInteractionState();
+        if (importOpening) return false; EnsureAvailable(); importOpening = true; var imported = false;
         try
         {
-            var document = url ? await Command("desktop_import_config_url", new { url = value, expectedRevision = revision }) : await Command("desktop_import_config", new { content = value, expectedRevision = revision });
-            ApplyDocument(ValidateDocument(document), true); reloadPending = true; saved = true; await Session.SetDirtyAsync(false); Message("配置已导入。点击“重新加载”应用到当前内核。"); return true;
+            if (!await CanLeaveAsync()) return false; EnsureAvailable();
+            if (Window.GetWindow(this) is not { } owner) return false;
+            importing = true; ApplyInteractionState();
+            await ConfigImportDialog.ShowAsync(owner, Session, seed, maxBytes, (document, applied) =>
+            {
+                ApplyDocument(ValidateDocument(document), true); reloadPending = !applied; saved = true; imported = true;
+                Message(applied ? IsRunning ? "配置已保存并应用。" : "配置已保存并校验，内核启动时将使用此配置。" : "配置已保存，可以稍后应用。"); ApplyInteractionState();
+            }, previewVisible =>
+            {
+                if (importPreviewVisible == previewVisible) return;
+                importPreviewVisible = previewVisible; ApplyInteractionState();
+            });
+            return imported;
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception error) { throw EditorFailure(error); }
-        finally { importing = false; ApplyInteractionState(); }
+        finally { importing = false; importOpening = false; importPreviewVisible = false; ApplyInteractionState(); }
     }
     public override async Task NavigateToAsync(NavigationTarget target)
     {
@@ -436,7 +574,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         else if (target.Action == "import") await ChooseFile();
         else if (target.Target == "set-resources")
         {
-            if (CanGoBack && !await CanLeaveAsync()) return; SetEditorVisible(false);
+            if (CanGoBack && !await CanLeaveAsync()) return; SetEditorVisible(false, false);
             await Dispatcher.InvokeAsync(() => { resourcesTarget.BringIntoView(); resourcesTarget.Focus(); resourcesTarget.SetResourceReference(Border.BorderBrushProperty, "AccentBrush"); FluentMotion.Flash(resourcesTarget); }, DispatcherPriority.Loaded);
             var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) }; timer.Tick += (_, _) => { timer.Stop(); resourcesTarget.BorderBrush = Brushes.Transparent; }; timer.Start();
         }

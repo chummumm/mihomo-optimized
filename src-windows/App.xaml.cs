@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Threading;
 using Mihomo.Desktop.Services;
 
 namespace Mihomo.Desktop;
@@ -14,6 +15,7 @@ public partial class App : Application
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        NativeFaultDiagnostics.Attach(this, e.Args);
         try
         {
             if (e.Args.FirstOrDefault() is "--install" or "--uninstall" or "--stop-for-update" or "--start-if-installed")
@@ -38,6 +40,17 @@ public partial class App : Application
             session.ApplyTheme();
             var window = new MainWindow(session);
             MainWindow = window;
+            EventHandler? initializeBackdrop = null;
+            initializeBackdrop = (_, _) =>
+            {
+                window.ContentRendered -= initializeBackdrop;
+                _ = Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
+                {
+                    if (!Dispatcher.HasShutdownStarted && !SystemParameters.HighContrast && Controls.FluentMotion.Enabled)
+                        Controls.FluentBackdropFilter.PrewarmRendering();
+                }));
+            };
+            window.ContentRendered += initializeBackdrop;
             instance.Listen(async command => await Dispatcher.InvokeAsync(async () =>
             {
                 if (command == "activate") { window.ShowMain(); return true; }
