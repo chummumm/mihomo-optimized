@@ -32,6 +32,9 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.402'
+      - name: Verify transparent shell controls receive pointer hits
+        timeout-minutes: 3
+        run: dotnet run --project desktop/tests/shell/ShellTests.csproj -c Release
       - name: Verify native backdrop snapshot pixels and cancellation
         timeout-minutes: 3
         run: dotnet run --project desktop/tests/backdrop/BackdropTests.csproj -c Release
