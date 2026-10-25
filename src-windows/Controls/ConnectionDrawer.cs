@@ -43,7 +43,7 @@ internal sealed class ConnectionDrawer : Border
         var header = new DockPanel { Margin = new Thickness(18, 0, 8, 0) }; var close = FluentControls.IconButton("close", "关闭详情", "CloseConnectionDetails"); close.Click += (_, _) => Hide(); DockPanel.SetDock(close, Dock.Right); header.Children.Add(close); header.Children.Add(Ui.Label("连接信息", 14, true));
         var headerFrame = new Border { Child = header, BorderThickness = new Thickness(0, 0, 0, 1) }; headerFrame.SetResourceReference(BorderBrushProperty, "DividerBrush"); layout.Children.Add(headerFrame);
         var statusCopy = new StackPanel { Orientation = Orientation.Horizontal }; statusCopy.Children.Add(lamp); statusCopy.Children.Add(state);
-        stateBadge = new Border { Child = statusCopy, Height = 24, Padding = new Thickness(8, 0, 8, 0), CornerRadius = new CornerRadius(4) }; network.FontFamily = new FontFamily("Cascadia Mono, Consolas"); network.Margin = new Thickness(8, 0, 0, 0);
+        stateBadge = new Border { Child = statusCopy, Height = 24, Padding = new Thickness(8, 0, 8, 0), CornerRadius = new CornerRadius(4) }; network.Tabular(); network.Margin = new Thickness(8, 0, 0, 0);
         var status = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 16) }; status.Children.Add(stateBadge); status.Children.Add(network);
         journey.Margin = new Thickness(0, 0, 0, 16);
         var factsFrame = new Border { Child = facts, BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(0, 14, 0, 0) }; factsFrame.SetResourceReference(BorderBrushProperty, "DividerBrush");

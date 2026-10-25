@@ -239,9 +239,12 @@ public partial class MainWindow : Window
         PhaseText.Text = L.T(label);
         PhaseText.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush");
         CoreStatusDot.SetResourceReference(ShellVisuals.BackgroundProperty, phase == "running" ? "SuccessBrush" : phase == "error" ? "DangerBrush" : phase is "starting" or "stopping" ? "WarningBrush" : "TextTertiaryBrush");
-        CoreAvatarBackground.SetResourceReference(ShellVisuals.BackgroundProperty, phase == "running" ? "AccentBrush" : "ControlAltBrush");
-        CoreGlyph.Kind = phase == "running" ? "globe-shield" : "power"; CoreGlyph.Filled = phase == "running";
-        CoreGlyph.SetResourceReference(Control.ForegroundProperty, phase == "running" ? "AccentTextBrush" : "TextSecondaryBrush");
+        // Running shows the full-colour emblem on a quiet accent tint; other phases keep the neutral power glyph.
+        CoreAvatarBackground.SetResourceReference(ShellVisuals.BackgroundProperty, phase == "running" ? "AccentSubtleBrush" : "ControlAltBrush");
+        CoreImage.Visibility = phase == "running" ? Visibility.Visible : Visibility.Collapsed;
+        CoreGlyph.Visibility = phase == "running" ? Visibility.Collapsed : Visibility.Visible;
+        CoreGlyph.Kind = phase == "error" ? "warning" : "power";
+        CoreGlyph.SetResourceReference(Control.ForegroundProperty, phase == "error" ? "DangerBrush" : "TextSecondaryBrush");
         CoreProgress.IsActive = phase is "starting" or "stopping";
         string version = ShortVersion(session.Status.Text("coreVersion")); VersionText.Text = version.Length > 0 ? L.F("内核 {0}", version) : "—";
         AutomationProperties.SetName(CoreCardButton, L.T("本地内核") + " · " + PhaseText.Text);
@@ -381,7 +384,7 @@ public partial class MainWindow : Window
             if (label is null) continue;
             FadeLabel(label, expanded, animate);
             item.ToolTip = expanded ? null : label.Text; AutomationProperties.SetName(item, label.Text);
-            item.Padding = new Thickness(12, 0, 12, 0);
+            item.Padding = new Thickness(10, 0, 10, 0);
         }
         FadeLabel(CoreText, expanded, animate);
         CoreCardButton.Padding = expanded ? new Thickness(8) : new Thickness(0);

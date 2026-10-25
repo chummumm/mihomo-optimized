@@ -20,18 +20,16 @@ internal sealed class SettingsSegments : ListBox
         <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
           <Style x:Key="Segments" TargetType="ListBox">
             <Setter Property="BorderThickness" Value="1"/><Setter Property="Padding" Value="2"/>
-            <Setter Property="Background" Value="{DynamicResource ControlAltBrush}"/>
+            <Setter Property="Background" Value="{DynamicResource SegmentTrackBrush}"/>
             <Setter Property="BorderBrush" Value="{DynamicResource ControlStrokeBrush}"/>
             <Setter Property="ItemsPanel"><Setter.Value><ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate></Setter.Value></Setter>
             <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBox">
               <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5" Padding="{TemplateBinding Padding}">
                 <Grid>
                   <Canvas IsHitTestVisible="False">
-                    <Border x:Name="PART_Selection" Height="28" CornerRadius="4" BorderThickness="1" BorderBrush="{DynamicResource ControlStrokeBrush}" Background="{DynamicResource ControlBrush}" Visibility="Hidden">
-                      <Grid>
-                        <Border Height="1" VerticalAlignment="Bottom" Background="{DynamicResource ControlElevationBrush}"/>
-                        <Border Width="16" Height="3" CornerRadius="2" VerticalAlignment="Bottom" Margin="0,0,0,2" Background="{DynamicResource AccentBrush}"/>
-                      </Grid>
+                    <!-- A raised chip like WinUI's Segmented control; the selection reads from elevation, not an underline. -->
+                    <Border x:Name="PART_Selection" Height="28" CornerRadius="4" BorderThickness="1" BorderBrush="{DynamicResource ControlStrokeBrush}" Background="{DynamicResource SegmentChipBrush}" Visibility="Hidden">
+                      <Border Height="1" Margin="2,0,2,-1" VerticalAlignment="Bottom" Background="{DynamicResource ControlElevationBrush}"/>
                     </Border>
                   </Canvas>
                   <ItemsPresenter/>

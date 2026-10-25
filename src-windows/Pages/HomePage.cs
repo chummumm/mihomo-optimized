@@ -33,11 +33,16 @@ public sealed class HomePage : NativePage
     private readonly Button start;
     private readonly Button stop;
     private readonly Button restart;
-    private readonly Border heroGlyph = new() { Width = 64, Height = 64, CornerRadius = new CornerRadius(32) };
-    private readonly Border heroHalo = new() { Width = 76, Height = 76, CornerRadius = new CornerRadius(38), BorderThickness = new Thickness(2), Opacity = .28 };
-    private readonly FluentIcon heroIcon = new("globe-shield", 28);
-    private readonly FluentProgressRing heroProgress = new() { Width = 76, Height = 76 };
-    private readonly Grid emblem = new() { Width = 76, Height = 76, Margin = new Thickness(-6, -6, 14, -6) };
+    // Emblem: the colour globe-shield floats on a soft accent glow while running; other phases use a
+    // neutral disc with a monochrome glyph, and errors show the colour warning sign.
+    private readonly Border heroGlyph = new() { Width = 56, Height = 56, CornerRadius = new CornerRadius(28), BorderThickness = new Thickness(1) };
+    private readonly Border heroGlow = new() { Width = 96, Height = 96, CornerRadius = new CornerRadius(48), Margin = new Thickness(-20), IsHitTestVisible = false };
+    private readonly Border heroWash = new() { CornerRadius = new CornerRadius(7), IsHitTestVisible = false };
+    private readonly Image heroImage = new() { Width = 48, Height = 48, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+    private readonly FluentIcon heroIcon = new("power", 24) { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+    private readonly FluentProgressRing heroProgress = new() { Width = 64, Height = 64, Margin = new Thickness(-4) };
+    private readonly Grid emblem = new() { Width = 56, Height = 56, Margin = new Thickness(0, 0, 16, 0), VerticalAlignment = VerticalAlignment.Center };
+    private readonly StackPanel heroContent = new();
     private readonly Grid heroMain = new();
     private readonly WrapPanel heroActions;
     private readonly WrapPanel facts;
@@ -75,14 +80,17 @@ public sealed class HomePage : NativePage
         heroMain.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); heroMain.ColumnDefinitions.Add(new ColumnDefinition()); heroMain.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         heroMain.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); heroMain.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         ShellVisuals.SetDuration(heroGlyph, 250); ShellVisuals.SetDuration(heroIcon, 250);
-        heroGlyph.Child = heroIcon; emblem.Children.Add(heroGlyph); emblem.Children.Add(heroHalo); emblem.Children.Add(heroProgress); heroMain.Children.Add(emblem);
+        RenderOptions.SetBitmapScalingMode(heroImage, BitmapScalingMode.HighQuality);
+        heroGlow.SetResourceReference(Border.BackgroundProperty, "AccentGlowBrush"); heroWash.SetResourceReference(Border.BackgroundProperty, "AccentWashBrush");
+        heroGlyph.SetResourceReference(Border.BorderBrushProperty, "CardStrokeBrush");
+        heroGlyph.Child = heroIcon; emblem.Children.Add(heroGlow); emblem.Children.Add(heroGlyph); emblem.Children.Add(heroImage); emblem.Children.Add(heroProgress); heroMain.Children.Add(emblem);
         var status = Ui.Column(phase, description); status.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(status, 1); heroMain.Children.Add(status);
         Grid.SetColumn(heroActions, 2); heroMain.Children.Add(heroActions);
         coreError.SetResourceReference(TextBlock.ForegroundProperty, "DangerBrush"); coreError.Margin = new Thickness(0, 12, 0, 0); coreError.Visibility = Visibility.Collapsed; coreError.Id("HomeCoreError");
         modes.Selected += async value => await RunUserActionAsync(() => ChangeAsync("mode", "desktop_patch_config", new { patch = new { mode = value } }));
         var modeRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center }; var modeLabel = Ui.Hint("出站模式", 14); modeLabel.Margin = new Thickness(0, 0, 12, 0); modeLabel.VerticalAlignment = VerticalAlignment.Center; modeRow.Children.Add(modeLabel); modeRow.Children.Add(modes);
-        coreVersion.FontFamily = proxyAddress.FontFamily = new FontFamily("Cascadia Mono, Cascadia Code, Consolas");
-        coreVersion.LineHeight = proxyAddress.LineHeight = 18.59;
+        // Readings use the UI face with tabular figures rather than a code font.
+        foreach (var reading in new[] { coreVersion, proxyAddress }) { reading.FontSize = 14; reading.LineHeight = 20; reading.Tabular(); }
         var coreLabel = Ui.Hint("内核"); var proxyLabel = Ui.Hint("本机代理");
         coreLabel.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); proxyLabel.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush");
         coreLabel.LineHeight = proxyLabel.LineHeight = 16;
@@ -91,7 +99,9 @@ public sealed class HomePage : NativePage
         ((FrameworkElement)facts.Children[0]).Margin = new Thickness(0, 0, 24, 0);
         var footContent = new HomeFlowRow(24, 12); footContent.Children.Add(modeRow); footContent.Children.Add(facts);
         var foot = new Border { Child = footContent, Margin = new Thickness(0, 16, 0, 0), Padding = new Thickness(0, 16, 0, 0), BorderThickness = new Thickness(0, 1, 0, 0) }; foot.SetResourceReference(Border.BorderBrushProperty, "DividerBrush");
-        hero = Ui.Card(Ui.Column(heroMain, coreError, foot), 24); hero.Margin = new Thickness(0);
+        heroContent.Children.Add(heroMain); heroContent.Children.Add(coreError); heroContent.Children.Add(foot);
+        var heroLayers = new Grid(); heroLayers.Children.Add(heroWash); heroLayers.Children.Add(heroContent);
+        hero = Ui.Card(heroLayers, 0); hero.Margin = new Thickness(0);
         proxy = new QuickSettingTile("nav-proxies", "系统代理", "systemProxy", () => Session.Navigate(new NavigationTarget("settings", "set-system-proxy")));
         tun = new QuickSettingTile("shield-lock", "TUN 模式", "tun", () => Session.Navigate(new NavigationTarget("settings", "set-tun")));
         lan = new QuickSettingTile("wifi", "局域网连接", "allowLan", () => Session.Navigate(new NavigationTarget("settings", "set-lan")));
@@ -138,6 +148,13 @@ public sealed class HomePage : NativePage
         Loaded += (_, _) => ApplyResponsiveLayout(PageContainerWidth);
         SetScrollableBody(body).Id("HomeScrollViewer"); UpdateStatus();
     }
+    private static void Fade(UIElement element, double opacity)
+    {
+        if (Math.Abs(element.Opacity - opacity) < .001) return;
+        double from = element.Opacity; element.BeginAnimation(OpacityProperty, null); element.Opacity = opacity;
+        if (FluentMotion.Enabled && element.IsVisible)
+            element.BeginAnimation(OpacityProperty, new System.Windows.Media.Animation.DoubleAnimation(from, opacity, TimeSpan.FromMilliseconds(250)) { EasingFunction = FluentMotion.Decelerate });
+    }
     private static FrameworkElement Legend(string name, string brush)
     {
         var panel = new StackPanel { Orientation = Orientation.Horizontal };
@@ -154,12 +171,14 @@ public sealed class HomePage : NativePage
     private void ApplyResponsiveLayout(double width)
     {
         bool narrow = width <= 720;
-        hero.Padding = width <= 480 ? new Thickness(16) : new Thickness(24, 20, 24, 20);
-        double glyphSize = width <= 480 ? 48 : 64;
-        heroGlyph.Width = heroGlyph.Height = glyphSize;
+        heroContent.Margin = width <= 480 ? new Thickness(16) : new Thickness(24, 20, 24, 20);
+        double glyphSize = width <= 480 ? 44 : 56;
+        heroGlyph.Width = heroGlyph.Height = emblem.Width = emblem.Height = glyphSize;
         heroGlyph.CornerRadius = new CornerRadius(glyphSize / 2);
-        heroHalo.Width = heroHalo.Height = heroProgress.Width = heroProgress.Height = emblem.Width = emblem.Height = glyphSize + 12;
-        heroHalo.CornerRadius = new CornerRadius((glyphSize + 12) / 2);
+        heroImage.Width = heroImage.Height = width <= 480 ? 40 : 48;
+        heroProgress.Width = heroProgress.Height = glyphSize + 8;
+        heroGlow.Width = heroGlow.Height = glyphSize + 40; heroGlow.CornerRadius = new CornerRadius((glyphSize + 40) / 2);
+        emblem.Margin = new Thickness(0, 0, width <= 480 ? 12 : 16, 0);
         Grid.SetColumn(heroActions, narrow ? 0 : 2); Grid.SetRow(heroActions, narrow ? 1 : 0); Grid.SetColumnSpan(heroActions, narrow ? 3 : 1);
         heroActions.HorizontalAlignment = narrow ? HorizontalAlignment.Left : HorizontalAlignment.Right; heroActions.Margin = narrow ? new Thickness(0, 20, 0, 0) : new Thickness(20, 0, 0, 0);
         facts.Visibility = width <= 480 ? Visibility.Collapsed : Visibility.Visible;
@@ -213,10 +232,13 @@ public sealed class HomePage : NativePage
         modes.SetMode(runtimeMode);
         phase.Text = L.T(state switch { "running" => "已连接", "starting" => "正在启动", "stopping" => "正在停止", "error" => "运行异常", "stopped" => "未运行", _ => "正在连接…" });
         phase.SetResourceReference(TextBlock.ForegroundProperty, state == "error" ? "DangerBrush" : "TextPrimaryBrush");
-        heroGlyph.SetResourceReference(ShellVisuals.BackgroundProperty, running ? "AccentBrush" : state == "error" ? "CriticalBackgroundBrush" : "ControlAltBrush");
-        heroIcon.Kind = state == "error" ? "warning" : "globe-shield"; heroIcon.Filled = running;
-        heroIcon.SetResourceReference(ShellVisuals.ForegroundProperty, running ? "AccentTextBrush" : state == "error" ? "DangerBrush" : "TextSecondaryBrush");
-        heroHalo.SetResourceReference(Border.BorderBrushProperty, "AccentBrush"); heroHalo.Visibility = running ? Visibility.Visible : Visibility.Collapsed; heroProgress.IsActive = busy;
+        bool failed = state == "error";
+        heroImage.SetResourceReference(Image.SourceProperty, failed ? "ColorIcon.warning.48" : "ColorIcon.globe-shield.48");
+        heroImage.Visibility = running || failed ? Visibility.Visible : Visibility.Collapsed;
+        heroGlyph.Visibility = running || failed ? Visibility.Collapsed : Visibility.Visible;
+        heroGlyph.SetResourceReference(ShellVisuals.BackgroundProperty, "ControlAltBrush");
+        heroIcon.SetResourceReference(ShellVisuals.ForegroundProperty, "TextSecondaryBrush");
+        Fade(heroGlow, running ? 1 : 0); Fade(heroWash, running ? 1 : 0); heroProgress.IsActive = busy;
         string mode = L.T(modes.Mode switch { "global" => "全局模式", "direct" => "直连模式", _ => "规则模式" });
         string? selected = exitSnapshot.Main?.Exit;
         description.Text = state switch

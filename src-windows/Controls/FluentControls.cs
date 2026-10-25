@@ -85,6 +85,7 @@ internal sealed class QuickSettingTile : Border
     private readonly TextBlock description = Ui.Muted("");
     private readonly FluentProgressRing progress = new() { Width = 20, Height = 20 };
     private readonly FluentIcon glyph;
+    private readonly Border chip = new() { Width = 32, Height = 32, CornerRadius = new CornerRadius(16) };
     private readonly TextBlock label;
     private readonly Button? moreButton;
     private readonly string title;
@@ -97,8 +98,11 @@ internal sealed class QuickSettingTile : Border
         SetResourceReference(BackgroundProperty, "SurfaceBrush"); SetResourceReference(BorderBrushProperty, "BorderBrush");
         var row = new Grid();
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); row.ColumnDefinitions.Add(new ColumnDefinition());
-        glyph = new FluentIcon(icon, 20) { VerticalAlignment = VerticalAlignment.Center };
-        var iconSlot = new Grid { Width = 20, Height = 24, Margin = new Thickness(0, 0, 14, 0) }; iconSlot.Children.Add(glyph); iconSlot.Children.Add(progress); row.Children.Add(iconSlot);
+        // A 32px status chip: accent-filled with the filled glyph when on, a quiet neutral disc when off.
+        glyph = new FluentIcon(icon, 16) { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        ShellVisuals.SetDuration(chip, 167); ShellVisuals.SetDuration(glyph, 167);
+        var chipContent = new Grid(); chipContent.Children.Add(glyph); chipContent.Children.Add(progress); chip.Child = chipContent;
+        chip.Margin = new Thickness(0, 0, 12, 0); chip.VerticalAlignment = VerticalAlignment.Center; row.Children.Add(chip);
         label = Ui.Label(title, 14, true); label.TextWrapping = TextWrapping.NoWrap; label.TextTrimming = TextTrimming.CharacterEllipsis;
         description.LineHeight = 16; description.TextWrapping = TextWrapping.NoWrap; description.TextTrimming = TextTrimming.CharacterEllipsis;
         var texts = Ui.Column(label, description); texts.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(texts, 1); row.Children.Add(texts);
@@ -109,7 +113,7 @@ internal sealed class QuickSettingTile : Border
         if (more is not null)
         {
             moreButton = FluentControls.IconButton("chevron-right", title, id + "Settings", 36); moreButton.Content = new FluentIcon("chevron-right", 12); moreButton.Style = FluentControls.Style("FluentHomeMore"); moreButton.Height = double.NaN; moreButton.VerticalAlignment = VerticalAlignment.Stretch;
-            moreButton.BorderThickness = new Thickness(1, 0, 0, 0); moreButton.SetResourceReference(Control.BorderBrushProperty, "BorderBrush"); moreButton.Click += (_, _) => more();
+            moreButton.BorderThickness = new Thickness(1, 0, 0, 0); moreButton.SetResourceReference(Control.BorderBrushProperty, "DividerBrush"); moreButton.Click += (_, _) => more();
             Grid.SetColumn(moreButton, 1); layout.Children.Add(moreButton);
         }
         Child = layout;
@@ -123,15 +127,15 @@ internal sealed class QuickSettingTile : Border
             toggle.IsChecked = enabled; toggle.IsEnabled = interactive; description.Text = subtitle;
             glyph.Visibility = busy ? Visibility.Hidden : Visibility.Visible; progress.IsActive = busy; glyph.Filled = enabled;
             progress.SetResourceReference(FluentProgressRing.ForegroundProperty, enabled ? "AccentTextBrush" : "AccentBrush");
-            SetResourceReference(BackgroundProperty, enabled ? "AccentBrush" : "SurfaceBrush");
-            SetResourceReference(BorderBrushProperty, enabled ? "AccentBrush" : "BorderBrush");
-            toggle.SetResourceReference(Control.ForegroundProperty, enabled ? "AccentTextBrush" : "TextPrimaryBrush");
-            description.SetResourceReference(TextBlock.ForegroundProperty, enabled ? "AccentTextSecondaryBrush" : "TextSecondaryBrush"); description.Opacity = 1;
+            chip.SetResourceReference(ShellVisuals.BackgroundProperty, enabled ? "AccentBrush" : "ControlAltHoverBrush");
+            glyph.SetResourceReference(ShellVisuals.ForegroundProperty, enabled ? "AccentTextBrush" : "TextSecondaryBrush");
+            chip.Opacity = interactive || enabled ? 1 : .6;
+            SetResourceReference(BackgroundProperty, "SurfaceBrush");
+            SetResourceReference(BorderBrushProperty, enabled ? "AccentSubtleStrokeBrush" : "BorderBrush");
+            description.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); description.Opacity = 1;
             if (moreButton is not null)
             {
                 moreButton.Tag = enabled;
-                moreButton.SetResourceReference(Control.ForegroundProperty, enabled ? "AccentTextBrush" : "TextPrimaryBrush");
-                moreButton.SetResourceReference(Control.BorderBrushProperty, enabled ? "OnAccentDividerBrush" : "DividerBrush");
                 string name = L.F("{0}设置", L.T(title)); moreButton.ToolTip = name; AutomationProperties.SetName(moreButton, name);
             }
             AutomationProperties.SetHelpText(toggle, subtitle);

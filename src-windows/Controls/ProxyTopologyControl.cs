@@ -36,7 +36,7 @@ internal sealed class ProxyTopologyControl : Grid
     {
         this.Id("ProxyTopology"); ClipToBounds = false;
         lines = new LinkSurface(this); Children.Add(lines); Children.Add(boxes);
-        foreach (var heading in headings) { heading.IsHitTestVisible = false; heading.FontFamily = new FontFamily("Cascadia Mono, Consolas"); heading.SetResourceReference(TextBlock.ForegroundProperty, "FaintBrush"); boxes.Children.Add(heading); }
+        foreach (var heading in headings) { heading.IsHitTestVisible = false; heading.Tabular(); heading.SetResourceReference(TextBlock.ForegroundProperty, "FaintBrush"); boxes.Children.Add(heading); }
         SizeChanged += (_, _) => { Place(); Wake(); }; IsVisibleChanged += (_, _) => Wake(); timer.Tick += (_, _) => Tick();
         L.Changed += () => { UpdateLabels(); lines.InvalidateVisual(); };
     }
@@ -181,7 +181,7 @@ internal sealed class ProxyTopologyControl : Grid
         {
             Node = node; Button.SetResourceReference(Control.BackgroundProperty, "PanelSolidBrush"); Button.SetResourceReference(Control.BorderBrushProperty, "HairStrongBrush");
             Title.TextWrapping = Subtitle.TextWrapping = TextWrapping.NoWrap; Title.TextTrimming = Subtitle.TextTrimming = TextTrimming.CharacterEllipsis;
-            Subtitle.FontFamily = new FontFamily("Cascadia Mono, Consolas"); Subtitle.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush");
+            Subtitle.Tabular(); Subtitle.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush");
             var canvas = new Canvas { Margin = new Thickness(-1) }; canvas.Children.Add(Ping); canvas.Children.Add(Marker); canvas.Children.Add(Title); canvas.Children.Add(Subtitle); Button.Content = canvas;
             TipTitle.LineHeight = TipSubtitle.LineHeight = 16; var tip = new ToolTip { Content = Ui.Column(TipTitle, TipSubtitle), MaxWidth = 280, Padding = new Thickness(8, 6, 8, 8), Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom, VerticalOffset = 6 }; Button.ToolTip = tip; ToolTipService.SetInitialShowDelay(Button, 0); ToolTipService.SetBetweenShowDelay(Button, 0);
         }
@@ -211,8 +211,8 @@ internal sealed class ProxyTopologyControl : Grid
             {
                 var link = particle.Link.Link; if (Curve(link) is not { } curve) continue;
                 var t = particle.T; var u = 1 - t; var point = new Point(u * u * u * curve.Start.X + 3 * u * u * t * curve.Middle + 3 * u * t * t * curve.Middle + t * t * t * curve.End.X, u * u * u * curve.Start.Y + 3 * u * u * t * curve.Start.Y + 3 * u * t * t * curve.End.Y + t * t * t * curve.End.Y);
-                var related = owner.hovered is null || link.From == owner.hovered || link.To == owner.hovered; var alpha = particle.Link.Alpha * (related ? 1 : .1) * Math.Sin(Math.PI * t); var brush = BrushFor(link); var ratio = owner.ActualWidth < 620 ? 2.4 : 3.4;
-                drawing.PushOpacity(alpha * (owner.Dark ? .32 : .16)); drawing.DrawEllipse(brush, null, point, particle.Radius * ratio, particle.Radius * ratio); drawing.Pop();
+                var related = owner.hovered is null || link.From == owner.hovered || link.To == owner.hovered; var alpha = particle.Link.Alpha * (related ? 1 : .1) * Math.Sin(Math.PI * t); var brush = BrushFor(link); var ratio = owner.ActualWidth < 620 ? 2 : 2.6;
+                drawing.PushOpacity(alpha * (owner.Dark ? .26 : .12)); drawing.DrawEllipse(brush, null, point, particle.Radius * ratio, particle.Radius * ratio); drawing.Pop();
                 drawing.PushOpacity(alpha); drawing.DrawEllipse(brush, null, point, particle.Radius, particle.Radius); drawing.Pop();
             }
         }

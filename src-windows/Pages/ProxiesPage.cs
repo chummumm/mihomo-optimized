@@ -116,7 +116,13 @@ public sealed class ProxiesPage : NativePage
         var legend = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(20, 0, 0, 0) }; legend.Children.Add(Legend("代理流量", "AccentBrush")); legend.Children.Add(Legend("直连", "FaintBrush")); Grid.SetColumn(legend, 1); bar.Children.Add(legend);
         topologyHint.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); topologyHint.HorizontalAlignment = HorizontalAlignment.Right; topologyHint.Margin = new Thickness(20, 0, 0, 0); Grid.SetColumn(topologyHint, 2); bar.Children.Add(topologyHint);
         topologyBody.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); topologyBody.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); topologyBody.Children.Add(bar);
-        var stage = new Grid { Margin = new Thickness(16, 8, 16, 16) }; stage.Children.Add(topology); idleMap.VerticalAlignment = VerticalAlignment.Bottom; idleMap.HorizontalAlignment = HorizontalAlignment.Center; idleMap.Margin = new Thickness(0, 0, 0, 6); idleMap.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); idleMap.IsHitTestVisible = false; stage.Children.Add(idleMap); Grid.SetRow(stage, 1); topologyBody.Children.Add(stage);
+        var stage = new Grid { Margin = new Thickness(16, 8, 16, 16) };
+        stage.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); stage.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        stage.Children.Add(topology);
+        // Give the idle caption its own row so it cannot cover the last policy
+        // node. Collapsing the caption also removes the row's height and margin.
+        idleMap.HorizontalAlignment = HorizontalAlignment.Center; idleMap.Margin = new Thickness(0, 6, 0, 0); idleMap.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush"); idleMap.IsHitTestVisible = false;
+        Grid.SetRow(idleMap, 1); stage.Children.Add(idleMap); Grid.SetRow(stage, 1); topologyBody.Children.Add(stage);
         topologyReveal.Child = topologyBody; topologyReveal.BorderThickness = new Thickness(0, 1, 0, 0); topologyReveal.SetResourceReference(Border.BorderBrushProperty, "DividerBrush");
         var topologyCard = Ui.Card(Ui.Column(topologyHeader, topologyReveal), 0); topologyCard.CornerRadius = new CornerRadius(4); topologyCard.Margin = new Thickness(0); content.Children.Add(topologyCard);
         topologyCard.SizeChanged += (_, _) =>
@@ -672,10 +678,10 @@ public sealed class ProxiesPage : NativePage
         void Rate(TextBlock target, string arrow, double value)
         {
             target.Inlines.Clear(); target.Inlines.Add(new Run(arrow + " "));
-            var number = new Run(Ui.Bytes(value) + "/s") { FontFamily = new FontFamily("Cascadia Mono, Consolas") }; number.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); target.Inlines.Add(number);
+            var number = new Run(Ui.Bytes(value) + "/s").Tabular(); number.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); target.Inlines.Add(number);
         }
         Rate(flowDown, "↓", down); Rate(flowUp, "↑", up);
-        flowCount.Inlines.Clear(); var count = new Run(activeConnections.ToString()) { FontFamily = new FontFamily("Cascadia Mono, Consolas") }; count.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); flowCount.Inlines.Add(count); flowCount.Inlines.Add(new Run(L.F("{0} 个连接", "")));
+        flowCount.Inlines.Clear(); var count = new Run(activeConnections.ToString()).Tabular(); count.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); flowCount.Inlines.Add(count); flowCount.Inlines.Add(new Run(L.F("{0} 个连接", "")));
         var compact = PageContainerWidth <= 640; flowCount.Visibility = compact ? Visibility.Collapsed : Visibility.Visible; flowUp.Margin = new Thickness(0, 0, compact ? 0 : 14, 0);
         liveDot.SetResourceReference(LivePing.FillProperty, activeConnections > 0 ? "SuccessBrush" : "FaintBrush");
     }

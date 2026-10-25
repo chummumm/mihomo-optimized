@@ -32,6 +32,12 @@ internal static class JsonData
 internal static class Ui
 {
     public static T Id<T>(this T element, string id) where T : DependencyObject { AutomationProperties.SetAutomationId(element, id); return element; }
+    /// <summary>Live readings (latency, rates, ports, versions) use the UI face with fixed-width figures instead of a code font.</summary>
+    public static T Tabular<T>(this T element) where T : DependencyObject
+    {
+        if (element is TextBlock or Control) element.ClearValue(element is TextBlock ? TextBlock.FontFamilyProperty : Control.FontFamilyProperty);
+        System.Windows.Documents.Typography.SetNumeralAlignment(element, FontNumeralAlignment.Tabular); return element;
+    }
     public static TextBlock Text(string value, double size = 14, bool strong = false) => new()
     {
         Text = value, FontSize = size, LineHeight = size == 12 ? 16 : size == 28 ? 36 : Math.Round(size * 1.43), FontWeight = strong ? FontWeights.SemiBold : FontWeights.Normal,

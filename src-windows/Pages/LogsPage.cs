@@ -140,7 +140,7 @@ public sealed class LogsPage : NativePage
         pausedLamp = new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(2), Margin = new Thickness(0, 0, 12, 0), VerticalAlignment = VerticalAlignment.Center };
         pausedLamp.SetResourceReference(Border.BackgroundProperty, "WarningBrush");
         pausedText.FontWeight = FontWeights.SemiBold; pausedText.SetResourceReference(TextBlock.ForegroundProperty, "WarningBrush"); pausedText.Margin = new Thickness(0, 0, 12, 0);
-        heldCount.FontFamily = new FontFamily("Cascadia Mono, Consolas"); heldCount.FontWeight = FontWeights.Medium; heldCount.Margin = new Thickness(0, 0, 4, 0);
+        heldCount.Tabular(); heldCount.FontWeight = FontWeights.Medium; heldCount.Margin = new Thickness(0, 0, 4, 0);
         heldLabel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 12, 0), VerticalAlignment = VerticalAlignment.Center };
         heldLabel.Children.Add(heldCount); heldLabel.Children.Add(Ui.Hint("条新日志等待显示"));
         var noticeLayout = new Grid();

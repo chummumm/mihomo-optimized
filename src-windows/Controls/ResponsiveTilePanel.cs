@@ -3,13 +3,21 @@ using System.Windows.Controls;
 
 namespace Mihomo.Desktop.Controls;
 
-/// <summary>Equal-width quick-setting tiles, wrapping at the design's minimum tile width.</summary>
+/// <summary>Equal-width quick-setting tiles, wrapping at the design's minimum tile width into balanced rows.</summary>
 public sealed class ResponsiveTilePanel : Panel
 {
     public double MinimumTileWidth { get; set; } = 200;
     public double Gap { get; set; } = 8;
     public int MaximumColumns { get; set; } = 4;
-    private int Columns(double width) => Math.Clamp(double.IsInfinity(width) ? MaximumColumns : (int)Math.Floor((Math.Max(0, width) + Gap) / (MinimumTileWidth + Gap)), 1, Math.Max(1, MaximumColumns));
+    private int Columns(double width)
+    {
+        int fit = Math.Clamp(double.IsInfinity(width) ? MaximumColumns : (int)Math.Floor((Math.Max(0, width) + Gap) / (MinimumTileWidth + Gap)), 1, Math.Max(1, MaximumColumns));
+        // Balance the rows instead of leaving one orphan tile: four tiles flow 4 → 2 × 2 → 1, never 3 + 1.
+        int count = InternalChildren.Cast<UIElement>().Count(child => child.Visibility != Visibility.Collapsed);
+        if (count <= 1) return 1;
+        int rows = (int)Math.Ceiling(count / (double)fit);
+        return Math.Max(1, (int)Math.Ceiling(count / (double)rows));
+    }
     protected override Size MeasureOverride(Size available)
     {
         int count = Columns(available.Width);

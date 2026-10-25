@@ -68,6 +68,8 @@
   <FontFamily x:Key="DisplayFont">Segoe UI Variable Display, Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Microsoft YaHei</FontFamily>
   <FontFamily x:Key="MonoFont">Cascadia Mono, Cascadia Code, Consolas, Microsoft YaHei UI</FontFamily>
   <SolidColorBrush x:Key="PanelSolidBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="SegmentTrackBrush" Color="#0C000000" />
+  <SolidColorBrush x:Key="SegmentChipBrush" Color="#FFFFFF" />
   <SolidColorBrush x:Key="HairStrongBrush" Color="#72000000" />
   <SolidColorBrush x:Key="OnAccentHoverBrush" Color="#14FFFFFF" />
   <SolidColorBrush x:Key="OnAccentDividerBrush" Color="#33FFFFFF" />
@@ -75,4 +77,13 @@
   <SolidColorBrush x:Key="AccentElevationBrush" Color="#52000000" />
   <SolidColorBrush x:Key="AccentHoverBrush" Color="#E6005FB8" />
   <SolidColorBrush x:Key="AccentPressedBrush" Color="#CC005FB8" />
+  <!-- Accent-derived surfaces. DesignTokens.Apply rebuilds these from the live system accent. -->
+  <SolidColorBrush x:Key="AccentSubtleBrush" Color="#1A005FB8" />
+  <SolidColorBrush x:Key="AccentSubtleStrokeBrush" Color="#33005FB8" />
+  <LinearGradientBrush x:Key="AccentWashBrush" StartPoint="0,0" EndPoint="1,0.35">
+    <GradientStop Color="#17005FB8" Offset="0" /><GradientStop Color="#00005FB8" Offset="0.62" />
+  </LinearGradientBrush>
+  <RadialGradientBrush x:Key="AccentGlowBrush">
+    <GradientStop Color="#38005FB8" Offset="0" /><GradientStop Color="#00005FB8" Offset="1" />
+  </RadialGradientBrush>
 </ResourceDictionary>

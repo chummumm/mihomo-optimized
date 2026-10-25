@@ -73,7 +73,7 @@ internal sealed class ExitSummaryList : Border
             title.TextWrapping = detail.TextWrapping = TextWrapping.NoWrap; title.TextTrimming = detail.TextTrimming = TextTrimming.CharacterEllipsis;
             title.FontSize = 14; title.FontWeight = FontWeights.Normal; title.LineHeight = 20; detail.FontSize = 12; detail.LineHeight = 16;
             var labels = Ui.Column(title, detail); labels.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(labels, 1); identity.Children.Add(labels); Identity = identity; grid.Children.Add(identity);
-            delay.FontFamily = new FontFamily("Cascadia Mono, Cascadia Code, Consolas");
+            delay.Tabular();
             dot.Margin = compact ? new Thickness(0) : new Thickness(0, 0, 6, 0);
             var latency = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(compact ? 12 : 16, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center }; latency.Children.Add(dot); if (!compact) latency.Children.Add(delay); Grid.SetColumn(latency, 1); grid.Children.Add(latency);
             var chevron = new FluentIcon("chevron-right", compact ? 12 : 16) { Margin = new Thickness(compact ? 12 : 16, 0, 0, 0) }; chevron.SetResourceReference(ForegroundProperty, "TextSecondaryBrush"); Grid.SetColumn(chevron, 2); grid.Children.Add(chevron);
