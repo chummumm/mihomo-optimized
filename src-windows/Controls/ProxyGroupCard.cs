@@ -47,7 +47,7 @@ internal sealed class ProxyGroupCard : Border
         var copy = Ui.Column(title, now); Grid.SetColumn(copy, 1); identity.Children.Add(copy); ConnectedNavigation.SetTarget(identity, group); header.Children.Add(identity);
         var typeBadge = new Border { Child = type, Padding = new Thickness(6, 1, 6, 1), CornerRadius = new CornerRadius(4), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0) }; typeBadge.SetResourceReference(BackgroundProperty, "ControlAltBrush"); meta.Children.Add(typeBadge);
         count.Margin = new Thickness(0, 0, 12, 0); count.VerticalAlignment = VerticalAlignment.Center; meta.Children.Add(count);
-        var reading = new StackPanel { Orientation = Orientation.Horizontal, MinWidth = 64, VerticalAlignment = VerticalAlignment.Center }; latency.FontFamily = new FontFamily("Cascadia Mono, Consolas"); reading.Children.Add(marker); reading.Children.Add(latency); meta.Children.Add(reading);
+        var reading = new StackPanel { Orientation = Orientation.Horizontal, MinWidth = 64, VerticalAlignment = VerticalAlignment.Center }; latency.Tabular(); reading.Children.Add(marker); reading.Children.Add(latency); meta.Children.Add(reading);
         meta.Margin = new Thickness(0, 0, 12, 0); Grid.SetColumn(meta, 1); header.Children.Add(meta);
         test = FluentControls.IconButton("speed", "测速", "MeasureGroup_" + group); test.Margin = new Thickness(0, 0, 12, 0); test.VerticalAlignment = VerticalAlignment.Center; test.Click += (_, _) => measure(); Grid.SetColumn(test, 2); header.Children.Add(test);
         var caretSlot = new Grid { Width = 32, Height = 32, VerticalAlignment = VerticalAlignment.Center, IsHitTestVisible = false }; caretSlot.Children.Add(caret); caret.SetResourceReference(Control.ForegroundProperty, "TextSecondaryBrush"); Grid.SetColumn(caretSlot, 3); header.Children.Add(caretSlot);
@@ -203,11 +203,11 @@ internal sealed class ProxyMemberGrid : Grid
             var first = new DockPanel { Margin = new Thickness(0, 0, 0, 4) }; var region = Region(name);
             if (region is not null)
             {
-                var label = Ui.Muted(region, 11); label.FontWeight = FontWeights.SemiBold; label.FontFamily = new FontFamily("Cascadia Mono, Consolas"); label.HorizontalAlignment = HorizontalAlignment.Center;
+                var label = Ui.Muted(region, 11); label.FontWeight = FontWeights.SemiBold; label.Tabular(); label.HorizontalAlignment = HorizontalAlignment.Center;
                 var badge = new Border { Child = label, MinWidth = 26, Height = 18, Padding = new Thickness(4, 0, 4, 0), CornerRadius = new CornerRadius(3), Margin = new Thickness(0, 0, 8, 0) }; badge.SetResourceReference(Border.BackgroundProperty, "SubtleHoverBrush"); DockPanel.SetDock(badge, Dock.Left); first.Children.Add(badge);
             }
             first.Children.Add(title);
-            var second = new DockPanel { Height = 16 }; var number = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 0, 0, 0) }; number.Children.Add(dot); reading.FontFamily = new FontFamily("Cascadia Mono, Consolas"); number.Children.Add(reading); DockPanel.SetDock(number, Dock.Right); second.Children.Add(number);
+            var second = new DockPanel { Height = 16 }; var number = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 0, 0, 0) }; number.Children.Add(dot); reading.Tabular(); number.Children.Add(reading); DockPanel.SetDock(number, Dock.Right); second.Children.Add(number);
             kind.TextWrapping = TextWrapping.NoWrap; kind.TextTrimming = TextTrimming.CharacterEllipsis; second.Children.Add(kind);
             var grid = new Grid(); grid.Children.Add(Ui.Column(first, second)); pendingBorder.SetResourceReference(Shape.StrokeProperty, "AccentBrush"); grid.Children.Add(pendingBorder); Content = grid;
             ToolTip = name; AutomationProperties.SetName(this, name); ProxyVisuals.Press(this, .97); ProxyVisuals.Surface(this, "ControlHoverBrush", "ControlPressedBrush");

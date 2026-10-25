@@ -672,10 +672,10 @@ public sealed class ProxiesPage : NativePage
         void Rate(TextBlock target, string arrow, double value)
         {
             target.Inlines.Clear(); target.Inlines.Add(new Run(arrow + " "));
-            var number = new Run(Ui.Bytes(value) + "/s") { FontFamily = new FontFamily("Cascadia Mono, Consolas") }; number.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); target.Inlines.Add(number);
+            var number = new Run(Ui.Bytes(value) + "/s").Tabular(); number.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); target.Inlines.Add(number);
         }
         Rate(flowDown, "↓", down); Rate(flowUp, "↑", up);
-        flowCount.Inlines.Clear(); var count = new Run(activeConnections.ToString()) { FontFamily = new FontFamily("Cascadia Mono, Consolas") }; count.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); flowCount.Inlines.Add(count); flowCount.Inlines.Add(new Run(L.F("{0} 个连接", "")));
+        flowCount.Inlines.Clear(); var count = new Run(activeConnections.ToString()).Tabular(); count.SetResourceReference(TextElement.ForegroundProperty, "TextPrimaryBrush"); flowCount.Inlines.Add(count); flowCount.Inlines.Add(new Run(L.F("{0} 个连接", "")));
         var compact = PageContainerWidth <= 640; flowCount.Visibility = compact ? Visibility.Collapsed : Visibility.Visible; flowUp.Margin = new Thickness(0, 0, compact ? 0 : 14, 0);
         liveDot.SetResourceReference(LivePing.FillProperty, activeConnections > 0 ? "SuccessBrush" : "FaintBrush");
     }

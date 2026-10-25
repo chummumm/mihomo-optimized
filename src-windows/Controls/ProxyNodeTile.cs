@@ -44,7 +44,7 @@ internal sealed class ProxyNodeTile : Button
         reading.Children.Add(latency); Grid.SetColumn(unit, 1); reading.Children.Add(unit); Grid.SetColumn(mean, 2); reading.Children.Add(mean); reading.Margin = new Thickness(0, 0, 0, 4); Grid.SetRow(reading, 1); root.Children.Add(reading);
         sparkline.Margin = new Thickness(0, 0, 0, 4); Grid.SetRow(sparkline, 2); root.Children.Add(sparkline);
         var footer = new StackPanel { Orientation = Orientation.Horizontal, Height = 16 }; footer.Children.Add(type);
-        var udpText = Ui.Muted("UDP", 10); udpText.FontFamily = new FontFamily("Cascadia Mono, Consolas"); udpText.LineHeight = 16; udpText.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
+        var udpText = Ui.Muted("UDP", 10); udpText.FontWeight = FontWeights.SemiBold; udpText.LineHeight = 16; udpText.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
         udp = new Border { Child = udpText, Padding = new Thickness(4, 0, 4, 0), CornerRadius = new CornerRadius(3), Margin = new Thickness(6, 0, 0, 0) }; udp.SetResourceReference(Border.BackgroundProperty, "SubtleHoverBrush"); footer.Children.Add(udp); Grid.SetRow(footer, 3); root.Children.Add(footer);
         probe.SetResourceReference(Border.BackgroundProperty, "AccentBrush"); probe.RenderTransform = probeMove; progress.Children.Add(probe);
         Grid.SetRowSpan(flash, 4); root.Children.Add(flash); Grid.SetRowSpan(progress, 4); root.Children.Add(progress); Content = root;

@@ -9,7 +9,7 @@ namespace Mihomo.Desktop.Controls;
 
 public sealed record RouteHop(string Name, string Brush, bool IsPolicy = false);
 
-/// <summary>Policy marks use configured line colors; group text yields first to preserve the exit name.</summary>
+/// <summary>Policy marks use configured line colors; when space runs out the group names collapse to their marks so the exit name stays readable.</summary>
 public sealed class RouteDisplay : Control
 {
     public static readonly DependencyProperty HopsProperty = DependencyProperty.Register(nameof(Hops), typeof(RouteHop[]), typeof(RouteDisplay), new FrameworkPropertyMetadata(Array.Empty<RouteHop>(), FrameworkPropertyMetadataOptions.AffectsRender, Changed));
@@ -31,20 +31,34 @@ public sealed class RouteDisplay : Control
             Resource(index == Hops.Length - 1 ? Closed ? "TextTertiaryBrush" : "TextPrimaryBrush" : "TextSecondaryBrush"), VisualTreeHelper.GetDpi(this).PixelsPerDip)).ToArray();
         var widths = text.Select(item => item.WidthIncludingTrailingWhitespace).ToArray();
         double marks = Hops.Sum(hop => (hop.IsPolicy ? 8 : 6) + 6) + Math.Max(0, Hops.Length - 1) * 10;
-        double excess = Math.Max(0, widths.Sum() + marks - ActualWidth);
-        // CSS flex-shrink is four for group text and one for the final adapter.
-        for (var pass = 0; excess > .01 && pass <= widths.Length; pass++)
+        double centre = ActualHeight / 2;
+        void Mark(RouteHop hop, double left)
         {
-            var weight = widths.Select((width, index) => width > 0 ? text[index].WidthIncludingTrailingWhitespace * (index == widths.Length - 1 ? 1 : 4) : 0).Sum(); if (weight <= 0) break;
-            double removed = 0; for (var index = 0; index < widths.Length; index++) { var cut = Math.Min(widths[index], excess * text[index].WidthIncludingTrailingWhitespace * (index == widths.Length - 1 ? 1 : 4) / weight); widths[index] -= cut; removed += cut; } excess -= removed;
+            var brush = Resource(hop.Brush);
+            drawing.DrawEllipse(hop.IsPolicy ? Resource("SurfaceBrush") : brush, hop.IsPolicy ? new Pen(brush, 2) : null, new Point(left + (hop.IsPolicy ? 4 : 3), centre), 3, 3);
         }
-        double x = 0;
-        for (var index = 0; index < Hops.Length; index++)
+        void Label(int index, double left, double width)
         {
-            var hop = Hops[index]; var mark = hop.IsPolicy ? 8d : 6d; var brush = Resource(hop.Brush);
-            drawing.DrawEllipse(hop.IsPolicy ? Resource("SurfaceBrush") : brush, hop.IsPolicy ? new Pen(brush, 2) : null, new Point(x + mark / 2, ActualHeight / 2), hop.IsPolicy ? 3 : 3, hop.IsPolicy ? 3 : 3); x += mark + 6;
-            if (widths[index] >= 1) { text[index].MaxTextWidth = widths[index]; text[index].MaxLineCount = 1; text[index].Trimming = TextTrimming.CharacterEllipsis; drawing.DrawText(text[index], new Point(x, (ActualHeight - text[index].Height) / 2)); }
-            x += widths[index] + 10;
+            if (width < 1) return;
+            text[index].MaxTextWidth = width; text[index].MaxLineCount = 1; text[index].Trimming = TextTrimming.CharacterEllipsis;
+            drawing.DrawText(text[index], new Point(left, (ActualHeight - text[index].Height) / 2));
         }
+        if (widths.Sum() + marks <= ActualWidth || Hops.Length == 1)
+        {
+            double x = 0;
+            for (var index = 0; index < Hops.Length; index++)
+            {
+                Mark(Hops[index], x); x += (Hops[index].IsPolicy ? 8 : 6) + 6;
+                Label(index, x, Math.Min(widths[index], ActualWidth - x)); x += widths[index] + 10;
+            }
+            return;
+        }
+        // Too narrow for every hop: never cut group names down to one glyph. The policy hops collapse into
+        // overlapping rings ahead of the exit, which keeps its full name; the tooltip still lists the chain.
+        double cursor = 0;
+        for (var index = 0; index < Hops.Length - 1; index++) { Mark(Hops[index], cursor); cursor += 6; }
+        cursor += 6;
+        var exit = Hops[^1]; Mark(exit, cursor); cursor += (exit.IsPolicy ? 8 : 6) + 6;
+        Label(Hops.Length - 1, cursor, Math.Max(0, ActualWidth - cursor));
     }
 }

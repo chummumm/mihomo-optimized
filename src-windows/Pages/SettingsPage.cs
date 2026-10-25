@@ -68,7 +68,7 @@ public sealed class SettingsPage : NativePage
     private readonly TextBox mixedPort = PortInput("SettingsMixedPort", "混合代理端口");
     private readonly TextBox httpPort = PortInput("SettingsHttpPort", "HTTP 代理端口");
     private readonly TextBox socksPort = PortInput("SettingsSocksPort", "SOCKS5 代理端口");
-    private readonly TextBox probeUrl = new() { Height = 32, MaxLength = 2048, VerticalContentAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Cascadia Mono, Consolas"), FontSize = 13 };
+    private readonly TextBox probeUrl = new() { Height = 32, MaxLength = 2048, VerticalContentAlignment = VerticalAlignment.Center, FontSize = 14 };
     private readonly TextBlock versions = Ui.Muted("");
     private readonly TextBlock serviceStatus = Ui.Muted("");
     private readonly TextBlock runtimeStatus = Ui.Muted("");
@@ -253,7 +253,7 @@ public sealed class SettingsPage : NativePage
     }
     private static TextBox PortInput(string id, string title)
     {
-        var input = new TextBox { Height = 32, MaxLength = 5, FontSize = 13, TextAlignment = TextAlignment.Right, VerticalContentAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Cascadia Mono, Consolas") }.Id(id);
+        var input = new TextBox { Height = 32, MaxLength = 5, FontSize = 13, TextAlignment = TextAlignment.Right, VerticalContentAlignment = VerticalAlignment.Center }.Tabular().Id(id);
         L.Bind(input, AutomationProperties.NameProperty, title); return input;
     }
     private Grid PortFields()
@@ -339,7 +339,7 @@ public sealed class SettingsPage : NativePage
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(55, GridUnitType.Star) });
         row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var title = Ui.Label("桌面应用"); title.LineHeight = 20; title.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
-        installedVersion.FontFamily = new FontFamily("Cascadia Mono, Consolas"); installedVersion.Margin = new Thickness(0, 2, 0, 0);
+        installedVersion.Tabular(); installedVersion.Margin = new Thickness(0, 2, 0, 0);
         var name = Ui.Column(title, installedVersion); row.Children.Add(name);
         updateStatus.VerticalAlignment = VerticalAlignment.Top; updateStatus.TextAlignment = TextAlignment.Right;
         Grid.SetColumn(updateStatus, 2); row.Children.Add(updateStatus); content.Children.Add(row);

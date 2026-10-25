@@ -147,17 +147,16 @@ public static class FluentControlState
             }
             else if (kind == "HomeTile")
             {
-                fill = pressed ? "SubtlePressedBrush" : hover ? selected ? "OnAccentHoverBrush" : "SubtleHoverBrush" : "Transparent";
+                // The tile stays a neutral card in both states; its accent icon chip carries "on".
+                fill = pressed ? "SubtlePressedBrush" : hover ? "SubtleHoverBrush" : "Transparent";
                 stroke = "Transparent";
-                foreground = selected ? "AccentTextBrush" : "TextPrimaryBrush";
-                if (!enabled) foreground = selected ? "AccentTextSecondaryBrush" : "TextDisabledBrush";
+                foreground = enabled ? "TextPrimaryBrush" : "TextDisabledBrush";
             }
             else if (kind == "HomeMore")
             {
-                fill = hover ? selected ? "OnAccentHoverBrush" : "SubtleHoverBrush" : "Transparent";
-                stroke = selected ? "OnAccentDividerBrush" : "DividerBrush";
-                foreground = selected ? "AccentTextBrush" : "TextPrimaryBrush";
-                if (!enabled) foreground = "TextDisabledBrush";
+                fill = pressed ? "SubtlePressedBrush" : hover ? "SubtleHoverBrush" : "Transparent";
+                stroke = "DividerBrush";
+                foreground = enabled ? "TextSecondaryBrush" : "TextDisabledBrush";
             }
             else if (kind == "Ghost")
             {

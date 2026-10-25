@@ -67,7 +67,7 @@
     <Style x:Key="ShellNavItem" TargetType="ListBoxItem">
       <Setter Property="FocusVisualStyle" Value="{StaticResource FluentFocus}"/>
       <Setter Property="controls:ShellVisuals.TrackPress" Value="True"/>
-      <Setter Property="Height" Value="36"/><Setter Property="Margin" Value="4,0,4,4"/><Setter Property="Padding" Value="12,0"/>
+      <Setter Property="Height" Value="36"/><Setter Property="Margin" Value="4,0,4,4"/><Setter Property="Padding" Value="10,0"/>
       <Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="VerticalContentAlignment" Value="Center"/>
       <Setter Property="Background" Value="Transparent"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBoxItem">
@@ -115,7 +115,7 @@
           <Button x:Name="CoreCardButton" Margin="4,2,4,8" Height="56" Padding="8" HorizontalContentAlignment="Stretch" Click="OpenCoreMenu" AutomationProperties.AutomationId="CoreCard" AutomationProperties.Name="{services:Tr 本地内核}">
             <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
               <Grid x:Name="CoreAvatar" Width="40" Height="40" VerticalAlignment="Center">
-                <Border x:Name="CoreAvatarBackground" CornerRadius="20" controls:ShellVisuals.Duration="250" controls:ShellVisuals.Background="{DynamicResource ControlAltBrush}"><controls:FluentIcon x:Name="CoreGlyph" Kind="power" Width="20" Height="20"/></Border>
+                <Border x:Name="CoreAvatarBackground" CornerRadius="20" BorderThickness="1" BorderBrush="{DynamicResource CardStrokeBrush}" controls:ShellVisuals.Duration="250" controls:ShellVisuals.Background="{DynamicResource ControlAltBrush}"><Grid><controls:FluentIcon x:Name="CoreGlyph" Kind="power" Width="20" Height="20"/><Image x:Name="CoreImage" Source="{StaticResource ColorIcon.globe-shield.24}" Width="24" Height="24" Visibility="Collapsed" RenderOptions.BitmapScalingMode="HighQuality"/></Grid></Border>
                 <Border x:Name="CoreStatusDot" Width="16" Height="16" Margin="0,0,-2,-2" CornerRadius="8" BorderThickness="2" BorderBrush="{DynamicResource DialogBottomBrush}" HorizontalAlignment="Right" VerticalAlignment="Bottom" controls:ShellVisuals.Duration="250" controls:ShellVisuals.Background="{DynamicResource TextTertiaryBrush}"/>
                 <controls:FluentProgressRing x:Name="CoreProgress" Width="48" Height="48" Margin="-4"/>
               </Grid>
@@ -127,18 +127,18 @@
           </Button>
           <ListBox x:Name="NavigationList" Grid.Row="1" Background="Transparent" BorderThickness="0" Padding="0" ItemContainerStyle="{StaticResource ShellNavItem}"
                    SelectionChanged="NavigationChanged" ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.VerticalScrollBarVisibility="Hidden" AutomationProperties.AutomationId="Navigation">
-            <ListBoxItem Tag="home" AutomationProperties.AutomationId="NavHome"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-home"/><TextBlock Text="{services:Tr 主页}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
-            <ListBoxItem Tag="proxies" AutomationProperties.AutomationId="NavProxies"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-proxies"/><TextBlock Text="{services:Tr 代理}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
-            <ListBoxItem Tag="connections" AutomationProperties.AutomationId="NavConnections"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-connections"/><TextBlock Text="{services:Tr 连接}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
-            <ListBoxItem Tag="dns" AutomationProperties.AutomationId="NavDns"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-dns"/><TextBlock Text="DNS" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
-            <ListBoxItem Tag="rules" AutomationProperties.AutomationId="NavRules"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-rules"/><TextBlock Text="{services:Tr 规则}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
-            <ListBoxItem Tag="logs" AutomationProperties.AutomationId="NavLogs"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-logs"/><TextBlock Text="{services:Tr 日志}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
+            <ListBoxItem Tag="home" AutomationProperties.AutomationId="NavHome"><StackPanel Orientation="Horizontal"><Image Source="{StaticResource ColorIcon.home.20}" Width="20" Height="20" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/><TextBlock Text="{services:Tr 主页}" Margin="14,0,0,0" VerticalAlignment="Center"/></StackPanel></ListBoxItem>
+            <ListBoxItem Tag="proxies" AutomationProperties.AutomationId="NavProxies"><StackPanel Orientation="Horizontal"><Image Source="{StaticResource ColorIcon.globe-shield.20}" Width="20" Height="20" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/><TextBlock Text="{services:Tr 代理}" Margin="14,0,0,0" VerticalAlignment="Center"/></StackPanel></ListBoxItem>
+            <ListBoxItem Tag="connections" AutomationProperties.AutomationId="NavConnections"><StackPanel Orientation="Horizontal"><Image Source="{StaticResource ColorIcon.data-line.20}" Width="20" Height="20" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/><TextBlock Text="{services:Tr 连接}" Margin="14,0,0,0" VerticalAlignment="Center"/></StackPanel></ListBoxItem>
+            <ListBoxItem Tag="dns" AutomationProperties.AutomationId="NavDns"><StackPanel Orientation="Horizontal"><Image Source="{StaticResource ColorIcon.database.20}" Width="20" Height="20" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/><TextBlock Text="DNS" Margin="14,0,0,0" VerticalAlignment="Center"/></StackPanel></ListBoxItem>
+            <ListBoxItem Tag="rules" AutomationProperties.AutomationId="NavRules"><StackPanel Orientation="Horizontal"><Image Source="{StaticResource ColorIcon.text-bullet-list-square.20}" Width="20" Height="20" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/><TextBlock Text="{services:Tr 规则}" Margin="14,0,0,0" VerticalAlignment="Center"/></StackPanel></ListBoxItem>
+            <ListBoxItem Tag="logs" AutomationProperties.AutomationId="NavLogs"><StackPanel Orientation="Horizontal"><Image Source="{StaticResource ColorIcon.notebook.20}" Width="20" Height="20" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/><TextBlock Text="{services:Tr 日志}" Margin="14,0,0,0" VerticalAlignment="Center"/></StackPanel></ListBoxItem>
           </ListBox>
           <Border Grid.Row="2" BorderThickness="0,1,0,0" BorderBrush="{DynamicResource DividerBrush}" Padding="0,6,0,0" Margin="0,12,0,0">
             <ListBox x:Name="SettingsNavigation" Background="Transparent" BorderThickness="0" Padding="0" ItemContainerStyle="{StaticResource ShellNavItem}" SelectionChanged="NavigationChanged" ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.VerticalScrollBarVisibility="Disabled">
-              <ListBoxItem Tag="profiles" Margin="4,0,4,4" AutomationProperties.AutomationId="NavProfiles"><StackPanel Orientation="Horizontal"><controls:FluentIcon Kind="nav-profiles"/><TextBlock x:Name="ProfilesLabel" Text="{services:Tr 配置}" Margin="16,0,0,0"/></StackPanel></ListBoxItem>
+              <ListBoxItem Tag="profiles" Margin="4,0,4,4" AutomationProperties.AutomationId="NavProfiles"><StackPanel Orientation="Horizontal"><Image Source="{StaticResource ColorIcon.document-text.20}" Width="20" Height="20" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/><TextBlock x:Name="ProfilesLabel" Text="{services:Tr 配置}" Margin="14,0,0,0" VerticalAlignment="Center"/></StackPanel></ListBoxItem>
               <ListBoxItem Tag="settings" Margin="4,0" AutomationProperties.AutomationId="NavSettings"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                <controls:FluentIcon Kind="nav-settings"/><TextBlock x:Name="SettingsLabel" Grid.Column="1" Text="{services:Tr 设置}" Margin="16,0,0,0"/>
+                <Image Source="{StaticResource ColorIcon.settings.20}" Width="20" Height="20" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/><TextBlock x:Name="SettingsLabel" Grid.Column="1" Text="{services:Tr 设置}" Margin="14,0,0,0" VerticalAlignment="Center"/>
                 <Border x:Name="UpdateBadge" Grid.Column="2" Width="6" Height="6" CornerRadius="3" Background="{DynamicResource AccentBrush}" Visibility="Collapsed"/>
               </Grid></ListBoxItem>
             </ListBox>

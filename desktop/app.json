@@ -1,6 +1,6 @@
 {
   "productName": "Mihomo Optimized",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "identifier": "com.chummumm.mihomo-optimized",
   "executable": "mihomo-optimized.exe",
   "hostExecutable": "mihomo-desktop-host.exe",

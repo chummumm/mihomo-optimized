@@ -74,6 +74,8 @@ internal static class DesignTokens
         ("Line7Brush", "#00727A", "#5DD3D6"),
         ("Line8Brush", "#B33A3A", "#FF9A9A"),
         ("PanelSolidBrush", "#FFFFFF", "#2B2B2B"),
+        ("SegmentTrackBrush", "#0C000000", "#26000000"),
+        ("SegmentChipBrush", "#FFFFFF", "#15FFFFFF"),
         ("HairStrongBrush", "#72000000", "#8BFFFFFF"),
         ("OnAccentHoverBrush", "#14FFFFFF", "#14FFFFFF"),
         ("OnAccentDividerBrush", "#33FFFFFF", "#33FFFFFF"),
@@ -82,6 +84,23 @@ internal static class DesignTokens
         ("AccentHoverBrush", "#E6005FB8", "#E660CDFF"),
         ("AccentPressedBrush", "#CC005FB8", "#CC60CDFF"),
     ];
+
+    /// <summary>Quiet tints of the live accent used by status emblems, enabled tiles and the home hero wash.</summary>
+    private static void ApplyAccentSurfaces(ResourceDictionary resources, Color accent, bool dark)
+    {
+        Color Alpha(double opacity) => Color.FromArgb((byte)Math.Round(255 * opacity), accent.R, accent.G, accent.B);
+        Brush Frozen(Brush brush) { brush.Freeze(); return brush; }
+        resources["AccentSubtleBrush"] = Frozen(new SolidColorBrush(Alpha(dark ? .16 : .10)));
+        resources["AccentSubtleStrokeBrush"] = Frozen(new SolidColorBrush(Alpha(dark ? .32 : .22)));
+        resources["AccentWashBrush"] = Frozen(new LinearGradientBrush(new GradientStopCollection
+        {
+            new(Alpha(dark ? .12 : .09), 0), new(Alpha(0), .62)
+        }, new Point(0, 0), new Point(1, .35)));
+        resources["AccentGlowBrush"] = Frozen(new RadialGradientBrush(new GradientStopCollection
+        {
+            new(Alpha(dark ? .30 : .22), 0), new(Alpha(0), 1)
+        }));
+    }
 
     internal static void Apply(bool dark)
     {
@@ -97,6 +116,7 @@ internal static class DesignTokens
         var accent = ((SolidColorBrush)resources["AccentBrush"]).Color;
         resources["AccentHoverBrush"] = new SolidColorBrush(Color.FromArgb((byte)(accent.A * .9), accent.R, accent.G, accent.B));
         resources["AccentPressedBrush"] = new SolidColorBrush(Color.FromArgb((byte)(accent.A * .8), accent.R, accent.G, accent.B));
+        ApplyAccentSurfaces(resources, accent, dark);
         if (SystemParameters.HighContrast)
         {
             foreach (var token in Palette)
@@ -108,6 +128,8 @@ internal static class DesignTokens
             resources["AccentTextBrush"] = resources["AccentTextSecondaryBrush"] = SystemColors.HighlightTextBrush;
             resources["FocusOuterBrush"] = SystemColors.WindowTextBrush; resources["FocusInnerBrush"] = SystemColors.WindowBrush;
             for (int i = 0; i < 9; i++) resources["Line" + i + "Brush"] = SystemColors.HighlightBrush;
+            foreach (var key in new[] { "AccentSubtleBrush", "AccentWashBrush", "AccentGlowBrush" }) resources[key] = Brushes.Transparent;
+            resources["AccentSubtleStrokeBrush"] = SystemColors.WindowTextBrush;
         }
         Changed?.Invoke();
     }
