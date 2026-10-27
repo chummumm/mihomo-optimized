@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/mihomo/component/easytier"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	icontext "github.com/metacubex/mihomo/context"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
 
@@ -45,12 +46,15 @@ type EasyTier struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	loopOnce   sync.Once
-	startMu    sync.Mutex
+	loopDone   chan struct{}
 	closed     bool
 	readyCh    chan struct{}
 	mu         sync.Mutex
 	host       *corehost.Host
-	instance   *corehost.Instance
+	instance   easyTierInstance
+	routeState *easyTierRouteSnapshot
+	routeRead  chan struct{}
+	routeEpoch uint64
 	unregister func()
 }
 
@@ -164,6 +168,8 @@ func NewEasyTier(option EasyTierOption) (*EasyTier, error) {
 		zone:       easytier.NormalizeZone(option.TLDDNSZone),
 		ctx:        ctx,
 		cancel:     cancel,
+		readyCh:    make(chan struct{}),
+		loopDone:   make(chan struct{}),
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 	outbound.unregister = dns.RegisterEasyTierDnsClient(option.Name, easyTierDNSTransport{easytier: outbound})
@@ -171,6 +177,9 @@ func NewEasyTier(option EasyTierOption) (*EasyTier, error) {
 }
 
 func (e *EasyTier) ensureStarted(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return icontext.TCPDialError(ctx, err)
+	}
 	e.loopOnce.Do(func() {
 		go e.loop()
 	})
@@ -178,30 +187,22 @@ func (e *EasyTier) ensureStarted(ctx context.Context) error {
 		if err := e.ctx.Err(); err != nil {
 			return errEasyTierClosed
 		}
-		e.startMu.Lock()
+		// State and its notification channel are observed under one mutex.
+		// Publishing Running cannot slip between a failed check and subscribing.
+		e.mu.Lock()
 		closed := e.closed
 		readyCh := e.readyCh
-		e.startMu.Unlock()
+		instance := e.instance
+		e.mu.Unlock()
 		if closed {
 			return errEasyTierClosed
 		}
-		e.mu.Lock()
-		instance := e.instance
-		e.mu.Unlock()
 		if instance != nil && instance.State() == corehost.StateRunning {
 			return nil
 		}
-		if readyCh == nil {
-			e.startMu.Lock()
-			if e.readyCh == nil {
-				e.readyCh = make(chan struct{})
-			}
-			readyCh = e.readyCh
-			e.startMu.Unlock()
-		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return icontext.TCPDialError(ctx, ctx.Err())
 		case <-e.ctx.Done():
 			return errEasyTierClosed
 		case <-readyCh:
@@ -210,23 +211,28 @@ func (e *EasyTier) ensureStarted(ctx context.Context) error {
 }
 
 func (e *EasyTier) signalReady() {
-	e.startMu.Lock()
-	if e.readyCh != nil {
-		close(e.readyCh)
-		e.readyCh = nil
-	}
-	e.startMu.Unlock()
+	e.mu.Lock()
+	e.signalReadyLocked()
+	e.mu.Unlock()
+}
+
+func (e *EasyTier) signalReadyLocked() {
+	close(e.readyCh)
+	e.readyCh = make(chan struct{})
+	e.routeState = nil
+	e.routeEpoch++
 }
 
 func (e *EasyTier) loop() {
+	defer close(e.loopDone)
 	backoff := easyTierMinBackoff
 	for {
 		if e.ctx.Err() != nil {
 			return
 		}
-		e.startMu.Lock()
+		e.mu.Lock()
 		closed := e.closed
-		e.startMu.Unlock()
+		e.mu.Unlock()
 		if closed {
 			return
 		}
@@ -250,15 +256,14 @@ func (e *EasyTier) loop() {
 			continue
 		}
 		backoff = easyTierMinBackoff
-		e.signalReady()
 		reason := e.serve()
 		_ = e.shutdown()
 		if e.ctx.Err() != nil {
 			return
 		}
-		e.startMu.Lock()
+		e.mu.Lock()
 		closed = e.closed
-		e.startMu.Unlock()
+		e.mu.Unlock()
 		if closed {
 			return
 		}
@@ -300,29 +305,42 @@ func (e *EasyTier) init() error {
 	if err != nil {
 		return err
 	}
-	e.mu.Lock()
-	e.host = host
-	e.mu.Unlock()
+	// Keep partially initialized resources local. Close can run while WASM
+	// compiles; nothing may be published after that outbound has been closed.
+	published := false
+	defer func() {
+		if !published {
+			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+			defer cancel()
+			_ = host.Close(ctx)
+		}
+	}()
 
 	instance, err := host.CreateInstanceTOML(e.ctx, instanceName, instanceID, e.configTOML)
 	if err != nil {
 		return err
 	}
-	e.mu.Lock()
-	e.instance = instance
-	e.instanceID = instance.ID()
-	e.mu.Unlock()
 	if err := writeInstanceID(e.stateDir, instance.ID()); err != nil {
 		return err
 	}
 	if err := instance.Start(e.ctx); err != nil {
 		return err
 	}
+	e.mu.Lock()
+	if e.closed || e.ctx.Err() != nil {
+		e.mu.Unlock()
+		return errEasyTierClosed
+	}
+	e.host, e.instance = host, instance
+	e.instanceID = instance.ID()
+	e.signalReadyLocked()
+	published = true
+	e.mu.Unlock()
 	log.Infoln("[EasyTier](%s) instance %s running", e.Name(), instance.ID())
 	return nil
 }
 
-func (e *EasyTier) currentInstance() (*corehost.Instance, error) {
+func (e *EasyTier) currentInstance() (easyTierInstance, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.instance == nil {
@@ -358,6 +376,7 @@ func (e *EasyTier) serve() string {
 			}
 			switch event.Kind {
 			case "peer_added", "peer_removed":
+				e.signalReady()
 				log.Infoln("[EasyTier](%s) %s: %s", e.Name(), event.Kind, event.Message)
 			default:
 				log.Debugln("[EasyTier](%s) %s: %s", e.Name(), event.Kind, event.Message)
@@ -423,6 +442,10 @@ func (e *EasyTier) resolveIPv4(ctx context.Context, host string) (netip.Addr, er
 	if easytier.IsMagicDNS(host, e.zone) {
 		return netip.Addr{}, fmt.Errorf("easytier: overlay hostname %q was not found", host)
 	}
+	return resolvePublicIPv4(ctx, host)
+}
+
+func resolvePublicIPv4(ctx context.Context, host string) (netip.Addr, error) {
 	ips, err := resolver.LookupIPv4WithResolver(ctx, host, resolver.ProxyServerHostResolver)
 	if err != nil {
 		return netip.Addr{}, err
@@ -434,20 +457,22 @@ func (e *EasyTier) resolveIPv4(ctx context.Context, host string) (netip.Addr, er
 }
 
 func (e *EasyTier) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	if err = e.ensureStarted(ctx); err != nil {
+	ctx, cancel := icontext.WithTCPDialBudget(ctx)
+	defer cancel()
+	defer func() { err = icontext.TCPDialError(ctx, err) }()
+	if err = icontext.BeginTCPPreparation(ctx); err != nil {
 		return nil, err
 	}
 	host := metadata.Host
 	if host == "" && metadata.DstIP.IsValid() {
 		host = metadata.DstIP.String()
 	}
-	ip, err := e.resolveIPv4(ctx, host)
+	instance, ip, err := e.prepareTarget(ctx, host)
 	if err != nil {
 		return nil, err
 	}
-	instance, err := e.currentInstance()
-	if err != nil {
-		return nil, err
+	if err = icontext.BeginTCPConnection(ctx); err != nil {
+		return nil, fmt.Errorf("easytier: prepare %s: %w", host, err)
 	}
 	address := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", metadata.DstPort))
 	conn, err := instance.Dial(ctx, "tcp4", address)
@@ -511,14 +536,21 @@ func (e *EasyTier) Close() error {
 	if e.unregister != nil {
 		e.unregister()
 	}
-	e.startMu.Lock()
+	e.mu.Lock()
 	e.closed = true
-	if e.readyCh != nil {
-		close(e.readyCh)
-		e.readyCh = nil
+	e.signalReadyLocked()
+	e.mu.Unlock()
+	// If nothing started the instance, there is no loop to join.
+	e.loopOnce.Do(func() { close(e.loopDone) })
+	err := e.shutdown()
+	timer := time.NewTimer(C.DefaultTCPTimeout)
+	defer timer.Stop()
+	select {
+	case <-e.loopDone:
+		return err
+	case <-timer.C:
+		return errors.Join(err, errors.New("easytier: shutdown is still in progress"))
 	}
-	e.startMu.Unlock()
-	return e.shutdown()
 }
 
 func (e *EasyTier) shutdown() error {
@@ -529,6 +561,7 @@ func (e *EasyTier) shutdown() error {
 	host := e.host
 	e.instance = nil
 	e.host = nil
+	e.signalReadyLocked()
 	e.mu.Unlock()
 	var err error
 	if instance != nil {
