@@ -66,8 +66,11 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private readonly Button closeEditor;
     private readonly ResourceUpdatePanel resources;
     private readonly Border resourcesTarget;
+    private readonly ConfigApplicationState application = new();
+    private Action? dismissSuccessNotice;
+    private long feedbackGeneration;
     private string revision = "", originalContent = "", documentPath = "", problem = "", lastPhase = "";
-    private bool applyingDocument, loaded, reading, saving, reloading, importing, dirty, conflict, saved, reloadPending, updateWasActive;
+    private bool applyingDocument, loaded, reading, saving, reloading, importing, dirty, conflict, updateWasActive;
     private bool writable = true;
     private bool importOpening, importPreviewVisible, leaveOpening;
     private long documentGeneration, draftGeneration, summaryReadAt;
@@ -226,9 +229,36 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private void HostEvent(string name, JsonElement data)
     {
         if (name != "desktop-config-changed" || saving || importing) return;
+        InvalidateSuccessFeedback();
         if (dirty) { problem = "磁盘上的配置已发生变化。当前草稿已保留，保存时会检查版本冲突。"; UpdateEditorState(); }
         else if (IsActive && !Session.IsUpdating) _ = RunAsync(ReadDocument);
         else loaded = false;
+    }
+    public override void Deactivate()
+    {
+        InvalidateSuccessFeedback();
+        base.Deactivate();
+    }
+
+    private long InvalidateSuccessFeedback()
+    {
+        ++feedbackGeneration;
+        var dismiss = dismissSuccessNotice;
+        dismissSuccessNotice = null;
+        dismiss?.Invoke();
+        return feedbackGeneration;
+    }
+
+    private void ShowSuccess(string text, long generation)
+    {
+        // An accepted save still completes while hidden. Only its transient
+        // feedback belongs to the initiating visible page/editor session.
+        if (generation != feedbackGeneration || !IsActive || !IsVisible || Window.GetWindow(this) is not MainWindow { IsVisible: true } window) return;
+        Message("");
+        var dismiss = dismissSuccessNotice;
+        dismissSuccessNotice = null;
+        dismiss?.Invoke();
+        dismissSuccessNotice = window.Notifications.Success(L.T(text), 2500);
     }
     public override async Task RefreshAsync()
     {
@@ -276,7 +306,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         {
             var document = ValidateDocument(await Command("desktop_read_config"));
             if (generation != documentGeneration || draft != draftGeneration || (dirty && !discardDraft)) return;
-            ApplyDocument(document, true); saved = reloadPending = false; await Session.SetDirtyAsync(false);
+            ApplyDocument(document, true); await Session.SetDirtyAsync(false);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception error) { throw EditorFailure(error); }
@@ -295,6 +325,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         try
         {
             originalContent = document.Text("content"); revision = document.Text("revision"); documentPath = document.Text("path");
+            application.ObserveDocument(documentPath, revision);
             maxBytes = (int)Math.Min(MaximumConfigBytes, document.Number("max_size", MaximumConfigBytes)); code.MaximumBytes = maxBytes;
             writable = document.Get("writable").ValueKind != JsonValueKind.False; code.SetDocument(originalContent, resetPosition);
             dirty = conflict = false; problem = ""; Session.IsDirty = false;
@@ -305,7 +336,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private void EditorChanged(object sender, TextChangedEventArgs e)
     {
         if (applyingDocument) return; ++draftGeneration;
-        dirty = ConfigCodeEditor.DisplayText(Editor.Text) != ConfigCodeEditor.DisplayText(originalContent); Session.IsDirty = dirty; saved = false;
+        dirty = ConfigCodeEditor.DisplayText(Editor.Text) != ConfigCodeEditor.DisplayText(originalContent); Session.IsDirty = dirty; InvalidateSuccessFeedback();
         editorBytes = Encoding.UTF8.GetByteCount(ConfigCodeEditor.SaveText(Editor.Text, originalContent));
         if (!conflict) problem = ""; ApplyInteractionState(); UpdatePosition();
     }
@@ -326,6 +357,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     }
     private void SetEditorVisible(bool visible, bool animate = true)
     {
+        if (editorOpen != visible) InvalidateSuccessFeedback();
         var wasOpen = editorOpen; editorOpen = visible; var generation = ++editorTransition;
         if (visible)
         {
@@ -371,7 +403,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     }
     private Task Reread()
     {
-        EnsureAvailable(); if (dirty) { SetConfirmation(Confirmation.Read); return Task.CompletedTask; } return ReadDocument(true);
+        EnsureAvailable(); InvalidateSuccessFeedback(); if (dirty) { SetConfirmation(Confirmation.Read); return Task.CompletedTask; } return ReadDocument(true);
     }
     private void SetConfirmation(Confirmation value)
     {
@@ -399,23 +431,24 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private async Task ResetDraft()
     {
         ++documentGeneration; ++draftGeneration; applyingDocument = true;
-        try { code.SetDocument(originalContent, true); editorBytes = Encoding.UTF8.GetByteCount(originalContent); dirty = conflict = saved = reloadPending = false; problem = ""; loaded = false; }
+        try { code.SetDocument(originalContent, true); editorBytes = Encoding.UTF8.GetByteCount(originalContent); dirty = conflict = false; problem = ""; loaded = false; }
         finally { applyingDocument = false; }
         await Session.SetDirtyAsync(false); ApplyInteractionState();
     }
     private async Task Save(bool apply)
     {
-        EnsureAvailable(); if (!loaded || !writable || conflict || confirmation != Confirmation.None || (!dirty && !reloadPending)) return;
+        EnsureAvailable(); if (!loaded || !writable || conflict || confirmation != Confirmation.None || (!dirty && !application.Pending)) return;
         var content = ConfigCodeEditor.SaveText(Editor.Text, originalContent);
         if (Encoding.UTF8.GetByteCount(content) > maxBytes) { problem = "配置大小超过允许的上限，请缩减内容后再保存。"; UpdateEditorState(); return; }
-        saving = true; saved = false; problem = ""; ApplyInteractionState(); var fileSaved = false;
+        var feedback = InvalidateSuccessFeedback(); Message("");
+        saving = true; problem = ""; ApplyInteractionState(); var fileSaved = false;
         try
         {
             // A reload retry must also check the saved revision before applying an external file.
             var document = ValidateDocument(await Command("desktop_save_config", new { content, expectedRevision = revision }));
-            ApplyDocument(document, false); fileSaved = true; reloadPending = true; await Session.SetDirtyAsync(false);
-            if (apply) { EnsureNoUpdate(); reloading = true; UpdateEditorState(); await Command("desktop_reload_config", new { force = true }); reloadPending = false; _ = RunAsync(RefreshSummary); }
-            saved = true; Message(apply ? IsRunning ? "配置文件已保存并重新加载。" : "配置已保存并校验，内核启动时将使用此配置。" : "配置已保存，可以稍后应用。");
+            ApplyDocument(document, false); fileSaved = true; application.Saved(); await Session.SetDirtyAsync(false);
+            if (apply) { EnsureNoUpdate(); reloading = true; UpdateEditorState(); await Command("desktop_reload_config", new { force = true }); application.Applied(); _ = RunAsync(RefreshSummary); }
+            ShowSuccess(apply ? IsRunning ? "配置文件已保存并重新加载。" : "配置已保存并校验，内核启动时将使用此配置。" : "配置已保存，可以稍后应用。", feedback);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception error) { throw EditorFailure(error, fileSaved); }
@@ -423,9 +456,10 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     }
     private Exception EditorFailure(Exception error, bool fileSaved = false)
     {
+        InvalidateSuccessFeedback();
         var code = error is DesktopException desktop ? desktop.Code : "network";
         if (code == "config_conflict") conflict = true; if (code is "config_read_only" or "config_missing") writable = false;
-        problem = fileSaved ? code is "config_invalid" or "reload_invalid" ? "配置已保存，但内核校验未通过。请修正配置后重新应用。" : "配置已保存，但应用失败。可以重试应用，或重新读取磁盘配置。" : code switch
+        var message = fileSaved ? code is "config_invalid" or "reload_invalid" ? "配置已保存，但内核校验未通过。请修正配置后重新应用。" : "配置已保存，但应用失败。可以重试应用，或重新读取磁盘配置。" : code switch
         {
             "config_conflict" => "磁盘配置已被修改，当前草稿已保留。请重新读取后再保存。",
             "config_read_only" => "配置文件为只读，请先调整文件权限，再重新读取。",
@@ -440,7 +474,9 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
             "invalid_url" => "请输入有效的 HTTP 或 HTTPS 订阅地址。",
             _ => "无法完成配置操作，请检查本地服务或网络后重试。"
         };
-        UpdateEditorState(); return new InvalidOperationException(L.T(problem));
+        if (fileSaved) { application.ApplyFailed(message); problem = ""; }
+        else problem = message;
+        UpdateEditorState(); return new InvalidOperationException(L.T(message));
     }
     private void ApplyInteractionState()
     {
@@ -450,7 +486,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         importUrlButton.IsEnabled = overviewAvailable && !string.IsNullOrWhiteSpace(importUrl.Text);
         Editor.IsReadOnly = !loaded || !writable || Busy || updating || confirmation != Confirmation.None; Editor.IsEnabled = loaded && !reading; code.SetAvailability(loaded, reading);
         readAgain.IsEnabled = available; discard.IsEnabled = available && dirty; closeEditor.IsEnabled = !Busy; keepEditing.IsEnabled = !Busy; confirmDiscard.IsEnabled = available;
-        save.IsEnabled = available && loaded && writable && !conflict && confirmation == Confirmation.None && (dirty || reloadPending);
+        save.IsEnabled = available && loaded && writable && !conflict && confirmation == Confirmation.None && (dirty || application.Pending);
         saveOnly.IsEnabled = available && loaded && writable && !conflict && confirmation == Confirmation.None && dirty;
         resources.UpdateAvailability(PageToken); UpdateEditorState();
         if (updating && !updateWasActive) Message("正在安装应用更新，配置编辑与导入已暂时锁定。请等待更新完成。");
@@ -459,11 +495,13 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private void UpdateEditorState()
     {
         editorPath.Text = documentPath.Length > 0 ? documentPath : L.T("配置文件"); editorPath.ToolTip = documentPath;
-        editorState.Text = L.T(reading ? "正在读取…" : saving ? reloading ? "正在重载…" : "正在保存…" : !writable ? "只读" : dirty ? "有未保存的修改" : reloadPending ? "已保存，待重载" : loaded ? "YAML" : "暂不可用");
+        editorState.Text = L.T(reading ? "正在读取…" : saving ? reloading ? "正在重载…" : "正在保存…" : !writable ? "只读" : dirty ? "有未保存的修改" : application.Pending ? "已保存，待重载" : loaded ? "YAML" : "暂不可用");
         editorState.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); editorDot.SetResourceReference(Shape.FillProperty, loaded && !conflict && writable ? "SuccessBrush" : "WarningBrush");
-        editorNotice.Text = L.T(problem.Length > 0 ? problem : !writable ? "内核当前无法写入此配置文件，已以只读方式打开。可以选择和复制内容；请检查文件及所在目录的权限，调整后重新读取以恢复编辑。" : saved ? reloadPending ? "配置已保存，点击“保存并重新加载”使其生效。" : IsRunning ? "配置文件已保存并重新加载。" : "配置已保存并校验，内核启动时将使用此配置。" : "保存并重新加载会先写入配置文件，再由内核校验并应用。控制器地址和密钥等启动配置需重启内核后生效。");
-        editorNotice.SetResourceReference(TextBlock.ForegroundProperty, problem.Length > 0 || saved ? "TextPrimaryBrush" : "TextSecondaryBrush"); editorNoticeFrame.SetResourceReference(Border.BackgroundProperty, problem.Length > 0 ? "WarningBackgroundBrush" : saved ? "SuccessBackgroundBrush" : "InfoBackgroundBrush"); if (problem.Length > 0 || saved) editorNoticeFrame.BorderBrush = Brushes.Transparent; else editorNoticeFrame.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
-        var title = saving ? reloading ? "正在重载…" : "正在保存…" : reloadPending && !dirty ? "重试重新加载" : "保存并重新加载";
+        string failure = problem.Length > 0 ? problem : application.Failure;
+        bool attention = failure.Length > 0 || !writable || application.Pending;
+        editorNotice.Text = L.T(failure.Length > 0 ? failure : !writable ? "内核当前无法写入此配置文件，已以只读方式打开。可以选择和复制内容；请检查文件及所在目录的权限，调整后重新读取以恢复编辑。" : application.Pending ? "配置已保存，点击“保存并重新加载”使其生效。" : "保存并重新加载会先写入配置文件，再由内核校验并应用。控制器地址和密钥等启动配置需重启内核后生效。");
+        editorNotice.SetResourceReference(TextBlock.ForegroundProperty, attention ? "TextPrimaryBrush" : "TextSecondaryBrush"); editorNoticeFrame.SetResourceReference(Border.BackgroundProperty, attention ? "WarningBackgroundBrush" : "InfoBackgroundBrush"); if (attention) editorNoticeFrame.BorderBrush = Brushes.Transparent; else editorNoticeFrame.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
+        var title = saving ? reloading ? "正在重载…" : "正在保存…" : application.Pending && !dirty ? "重试重新加载" : "保存并重新加载";
         saveLabel.Text = L.T(title); saveGlyph.Kind = reloading ? "update" : "save"; saveGlyph.Visibility = saving && !reloading ? Visibility.Collapsed : Visibility.Visible;
         saveSpinner.IsActive = saving && !reloading; saveSpinner.Visibility = saveSpinner.IsActive ? Visibility.Visible : Visibility.Collapsed; ProxyVisuals.SetBusyIcon(saveGlyph, saving && reloading);
         if (saving) saveContent.SetResourceReference(TextElement.ForegroundProperty, "TextSecondaryBrush"); else saveContent.ClearValue(TextElement.ForegroundProperty);
@@ -474,15 +512,15 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private void EnsureAvailable() { EnsureNoUpdate(); if (Busy) throw new InvalidOperationException(L.T("配置操作正在进行，请稍后重试。")); }
     private async Task Reload()
     {
-        EnsureAvailable(); if (!await CanLeaveAsync()) return; EnsureAvailable(); saving = reloading = true; ApplyInteractionState();
+        EnsureAvailable(); if (!await CanLeaveAsync()) return; EnsureAvailable(); var feedback = InvalidateSuccessFeedback(); Message(""); saving = reloading = true; ApplyInteractionState();
         try
         {
-            await Command("desktop_reload_config", new { force = true }); reloadPending = false;
-            Message(IsRunning ? "配置已重新加载。" : "配置已校验，内核启动时将使用此配置。");
+            await Command("desktop_reload_config", new { force = true }); application.Applied();
+            ShowSuccess(IsRunning ? "配置已重新加载。" : "配置已校验，内核启动时将使用此配置。", feedback);
             try { await ReadDocument(); } catch (Exception) { Message("配置已重新加载，但暂时无法重新读取文件。请稍后重试读取。"); }
         }
         catch (OperationCanceledException) { throw; }
-        catch (Exception error) { throw EditorFailure(error); }
+        catch (Exception error) { throw EditorFailure(error, true); }
         finally { saving = reloading = false; ApplyInteractionState(); }
     }
     public override async Task<bool> CanLeaveAsync()
@@ -545,7 +583,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     private Task Paste() => OpenImport(new ConfigImportSeed("text"));
     private async Task<bool> OpenImport(ConfigImportSeed seed)
     {
-        if (importOpening) return false; EnsureAvailable(); importOpening = true; var imported = false;
+        if (importOpening) return false; EnsureAvailable(); var feedback = InvalidateSuccessFeedback(); Message(""); importOpening = true; var imported = false;
         try
         {
             if (!await CanLeaveAsync()) return false; EnsureAvailable();
@@ -553,8 +591,10 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
             importing = true; ApplyInteractionState();
             await ConfigImportDialog.ShowAsync(owner, Session, seed, maxBytes, (document, applied) =>
             {
-                ApplyDocument(ValidateDocument(document), true); reloadPending = !applied; saved = true; imported = true;
-                Message(applied ? IsRunning ? "配置已保存并应用。" : "配置已保存并校验，内核启动时将使用此配置。" : "配置已保存，可以稍后应用。"); ApplyInteractionState();
+                ApplyDocument(ValidateDocument(document), true); imported = true;
+                if (applied) { application.Applied(); ShowSuccess(IsRunning ? "配置已保存并应用。" : "配置已保存并校验，内核启动时将使用此配置。", feedback); }
+                else application.Saved();
+                ApplyInteractionState();
             }, previewVisible =>
             {
                 if (importPreviewVisible == previewVisible) return;

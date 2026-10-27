@@ -2,6 +2,14 @@
 
 设计依据是用户提供的 `mihomo-fluent-redesign(1).zip` 中 `files/` 的最终源文件及 patch。本表记录原生实现入口和验收路径；网页端文件仍作为设计依据，不参与 Windows 运行。Windows 使用 C# WPF，系统集成保留现有 Rust host 和固定 Go 内核。
 
+## 0.2.4 窗口工作区与 DPI 适配
+
+`WindowPlacement` 在原生 HWND 首次显示前，按当前显示器的工作区和窗口 DPI 限制初始尺寸并居中。1240×820 DIP 是首选尺寸；500×560 DIP 是常规最小尺寸，工作区更小时同步降低有效最小值，避免 WPF 将已适配的窗口重新撑出屏幕。托盘恢复只修正越界的位置和尺寸，保留仍然有效的用户位置。
+
+跨显示器、DPI、分辨率和工作区变化先交给 WPF 的 PerMonitorV2 与 Windows 处理，再合并检查最终边界；不会拦截原生 DPI、最大化或 Snap 消息，普通拖动也不会被强制居中。最大化内容内边距来自实际客户区超出工作区的四边距离，并按当前窗口 DPI 换算，避免固定边框值或系统 DPI 缓存造成标题栏裁切。
+
+首次显示验收不调用截图的 `native_resize`。shell 测试在真实 `WM_SHOWWINDOW` 时同步读取 HWND 矩形，并检查首次渲染标题栏、有效最小尺寸、位置保持及隐藏后恢复；安装验收独立从 Windows 工作区和 UIA 控件屏幕坐标核对标题栏按钮。显式截图尺寸与正式窗口共用几何适配逻辑，不再独占一份能掩盖冷启动缺陷的修正实现。
+
 ## 0.2.2 标题栏鼠标输入
 
 `ShellVisuals.Background` 区分未设置背景和显式透明背景，确保首次设置透明背景时初始化真实的 `Border.Background`，图标按钮的整个可点击区域均能接收鼠标。返回、导航、最小化、关闭使用原有 WPF 事件；最大化保留原有 Windows 非客户区消息和贴靠行为。
@@ -24,7 +32,7 @@
 
 | 原稿 | 原生入口 | 对应行为 |
 | --- | --- | --- |
-| Shell/TitleBar、Sidebar、Shell/nav-mode | MainWindow、NativeTitleBar | 默认 1240×820、最小 500×560，48px 标题栏、返回、窗口按钮、拖动/缩放/贴靠、展开/紧凑/覆盖式导航、Escape 关闭覆盖导航 |
+| Shell/TitleBar、Sidebar、Shell/nav-mode | MainWindow、NativeTitleBar、WindowPlacement | 首选 1240×820 DIP、常规最小 500×560 DIP，按当前工作区与 DPI 适配；48 DIP 标题栏、返回、窗口按钮、拖动/缩放/贴靠、展开/紧凑/覆盖式导航、Escape 关闭覆盖导航 |
 | Shell/appearance、styles/tokens、components/Icon/Motion | AppSession、NativeBackdrop、FluentIcon、FluentMotion | 系统主题与强调色、Mica/Acrylic、原稿 Fluent 图标、状态和页面过渡、减少动画/高对比度/透明效果回退 |
 | Shell/CoreCard | MainWindow CoreCard | 内核状态、版本、启停/重启/日志/配置快捷入口 |
 | Shell/GlobalSearch、search-targets、Settings/focus-target | SearchFlyout、SearchTargets、NavigationTarget | 命令/页面/组/节点/设置/规则检索、匹配高亮、键盘操作、设置定位和短暂高亮、代理定位、规则筛选 |
@@ -41,8 +49,8 @@
 
 ## 验收
 
-- `desktop/tests/shell`：在真实 WPF 窗口中检查透明背景首次设置、未设置背景的穿透、以及悬停和主题状态往返后的鼠标命中区域。
-- `desktop/tests/protocol`：stdio 边界、取消/并发、退出、Windows 单实例身份校验，以及 DNS 原子分页索引的稀疏 ID、UInt64 边界、空页、非法/旧版元数据。
+- `desktop/tests/shell`：在真实 WPF 窗口中检查透明背景首次设置、未设置背景的穿透、悬停和主题状态往返后的鼠标命中区域，以及不预先调整窗口的原生首次显示和隐藏后恢复。
+- `desktop/tests/protocol`：stdio 边界、取消/并发、退出、Windows 单实例身份校验；DNS 原子分页索引的稀疏 ID、UInt64 边界、空页、非法/旧版元数据；窗口几何的高 DPI、小工作区、负屏幕坐标、最大化裁切距离及位置保持。
 - `desktop/tests/backdrop`：以原始 UI 视觉的 VisualBrush/RTB 为基准，逐像素检查后台场景的变换、裁剪、透明度、效果、文本和不同 DPI，并验证冻结后的来源隔离、取消和不支持资源回退。
 - `desktop/tests/windows_smoke.py` 与 `uia-query.ps1`：实际安装程序、普通权限 WPF 界面、原生 UIA 控件操作及截图；验证空连接表能实际横向滚到末列、首列保持冻结并恢复起点，同时保留系统代理、TUN、服务身份、资源引导和异常退出恢复检查。
 - `desktop/tests/prepare-visual-reference.py` 与 `capture-reference.cjs`：恢复并渲染固定原稿，使用安装验收导出的安全数据和实际页面滚动位置；输出实际尺寸、DPI、主题、字体及关键元素几何信息。测试浏览器禁止访问本地夹具以外的网络目标。

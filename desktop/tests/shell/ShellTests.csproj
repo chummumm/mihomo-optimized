@@ -10,5 +10,7 @@
   <ItemGroup>
     <Compile Include="../../../src-windows/Controls/ShellVisuals.cs" Link="ShellVisuals.cs" />
     <Compile Include="../../../src-windows/Controls/FluentMotion.cs" Link="FluentMotion.cs" />
+    <Compile Include="../../../src-windows/Services/WindowPlacementGeometry.cs" Link="WindowPlacementGeometry.cs" />
+    <Compile Include="../../../src-windows/Services/WindowPlacement.cs" Link="WindowPlacement.cs" />
   </ItemGroup>
 </Project>

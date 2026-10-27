@@ -23,6 +23,7 @@ public partial class MainWindow : Window
     private readonly TrayController tray;
     private readonly NativeBackdrop backdrop;
     private readonly NativeTitleBar titleBar;
+    private readonly WindowPlacement windowPlacement;
     private readonly DesktopRecovery recovery;
     private readonly DesktopUpdateNotice updateNotice;
     private readonly FluentBackdropFilter navigationBackdrop = new()
@@ -96,6 +97,7 @@ public partial class MainWindow : Window
         CoreCardButton.Style = FluentControls.Style("Ghost");
         backdrop = new NativeBackdrop(this, ClientArea, session);
         titleBar = new NativeTitleBar(this, MaximizeButton, ToggleMaximize);
+        windowPlacement = new WindowPlacement(this, UpdateCaption);
         tray = new TrayController(this, session);
         session.StatusChanged += (_, _) => UpdateStatus();
         session.PropertyChanged += (_, e) =>
@@ -304,7 +306,9 @@ public partial class MainWindow : Window
     public void ShowMain()
     {
         if (allowClose || session.IsExiting) return;
+        windowPlacement.EnsureVisible();
         Show(); if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        windowPlacement.EnsureVisible();
         Activate(); Focus(); UpdatePageActivity();
     }
     public void HideToTray() { ConnectedNavigation.Cancel(this); CloseOverlay(false); Hide(); activePage?.Deactivate(); }
@@ -622,7 +626,7 @@ public partial class MainWindow : Window
     {
         bool maximized = WindowState == WindowState.Maximized; MaximizeIcon.Kind = maximized ? "restore" : "maximize";
         L.Bind(MaximizeButton, ToolTipProperty, maximized ? "还原" : "最大化"); L.Bind(MaximizeButton, AutomationProperties.NameProperty, maximized ? "还原" : "最大化");
-        ClientArea.Margin = maximized ? SystemParameters.WindowResizeBorderThickness : new Thickness(0);
+        ClientArea.Margin = maximized ? WindowPlacement.MaximizedClientInsets(this) : new Thickness(0);
     }
     private void ShowSearch()
     {
@@ -716,7 +720,7 @@ public partial class MainWindow : Window
         StopNavigationEntranceObservation();
         CancelProxiesPreparation();
         foreach (var page in pages.Values) page.Deactivate();
-        L.Changed -= OnLanguageChanged; searchWindow?.Close(); backdrop.Dispose(); navigationBackdrop.Dispose(); searchBackdrop.Dispose(); titleBar.Dispose(); tray.Dispose();
+        L.Changed -= OnLanguageChanged; searchWindow?.Close(); backdrop.Dispose(); navigationBackdrop.Dispose(); searchBackdrop.Dispose(); titleBar.Dispose(); windowPlacement.Dispose(); tray.Dispose();
         Notifications.Dispose();
         await session.DisposeAsync(); Close(); Application.Current.Shutdown();
     }

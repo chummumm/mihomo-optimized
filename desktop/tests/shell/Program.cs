@@ -29,6 +29,11 @@ internal static class Program
                     ShowInTaskbar = false, Title = "Shell hit-test contract"
                 };
                 await VerifyAsync(window, timeout.Token).WaitAsync(timeout.Token);
+                window.Close(); window = null;
+                await WindowPlacementTests.VerifyAsync((name, passed, expected, actual) => {
+                    Results.Add(new Check(name, passed, expected, actual));
+                    Console.WriteLine($"{(passed ? "PASS" : "FAIL")} {name}: expected {expected}; actual {actual}");
+                }, timeout.Token).WaitAsync(timeout.Token);
             }
             catch (Exception failure) { error = failure.ToString(); Console.Error.WriteLine(error); }
             finally
@@ -39,10 +44,10 @@ internal static class Program
                 Directory.CreateDirectory(EvidenceDirectory);
                 File.WriteAllText(Path.Combine(EvidenceDirectory, "report.json"), JsonSerializer.Serialize(new {
                     passed, timeoutSeconds = 15, motionEnabled = FluentMotion.Enabled,
-                    method = "Window.InputHitTest on a shown WPF window; no UIA invocation or synthetic routed event",
+                    method = "Window.InputHitTest and first-visible HWND/work-area checks on real WPF windows; no initial resize or UIA invocation",
                     results = Results, error
                 }, new JsonSerializerOptions { WriteIndented = true }));
-                Console.WriteLine(passed ? "PASS: shell transparent-background hit-test contracts." : "FAIL: shell hit-test contracts; see report.json.");
+                Console.WriteLine(passed ? "PASS: shell hit-test and native window-placement contracts." : "FAIL: shell contracts; see report.json.");
                 app.Shutdown(passed ? 0 : 1);
             }
         };

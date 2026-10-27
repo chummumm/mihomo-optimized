@@ -1046,6 +1046,11 @@ class MouseEvent(ctypes.Structure):
     _fields_ = [("type", ctypes.c_uint32), ("mouse", MouseInput)]
 
 
+class MonitorInfo(ctypes.Structure):
+    _fields_ = [("size", wintypes.DWORD), ("monitor", wintypes.RECT),
+                ("work", wintypes.RECT), ("flags", wintypes.DWORD)]
+
+
 class NativePointer:
     """Read UIA geometry, then exercise the real Windows mouse/hit-test path.
 
@@ -1064,6 +1069,9 @@ class NativePointer:
             "SetPhysicalCursorPos": ([ctypes.c_int, ctypes.c_int], wintypes.BOOL),
             "GetWindowThreadProcessId": ([wintypes.HWND, ctypes.POINTER(wintypes.DWORD)], wintypes.DWORD),
             "GetWindowRect": ([wintypes.HWND, ctypes.POINTER(wintypes.RECT)], wintypes.BOOL),
+            "MonitorFromWindow": ([wintypes.HWND, wintypes.DWORD], wintypes.HANDLE),
+            "GetMonitorInfoW": ([wintypes.HANDLE, ctypes.POINTER(MonitorInfo)], wintypes.BOOL),
+            "GetDpiForWindow": ([wintypes.HWND], wintypes.UINT),
             "GetForegroundWindow": ([], wintypes.HWND),
             "GetAncestor": ([wintypes.HWND, wintypes.UINT], wintypes.HWND),
             "WindowFromPoint": ([wintypes.POINT], wintypes.HWND),
@@ -1128,6 +1136,45 @@ class NativePointer:
                 "minimized": bool(self.api.IsIconic(self.window)),
                 "maximized": bool(self.api.IsZoomed(self.window)),
                 "rect": [rect.left, rect.top, rect.right, rect.bottom]}
+
+    def visible_caption(self) -> dict:
+        """Inspect screen coordinates without moving, showing or resizing the HWND."""
+        def probe():
+            try:
+                return self._read_visible_caption()
+            except SmokeFailure as error:
+                # Native maximize/restore changes IsZoomed before WPF finishes
+                # arranging its caption. Wait only for readable geometry;
+                # ownership or HWND identity failures are never retried.
+                code = str(error)
+                if (code.startswith("native_caption_outside_work_area_") or
+                        code.startswith("native_pointer_target_unavailable_") or
+                        code == "native_pointer_target_bounds_invalid"):
+                    return None
+                raise
+        return wait_until(probe, "native_caption_not_visible_within_work_area", 10)
+
+    def _read_visible_caption(self) -> dict:
+        state = self.state()
+        require(state["visible"] and not state["minimized"], "native_caption_window_not_visible")
+        monitor = self.api.MonitorFromWindow(self.window, 2)
+        info = MonitorInfo()
+        info.size = ctypes.sizeof(info)
+        require(monitor and self.api.GetMonitorInfoW(monitor, ctypes.byref(info)),
+                "native_caption_work_area_unavailable")
+        work = info.work
+        controls = {}
+        # The title Grid has no UIA peer. Inspect its real interactive controls;
+        # shell tests separately check the full 48 DIP title Visual at first show.
+        for identifier in ("NavigationToggle", "GlobalSearch", "TitleBarMinimize", "TitleBarMaximize", "TitleBarClose"):
+            bounds = self.bounds(identifier)
+            require(bounds["x"] >= work.left - 1 and bounds["y"] >= work.top - 1
+                    and bounds["x"] + bounds["width"] <= work.right + 1
+                    and bounds["y"] + bounds["height"] <= work.bottom + 1,
+                    "native_caption_outside_work_area_" + identifier)
+            controls[identifier] = bounds
+        return {"window": state, "workArea": [work.left, work.top, work.right, work.bottom],
+                "dpi": self.api.GetDpiForWindow(self.window), "controls": controls}
 
     def bounds(self, identifier: str) -> dict:
         result = self.driver.ui(identifier)
@@ -1654,9 +1701,11 @@ class Acceptance:
                 operation = pointer.click("TitleBarMaximize")
                 verify(operation, lambda: window_matches(maximized=True, minimized=False),
                        "native_pointer_maximize_failed")
+                operation["visibleCaption"] = pointer.visible_caption()
                 operation = pointer.click("TitleBarMaximize", horizontal=.2)
                 verify(operation, lambda: window_matches(maximized=False, minimized=False),
                        "native_pointer_restore_failed")
+                operation["visibleCaption"] = pointer.visible_caption()
 
                 operation = pointer.click("TitleBarMinimize", horizontal=.2)
                 verify(operation, lambda: window_matches(minimized=True), "native_pointer_minimize_failed")
@@ -1675,6 +1724,7 @@ class Acceptance:
                 operation["passed"] = True
                 driver.invoke("native_show")  # Close means hide to tray, not process exit.
                 wait_until(lambda: window_matches(visible=True, minimized=False), "native_pointer_close_cleanup_failed", 10)
+                evidence["restoredCaption"] = pointer.visible_caption()
 
                 operation = pointer.drag_title(64, 48)
                 before = operation["before"]["rect"]
@@ -2091,6 +2141,65 @@ class Acceptance:
         found("CloseEditor", enabled=True)
         driver.ui("CloseEditor", "invoke")
         wait_until(lambda: not driver.ui("ConfigEditor").get("found") or driver.ui("ConfigEditor").get("offscreen"), "native_editor_did_not_close", 15)
+
+        # A successful write and an applied configuration are different states.
+        # Reopening or rereading the cached page must not acknowledge an apply.
+        driver.ui("EditConfig", "invoke")
+        wait_until(lambda: "待重载" in driver.ui("ConfigEditorState").get("name", ""),
+                   "native_editor_reopen_lost_pending_apply")
+        driver.ui("ConfigReadAgain", "invoke")
+        found("SaveConfig", enabled=True)
+        require("待重载" in found("ConfigEditorState").get("name", ""),
+                "native_editor_reread_lost_pending_apply")
+        driver.ui("SaveConfig", "invoke")
+        wait_until(lambda: driver.ui("ConfigEditorState").get("name") == "YAML",
+                   "native_editor_pending_apply_did_not_complete", 30)
+
+        def clean_editor_notice(reason: str) -> None:
+            require(found("ConfigEditorState").get("name") == "YAML", reason + "_state")
+            notice = found("ConfigEditorNotice").get("name", "")
+            require("配置文件已保存并重新加载。" not in notice and
+                    "配置已保存并校验，内核启动时将使用此配置。" not in notice,
+                    reason + "_stale_success")
+
+        driver.ui("CloseEditor", "invoke")
+        found("EditConfig", enabled=True)
+        driver.ui("EditConfig", "invoke")
+        clean_editor_notice("native_editor_reopen")
+        driver.ui("CloseEditor", "invoke")
+        driver.navigate("home")
+        driver.navigate("profiles")
+        driver.ui("EditConfig", "invoke")
+        clean_editor_notice("native_editor_page_return")
+        driver.invoke("native_hide")
+        driver.invoke("native_show")
+        clean_editor_notice("native_editor_tray_return")
+        checked("native_editor_pending_apply_and_success_lifetime")
+
+        # Valid YAML with an invalid proxy type saves successfully, then the
+        # real running core rejects it. Rereading that revision must retain the
+        # error and retry action until a later apply actually succeeds.
+        invalid = draft.replace("type: socks5", "type: native-acceptance-invalid", 1)
+        require(invalid != draft, "native_editor_invalid_fixture_missing")
+        driver.ui("ConfigEditor", "set", invalid)
+        driver.ui("SaveConfig", "invoke")
+        wait_until(lambda: "校验未通过" in driver.ui("ConfigEditorNotice").get("name", ""),
+                   "native_editor_apply_failure_not_shown", 30)
+        found("SaveConfig", enabled=True)
+        driver.ui("ConfigReadAgain", "invoke")
+        found("SaveConfig", enabled=True)
+        require("校验未通过" in found("ConfigEditorNotice").get("name", ""),
+                "native_editor_reread_erased_apply_failure")
+        require("待重载" in found("ConfigEditorState").get("name", ""),
+                "native_editor_failure_lost_retry_state")
+        driver.ui("ConfigEditor", "set", draft)
+        driver.ui("SaveConfig", "invoke")
+        wait_until(lambda: driver.ui("ConfigEditorState").get("name") == "YAML",
+                   "native_editor_corrected_apply_did_not_complete", 30)
+        clean_editor_notice("native_editor_corrected_apply")
+        driver.ui("CloseEditor", "invoke")
+        checked("native_editor_apply_failure_survives_reread")
+
         self.save_configuration(valid)
         self.driver.invoke("desktop_reload_config", {"force": True})
         self.phase("running")
@@ -2221,6 +2330,11 @@ class Acceptance:
         self.mark("non_elevated_gui")
         wait_until(lambda: self.driver.snapshot().get("ready") is True,
                    "automatic_startup_ui_not_loaded", 15)
+        # Check the untouched first-show rectangle. native_resize intentionally
+        # fits capture windows to the work area and would conceal this defect.
+        with NativePointer(self.driver, []) as pointer:
+            self.report["nativeStartupWindow"] = pointer.visible_caption()
+        self.mark("native_startup_window_bounds")
         wait_until(lambda: self.resources.count("/rules.yaml") > 0, "automatic_startup_resource_not_requested", 15)
         require(not cache.exists(), "automatic_startup_resource_released_before_inspection")
 
@@ -3094,7 +3208,7 @@ def main() -> int:
                 acceptance.cleanup()
             except Exception as error:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": "unexpected_" + type(error).__name__})
-            required = {"native_uia_json_contract", "native_host_parent_binding", "update_cache_cleanup", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
+            required = {"native_uia_json_contract", "native_host_parent_binding", "update_cache_cleanup", "native_startup_window_bounds", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
                         "single_instance_and_native_ui", "native_titlebar_pointer", "native_redesign_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
                         "resource_bootstrap_recovery", "system_proxy_service_recovery"}
