@@ -60,7 +60,7 @@ func (p *Proxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 	// without selecting a round-robin/load-balance group a second time.
 	ctx = icontext.WithDNSFixedOutbound(ctx, p.ProxyAdapter)
 	conn, err := p.ProxyAdapter.DialContext(ctx, metadata)
-	return conn, err
+	return conn, icontext.TCPDialError(ctx, err)
 }
 
 // ListenPacketContext implements C.ProxyAdapter

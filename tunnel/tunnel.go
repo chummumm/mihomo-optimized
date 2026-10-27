@@ -82,6 +82,10 @@ func (t tunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
 	handleTCPConn(connCtx)
 }
 
+func (t tunnel) HandleTCPConnContext(ctx context.Context, conn net.Conn, metadata *C.Metadata) {
+	handleTCPConn(icontext.NewConnContextWithContext(ctx, conn, metadata))
+}
+
 func initUDP() {
 	numUDPWorkers := 4
 	if num := runtime.GOMAXPROCS(0); num > numUDPWorkers {
@@ -614,17 +618,28 @@ func handleTCPConn(connCtx C.ConnContext) {
 	var peekBytes []byte
 	var peekLen int
 
-	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+	parent := context.Background()
+	if source, ok := connCtx.(interface{ Context() context.Context }); ok {
+		parent = source.Context()
+	}
+	ctx, cancel := icontext.WithTCPDialBudget(parent)
 	defer cancel()
 	ctx = icontext.WithDNSFixedOutbound(icontext.WithDNSRoutingMetadata(ctx, metadata), proxy)
 	remoteConn, err := retry(ctx, func(ctx context.Context) (remoteConn C.Conn, err error) {
 		remoteConn, err = proxy.DialContext(ctx, dialMetadata)
 		if err != nil {
+			err = icontext.TCPDialError(ctx, err)
 			return
 		}
 
 		if N.NeedHandshake(remoteConn) {
+			// Some adapters finish their handshake in the first Write. The
+			// same dial budget must interrupt that I/O too. Detach before
+			// handing a successful connection to the long-lived relay.
+			done := N.SetupContextForConn(ctx, remoteConn)
 			defer func() {
+				done(&err)
+				err = icontext.TCPDialError(ctx, err)
 				if err != nil {
 					_ = remoteConn.Close()
 					for _, chain := range remoteConn.Chains() {
@@ -831,8 +846,12 @@ func shouldStopRetry(err error) bool {
 func retry[T any](ctx context.Context, ft func(context.Context) (T, error), fe func(err error)) (t T, err error) {
 	s := slowdown.New()
 	for i := 0; i < 10; i++ {
+		if err = ctx.Err(); err != nil {
+			return t, icontext.TCPDialError(ctx, err)
+		}
 		t, err = ft(ctx)
 		if err != nil {
+			err = icontext.TCPDialError(ctx, err)
 			if fe != nil {
 				fe(err)
 			}

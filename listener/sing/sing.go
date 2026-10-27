@@ -146,7 +146,13 @@ func (h *ListenerHandler) NewConnection(ctx context.Context, conn net.Conn, meta
 	inbound.ApplyAdditions(cMetadata, h.Additions...)
 	inbound.ApplyAdditions(cMetadata, getAdditions(ctx)...)
 
-	h.Tunnel.HandleTCPConn(conn, cMetadata) // this goroutine must exit after conn unused
+	// Preserve the listener/connection lifetime when the tunnel supports it.
+	// This does not infer a remote close by reading the client's application data.
+	if tunnel, ok := h.Tunnel.(C.ContextTunnel); ok {
+		tunnel.HandleTCPConnContext(ctx, conn, cMetadata)
+	} else {
+		h.Tunnel.HandleTCPConn(conn, cMetadata)
+	} // this goroutine must exit after conn unused
 	return nil
 }
 

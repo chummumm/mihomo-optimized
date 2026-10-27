@@ -1,6 +1,9 @@
 package constant
 
-import "net"
+import (
+	"context"
+	"net"
+)
 
 type Tunnel interface {
 	// HandleTCPConn will handle a tcp connection blocking
@@ -9,4 +12,11 @@ type Tunnel interface {
 	HandleUDPPacket(packet UDPPacket, metadata *Metadata)
 	// NatTable return nat table
 	NatTable() NatTable
+}
+
+// ContextTunnel preserves an inbound's existing lifetime when it supplies one.
+// A listener context does not necessarily report a remote TCP close.
+type ContextTunnel interface {
+	Tunnel
+	HandleTCPConnContext(context.Context, net.Conn, *Metadata)
 }
