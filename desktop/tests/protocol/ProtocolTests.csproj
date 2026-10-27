@@ -10,5 +10,7 @@
     <Compile Include="../../../src-windows/Services/HostChannel.cs" Link="HostChannel.cs" />
     <Compile Include="../../../src-windows/Services/InstanceBroker.cs" Link="InstanceBroker.cs" />
     <Compile Include="../../../src-windows/Services/DnsPageIndex.cs" Link="DnsPageIndex.cs" />
+    <Compile Include="../../../src-windows/Services/WindowPlacementGeometry.cs" Link="WindowPlacementGeometry.cs" />
+    <Compile Include="../../../src-windows/Services/ConfigApplicationState.cs" Link="ConfigApplicationState.cs" />
   </ItemGroup>
 </Project>

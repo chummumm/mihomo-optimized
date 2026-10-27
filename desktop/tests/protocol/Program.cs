@@ -9,6 +9,8 @@ if (args.FirstOrDefault() == "--broker-fixture" && OperatingSystem.IsWindows())
     return;
 }
 
+WindowPlacementGeometryTests.Run();
+
 static StreamReader Reader(string text) => new(new MemoryStream(Encoding.UTF8.GetBytes(text)), Encoding.UTF8);
 static void Equal<T>(T expected, T actual)
 {
@@ -66,3 +68,4 @@ foreach (var invalid in new object[] {
     new { retained = 400, anchor_id = "1000", next_cursor = "500" }
 }) Equal<DnsPageIndex?>(null, DnsPageIndex.Read(PageFixture(invalid), 50));
 Console.WriteLine("Native DNS pagination: filtered totals, sparse IDs, 64-bit boundaries, empty pages and malformed/legacy metadata passed.");
+ConfigApplicationStateTests.Run();

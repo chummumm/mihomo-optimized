@@ -123,6 +123,14 @@ jobs:
         # Reduce contention around the pinned tests' short wall-clock deadlines.
         # Keep every package, assertion, deadline and uncached execution intact.
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./component/desktop ./component/resource ./component/http ./component/dialer ./component/resolver ./component/profile/cachefile ./adapter/provider ./adapter/outboundgroup ./config ./hub/executor ./hub/route . -run 'Desktop|ResourceBootstrap|ReadSelectedSnapshot'
+      - name: Verify EasyTier first-dial readiness and shared TCP deadlines
+        working-directory: core-src
+        run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./component/easytier ./context ./adapter/outbound ./tunnel -run 'EasyTier|DialBudget'
+      - name: Verify a single EasyTier dial waits for a delayed relay route
+        working-directory: core-src
+        env:
+          MIHOMO_EASYTIER_INTEGRATION: '1'
+        run: go test -p 1 -tags with_gvisor -count=1 -v -timeout=60s ./adapter/outbound -run '^TestEasyTierFirstDialWaitsForDelayedRelayRoute$'
       - name: Install pinned Rust compiler
         run: rustup toolchain install 1.99.1 --profile minimal
       - name: Cache Rust dependencies
