@@ -2,6 +2,8 @@ package tunnel
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -11,7 +13,6 @@ import (
 
 	N "github.com/metacubex/mihomo/common/net"
 	C "github.com/metacubex/mihomo/constant"
-	icontext "github.com/metacubex/mihomo/context"
 )
 
 func tcpDialTestState(t *testing.T, dial func(context.Context, *C.Metadata) (C.Conn, error)) {
@@ -123,11 +124,79 @@ func TestTCPDialBudgetCancelsBlockedFirstWriteAndClosesConnection(t *testing.T) 
 }
 
 func TestTCPDialBudgetRetryDoesNotStartAfterCancellation(t *testing.T) {
-	ctx, cancel := icontext.WithTCPDialBudget(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	calls := 0
 	_, err := retry(ctx, func(context.Context) (int, error) { calls++; return 1, nil }, nil)
 	if err != context.Canceled || calls != 0 {
 		t.Fatalf("canceled request ran another attempt: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestTCPDialUsesOrdinaryFiveSecondsAndEarlierParent(t *testing.T) {
+	for _, early := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "parent"}[early], func(t *testing.T) {
+			var seen time.Time
+			tcpDialTestState(t, func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+				seen, _ = ctx.Deadline()
+				return nil, C.ErrTargetIPFamily
+			})
+			parent := context.Background()
+			var expected time.Time
+			if early {
+				var cancel context.CancelFunc
+				expected = time.Now().Add(300 * time.Millisecond)
+				parent, cancel = context.WithDeadline(parent, expected)
+				defer cancel()
+			}
+			inbound, client := net.Pipe()
+			defer client.Close()
+			start := time.Now()
+			Tunnel.HandleTCPConnContext(parent, inbound, tcpDialTestMetadata())
+			if seen.IsZero() {
+				t.Fatal("business dial lost its deadline")
+			}
+			if early {
+				if !seen.Equal(expected) {
+					t.Fatalf("earlier parent replaced: %v != %v", seen, expected)
+				}
+			} else if budget := seen.Sub(start); budget < 4900*time.Millisecond || budget > 5100*time.Millisecond {
+				t.Fatalf("ordinary request budget = %s; old staged extension remained", budget)
+			}
+		})
+	}
+}
+
+type tcpFirstPayloadFailure struct {
+	*dnsProxyTestConn
+	writes atomic.Int32
+	err    error
+}
+
+func (c *tcpFirstPayloadFailure) NeedHandshake() bool { return true }
+func (c *tcpFirstPayloadFailure) Write(data []byte) (int, error) {
+	c.writes.Add(1)
+	if len(data) == 0 {
+		return 0, errors.New("fixture did not supply application payload")
+	}
+	return 0, c.err
+}
+
+func TestTCPFirstApplicationWriteIsNeverReplayed(t *testing.T) {
+	for _, writeErr := range []error{io.ErrUnexpectedEOF, nil} {
+		t.Run(map[bool]string{true: "error", false: "short-write"}[writeErr != nil], func(t *testing.T) {
+			remote, server := net.Pipe()
+			defer server.Close()
+			conn := &tcpFirstPayloadFailure{dnsProxyTestConn: &dnsProxyTestConn{ExtendedConn: N.NewExtendedConn(remote)}, err: writeErr}
+			var dials atomic.Int32
+			tcpDialTestState(t, func(context.Context, *C.Metadata) (C.Conn, error) { dials.Add(1); return conn, nil })
+			inbound, client := net.Pipe()
+			defer client.Close()
+			go func() { _, _ = client.Write([]byte("non-idempotent application request")) }()
+			Tunnel.HandleTCPConnContext(context.Background(), inbound, tcpDialTestMetadata())
+			if dials.Load() != 1 || conn.writes.Load() != 1 {
+				t.Fatalf("application request replayed: dials=%d writes=%d", dials.Load(), conn.writes.Load())
+			}
+		})
 	}
 }

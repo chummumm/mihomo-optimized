@@ -267,7 +267,7 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 		return
 	}
 
-	if errors.Is(err, C.ErrNotSupport) {
+	if errors.Is(err, C.ErrNotSupport) || errors.Is(err, C.ErrTargetIPFamily) || errors.Is(err, C.ErrNoProxyTarget) {
 		return
 	}
 

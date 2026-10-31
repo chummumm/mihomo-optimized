@@ -369,7 +369,17 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.20
+              printf '%s\n\n' '## 本次更新：1.0.23
+
+          - LAN 后台预连接只针对 RFC1918 IPv4 / ULA IPv6 业务目标，覆盖 EasyTier、WireGuard / AmneziaWG、Tailscale、ZeroTier 和 OpenVPN；沿用现有规则、稳定选组和实际目标，不增加节点字段，不扫描网段或重放 UDP。
+          - 回退 EasyTier 请求内 15 秒准备加 5 秒拨号的延长预算，业务恢复原有 5 秒期限；保留路由、实际下一跳、共享初始化、取消和关闭保护。后台先准备通道，未知冷目标的第一次请求仍可能超时。
+          - 实现 issue #61：可选 proxy-force-ip 在 TCP / UDP 代理协议中使用真实目标 IP，保留规则和日志域名，DIRECT 不变。target-ip-family 按具体节点及链式代理每一跳检查，不对整条链求地址族交集。
+          - 新增按原始查询域名匹配的 dns.answer-ip-family-policy，处理 A / AAAA 和 HTTPS / SVCB 地址提示，保留原始缓存及受保护答案边界。normal 模式继续保留，不根据一次失败或 DNS 查询出口自动推断远端地址族能力。
+          - 配套 Windows 桌面 0.2.5 修复服务心跳计时和恢复协调。内核新增认证的动态 TUN 健康与恢复接口，检查自有设备身份、地址和路由，健康实例保留；无法确认所有权时不盲目清理。
+          - 自动测试覆盖实际代理协议目标、DNS 输出、LAN 生命周期与真实 EasyTier 中继。Windows 流水线另验健康 PID 保留、自有 TUN 路由修复及宿主替换；CI 不替代 S3 / S4 / Modern Standby 硬件睡眠实测。
+
+          [LAN 预连接](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.23/docs/lan-preconnect.md) · [代理目标 IP](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.23/docs/proxy-force-ip.md) · [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.23/docs/releases.md)'
+              printf '%s\n\n' '## 1.0.20：通用代理组引导
 
           - resource-bootstrap 支持已有 select、fallback、url-test、load-balance 和 GLOBAL 组，包含嵌套、过滤和本地订阅成员；沿用各组选择策略与现有选择缓存，不增加另一套配置或存储。
           - 资源需要下载时才创建私有代理图和有界探测。手动组保持选择，自动组可在本次 GET 中回退失败路径；连接、TLS、HTTP 与读体重试共享原预算，空组或全部失败不静默直连。

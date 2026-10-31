@@ -36,13 +36,14 @@ func TestUnifiedUpdateConfigurationFreezesAppliedSourcesAndPolicies(t *testing.T
 	geodata.SetUsage(geodata.Usage{GeoSite: true})
 	cfg := &config.Config{
 		Rules:         []C.Rule{&RC.GEOSITE{}},
-		General:       &config.General{GeoXUrl: config.GeoXUrl{GeoSite: "https://applied.example/geosite"}, CoreUpdateInterval: 12, GeoAutoUpdate: true},
+		General:       &config.General{GeoXUrl: config.GeoXUrl{GeoSite: "https://applied.example/geosite"}, CoreUpdateInterval: 12, GeoAutoUpdate: true, ProxyForceIP: true},
 		RuleProviders: map[string]P.RuleProvider{"original": nil},
 	}
 	publishUpdateConfiguration(cfg)
 	snapshot := CurrentUpdateConfiguration()
 	cfg.General.GeoXUrl.GeoSite = "https://candidate.example/not-applied"
 	cfg.General.CoreUpdateInterval = 6
+	cfg.General.ProxyForceIP = false
 	cfg.RuleProviders["not-applied"] = nil
 	oldURL := geodata.GeoSiteUrl()
 	geodata.SetGeoSiteUrl("https://temporary-parser.example/not-applied")
@@ -52,6 +53,9 @@ func TestUnifiedUpdateConfigurationFreezesAppliedSourcesAndPolicies(t *testing.T
 	}
 	if snapshot.Context.Err() != nil || snapshot.Geo.Context != snapshot.Context {
 		t.Fatal("GeoData did not share the applied configuration's lifetime")
+	}
+	if !GetGeneral().ProxyForceIP {
+		t.Fatal("proxy-force-ip API state observed the candidate rather than the applied configuration")
 	}
 }
 

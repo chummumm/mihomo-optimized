@@ -81,16 +81,18 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
 		metadata = metadata.Clone() // don't modify PacketAdapter's metadata
 
 		_ = preHandleMetadata(metadata) // error was pre-checked
-		metadata = metadata.Pure()
-		if metadata.Host != "" || (metadata.InboundDstIP.IsValid() && metadata.InboundDstIP != metadata.DstIP) {
-			// TODO: ResolveUDP may take a long time to block the Process loop
-			//       but we want keep sequence sending so can't open a new goroutine
-			// DIRECT must also restore a real client IP changed by hosts
-			// mapping, even when Pure has removed the mapped hostname.
-			if err := pc.ResolveUDP(s.ctx, metadata); err != nil {
-				log.Warnln("[UDP] Resolve Ip error: %s", err)
-				return
-			}
+		policy, present := N.FindUpstream[interface{ ForceIPPolicy() bool }](pc, nil)
+		if !present || !policy.ForceIPPolicy() {
+			metadata = metadata.Pure()
+		}
+		// TODO: ResolveUDP may take a long time to block the Process loop
+		//       but we want keep sequence sending so can't open a new goroutine
+		// DIRECT must also restore a real client IP changed by hosts mapping.
+		// Always-IP keeps Host until the established leaf chooses its family;
+		// this also preserves an explicit hosts rewrite's complete candidate set.
+		if err := pc.ResolveUDP(s.ctx, metadata); err != nil {
+			log.Warnln("[UDP] Resolve Ip error: %s", err)
+			return
 		}
 
 		if !metadata.DstIP.IsValid() {

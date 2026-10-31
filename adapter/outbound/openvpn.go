@@ -12,6 +12,7 @@ import (
 
 	"github.com/metacubex/mihomo/common/contextutils"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/lanpreconnect"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
@@ -156,6 +157,9 @@ func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
 }
 
 func (o *OpenVPN) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	if metadata.Host == "" {
+		observeLANDial(ctx, o, metadata.DstIP)
+	}
 	tunDevice, r, err := o.run(ctx)
 	if err != nil {
 		return nil, err
@@ -167,9 +171,10 @@ func (o *OpenVPN) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Co
 		}
 		options := o.DialOptions()
 		options = append(options, dialer.WithResolver(r))
-		options = append(options, dialer.WithNetDialer(ipStackNetDialer{stack: tunDevice}))
+		options = append(options, dialer.WithNetDialer(ipStackNetDialer{stack: tunDevice, lan: o}))
 		conn, err = dialer.NewDialer(options...).DialContext(ctx, "tcp", metadata.RemoteAddress())
 	} else {
+		observeLANDial(ctx, o, metadata.DstIP)
 		conn, err = tunDevice.DialTCP(ctx, "tcp", netip.AddrPort{}, metadata.AddrPort())
 	}
 	if err != nil {
@@ -198,7 +203,7 @@ func (o *OpenVPN) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 	if pc == nil {
 		return nil, errors.New("packetConn is nil")
 	}
-	return NewPacketConn(pc, o), nil
+	return newLANPacketConn(ctx, pc, o, o), nil
 }
 
 func (o *OpenVPN) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
@@ -220,7 +225,28 @@ func (o *OpenVPN) resolveUDP(ctx context.Context, metadata *C.Metadata, r resolv
 		}
 		metadata.DstIP = ip
 	}
-	return nil
+	return metadata.TargetIPFamily.Check(metadata.DstIP.Unmap())
+}
+
+func (o *OpenVPN) PrepareLAN(ctx context.Context, target netip.Addr) error {
+	if target.IsValid() && !lanpreconnect.IsLAN(target) {
+		return errors.New("openvpn: LAN preparation requires a private target")
+	}
+	_, _, err := o.run(ctx) // Native TLS, key exchange, PUSH and data stack.
+	return err
+}
+
+func (o *OpenVPN) LANPreconnectKey(netip.Addr) string { return "control-session" }
+
+func (o *OpenVPN) ResolveProxyTarget(ctx context.Context, metadata *C.Metadata) error {
+	_, r, err := o.run(ctx)
+	if err != nil {
+		return err
+	}
+	if r == nil {
+		r = resolver.DefaultResolver
+	}
+	return ResolveProxyTarget(ctx, metadata, r, o.prefer)
 }
 
 func (o *OpenVPN) ProxyInfo() C.ProxyInfo {
@@ -234,6 +260,7 @@ func (o *OpenVPN) IsL3Protocol(metadata *C.Metadata) bool {
 }
 
 func (o *OpenVPN) Close() error {
+	lanpreconnect.Default.Forget(o)
 	if o.runCancel != nil {
 		o.runCancel()
 	}
@@ -400,12 +427,17 @@ func (o *OpenVPN) startPacketLoops() {
 			_ = client.Close()
 			_ = tunDevice.Close()
 			_ = o.runLock.Acquire(context.Background(), 1)
+			changed := false
 			if o.client == client {
 				o.client = nil
 				o.tunDevice = nil
 				o.running = false
+				changed = true
 			}
 			o.runLock.Release(1)
+			if changed && o.runCtx.Err() == nil {
+				lanpreconnect.Default.Changed(o)
+			}
 		})
 	}
 	go func() {

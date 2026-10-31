@@ -139,7 +139,7 @@ func recreateTunLocked(tunConf LC.Tun, tunnel C.Tunnel, repair bool) error {
 		}
 		return nil
 	}
-	if managed && tunConf.Enable && tunConf.FileDescriptor == 0 && tunConf.Device != "" {
+	if (managed || repair) && tunConf.Enable && tunConf.FileDescriptor == 0 && tunConf.Device != "" {
 		device, lookupErr := tunInterfaceByName(tunConf.Device)
 		if lookupErr != nil && !errors.Is(lookupErr, errTunDeviceMissing) {
 			return fmt.Errorf("verify target TUN identity: %w", lookupErr)
@@ -189,6 +189,17 @@ func closeTunListenerLocked() error {
 		}
 		if device != nil && device.Index != index {
 			return fmt.Errorf("refuse to close TUN %q: ifindex changed from %d to %d", device.Name, index, device.Index)
+		}
+		if device != nil {
+			if guard, ok := tunLister.(interface{ CheckDeviceIdentity() (bool, error) }); ok {
+				owned, err := guard.CheckDeviceIdentity()
+				if err != nil {
+					return fmt.Errorf("preserve current TUN: verify device identity: %w", err)
+				}
+				if !owned {
+					return fmt.Errorf("refuse to close TUN %q: device identity changed", device.Name)
+				}
+			}
 		}
 	} else if transparentConfig().Enable {
 		return fmt.Errorf("preserve current TUN: original kernel identity is unknown")

@@ -64,6 +64,8 @@ Allowed browser origins are `tauri://localhost`, `http://tauri.localhost`, and
     "config_edit": true,
     "config_reload": true,
     "tun": true,
+    "tun_health": true,
+    "tun_repair": true,
     "rule_updates": true,
     "geodata_updates": true,
     "core_update": false,
@@ -87,6 +89,57 @@ TUN capability means the
 implementation is present; it does not assert privileges, driver readiness or
 successful capture of traffic. The GUI can remain open even if the core cannot
 start a configuration and the endpoint is unavailable.
+
+### Local health and resume recovery
+
+Core 1.0.23 adds `tun_health` and `tun_repair`, advertised only on Windows.
+These are optional API 1 capabilities; a supervisor must feature-detect them
+before using the new endpoints with an older core. They report local ownership
+and resources, not Internet connectivity or remote proxy availability.
+
+`GET /desktop/health` returns a fresh authenticated, `no-store` snapshot:
+
+```json
+{
+  "managed": true,
+  "api_version": 1,
+  "state": "running",
+  "pid": 1234,
+  "tun": {
+    "enabled": true,
+    "state": "healthy",
+    "device": "Mihomo",
+    "index": 42,
+    "repairable": false
+  }
+}
+```
+
+TUN states are `disabled`, `healthy`, `degraded`, `unavailable`, or `conflict`;
+an optional `reason` describes the local failure. The check compares the owned
+device's name, index and Windows LUID, every configured address, and expected
+automatic route prefixes with their gateway. An inspection error is not proof
+that the interface is missing. The supervisor still checks its child process
+identity and the actual configured proxy listeners.
+
+`POST /desktop/recover` accepts an empty body and no query parameters. It
+serializes with configuration changes, retains a healthy TUN, and recreates a
+verified degraded TUN using the current applied configuration. It does not
+download resources, reset the configuration, probe Internet reachability or
+change the user's running intent. The result includes `pid`, `tun`, `status`
+and an optional `error`; status is `healthy`, `repaired`, `unavailable`,
+`conflict`, or `needs_restart`. The last result permits the supervisor to use
+its bounded owned-process restart policy after confirmed shutdown. Foreign
+device identities and unknown inspection failures do not authorize that path.
+
+Both endpoints return HTTP 503 with `Retry-After: 1` when configuration or
+recovery already owns the lifecycle lock. This is a retryable busy state, not
+process death. A recover request before readiness or during shutdown returns
+HTTP 409. Stop intent takes precedence over subsequent resume work. Successful
+recovery also invalidates old LAN preparation results so current LAN intents
+can prepare in the background.
+
+### Shutdown
 
 `POST /desktop/shutdown` requires an empty body and no query parameters. It
 closes admission to configuration changes, flushes HTTP 202 with

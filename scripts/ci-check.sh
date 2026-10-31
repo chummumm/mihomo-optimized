@@ -13,7 +13,7 @@ case "${1:-test}" in
     python3 scripts/test-release-build.py
     CGO_ENABLED=0 go test -tags with_gvisor -count=1 -timeout=5m \
       ./adapter ./common/arc/... ./common/lru/... ./common/net/... ./common/singleflight/... ./component/trie/... ./component/easytier/... ./component/fakeip/... ./component/dnsmessage/... ./component/dnsstats/... ./component/process/... ./component/resolver/... ./component/http/... ./component/resource/... ./component/geodata/... ./component/mmdb/... ./component/updater/... ./context/... ./dns/... ./listener/sing_tun/... ./transport/socks4/... ./transport/socks5/... \
-      ./tunnel/... ./rules/logic/... ./rules/provider/... ./adapter/provider/... ./config/... \
+      ./tunnel/... ./component/lanpreconnect/... ./rules/logic/... ./rules/provider/... ./adapter/provider/... ./config/... \
       ./hub/route/... ./hub/executor/... ./component/desktop/...
     CGO_ENABLED=0 go test -tags with_gvisor -count=1 -timeout=5m \
       . ./component/transparentproxy ./component/dialer ./listener ./listener/redir ./listener/tproxy
@@ -24,19 +24,22 @@ case "${1:-test}" in
     CGO_ENABLED=0 go test -tags with_gvisor ./component/dnsstats -run '^$' \
       -bench . -benchmem -benchtime=200ms -count=1
     CGO_ENABLED=0 go test -tags with_gvisor -count=1 -timeout=5m ./adapter/outbound \
-      -run 'DNSObservability|DNSStatsIdentity|DirectDestination|EasyTier'
+      -run 'DNSObservability|DNSStatsIdentity|DirectDestination|EasyTier|LAN|ProxyTarget|TargetIPFamily'
     MIHOMO_EASYTIER_INTEGRATION=1 CGO_ENABLED=0 go test -tags with_gvisor \
-      -count=1 -v -timeout=60s ./adapter/outbound \
-      -run '^TestEasyTierFirstDialWaitsForDelayedRelayRoute$'
+      -count=1 -v -timeout=120s ./adapter/outbound \
+      -run '^(TestEasyTierFirstDialWaitsForDelayedRelayRoute|TestLANEasyTierSubnetPreparesBeforeBusiness)$'
+    MIHOMO_LAN_INTEGRATION=1 CGO_ENABLED=0 go test -tags with_gvisor \
+      -count=1 -v -timeout=90s ./adapter/outbound \
+      -run '^TestLANWireGuardNativePreparationBeforeBusiness$'
     CGO_ENABLED=1 go test -race -tags with_gvisor -count=1 -timeout=5m ./component/dnsstats/...
     CGO_ENABLED=1 go test -race -tags with_gvisor -count=1 -timeout=5m ./common/net/... ./common/singleflight/...
     CGO_ENABLED=1 go test -race -tags with_gvisor -count=1 -timeout=5m ./adapter/outbound \
-      -run 'DNSObservability|DNSStatsIdentity|DirectDestination|EasyTier'
+      -run 'DNSObservability|DNSStatsIdentity|DirectDestination|EasyTier|LAN|ProxyTarget|TargetIPFamily'
     CGO_ENABLED=1 go test -race -tags with_gvisor -count=1 -timeout=5m \
       ./adapter ./adapter/provider/... ./common/arc/... ./common/lru/... ./component/trie/... ./component/easytier/... ./component/dnsmessage/... ./component/process/... ./component/resolver/... ./component/http/... ./component/resource/... ./component/geodata/... ./component/mmdb/... ./component/updater/... ./context/... ./dns/... \
-      ./listener/sing_tun/... ./tunnel/... ./rules/logic/... ./rules/provider/... \
+      ./listener/sing_tun/... ./tunnel/... ./component/lanpreconnect/... ./rules/logic/... ./rules/provider/... \
       ./config/... ./hub/route/... ./hub/executor/... \
-      -run 'EasyTier|DialBudget|DirectDestination|DNSOrderedDial|DNSStatsIdentity|AutomaticSchedule|UpgradeSchedule|StagedCoreVersionProbe|DNSRouting|DNSRuleRouting|DNSProxy|DNSDrop|DNSDirectProbe|DNSOptimization|DNSObservability|DNSClient|DNSDoT|DNSDoHLateCancellation|DNSQUICCancellation|DNSObservedOutbound|DNSMarker|SnapshotSampling|DNSResponseMode|DNSAnswerPolicy|DNSNegativeCache|DNSEarlyReply|SpeedCheck|TCPSYN|DualStack|CacheControl|ARCDelete|DNSPerf|DNSCandidate|DNSCachedTTL|DNSAnswerLifetime|DNSResolverDoesNotRestartTTL|DNSFallback|DNSIndependentDirectPool|CoreUpdater|UIUpdater|UIUpgrade|ConfigFile|ProcessLookup|RedirHostFilter|LRUClone|Unified|RuleUsage|RuleProvider|ResourceBootstrap|ResourceWrite|Fetcher|HTTPVehicleRejects|GeoCheck|GeoAutomatic|GeoConfigured|DatabaseUpdate|ASNUpdate'
+      -run 'EasyTier|DialBudget|TCPDial|TCPFirst|LAN|Desktop|ProxyForceIP|ProxyTarget|TargetIPFamily|AnswerIPFamily|ProxyProviderUpdateCallback|DirectDestination|DNSOrderedDial|DNSStatsIdentity|AutomaticSchedule|UpgradeSchedule|StagedCoreVersionProbe|DNSRouting|DNSRuleRouting|DNSProxy|DNSDrop|DNSDirectProbe|DNSOptimization|DNSObservability|DNSClient|DNSDoT|DNSDoHLateCancellation|DNSQUICCancellation|DNSObservedOutbound|DNSMarker|SnapshotSampling|DNSResponseMode|DNSAnswerPolicy|DNSNegativeCache|DNSEarlyReply|SpeedCheck|TCPSYN|DualStack|CacheControl|ARCDelete|DNSPerf|DNSCandidate|DNSCachedTTL|DNSAnswerLifetime|DNSResolverDoesNotRestartTTL|DNSFallback|DNSIndependentDirectPool|CoreUpdater|UIUpdater|UIUpgrade|ConfigFile|ProcessLookup|RedirHostFilter|LRUClone|Unified|RuleUsage|RuleProvider|ResourceBootstrap|ResourceWrite|Fetcher|HTTPVehicleRejects|GeoCheck|GeoAutomatic|GeoConfigured|DatabaseUpdate|ASNUpdate'
     # A single green rerun cannot validate detached HTTP/2 dial shutdown.
     # Repeat the lifecycle barriers with different Go scheduler parallelism.
     for procs in 1 4; do

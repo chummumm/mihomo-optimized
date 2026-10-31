@@ -24,6 +24,7 @@ func (types *ForcedQtypes) Contains(qtype uint16) bool {
 // resolvers and ordinary proxy traffic do not inherit these business settings.
 // Zero values retain the original answer and its authoritative lifetimes.
 type AnswerPolicy struct {
+	IPFamily      *AnswerIPFamilyPolicy
 	ForceNoCNAME  bool
 	ForceAAAASOA  bool
 	ForceQtypeSOA *ForcedQtypes
@@ -35,7 +36,7 @@ type AnswerPolicy struct {
 }
 
 func (p AnswerPolicy) enabled() bool {
-	return p.ForceNoCNAME || p.ForceAAAASOA || p.RRTTL != 0 || p.RRTTLMin != 0 || p.RRTTLMax != 0 || p.RRTTLReplyMax != 0 || p.ReplyIPLimit != 0
+	return p.IPFamily != nil || p.ForceNoCNAME || p.ForceAAAASOA || p.RRTTL != 0 || p.RRTTLMin != 0 || p.RRTTLMax != 0 || p.RRTTLReplyMax != 0 || p.ReplyIPLimit != 0
 }
 
 // Automatic QNAME routing already keys the complete wire question. Optional

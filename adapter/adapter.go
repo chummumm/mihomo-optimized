@@ -14,6 +14,7 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/lanpreconnect"
 	C "github.com/metacubex/mihomo/constant"
 	icontext "github.com/metacubex/mihomo/context"
 	"github.com/metacubex/mihomo/log"
@@ -34,10 +35,16 @@ type internalProxyState struct {
 
 type Proxy struct {
 	C.ProxyAdapter
+	forceIP bool
 	alive   atomic.Bool
 	history *queue.Queue[C.DelayHistory]
 	extra   xsync.Map[string, *internalProxyState]
 }
+
+// ForceIPPolicy is the immutable policy snapshot used when this proxy was
+// constructed. Groups can preserve the hostname until their normal selection
+// reaches the leaf without changing behavior for an existing configuration.
+func (p *Proxy) ForceIPPolicy() bool { return p.forceIP }
 
 // Adapter implements C.Proxy
 func (p *Proxy) Adapter() C.ProxyAdapter {
@@ -55,18 +62,28 @@ func (p *Proxy) AliveForTestUrl(url string) bool {
 
 // DialContext implements C.ProxyAdapter
 func (p *Proxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+	ctx = selectLANOutbound(ctx, p.ProxyAdapter)
 	// A group calls its selected child's Proxy method. Updating at each
 	// layer pins any subsequent local target lookup to the actual adapter,
 	// without selecting a round-robin/load-balance group a second time.
 	ctx = icontext.WithDNSFixedOutbound(ctx, p.ProxyAdapter)
 	conn, err := p.ProxyAdapter.DialContext(ctx, metadata)
-	return conn, icontext.TCPDialError(ctx, err)
+	return conn, err
 }
 
 // ListenPacketContext implements C.ProxyAdapter
 func (p *Proxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	unselected := lanpreconnect.NeedsSelection(ctx)
+	ctx = selectLANOutbound(ctx, p.ProxyAdapter)
+	original := metadata
+	if !p.forceIP && unselected && !lanpreconnect.NeedsSelection(ctx) {
+		metadata = metadata.Pure()
+	}
 	ctx = icontext.WithDNSFixedOutbound(ctx, p.ProxyAdapter)
 	pc, err := p.ProxyAdapter.ListenPacketContext(ctx, metadata)
+	if err == nil {
+		original.DstIP = metadata.DstIP
+	}
 	return pc, err
 }
 
@@ -289,9 +306,11 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 	return
 }
 
-func NewProxy(adapter C.ProxyAdapter) *Proxy {
+func NewProxy(adapter C.ProxyAdapter, forceIP ...bool) *Proxy {
+	policy := len(forceIP) > 0 && forceIP[0]
 	return &Proxy{
 		ProxyAdapter: adapter,
+		forceIP:      policy,
 		history:      queue.New[C.DelayHistory](defaultHistoriesNum),
 		alive:        atomic.NewBool(true),
 	}

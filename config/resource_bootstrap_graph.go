@@ -374,7 +374,7 @@ func (n *bootstrapNode) adapter() (C.ProxyAdapter, error) {
 			}
 			return n.owner.socketDialer(opts)
 		}
-		n.actual, n.err = adapter.ParseProxy(n.mapping, adapter.WithDialerFactoryForAPI(factory))
+		n.actual, n.err = adapter.ParseProxy(n.mapping, adapter.WithDialerFactoryForAPI(factory), adapter.WithProxyForceIP(n.owner.raw.ProxyForceIP))
 	}
 	if n.err != nil {
 		n.err = n.owner.failure("invalid_proxy", n.Name(), n.err)

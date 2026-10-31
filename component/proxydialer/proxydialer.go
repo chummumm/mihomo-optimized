@@ -22,7 +22,7 @@ func New(proxy C.ProxyAdapter, statistic bool) C.Dialer {
 }
 
 func (p proxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	currentMeta := &C.Metadata{Type: C.INNER}
+	currentMeta := &C.Metadata{Type: C.INNER, ProxyTransport: true}
 	if err := currentMeta.SetRemoteAddress(address); err != nil {
 		return nil, err
 	}
@@ -54,7 +54,7 @@ func (p proxyDialer) ListenPacket(ctx context.Context, network, address string, 
 	if !strings.HasPrefix(network, "udp") {
 		return nil, fmt.Errorf("proxyDialer only support udp network, but got: %s", network)
 	}
-	currentMeta := &C.Metadata{Type: C.INNER, DstIP: rAddrPort.Addr(), DstPort: rAddrPort.Port()}
+	currentMeta := &C.Metadata{Type: C.INNER, ProxyTransport: true, DstIP: rAddrPort.Addr(), DstPort: rAddrPort.Port()}
 	return p.listenPacket(ctx, currentMeta)
 }
 

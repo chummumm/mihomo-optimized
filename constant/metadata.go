@@ -219,6 +219,17 @@ type Metadata struct {
 	// destination sniffing. DIRECT uses it without resolving another address.
 	// FakeIP and internal DNS destinations do not inherit this value.
 	InboundDstIP netip.Addr `json:"-"`
+	// DestinationOverride records an explicit hosts/sniffer destination rewrite;
+	// a domain recovered from an IP mapping alone must not replace a client IP.
+	DestinationOverride bool `json:"-"`
+	// TargetIPFamily is carried only by a selected node's destination copy.
+	TargetIPFamily TargetIPFamily `json:"-"`
+	// TargetCandidates is an immutable, request-local result from a protocol's
+	// private resolver. It is never used as an IP-to-domain mapping or cache.
+	TargetCandidates []netip.Addr `json:"-"`
+	// ProxyTransport marks a next-hop/control destination created by a dialer;
+	// its lookup uses proxy bootstrap DNS, not the final site's DNS policy.
+	ProxyTransport bool `json:"-"`
 	// Only domain rule
 	SniffHost string `json:"sniffHost"`
 }

@@ -183,6 +183,10 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 			if skipper.ShouldSkipped(host) {
 				return next(ctx, r)
 			}
+			if familyBlocksQtype(answerIPFamily(ctx), q.Qtype) {
+				ctx.SetType(icontext.DNSTypeFakeIP)
+				return answerFamilyFakeNODATA(r), nil
+			}
 
 			var rr D.RR
 			switch q.Qtype {
@@ -294,6 +298,9 @@ func newHandler(resolver resolver.Resolver, mapper *ResolverEnhancer) handler {
 	var middlewares []middleware
 	native, _ := resolver.(*Resolver)
 	if native != nil && !native.bootstrap {
+		if native.answerPolicy.IPFamily != nil {
+			middlewares = append(middlewares, withAnswerIPFamilyPolicy(native.answerPolicy.IPFamily))
+		}
 		if native.answerPolicy.RRTTLReplyMax != 0 || native.answerPolicy.ForceNoCNAME || native.answerPolicy.ReplyIPLimit != 0 {
 			middlewares = append(middlewares, withFinalAnswerPolicy(native.answerPolicy))
 		}

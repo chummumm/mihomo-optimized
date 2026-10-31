@@ -26,6 +26,7 @@ import (
 	mihomoHttp "github.com/metacubex/mihomo/component/http"
 	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/keepalive"
+	"github.com/metacubex/mihomo/component/lanpreconnect"
 	"github.com/metacubex/mihomo/component/profile"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -63,6 +64,7 @@ var stopping atomic.Bool
 func RequestShutdown() {
 	stopping.Store(true)
 	resource.CancelBootstraps()
+	lanpreconnect.Default.Stop()
 }
 
 // ShutdownRequested permits a final check immediately before process exec.
@@ -236,6 +238,10 @@ func ApplyConfig(cfg *config.Config, force bool) error {
 	publishUpdateConfiguration(cfg)
 	finishUpdates()
 	desktop.SetReady(applyErr == nil)
+	if applyErr == nil && !ShutdownRequested() {
+		bindLANPreconnectUpdates(cfg)
+		tunnel.RefreshLANPreconnect()
+	}
 	return applyErr
 }
 
@@ -251,6 +257,10 @@ func GetGeneral() *config.General {
 	var authenticator []string
 	if auth := authStore.Default.Authenticator(); auth != nil {
 		authenticator = auth.Users()
+	}
+	var proxyForceIP bool
+	if applied := CurrentUpdateConfiguration(); applied != nil {
+		proxyForceIP = applied.General.ProxyForceIP
 	}
 
 	general := &config.General{
@@ -274,6 +284,7 @@ func GetGeneral() *config.General {
 			InboundMPTCP:      inbound.MPTCP(),
 		},
 		DNSRuleRouting:   tunnel.DNSRuleRoutingEnabled(),
+		ProxyForceIP:     proxyForceIP,
 		Mode:             tunnel.Mode(),
 		UnifiedDelay:     adapter.UnifiedDelay.Load(),
 		LogLevel:         log.Level(),

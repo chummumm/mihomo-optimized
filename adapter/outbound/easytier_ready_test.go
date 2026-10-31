@@ -14,27 +14,27 @@ import (
 	"time"
 
 	C "github.com/metacubex/mihomo/constant"
-	icontext "github.com/metacubex/mihomo/context"
 
 	corehost "github.com/easytier/easytier/easytier-go"
 	protoCommon "github.com/easytier/easytier/easytier-go/proto/common"
 )
 
 type easyTierReadyInstance struct {
-	state      atomic.Int32
-	mu         sync.Mutex
-	info       *corehost.NodeInfo
-	routes     []*corehost.Route
-	nextRoutes []*corehost.Route
-	peers      []net.Conn
-	stateRead  chan struct{}
-	stateAllow chan struct{}
-	stateOnce  sync.Once
-	rpcStart   chan struct{}
-	rpcAllow   chan struct{}
-	rpcOnce    sync.Once
-	rpcCount   atomic.Int32
-	dials      atomic.Int32
+	state        atomic.Int32
+	mu           sync.Mutex
+	info         *corehost.NodeInfo
+	routes       []*corehost.Route
+	nextRoutes   []*corehost.Route
+	peers        []net.Conn
+	stateRead    chan struct{}
+	stateAllow   chan struct{}
+	stateOnce    sync.Once
+	rpcStart     chan struct{}
+	rpcAllow     chan struct{}
+	rpcOnce      sync.Once
+	rpcCount     atomic.Int32
+	dials        atomic.Int32
+	dialDeadline time.Time
 }
 
 func (f *easyTierReadyInstance) State() corehost.State {
@@ -85,6 +85,7 @@ func (f *easyTierReadyInstance) Dial(ctx context.Context, _, _ string) (net.Conn
 	client, server := net.Pipe()
 	f.mu.Lock()
 	f.peers = append(f.peers, server)
+	f.dialDeadline, _ = ctx.Deadline()
 	f.mu.Unlock()
 	return client, nil
 }
@@ -142,50 +143,46 @@ func TestEasyTierReadyNotificationCannotBeLostBetweenCheckAndWait(t *testing.T) 
 	}
 }
 
-func TestEasyTierFirstDialWaitsPastFiveSecondsForTargetRoute(t *testing.T) {
-	if testing.Short() {
-		t.Skip("exercises the real five-second regression boundary")
-	}
+func TestEasyTierFirstDialHonorsCallerDeadline(t *testing.T) {
 	e, f := newEasyTierReadyTest(t)
-	ctx, cancel := icontext.WithTCPDialBudget(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	routeReady := make(chan struct{})
-	go func() {
-		timer := time.NewTimer(5200 * time.Millisecond)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			close(routeReady)
-			return
-		case <-timer.C:
-		}
-		f.mu.Lock()
-		f.routes = []*corehost.Route{easyTierTestRoute("10.78.0.2", 2, 3)}
-		f.mu.Unlock()
-		// Deliberately omit peer/route events to exercise periodic recovery.
-		close(routeReady)
-	}()
-	conn, err := e.DialContext(ctx, &C.Metadata{DstIP: netip.MustParseAddr("10.78.0.2"), DstPort: 7777})
-	<-routeReady
+	_, err := e.DialContext(ctx, &C.Metadata{DstIP: netip.MustParseAddr("10.78.0.2"), DstPort: 7777})
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > time.Second || f.dials.Load() != 0 {
+		t.Fatalf("cold route ignored the caller deadline: %v, elapsed=%s dials=%d", err, time.Since(started), f.dials.Load())
+	}
+	if e.ctx.Err() != nil {
+		t.Fatal("request timeout canceled the shared runtime")
+	}
+	f.mu.Lock()
+	f.routes = []*corehost.Route{easyTierTestRoute("10.78.0.2", 2, 3)}
+	f.mu.Unlock()
+	e.signalReady()
+	// A direct caller retains its own seven-second deadline; the adapter does
+	// not replace it with either a new five-second cap or the old 20s budget.
+	next, stop := context.WithTimeout(context.Background(), 7*time.Second)
+	defer stop()
+	conn, err := e.DialContext(next, &C.Metadata{DstIP: netip.MustParseAddr("10.78.0.2"), DstPort: 7777})
 	if err != nil {
-		t.Fatalf("first dial failed before route convergence: %v", err)
+		t.Fatal(err)
 	}
 	defer conn.Close()
-	if time.Since(started) <= 5*time.Second || f.dials.Load() != 1 {
-		t.Fatalf("expected one actual dial after >5s, got %s, %d", time.Since(started), f.dials.Load())
-	}
-	// Ending the dial scope must not close a successfully established stream.
-	cancel()
 	f.mu.Lock()
+	deadline := f.dialDeadline
 	peer := f.peers[0]
 	f.mu.Unlock()
+	want, _ := next.Deadline()
+	if !deadline.Equal(want) {
+		t.Fatalf("adapter changed caller deadline: got %v want %v", deadline, want)
+	}
+	stop()
 	written := make(chan error, 1)
 	go func() { _, err := peer.Write([]byte{42}); written <- err }()
 	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 	buf := make([]byte, 1)
 	if _, err := conn.Read(buf); err != nil || buf[0] != 42 {
-		t.Fatalf("dial cancellation reached the established stream: %v", err)
+		t.Fatalf("dial cancellation reached established stream: %v", err)
 	}
 	if err := <-written; err != nil {
 		t.Fatal(err)

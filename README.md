@@ -6,6 +6,8 @@
 
 [下载 Releases](https://github.com/chummumm/mihomo-optimized/releases) · [构建状态](https://github.com/chummumm/mihomo-optimized/actions/workflows/build.yml) · [完整配置说明](docs/dns-proxy.md) · [验证记录](docs/dns-rule-routing-validation.md)
 
+**1.0.23 新增：** [LAN 后台预连接](docs/lan-preconnect.md) · [代理目标 IP 与 DNS 地址族策略（issue #61）](docs/proxy-force-ip.md) · [Windows 桌面恢复协议](docs/desktop-managed.md#local-health-and-resume-recovery)。`normal` 模式继续保留；LAN 预连接不增加节点配置。
+
 **配置入口：** [完整配置示例](#完整配置示例) · [启动资源下载](docs/resource-bootstrap.md) · [面板与内核自动更新](#面板与内核自动更新) · [Linux 透明代理与自动路由恢复](#linux-透明代理与自动路由恢复) · [DNS 可选字段](#可选-dns-设置) · [共享连接例外](#共享-dns-连接与单个上游例外) · [旧配置迁移](#旧配置迁移与停用范围)
 
 ## 解决什么问题
@@ -39,7 +41,7 @@ UDP、TCP 和 DoT 上游在实际出口固定时共享连接，多个查询通�
 
 新增的 DNS 面板数据由本机控制器提供，查询记录、趋势和上游统计只保存在进程内存中，不写数据库或日志文件，也不发送遥测。无需维护第二份分流规则；观测不会改变 DNS 回答和出口选择。优化范围、缓存安全边界及测试方式见 [DNS 性能说明](docs/dns-performance.md)。
 
-正式版本采用 **`mihomo-optimized-vX.Y.Z`**，当前为 `mihomo-optimized-v1.0.22`。tag、发行标题、`version.txt` 和运行内核版本一致；`PROJECT_VERSION` 记录独立项目版本，上游 mihomo 的版本与提交另存于 `UPSTREAM_VERSION` / `UPSTREAM_COMMIT`。源码哈希保留在 BUILDINFO 中。**旧版 `v1.19.32-optimized-N` 及更早内核首次切换到新系列，需要手动安装一次**；新系列随后可通过 YAML 启用内核后台检查和更新，详见[更新说明](docs/releases.md#内核自动更新)。
+正式版本采用 **`mihomo-optimized-vX.Y.Z`**，当前为 `mihomo-optimized-v1.0.23`。tag、发行标题、`version.txt` 和运行内核版本一致；`PROJECT_VERSION` 记录独立项目版本，上游 mihomo 的版本与提交另存于 `UPSTREAM_VERSION` / `UPSTREAM_COMMIT`。源码哈希保留在 BUILDINFO 中。**旧版 `v1.19.32-optimized-N` 及更早内核首次切换到新系列，需要手动安装一次**；新系列随后可通过 YAML 启用内核后台检查和更新，详见[更新说明](docs/releases.md#内核自动更新)。
 
 ## 启动资源下载
 

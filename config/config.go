@@ -51,6 +51,7 @@ import (
 type General struct {
 	Inbound
 	DNSRuleRouting           bool                    `json:"dns-rule-routing"`
+	ProxyForceIP             bool                    `json:"proxy-force-ip"`
 	Mode                     T.TunnelMode            `json:"mode"`
 	UnifiedDelay             bool                    `json:"unified-delay"`
 	LogLevel                 log.LogLevel            `json:"log-level"`
@@ -273,6 +274,7 @@ type RawDNS struct {
 	ServeExpiredPrefetchTime      int64                               `yaml:"serve-expired-prefetch-time" json:"serve-expired-prefetch-time"`
 	ServeExpiredReplyTTL          *int64                              `yaml:"serve-expired-reply-ttl" json:"serve-expired-reply-ttl"`
 	ForceNoCNAME                  bool                                `yaml:"force-no-CNAME" json:"force-no-CNAME"`
+	AnswerIPFamilyPolicy          map[string]string                   `yaml:"answer-ip-family-policy" json:"answer-ip-family-policy"`
 	ForceAAAASOA                  bool                                `yaml:"force-AAAA-SOA" json:"force-AAAA-SOA"`
 	ForceQtypeSOA                 RawDNSQtypes                        `yaml:"force-qtype-SOA" json:"force-qtype-SOA"`
 	RRTTL                         int64                               `yaml:"rr-ttl" json:"rr-ttl"`
@@ -450,6 +452,7 @@ type RawConfig struct {
 	TProxyPort                    int                `yaml:"tproxy-port" json:"tproxy-port"`
 	MixedPort                     int                `yaml:"mixed-port" json:"mixed-port"`
 	DNSRuleRouting                bool               `yaml:"dns-rule-routing" json:"dns-rule-routing"`
+	ProxyForceIP                  bool               `yaml:"proxy-force-ip" json:"proxy-force-ip"`
 	ShadowSocksConfig             string             `yaml:"ss-config" json:"ss-config"`
 	VmessConfig                   string             `yaml:"vmess-config" json:"vmess-config"`
 	InboundTfo                    bool               `yaml:"inbound-tfo" json:"inbound-tfo"`
@@ -900,6 +903,7 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 			InboundMPTCP:      cfg.InboundMPTCP,
 		},
 		DNSRuleRouting:   cfg.DNSRuleRouting,
+		ProxyForceIP:     cfg.ProxyForceIP,
 		UnifiedDelay:     cfg.UnifiedDelay,
 		Mode:             cfg.Mode,
 		LogLevel:         cfg.LogLevel,
@@ -1017,7 +1021,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 
 	// parse proxy
 	for idx, mapping := range proxiesConfig {
-		proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(T.Tunnel))
+		proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(T.Tunnel), adapter.WithProxyForceIP(cfg.ProxyForceIP))
 		if err != nil {
 			return nil, nil, fmt.Errorf("proxy %d: %w", idx, err)
 		}
@@ -1032,6 +1036,9 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 
 	// keep the original order of ProxyGroups in config file
 	for idx, mapping := range groupsConfig {
+		if _, exists := mapping["target-ip-family"]; exists {
+			return nil, nil, fmt.Errorf("proxy group %d: target-ip-family is only supported on protocol nodes", idx)
+		}
 		groupName, existName := mapping["name"].(string)
 		if !existName {
 			return nil, nil, fmt.Errorf("proxy group %d: missing name", idx)
@@ -1054,7 +1061,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 			return nil, nil, fmt.Errorf("can not defined a provider called `%s`", provider.ReservedName)
 		}
 
-		pd, err := provider.ParseProxyProvider(name, mapping, T.Tunnel)
+		pd, err := provider.ParseProxyProvider(name, mapping, T.Tunnel, adapter.WithProxyForceIP(cfg.ProxyForceIP))
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse proxy provider %s error: %w", name, err)
 		}
@@ -1078,7 +1085,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 			return nil, nil, fmt.Errorf("proxy group %s: the duplicate name", groupName)
 		}
 
-		proxies[groupName] = adapter.NewProxy(group)
+		proxies[groupName] = adapter.NewProxy(group, cfg.ProxyForceIP)
 	}
 
 	var ps []C.Proxy
@@ -1104,7 +1111,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 		if err != nil {
 			return nil, nil, fmt.Errorf("new GLOBAL proxy group error: %w", err)
 		}
-		proxies["GLOBAL"] = adapter.NewProxy(global)
+		proxies["GLOBAL"] = adapter.NewProxy(global, cfg.ProxyForceIP)
 	}
 
 	// validate dialer-proxy references
@@ -1536,6 +1543,10 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		return nil, err
 	}
 	answerPolicy, err := parseDNSAnswerPolicy(cfg)
+	if err != nil {
+		return nil, err
+	}
+	answerPolicy.IPFamily, err = parseDNSAnswerIPFamily(rawCfg, answerPolicy)
 	if err != nil {
 		return nil, err
 	}

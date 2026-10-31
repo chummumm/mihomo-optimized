@@ -1,6 +1,7 @@
 package route
 
 import (
+	"errors"
 	"io"
 	"os"
 	"runtime"
@@ -18,6 +19,8 @@ import (
 func desktopRouter() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getDesktopStatus)
+	r.Get("/health", getDesktopHealth)
+	r.Post("/recover", recoverDesktop)
 	r.Post("/shutdown", shutdownDesktop)
 	return r
 }
@@ -42,8 +45,53 @@ func getDesktopStatus(w http.ResponseWriter, r *http.Request) {
 			"rule_updates": true, "geodata_updates": true,
 			"core_update": false, "ui_update": false, "self_restart": false,
 			"shutdown": true, "unified_update_scope": "rules_and_geodata",
+			"tun_health": runtime.GOOS == "windows", "tun_repair": runtime.GOOS == "windows",
 		},
 	})
+}
+
+func getDesktopHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	health, err := executor.InspectDesktopHealth(r.Context())
+	if err != nil {
+		renderDesktopRecoveryError(w, r, err)
+		return
+	}
+	state := "loading"
+	if desktop.Ready() {
+		state = "running"
+	}
+	if executor.ShutdownRequested() {
+		state = "stopping"
+	}
+	render.JSON(w, r, render.M{"managed": true, "api_version": 1, "pid": os.Getpid(), "state": state, "tun": health})
+}
+
+func recoverDesktop(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1))
+	if err != nil || len(body) != 0 || r.URL.RawQuery != "" {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("recovery requires an empty request"))
+		return
+	}
+	result, err := executor.RecoverDesktop(r.Context())
+	if err != nil {
+		renderDesktopRecoveryError(w, r, err)
+		return
+	}
+	render.JSON(w, r, render.M{"pid": os.Getpid(), "status": result.Status, "tun": result.Tun, "error": result.Error})
+}
+
+func renderDesktopRecoveryError(w http.ResponseWriter, r *http.Request, err error) {
+	status := http.StatusServiceUnavailable
+	if errors.Is(err, executor.ErrShuttingDown) || errors.Is(err, executor.ErrCoreNotReady) {
+		status = http.StatusConflict
+	} else {
+		w.Header().Set("Retry-After", "1")
+	}
+	render.Status(r, status)
+	render.JSON(w, r, newError(err.Error()))
 }
 
 func shutdownDesktop(w http.ResponseWriter, r *http.Request) {

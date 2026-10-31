@@ -17,6 +17,10 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 	}
 
 	opt := applyProxyOptions(options...)
+	targetFamily, err := parseProxyTargetPolicy(mapping, opt.ProxyForceIP)
+	if err != nil {
+		return nil, err
+	}
 	dnsStatsIdentity := proxyDNSStatsIdentity(mapping, opt)
 	basicOption := outbound.BasicOption{
 		DialerForAPI:        opt.DialerForAPI,
@@ -27,7 +31,6 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 
 	var (
 		proxy outbound.ProxyAdapter
-		err   error
 	)
 	switch proxyType {
 	case "ss":
@@ -234,6 +237,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		return nil, err
 	}
 
+	protocol := proxy
 	if muxMapping, muxExist := mapping["smux"].(map[string]any); muxExist {
 		muxOption := &outbound.SingMuxOption{}
 		err = decoder.Decode(muxMapping, muxOption)
@@ -249,10 +253,19 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 	}
 
 	proxy = outbound.NewAutoCloseProxyAdapterWithDNSStatsIdentity(proxy, dnsStatsIdentity)
-	return NewProxy(proxy), nil
+	if opt.ProxyForceIP && !proxyTargetExcluded(proxyType) {
+		var prefer C.DNSPrefer
+		if value, ok := mapping["ip-version"].(string); ok {
+			_ = prefer.UnmarshalText([]byte(value))
+		}
+		targetResolver, _ := protocol.(proxyTargetResolver)
+		proxy = &proxyTargetAdapter{ProxyAdapter: proxy, targetResolver: targetResolver, preparer: protocol, family: targetFamily, prefer: prefer}
+	}
+	return NewProxy(proxy, opt.ProxyForceIP && !proxyTargetExcluded(proxyType)), nil
 }
 
 type proxyOption struct {
+	ProxyForceIP        bool
 	DialerForAPI        C.Dialer
 	DialerFactoryForAPI func([]dialer.Option) C.Dialer
 	TunnelForAPI        C.Tunnel
@@ -274,6 +287,11 @@ func applyProxyOptions(options ...ProxyOption) proxyOption {
 }
 
 type ProxyOption func(opt *proxyOption)
+
+// WithProxyForceIP fixes the policy for the lifetime of a parsed node/provider.
+func WithProxyForceIP(enabled bool) ProxyOption {
+	return func(opt *proxyOption) { opt.ProxyForceIP = enabled }
+}
 
 func WithDialerForAPI(dialer C.Dialer) ProxyOption {
 	return func(opt *proxyOption) {
