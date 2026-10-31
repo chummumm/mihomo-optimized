@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/metacubex/mihomo/component/resolver"
 )
 
 type testPreparer struct {
@@ -43,6 +45,48 @@ func TestLANScope(t *testing.T) {
 			t.Errorf("non-LAN admitted: %s", value)
 		}
 	}
+}
+
+type privateFakeRange struct{ resolver.Enhancer }
+
+func (privateFakeRange) IsFakeIP(ip netip.Addr) bool {
+	return netip.MustParsePrefix("192.168.250.0/24").Contains(ip.Unmap())
+}
+func TestLANExcludesConfiguredPrivateFakePool(t *testing.T) {
+	old := resolver.DefaultHostMapper
+	resolver.DefaultHostMapper = privateFakeRange{}
+	defer func() { resolver.DefaultHostMapper = old }()
+	if IsLAN(netip.MustParseAddr("192.168.250.7")) || IsLAN(netip.MustParseAddr("::ffff:192.168.250.7")) {
+		t.Fatal("configured private fake pool admitted as real LAN")
+	}
+}
+
+func TestLANExpiredPathIsRecheckedOnRealObservation(t *testing.T) {
+	m := New()
+	defer m.Close()
+	finished := make(chan struct{}, 4)
+	p := &testPreparer{name: "gateway", path: "same-peer", prepare: func(context.Context, netip.Addr) error { finished <- struct{}{}; return nil }}
+	ip := netip.MustParseAddr("10.0.0.1")
+	m.Replace([]Intent{{p, ip}})
+	await(t, finished)
+	deadline := time.Now().Add(time.Second)
+	for {
+		m.mu.Lock()
+		entry := m.entries[intentKey{p, ip}]
+		if !entry.pending {
+			entry.preparedAt = time.Now().Add(-2 * preparedLifetime)
+			m.prepared[pathKey{p, "same-peer"}] = entry.preparedAt
+			m.mu.Unlock()
+			break
+		}
+		m.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("first preparation did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	m.Observe(p, ip)
+	await(t, finished)
 }
 
 func TestLANStaticIntentPreparesBeforeBusinessAndStopIsPermanent(t *testing.T) {

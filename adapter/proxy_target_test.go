@@ -501,3 +501,30 @@ func TestProxyTargetFamilyIsPerHopNotChainIntersection(t *testing.T) {
 		t.Fatalf("carrier family was bypassed: conn=%v error=%v attempts=%d", conn, err, len(innerProtocol.seen))
 	}
 }
+
+func TestProxyTargetUDPHostsRewriteChoosesPermittedFamily(t *testing.T) {
+	r := installTargetTestResolver(t)
+	v4, v6 := netip.MustParseAddr("203.0.113.20"), netip.MustParseAddr("2001:db8::20")
+	hosts := trie.New[resolver.HostValue]()
+	if err := hosts.Insert("rewrite.example", resolver.HostValue{IPs: []netip.Addr{v6, v4}}); err != nil {
+		t.Fatal(err)
+	}
+	resolver.DefaultHosts = resolver.NewHosts(hosts)
+	a, _ := newTargetTestAdapter(C.TargetIPv4)
+	pc, err := a.ListenPacketContext(context.Background(), &C.Metadata{DstIP: v4, DstPort: 443, NetWork: C.UDP})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	m := &C.Metadata{Host: "rewrite.example", DstIP: v6, InboundDstIP: netip.MustParseAddr("192.0.2.20"),
+		DstPort: 443, NetWork: C.UDP, DNSMode: C.DNSMapping, DestinationOverride: true}
+	if err := pc.ResolveUDP(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	if m.DstIP != v4 || m.Host != "rewrite.example" || r.calls != 0 {
+		t.Fatalf("hosts family decision changed: target=%v DNS calls=%d", m, r.calls)
+	}
+	if policy, ok := pc.(interface{ ForceIPPolicy() bool }); !ok || !policy.ForceIPPolicy() {
+		t.Fatal("established connection lost its target policy snapshot")
+	}
+}

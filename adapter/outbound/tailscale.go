@@ -262,11 +262,26 @@ func (t *Tailscale) watchBackendState() {
 			return
 		}
 		if exitNodeNeedsStatus && *n.State == ipn.Running {
-			if err := t.applyExitNodePrefs(t.ctx); err != nil {
-				log.Warnln("[Tailscale](%s) set exit node failed: %v", t.Name(), err)
-				t.setBackendInitialized(err)
-			} else {
-				t.setBackendInitialized(nil)
+			// A named exit node may arrive after Running, and LocalAPI may
+			// transiently reject a preference update. Keep the shared readiness
+			// barrier closed until it is applied; do not latch a transient error
+			// forever. Individual business/background waiters retain their ctx.
+			for t.ctx.Err() == nil {
+				attempt, cancel := context.WithTimeout(t.ctx, C.DefaultTCPTimeout)
+				err := t.applyExitNodePrefs(attempt)
+				cancel()
+				if err == nil {
+					t.setBackendInitialized(nil)
+					return
+				}
+				log.Debugln("[Tailscale](%s) waiting for exit node: %v", t.Name(), err)
+				timer := time.NewTimer(2 * time.Second)
+				select {
+				case <-t.ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
 			}
 			return
 		}

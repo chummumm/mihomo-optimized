@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -63,8 +64,13 @@ func testEasyTierBackgroundRelay(t *testing.T, subnet bool) {
 	var client *EasyTier
 	var listener net.Listener
 	var connection net.Conn
+	var lanStack ipStack
+	var lanPackets atomic.Int32
 	t.Cleanup(func() {
 		cancel()
+		if lanStack != nil {
+			_ = lanStack.Close()
+		}
 		if connection != nil {
 			_ = connection.Close()
 		}
@@ -104,15 +110,20 @@ func testEasyTierBackgroundRelay(t *testing.T, subnet bool) {
 	}
 	var err error
 	if subnet {
-		// The remote gateway's native ProxyNAT socket targets this LAN host.
-		// Only the final host socket is mapped to loopback by the fixture; the
-		// real three-node overlay, proxy-CIDR route and NAT remain in the core.
-		listener, err = net.Listen("tcp4", "127.0.0.1:0")
+		// Model a routed LAN behind the remote gateway using its public packet
+		// interface and an isolated userspace LAN host. No OS route or real
+		// private network is modified; the advertised CIDR and relay are real.
+		lanStack, err = newIPStack(IPStackOption{Mode: ipStackMips}, []netip.Prefix{netip.PrefixFrom(businessIP, 24)}, 1408)
 		if err != nil {
 			t.Fatal(err)
 		}
-		sockets.lanTarget = netip.AddrPortFrom(businessIP, uint16(listener.Addr().(*net.TCPAddr).Port))
-		sockets.lanLoopback = listener.Addr().(*net.TCPAddr)
+		if err = lanStack.Start(); err != nil {
+			t.Fatal(err)
+		}
+		listener, err = lanStack.ListenTCP(ctx, "tcp4", netip.AddrPortFrom(businessIP, 7777))
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	host, err = corehost.New(ctx, corehost.Options{Platform: platform.Services{Sockets: sockets}})
 	if err != nil {
@@ -159,7 +170,8 @@ func testEasyTierBackgroundRelay(t *testing.T, subnet bool) {
 		if configErr != nil {
 			t.Fatal(configErr)
 		}
-		target, err = host.CreateInstanceTOML(ctx, "subnet-gateway", "", "stun_servers = []\nstun_servers_v6 = []\n"+config+"use_smoltcp = true\n")
+		config = strings.Replace(config, "no_tun = true", "no_tun = false", 1) + "proxy_forward_by_system = true\n"
+		target, err = host.CreateInstanceTOML(ctx, "subnet-gateway", "", "stun_servers = []\nstun_servers_v6 = []\n"+config)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -168,6 +180,35 @@ func testEasyTierBackgroundRelay(t *testing.T, subnet bool) {
 	}
 	if err = target.Start(ctx); err != nil {
 		t.Fatalf("start target: %v", err)
+	}
+	if subnet {
+		go func() {
+			for {
+				packet, receiveErr := target.ReceivePacket(ctx)
+				if receiveErr != nil {
+					return
+				}
+				lanPackets.Add(1)
+				if _, writeErr := lanStack.Write([][]byte{packet}, 0); writeErr != nil {
+					return
+				}
+			}
+		}()
+		go func() {
+			buffers := [][]byte{make([]byte, 65536)}
+			sizes := make([]int, 1)
+			for {
+				count, readErr := lanStack.Read(buffers, sizes, 0)
+				if readErr != nil {
+					return
+				}
+				for i := 0; i < count; i++ {
+					if sendErr := target.SendPacket(ctx, buffers[i][:sizes[i]]); sendErr != nil {
+						return
+					}
+				}
+			}
+		}()
 	}
 	if !subnet {
 		listener, err = easyTierListenTCP(ctx, target)
@@ -259,8 +300,8 @@ func testEasyTierBackgroundRelay(t *testing.T, subnet bool) {
 	if time.Since(started) < routeDelay {
 		t.Fatal("fixture did not exercise startup beyond five seconds")
 	}
-	if sockets.lanConnections.Load() != 0 {
-		t.Fatal("preparation contacted a LAN application port")
+	if lanPackets.Load() != 0 {
+		t.Fatal("preparation sent a fabricated LAN data packet")
 	}
 	// The first business connection gets only the ordinary five seconds and
 	// reuses the already-established native relay path.
@@ -269,7 +310,7 @@ func testEasyTierBackgroundRelay(t *testing.T, subnet bool) {
 	businessStarted := time.Now()
 	connection, err = client.DialContext(dialCtx, &C.Metadata{NetWork: C.TCP, DstIP: businessIP, DstPort: uint16(listener.Addr().(*net.TCPAddr).Port)})
 	if err != nil {
-		t.Fatalf("first business dial after background preparation: %v (LAN socket calls=%d)", err, sockets.lanConnections.Load())
+		t.Fatalf("first business dial after background preparation: %v (LAN forwarded packets=%d)", err, lanPackets.Load())
 	}
 	if time.Since(businessStarted) >= C.DefaultTCPTimeout {
 		t.Fatal("business dial exceeded ordinary timeout")
@@ -327,8 +368,8 @@ func testEasyTierBackgroundRelay(t *testing.T, subnet bool) {
 	if route == nil || route.GetNextHopPeerId() != relayInfo.GetPeerId() || route.GetNextHopPeerId() == route.GetPeerId() {
 		t.Fatalf("TCP target route must use the relay, without a direct target connection: relay=%d route=%v", relayInfo.GetPeerId(), route)
 	}
-	if subnet && sockets.lanConnections.Load() != 1 {
-		t.Fatalf("LAN host socket count = %d, want one business connection", sockets.lanConnections.Load())
+	if subnet && lanPackets.Load() == 0 {
+		t.Fatal("business TCP bypassed the remote LAN packet path")
 	}
 	t.Logf("background relay preparation before business: admitted after %s; total elapsed %s; relay=%d target=%d next_hop=%d; exchanged %d/%d bytes",
 		admittedAfter, time.Since(started), relayInfo.GetPeerId(), route.GetPeerId(), route.GetNextHopPeerId(), len(request), len(response))
@@ -367,25 +408,14 @@ func easyTierRouteTo(routes []*corehost.Route, address netip.Addr) *corehost.Rou
 }
 
 type easyTierRelaySockets struct {
-	inner          netstd.SocketFactory
-	admit          <-chan struct{}
-	listening      chan int
-	attempted      chan struct{}
-	once           sync.Once
-	lanTarget      netip.AddrPort
-	lanLoopback    *net.TCPAddr
-	lanConnections atomic.Int32
+	inner     netstd.SocketFactory
+	admit     <-chan struct{}
+	listening chan int
+	attempted chan struct{}
+	once      sync.Once
 }
 
 func (s *easyTierRelaySockets) ConnectTCP(ctx context.Context, options platform.TCPConnectOptions) (net.Conn, error) {
-	if options.RemoteAddr != nil && s.lanTarget.IsValid() && netip.AddrPortFrom(options.RemoteAddr.AddrPort().Addr().Unmap(), uint16(options.RemoteAddr.Port)) == s.lanTarget {
-		if options.Purpose != platform.TCPConnectProxyNAT {
-			return nil, fmt.Errorf("LAN socket has unexpected purpose %v", options.Purpose)
-		}
-		s.lanConnections.Add(1)
-		options.RemoteAddr = s.lanLoopback
-		return s.inner.ConnectTCP(ctx, options)
-	}
 	if options.RemoteAddr == nil || !options.RemoteAddr.IP.IsLoopback() {
 		return nil, errors.New("integration test forbids non-loopback TCP")
 	}

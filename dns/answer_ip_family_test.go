@@ -2,10 +2,13 @@ package dns
 
 import (
 	"context"
+	"crypto"
 	"errors"
+	"net"
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/metacubex/mihomo/component/fakeip"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -210,5 +213,82 @@ func TestAnswerIPFamilyBlocksFakeAllocationWithoutLookup(t *testing.T) {
 	got, err = h(icontext.NewDNSContext(context.Background()), q)
 	if err != nil || len(got.Answer) != 1 || got.Answer[0].Header().Rrtype != D.TypeA {
 		t.Fatalf("allowed fake family stopped: %v %v", got, err)
+	}
+}
+
+func TestAnswerIPFamilyDNSSECValidatingWireClient(t *testing.T) {
+	key := &D.DNSKEY{Hdr: D.RR_Header{Name: "example.", Rrtype: D.TypeDNSKEY, Class: D.ClassINET, Ttl: 60},
+		Flags: 256, Protocol: 3, Algorithm: D.ED25519}
+	private, err := key.Generate(256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, signed := answerPolicyMessage(t, D.TypeAAAA, "www.example. 60 IN AAAA 2001:db8::1")
+	now := time.Now()
+	signature := &D.RRSIG{Hdr: D.RR_Header{Name: q.Question[0].Name, Rrtype: D.TypeRRSIG, Class: D.ClassINET, Ttl: 60},
+		Algorithm: key.Algorithm, KeyTag: key.KeyTag(), SignerName: key.Hdr.Name,
+		Inception: uint32(now.Add(-time.Minute).Unix()), Expiration: uint32(now.Add(time.Hour).Unix())}
+	if err := signature.Sign(private.(crypto.Signer), signed.Answer); err != nil {
+		t.Fatal(err)
+	}
+	signed.Answer = append(signed.Answer, signature)
+	q.SetEdns0(1232, true)
+	for _, family := range []string{"ipv6", "ipv4"} {
+		t.Run(family, func(t *testing.T) {
+			r := NewResolverFromClient(&answerPolicyTestClient{answer: signed})
+			defer r.Close()
+			r.answerPolicy.IPFamily, _ = NewAnswerIPFamilyPolicy(map[string]string{"+.example": family})
+			h := newHandler(r, &ResolverEnhancer{mode: C.DNSNormal, ipv6: true})
+			pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			started := make(chan struct{})
+			server := &D.Server{PacketConn: pc, NotifyStartedFunc: func() { close(started) }, Handler: D.HandlerFunc(func(w D.ResponseWriter, query *D.Msg) {
+				answer, err := h(icontext.NewDNSContext(context.Background()), query)
+				if err != nil {
+					answer = new(D.Msg).SetRcode(query, D.RcodeServerFailure)
+				}
+				_ = w.WriteMsg(answer)
+			})}
+			defer server.Shutdown()
+			finished := make(chan error, 1)
+			go func() { finished <- server.ActivateAndServe() }()
+			select {
+			case <-started:
+			case err := <-finished:
+				t.Fatal(err)
+			case <-time.After(time.Second):
+				t.Fatal("local validating fixture did not start")
+			}
+			client := &D.Client{Net: "udp", Timeout: time.Second}
+			answer, _, err := client.Exchange(q.Copy(), pc.LocalAddr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if family == "ipv4" {
+				if answer.Rcode != D.RcodeRefused || answer.AuthenticatedData || len(answer.Answer) != 0 || len(answer.Ns) != 0 {
+					t.Fatalf("validator received a forged negative or forbidden address: %s", answer)
+				}
+				opt := answer.IsEdns0()
+				if opt == nil || len(opt.Option) != 1 {
+					t.Fatalf("wire refusal lost its filter reason: %s", answer)
+				}
+				if ede, ok := opt.Option[0].(*D.EDNS0_EDE); !ok || ede.InfoCode != D.ExtendedErrorCodeFiltered {
+					t.Fatalf("unexpected refusal reason: %v", opt.Option)
+				}
+				return
+			}
+			if answer.Rcode != D.RcodeSuccess || len(answer.Answer) != 2 {
+				t.Fatalf("permitted signed RRset was changed: %s", answer)
+			}
+			wireSignature, ok := answer.Answer[1].(*D.RRSIG)
+			if !ok || !wireSignature.ValidityPeriod(time.Now()) {
+				t.Fatal("wire signature is missing or outside its validity period")
+			}
+			if err := wireSignature.Verify(key, answer.Answer[:1]); err != nil {
+				t.Fatal("client verification against the local trust key failed:", err)
+			}
+		})
 	}
 }

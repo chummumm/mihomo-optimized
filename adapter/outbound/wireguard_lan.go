@@ -62,7 +62,6 @@ func (w *WireGuard) LANPreconnectPrefixes() []netip.Prefix {
 
 type wireGuardLANControl interface {
 	SendKeepalive()
-	SendHandshakeInitiation(bool) error
 }
 
 func wireGuardControlPeer(dev wireguardGoDevice, publicKey string) (wireGuardLANControl, error) {
@@ -161,6 +160,9 @@ func (w *WireGuard) PrepareLAN(ctx context.Context, target netip.Addr) error {
 		}
 	}
 	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		peer, err := wireGuardControlPeer(dev, key)
 		if err != nil {
 			return err
@@ -169,9 +171,6 @@ func (w *WireGuard) PrepareLAN(ctx context.Context, target netip.Addr) error {
 		peer.SendKeepalive()
 		if wireGuardRecentHandshake(dev, key, time.Now()) {
 			continue
-		}
-		if err := peer.SendHandshakeInitiation(false); err != nil {
-			return err
 		}
 		ticker := time.NewTicker(100 * time.Millisecond)
 		for !wireGuardRecentHandshake(dev, key, time.Now()) {

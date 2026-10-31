@@ -31,6 +31,7 @@ func TestLANStaticRuleOrderAndPrefixCoverage(t *testing.T) {
 		{"partial coverage", []string{"IP-CIDR,192.168.1.0/25,DIRECT,no-resolve", "IP-CIDR,192.168.1.0/24,lan,no-resolve"}, 1},
 		{"domain disjoint", []string{"DOMAIN,example.com,DIRECT", "IP-CIDR,192.168.1.0/24,lan,no-resolve"}, 1},
 		{"regex can match empty host", []string{"DOMAIN-REGEX,.*,DIRECT", "IP-CIDR,192.168.1.0/24,lan,no-resolve"}, 0},
+		{"wildcard can match empty host", []string{"DOMAIN-WILDCARD,*,DIRECT", "IP-CIDR,192.168.1.0/24,lan,no-resolve"}, 0},
 		{"source unknown", []string{"SRC-IP-CIDR,192.168.0.0/16,DIRECT", "IP-CIDR,192.168.1.0/24,lan,no-resolve"}, 0},
 		{"CGNAT excluded", []string{"IP-CIDR,100.64.0.0/10,lan,no-resolve"}, 0},
 		{"default alone", []string{"MATCH,lan"}, 0},

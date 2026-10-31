@@ -54,7 +54,7 @@ func TestProxyTargetUDPNewAddressRetainsHostsCandidates(t *testing.T) {
 	defer sender.Close()
 	metadata := &C.Metadata{DstIP: clientIP, DstPort: 4444, NetWork: C.UDP}
 	fixMetadata(metadata)
-	for range 2 {
+	for i := 0; i < 2; i++ {
 		sender.processPacket(pc, C.NewPacketAdapter(&directUDPTestPacket{}, metadata))
 	}
 	if transport.calls != 1 || len(transport.written) != 2 {

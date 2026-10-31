@@ -92,9 +92,9 @@ func staticLANIntents(proxies map[string]C.Proxy, rules []C.Rule, ruleMode bool)
 				}
 			}
 			previous = append(previous, prefix)
-		case C.Domain, C.DomainSuffix, C.DomainWildcard, C.GEOSITE:
+		case C.GEOSITE:
 			// These do not shadow literal-IP traffic to an explicit LAN rule.
-		case C.DomainKeyword:
+		case C.Domain, C.DomainSuffix, C.DomainKeyword:
 			if rule.Payload() == "" {
 				return intents
 			}
