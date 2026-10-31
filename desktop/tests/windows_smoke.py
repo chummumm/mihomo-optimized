@@ -884,8 +884,30 @@ class NativeDriver:
         return result
 
     def navigate(self, page: str) -> None:
-        self.invoke("native_navigate", {"page": page}, timeout=10)
-        wait_until(lambda: self.snapshot().get("page") == page, "native_navigation_failed", 10)
+        result = self.invoke("native_navigate", {"page": page}, timeout=10)
+        last_snapshot = {}
+
+        def arrived() -> bool:
+            nonlocal last_snapshot
+            last_snapshot = self.snapshot()
+            return last_snapshot.get("page") == page
+
+        def failure(code: str) -> SmokeFailure:
+            return SmokeFailure(code, uia={"action": "navigate", "requestedPage": page,
+                "navigated": isinstance(result, dict) and result.get("navigated") is True,
+                "snapshot": {key: last_snapshot[key] for key in
+                    ("ready", "visible", "phase", "page", "busy", "editorOpen") if key in last_snapshot}})
+
+        if not isinstance(result, dict) or result.get("navigated") is not True:
+            with contextlib.suppress(Exception):
+                last_snapshot = self.snapshot()
+            raise failure("native_navigation_rejected")
+        try:
+            wait_until(arrived, "native_navigation_failed", 10)
+        except SmokeFailure as error:
+            if str(error) == "native_navigation_failed":
+                raise failure("native_navigation_failed") from None
+            raise
 
     def gui_timeout_probe(self) -> dict:
         """One bounded WM_NULL probe, independent of UIA and the command pipe."""
@@ -2167,6 +2189,27 @@ class Acceptance:
         driver.ui("EditConfig", "invoke")
         clean_editor_notice("native_editor_reopen")
         driver.ui("CloseEditor", "invoke")
+        # WPF's UIA Invoke queues the click at Input priority and returns before
+        # that click must run. The independent command pipe must observe closure
+        # before sending a single navigation; it must never retry a rejected one.
+        close_state = {}
+
+        def editor_closed_for_navigation() -> bool:
+            snapshot = driver.snapshot()
+            close_state["snapshot"] = {key: snapshot[key] for key in
+                ("phase", "page", "busy", "editorOpen") if key in snapshot}
+            if snapshot.get("editorOpen") is not False:
+                return False
+            editor = driver.ui("ConfigEditor")
+            close_state["editor"] = {key: editor[key] for key in ("found", "offscreen") if key in editor}
+            return editor.get("found") is False or editor.get("offscreen") is True
+
+        try:
+            wait_until(editor_closed_for_navigation, "native_editor_did_not_close", 15)
+        except SmokeFailure as error:
+            if str(error) == "native_editor_did_not_close":
+                raise SmokeFailure("native_editor_did_not_close", uia={"action": "wait_editor_closed", **close_state}) from None
+            raise
         driver.navigate("home")
         driver.navigate("profiles")
         driver.ui("EditConfig", "invoke")
