@@ -104,10 +104,24 @@ func TestDesktopManagedContracts(t *testing.T) {
 		}
 	}
 	assertState("running")
-	for _, path := range []string{"/desktop", "/configs/file", "/upgrade/check"} {
+	for _, path := range []string{"/desktop", "/desktop/health", "/configs/file", "/upgrade/check"} {
 		if w := request(http.MethodGet, path, "", false); w.Code != http.StatusUnauthorized {
 			t.Fatalf("missing authentication accepted at %s: %d", path, w.Code)
 		}
+	}
+	if w := request(http.MethodPost, "/desktop/recover", "", false); w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated recovery accepted: %d %s", w.Code, w.Body.String())
+	}
+	for _, body := range []string{"{}", " ", "{\"tun\":true}"} {
+		if w := request(http.MethodPost, "/desktop/recover", body, true); w.Code != http.StatusBadRequest {
+			t.Fatalf("recovery accepted a configuration body: %d %s", w.Code, w.Body.String())
+		}
+	}
+	if w := request(http.MethodPost, "/desktop/recover?force=true", "", true); w.Code != http.StatusBadRequest {
+		t.Fatalf("recovery accepted query overrides: %d %s", w.Code, w.Body.String())
+	}
+	if w := request(http.MethodGet, "/desktop/health", "", true); w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Body.String(), "\"state\":\"disabled\"") {
+		t.Fatalf("disabled TUN health is incorrect: %d %s", w.Code, w.Body.String())
 	}
 	for _, origin := range []string{"http://localhost:3000", "https://untrusted.example"} {
 		r := httptest.NewRequest(http.MethodGet, "/desktop", nil)
@@ -167,6 +181,9 @@ func TestDesktopManagedContracts(t *testing.T) {
 		t.Fatalf("late TUN apply failure was not returned: %d %s", w.Code, w.Body.String())
 	}
 	assertState("loading")
+	if w := request(http.MethodPost, "/desktop/recover", "", true); w.Code != http.StatusConflict {
+		t.Fatalf("recovery admitted an incomplete configuration: %d %s", w.Code, w.Body.String())
+	}
 	if w := request(http.MethodPut, "/configs?force=true", string(payload), true); w.Code != http.StatusNoContent {
 		t.Fatalf("valid recovery reload failed: %d %s", w.Code, w.Body.String())
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/common/atomic"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/lanpreconnect"
 	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/nat"
 	"github.com/metacubex/mihomo/component/process"
@@ -138,6 +140,7 @@ func (t tunnel) RuleUpdateCallback() *utils.Callback[P.RuleProvider] {
 
 func OnSuspend() {
 	status.Store(Suspend)
+	lanpreconnect.Default.Suspend()
 }
 
 func OnInnerLoading() {
@@ -262,6 +265,9 @@ func Mode() TunnelMode {
 func SetMode(m TunnelMode) {
 	if mode.Swap(m) != m {
 		dnsRoutingEpoch.Add(1)
+		if Status() == Running {
+			RefreshLANPreconnect()
+		}
 	}
 }
 
@@ -311,8 +317,10 @@ func preHandleMetadata(metadata *C.Metadata) error {
 			} else if node, ok := resolver.DefaultHosts.Search(host, false); ok {
 				// redir-host should lookup the hosts
 				metadata.DstIP, _ = node.RandIP()
+				metadata.DestinationOverride = metadata.DstIP.IsValid()
 			} else if node != nil && node.IsDomain {
 				metadata.Host = node.Domain
+				metadata.DestinationOverride = true
 			}
 		} else if resolver.IsFakeIP(metadata.DstIP) {
 			return fmt.Errorf("fake DNS record %s missing", metadata.DstIP)
@@ -320,6 +328,7 @@ func preHandleMetadata(metadata *C.Metadata) error {
 	} else if node, ok := resolver.DefaultHosts.Search(metadata.Host, true); ok {
 		// try use domain mapping
 		metadata.Host = node.Domain
+		metadata.DestinationOverride = true
 	}
 
 	return nil
@@ -510,8 +519,14 @@ func handleUDPConn(packet C.PacketAdapter) {
 			}
 
 			dialMetadata := metadata.Pure()
+			if policy, ok := proxy.(interface{ ForceIPPolicy() bool }); ok && policy.ForceIPPolicy() {
+				// Keep the hostname for the group's normal single selection.
+				// The selected leaf enforces its immutable target policy.
+				dialMetadata = metadata.Clone()
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
 			defer cancel()
+			ctx = lanpreconnect.Business(ctx)
 			ctx = icontext.WithDNSFixedOutbound(icontext.WithDNSRoutingMetadata(ctx, metadata), proxy)
 			rawPc, err := retry(ctx, func(ctx context.Context) (C.PacketConn, error) {
 				return proxy.ListenPacketContext(ctx, dialMetadata)
@@ -607,10 +622,13 @@ func handleTCPConn(connCtx C.ConnContext) {
 	dialMetadata := metadata
 	if len(metadata.Host) > 0 {
 		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
-			if dstIp, _ := node.RandIP(); !resolver.IsFakeIP(dstIp) {
+			if dstIp, _ := node.RandIP(); dstIp.IsValid() && !resolver.IsFakeIP(dstIp) {
 				dialMetadata.DstIP = dstIp
 				dialMetadata.DNSMode = C.DNSHosts
-				dialMetadata = dialMetadata.Pure()
+				dialMetadata.DestinationOverride = true
+				if policy, ok := proxy.(interface{ ForceIPPolicy() bool }); !ok || !policy.ForceIPPolicy() {
+					dialMetadata = dialMetadata.Pure()
+				}
 			}
 		}
 	}
@@ -622,13 +640,13 @@ func handleTCPConn(connCtx C.ConnContext) {
 	if source, ok := connCtx.(interface{ Context() context.Context }); ok {
 		parent = source.Context()
 	}
-	ctx, cancel := icontext.WithTCPDialBudget(parent)
+	ctx, cancel := context.WithTimeout(parent, C.DefaultTCPTimeout)
 	defer cancel()
+	ctx = lanpreconnect.Business(ctx)
 	ctx = icontext.WithDNSFixedOutbound(icontext.WithDNSRoutingMetadata(ctx, metadata), proxy)
 	remoteConn, err := retry(ctx, func(ctx context.Context) (remoteConn C.Conn, err error) {
 		remoteConn, err = proxy.DialContext(ctx, dialMetadata)
 		if err != nil {
-			err = icontext.TCPDialError(ctx, err)
 			return
 		}
 
@@ -639,7 +657,6 @@ func handleTCPConn(connCtx C.ConnContext) {
 			done := N.SetupContextForConn(ctx, remoteConn)
 			defer func() {
 				done(&err)
-				err = icontext.TCPDialError(ctx, err)
 				if err != nil {
 					_ = remoteConn.Close()
 					for _, chain := range remoteConn.Chains() {
@@ -654,8 +671,17 @@ func handleTCPConn(connCtx C.ConnContext) {
 			peekMutex.Lock()
 			defer peekMutex.Unlock()
 			peekBytes, _ = conn.Peek(conn.Buffered())
-			_, err = remoteConn.Write(peekBytes)
+			var written int
+			written, err = remoteConn.Write(peekBytes)
+			if err == nil && written != len(peekBytes) {
+				err = io.ErrShortWrite
+			}
 			if err != nil {
+				// Once application data has been submitted, delivery is unknown
+				// even if Write reports zero. Never replay it on another attempt.
+				if len(peekBytes) != 0 {
+					err = errors.Join(errTCPFirstPayloadWrite, err)
+				}
 				return
 			}
 			if peekLen = len(peekBytes); peekLen > 0 {
@@ -827,7 +853,12 @@ func getRules(metadata *C.Metadata) []C.Rule {
 	}
 }
 
+var errTCPFirstPayloadWrite = errors.New("first application write failed")
+
 func shouldStopRetry(err error) bool {
+	if errors.Is(err, C.ErrTargetIPFamily) || errors.Is(err, C.ErrNoProxyTarget) || errors.Is(err, errTCPFirstPayloadWrite) {
+		return true
+	}
 	if errors.Is(err, resolver.ErrIPNotFound) {
 		return true
 	}
@@ -847,11 +878,10 @@ func retry[T any](ctx context.Context, ft func(context.Context) (T, error), fe f
 	s := slowdown.New()
 	for i := 0; i < 10; i++ {
 		if err = ctx.Err(); err != nil {
-			return t, icontext.TCPDialError(ctx, err)
+			return t, err
 		}
 		t, err = ft(ctx)
 		if err != nil {
-			err = icontext.TCPDialError(ctx, err)
 			if fe != nil {
 				fe(err)
 			}

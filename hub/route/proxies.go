@@ -10,6 +10,7 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/tunnel"
 
 	"github.com/metacubex/chi"
@@ -96,6 +97,7 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cachefile.Cache().SetSelected(proxy.Name(), req.Name)
+	executor.RequestLANPreconnectRefresh()
 	if SwitchProxiesCallback != nil {
 		// refresh tray menu
 		go SwitchProxiesCallback(proxy.Name(), req.Name)

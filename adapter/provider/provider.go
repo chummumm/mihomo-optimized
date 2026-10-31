@@ -45,11 +45,12 @@ type providerForApi struct {
 }
 
 type baseProvider struct {
-	mutex       sync.RWMutex
-	name        string
-	proxies     []C.Proxy
-	healthCheck *HealthCheck
-	version     uint32
+	mutex         sync.RWMutex
+	name          string
+	proxies       []C.Proxy
+	healthCheck   *HealthCheck
+	version       uint32
+	onProxyUpdate func()
 }
 
 func (bp *baseProvider) Name() string {
@@ -103,13 +104,27 @@ func (bp *baseProvider) RegisterHealthCheckTask(url string, expectedStatus utils
 
 func (bp *baseProvider) setProxies(proxies []C.Proxy) {
 	bp.mutex.Lock()
-	defer bp.mutex.Unlock()
 	bp.proxies = proxies
 	bp.version += 1
 	bp.healthCheck.setProxies(proxies)
+	callback := bp.onProxyUpdate
+	bp.mutex.Unlock()
+	if callback != nil {
+		// The applied configuration installs a nonblocking notification. Never
+		// call it with the provider lock held: refresh reads the published list.
+		callback()
+	}
 	if bp.healthCheck.auto() {
 		go bp.healthCheck.check()
 	}
+}
+
+// SetProxyUpdateCallback is bound only after a configuration is installed.
+// Temporary parsers and resource-bootstrap providers have no callback.
+func (bp *baseProvider) SetProxyUpdateCallback(callback func()) {
+	bp.mutex.Lock()
+	bp.onProxyUpdate = callback
+	bp.mutex.Unlock()
 }
 
 func (bp *baseProvider) Close() error {
@@ -345,7 +360,7 @@ func (cp *CompatibleProvider) Close() error {
 	return cp.compatibleProvider.Close()
 }
 
-func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilter string, excludeType string, dialerProxy string, override overrideSchema, ageSecretKey string) (resource.Parser[[]C.Proxy], error) {
+func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilter string, excludeType string, dialerProxy string, override overrideSchema, ageSecretKey string, options ...adapter.ProxyOption) (resource.Parser[[]C.Proxy], error) {
 	parseMappings, err := newProxyMappingsParser(filter, excludeFilter, excludeType, dialerProxy, override, ageSecretKey)
 	if err != nil {
 		return nil, err
@@ -357,7 +372,8 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 		}
 		proxies := make([]C.Proxy, 0, len(mappings))
 		for idx, mapping := range mappings {
-			proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName))
+			parseOptions := append([]adapter.ProxyOption{adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName)}, options...)
+			proxy, err := adapter.ParseProxy(mapping, parseOptions...)
 			if err != nil {
 				for _, previous := range proxies {
 					_ = previous.Close()

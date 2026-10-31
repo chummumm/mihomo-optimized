@@ -12,14 +12,16 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/metacubex/mihomo/component/easytier"
+	"github.com/metacubex/mihomo/component/lanpreconnect"
 	C "github.com/metacubex/mihomo/constant"
-	icontext "github.com/metacubex/mihomo/context"
 
 	corehost "github.com/easytier/easytier/easytier-go"
 	"github.com/easytier/easytier/easytier-go/platform"
@@ -30,14 +32,26 @@ import (
 // CI opts in explicitly; ordinary unit tests need neither sockets nor a WASM
 // compilation. No peer, STUN server, DNS name or destination uses the Internet.
 func TestEasyTierFirstDialWaitsForDelayedRelayRoute(t *testing.T) {
+	testEasyTierBackgroundRelay(t, false)
+}
+
+func TestLANEasyTierSubnetPreparesBeforeBusiness(t *testing.T) {
+	testEasyTierBackgroundRelay(t, true)
+}
+
+func testEasyTierBackgroundRelay(t *testing.T, subnet bool) {
 	if os.Getenv("MIHOMO_EASYTIER_INTEGRATION") != "1" {
 		t.Skip("set MIHOMO_EASYTIER_INTEGRATION=1 for the real three-node relay regression")
 	}
 
-	const routeDelay = 6 * time.Second // Deliberately exceeds the old 5 s TCP budget.
+	const routeDelay = 6 * time.Second // Background startup may exceed a business dial budget.
 	const network = "mihomo-first-dial-integration"
 	relayIP := netip.MustParseAddr("10.78.0.1")
 	targetIP := netip.MustParseAddr("10.78.0.2")
+	businessIP := targetIP
+	if subnet {
+		businessIP = netip.MustParseAddr("192.168.42.7")
+	}
 	clientIP := netip.MustParseAddr("10.78.0.3")
 	stateRoot := t.TempDir()
 	originalHome := C.Path.HomeDir()
@@ -50,8 +64,13 @@ func TestEasyTierFirstDialWaitsForDelayedRelayRoute(t *testing.T) {
 	var client *EasyTier
 	var listener net.Listener
 	var connection net.Conn
+	var lanStack ipStack
+	var lanPackets atomic.Int32
 	t.Cleanup(func() {
 		cancel()
+		if lanStack != nil {
+			_ = lanStack.Close()
+		}
 		if connection != nil {
 			_ = connection.Close()
 		}
@@ -90,6 +109,22 @@ func TestEasyTierFirstDialWaitsForDelayedRelayRoute(t *testing.T) {
 		admit: admitTarget, listening: make(chan int, 1), attempted: make(chan struct{}),
 	}
 	var err error
+	if subnet {
+		// Model a routed LAN behind the remote gateway using its public packet
+		// interface and an isolated userspace LAN host. No OS route or real
+		// private network is modified; the advertised CIDR and relay are real.
+		lanStack, err = newIPStack(IPStackOption{Mode: ipStackMips}, []netip.Prefix{netip.PrefixFrom(businessIP, 24)}, 1408)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = lanStack.Start(); err != nil {
+			t.Fatal(err)
+		}
+		listener, err = lanStack.ListenTCP(ctx, "tcp4", netip.AddrPortFrom(businessIP, 7777))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	host, err = corehost.New(ctx, corehost.Options{Platform: platform.Services{Sockets: sockets}})
 	if err != nil {
 		t.Fatalf("create relay/target host: %v", err)
@@ -125,13 +160,61 @@ func TestEasyTierFirstDialWaitsForDelayedRelayRoute(t *testing.T) {
 		t.Fatalf("relay did not open its loopback listener: %v", ctx.Err())
 	}
 	relayURI := fmt.Sprintf("tcp://127.0.0.1:%d", relayPort)
-	target = create(build("local-target", targetIP).AddPeers(relayURI))
+	if subnet {
+		disabled, enabled := false, true
+		config, configErr := (easytier.Config{
+			NetworkName: network, NetworkSecret: "local-test-only", Hostname: "local-target",
+			IPv4: targetIP.String() + "/24", Peers: []string{relayURI}, ProxyNetworks: []string{"192.168.42.0/24"},
+			NoListener: &enabled, DisableP2P: &enabled, EnableEncryption: &disabled,
+		}).RenderTOML()
+		if configErr != nil {
+			t.Fatal(configErr)
+		}
+		config = strings.Replace(config, "no_tun = true", "no_tun = false", 1) + "proxy_forward_by_system = true\n"
+		target, err = host.CreateInstanceTOML(ctx, "subnet-gateway", "", "stun_servers = []\nstun_servers_v6 = []\n"+config)
+		if err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		target = create(build("local-target", targetIP).AddPeers(relayURI))
+	}
 	if err = target.Start(ctx); err != nil {
 		t.Fatalf("start target: %v", err)
 	}
-	listener, err = easyTierListenTCP(ctx, target)
-	if err != nil {
-		t.Fatalf("prepare target TCP service: %v", err)
+	if subnet {
+		go func() {
+			for {
+				packet, receiveErr := target.ReceivePacket(ctx)
+				if receiveErr != nil {
+					return
+				}
+				lanPackets.Add(1)
+				if _, writeErr := lanStack.Write([][]byte{packet}, 0); writeErr != nil {
+					return
+				}
+			}
+		}()
+		go func() {
+			buffers := [][]byte{make([]byte, 65536)}
+			sizes := make([]int, 1)
+			for {
+				count, readErr := lanStack.Read(buffers, sizes, 0)
+				if readErr != nil {
+					return
+				}
+				for i := 0; i < count; i++ {
+					if sendErr := target.SendPacket(ctx, buffers[i][:sizes[i]]); sendErr != nil {
+						return
+					}
+				}
+			}
+		}()
+	}
+	if !subnet {
+		listener, err = easyTierListenTCP(ctx, target)
+		if err != nil {
+			t.Fatalf("prepare target TCP service: %v", err)
+		}
 	}
 	select {
 	case <-sockets.attempted:
@@ -153,25 +236,19 @@ func TestEasyTierFirstDialWaitsForDelayedRelayRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create Mihomo EasyTier outbound: %v", err)
 	}
-	client.dialer = easyTierLoopbackDialer{}
+	var underlayConnections atomic.Int32
+	client.dialer = easyTierLoopbackDialer{connections: &underlayConnections}
 	// The structured Mihomo options do not expose STUN server lists. Override
 	// only those test-fixture lists, retaining the real outbound startup path.
 	client.configTOML = "stun_servers = []\nstun_servers_v6 = []\n" + client.configTOML
 
-	type dialResult struct {
-		connection net.Conn
-		err        error
-	}
-	result := make(chan dialResult, 1)
-	dialCtx, stopDial := icontext.WithTCPDialBudget(ctx)
-	defer stopDial()
+	// Start through the same bounded background coordinator used by a proven
+	// LAN rule. No business DialContext or payload has occurred at this point.
+	prepared := make(chan error, 1)
+	manager := lanpreconnect.New()
+	t.Cleanup(manager.Close)
+	manager.Replace([]lanpreconnect.Intent{{Outbound: &easyTierObservedPreparation{EasyTier: client, completed: prepared}, Target: businessIP}})
 	started := time.Now()
-	go func() {
-		conn, dialErr := client.DialContext(dialCtx, &C.Metadata{
-			NetWork: C.TCP, DstIP: targetIP, DstPort: uint16(listener.Addr().(*net.TCPAddr).Port),
-		})
-		result <- dialResult{connection: conn, err: dialErr}
-	}()
 
 	delay := time.NewTimer(routeDelay)
 	defer delay.Stop()
@@ -180,11 +257,8 @@ func TestEasyTierFirstDialWaitsForDelayedRelayRoute(t *testing.T) {
 	minimumDelayPassed, relayVisible := false, false
 	for !minimumDelayPassed || !relayVisible {
 		select {
-		case early := <-result:
-			if early.connection != nil {
-				_ = early.connection.Close()
-			}
-			t.Fatalf("first and only dial returned before the target route was admitted (%s): %v", time.Since(started), early.err)
+		case early := <-prepared:
+			t.Fatalf("background preparation completed before target route admission (%s): %v", time.Since(started), early)
 		case <-delay.C:
 			minimumDelayPassed = true
 		case <-poll.C:
@@ -196,7 +270,7 @@ func TestEasyTierFirstDialWaitsForDelayedRelayRoute(t *testing.T) {
 			routes, routeErr := instance.ListRoute(probe)
 			stop()
 			if routeErr == nil {
-				if easyTierRouteTo(routes, targetIP) != nil {
+				if easyTierRouteTo(routes, businessIP) != nil {
 					t.Fatal("target route appeared before its loopback connection was admitted")
 				}
 				relayVisible = easyTierRouteTo(routes, relayIP) != nil
@@ -205,29 +279,41 @@ func TestEasyTierFirstDialWaitsForDelayedRelayRoute(t *testing.T) {
 			t.Fatalf("wait for a running client with relay but no target route: %v", ctx.Err())
 		}
 	}
-	// A running instance and a connected relay have not completed this dial.
-	// Release the missing target after the original TCP timeout has elapsed.
+	if underlayConnections.Load() == 0 {
+		t.Fatal("background startup did not establish a real relay connection before business")
+	}
 	select {
-	case early := <-result:
-		if early.connection != nil {
-			_ = early.connection.Close()
-		}
-		t.Fatalf("first dial completed while only the relay was reachable: %v", early.err)
+	case early := <-prepared:
+		t.Fatalf("target was declared ready before admission: %v", early)
 	default:
 	}
 	admittedAfter := time.Since(started)
 	close(admitTarget)
 	select {
-	case completed := <-result:
-		if completed.err != nil {
-			t.Fatalf("the same dial failed after admitting the target at %s: %v", admittedAfter, completed.err)
+	case err := <-prepared:
+		if err != nil {
+			t.Fatalf("background preparation failed: %v", err)
 		}
-		connection = completed.connection
 	case <-ctx.Done():
-		t.Fatalf("first dial did not finish: %v", ctx.Err())
+		t.Fatalf("background preparation did not finish: %v", ctx.Err())
 	}
-	if connection == nil || time.Since(started) < routeDelay {
-		t.Fatal("first dial did not wait for the delayed target")
+	if time.Since(started) < routeDelay {
+		t.Fatal("fixture did not exercise startup beyond five seconds")
+	}
+	if lanPackets.Load() != 0 {
+		t.Fatal("preparation sent a fabricated LAN data packet")
+	}
+	// The first business connection gets only the ordinary five seconds and
+	// reuses the already-established native relay path.
+	dialCtx, stopDial := context.WithTimeout(ctx, C.DefaultTCPTimeout)
+	defer stopDial()
+	businessStarted := time.Now()
+	connection, err = client.DialContext(dialCtx, &C.Metadata{NetWork: C.TCP, DstIP: businessIP, DstPort: uint16(listener.Addr().(*net.TCPAddr).Port)})
+	if err != nil {
+		t.Fatalf("first business dial after background preparation: %v (LAN forwarded packets=%d)", err, lanPackets.Load())
+	}
+	if time.Since(businessStarted) >= C.DefaultTCPTimeout {
+		t.Fatal("business dial exceeded ordinary timeout")
 	}
 	if err = connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("set client TCP deadline: %v", err)
@@ -278,11 +364,14 @@ func TestEasyTierFirstDialWaitsForDelayedRelayRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read established client routing table: %v", err)
 	}
-	route := easyTierRouteTo(routes, targetIP)
+	route := easyTierRouteTo(routes, businessIP)
 	if route == nil || route.GetNextHopPeerId() != relayInfo.GetPeerId() || route.GetNextHopPeerId() == route.GetPeerId() {
 		t.Fatalf("TCP target route must use the relay, without a direct target connection: relay=%d route=%v", relayInfo.GetPeerId(), route)
 	}
-	t.Logf("single TCP dial succeeded: target admitted after %s; elapsed %s; relay=%d target=%d next_hop=%d; exchanged %d/%d bytes",
+	if subnet && lanPackets.Load() == 0 {
+		t.Fatal("business TCP bypassed the remote LAN packet path")
+	}
+	t.Logf("background relay preparation before business: admitted after %s; total elapsed %s; relay=%d target=%d next_hop=%d; exchanged %d/%d bytes",
 		admittedAfter, time.Since(started), relayInfo.GetPeerId(), route.GetPeerId(), route.GetNextHopPeerId(), len(request), len(response))
 }
 
@@ -303,12 +392,19 @@ func easyTierListenTCP(ctx context.Context, instance *corehost.Instance) (net.Li
 }
 
 func easyTierRouteTo(routes []*corehost.Route, address netip.Addr) *corehost.Route {
+	var selected *corehost.Route
+	bits := -1
 	for _, route := range routes {
 		if ipv4 := route.GetIpv4Addr().GetAddress(); ipv4 != nil && easytier.IPv4FromUint32(ipv4.GetAddr()) == address {
 			return route
 		}
+		for _, cidr := range route.GetProxyCidrs() {
+			if prefix, err := netip.ParsePrefix(cidr); err == nil && prefix.Contains(address) && prefix.Bits() > bits {
+				selected, bits = route, prefix.Bits()
+			}
+		}
 	}
-	return nil
+	return selected
 }
 
 type easyTierRelaySockets struct {
@@ -351,14 +447,32 @@ func (s *easyTierRelaySockets) BindUDP(ctx context.Context, options platform.UDP
 	return easyTierLocalPackets{packet}, nil
 }
 
-type easyTierLoopbackDialer struct{}
+type easyTierObservedPreparation struct {
+	*EasyTier
+	completed chan<- error
+}
 
-func (easyTierLoopbackDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+func (p *easyTierObservedPreparation) PrepareLAN(ctx context.Context, target netip.Addr) error {
+	err := p.EasyTier.PrepareLAN(ctx, target)
+	select {
+	case p.completed <- err:
+	default:
+	}
+	return err
+}
+
+type easyTierLoopbackDialer struct{ connections *atomic.Int32 }
+
+func (d easyTierLoopbackDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	peer, err := netip.ParseAddrPort(address)
 	if err != nil || !peer.Addr().IsLoopback() {
 		return nil, fmt.Errorf("integration test forbids non-loopback dial %q", address)
 	}
-	return (&net.Dialer{}).DialContext(ctx, network, address)
+	conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+	if err == nil && d.connections != nil {
+		d.connections.Add(1)
+	}
+	return conn, err
 }
 
 func (easyTierLoopbackDialer) ListenPacket(ctx context.Context, network, address string, _ netip.AddrPort) (net.PacketConn, error) {

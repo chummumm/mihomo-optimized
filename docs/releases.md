@@ -2,6 +2,14 @@
 
 项目使用独立版本 **`mihomo-optimized-vX.Y.Z`**，首版为 `mihomo-optimized-v1.0.0`。`main` 的源码、依赖或构建配置变更在全部测试和完整编译成功后生成固定提交的 GitHub Release。Latest 仅在该构建仍对应当前 `main` 时更新；PR 只做合并前检查，不生成正式发布包。纯文档变更不消耗版本号，也不触发自动发布。
 
+## 1.0.23：LAN 后台预连接、代理目标 IP 与 Windows 恢复
+
+回退 `1.0.22` 引入的 EasyTier 请求内 15 秒准备加 5 秒建连预算，普通请求恢复原有 5 秒期限。保留目标路由、下一跳、并发初始化与关闭保护，改为只对 RFC1918 / ULA 业务目标进行后台准备；覆盖 EasyTier、WireGuard / AmneziaWG、Tailscale、ZeroTier 和 OpenVPN，不新增节点预连接字段，不扫描 LAN 或重放业务数据。现有规则、稳定选组、实际目标、配置及网络变化共同维护准备范围，详见 [LAN 预连接](lan-preconnect.md)。
+
+实现 issue [#61](https://github.com/chummumm/mihomo-optimized/issues/61)：可选 `proxy-force-ip` 在 TCP / UDP 代理协议中使用本地取得的真实目标 IP，保留规则和日志域名，DIRECT 不变。增加节点 `target-ip-family` 与按域名限定的 `dns.answer-ip-family-policy`，继续保留 `normal`。DNS 策略只修改客户端答案副本，并处理 HTTPS / SVCB 提示和受保护答案；不会根据一次超时或 DNS 查询出口推断远端地址族能力。配置和边界见 [代理目标 IP](proxy-force-ip.md)。
+
+为配套 Windows 桌面 `0.2.5` 增加认证的动态 TUN 健康及恢复能力：检查本进程拥有的设备身份、地址与路由；健康实例保留，确认局部资源失效后才修复，遇到其他设备身份或无法确认的状态不盲目删除。桌面同时修复睡眠时间计入服务心跳租约及恢复期间的状态协调。接口与恢复职责见 [桌面受管协议](desktop-managed.md)。
+
 ## 1.0.22：EasyTier 首次组网与 TCP 连接预算
 
 EasyTier 保留按需启动和实例复用。实际选中的 EasyTier 出站可以在同一次请求内等待组网准备，准备阶段最多 15 秒；目标路由就绪后，TCP 建连最多再用 5 秒。整次请求有 20 秒绝对上限，组内重试和嵌套出站不会重新取得完整预算，调用方更短的期限或取消继续生效。普通 TCP 连接保持原来的 5 秒预算，策略组选择与连接链沿用现有流程。

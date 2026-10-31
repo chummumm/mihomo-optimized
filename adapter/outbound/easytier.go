@@ -16,9 +16,9 @@ import (
 
 	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/component/easytier"
+	"github.com/metacubex/mihomo/component/lanpreconnect"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
-	icontext "github.com/metacubex/mihomo/context"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
 
@@ -178,7 +178,7 @@ func NewEasyTier(option EasyTierOption) (*EasyTier, error) {
 
 func (e *EasyTier) ensureStarted(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		return icontext.TCPDialError(ctx, err)
+		return err
 	}
 	e.loopOnce.Do(func() {
 		go e.loop()
@@ -202,7 +202,7 @@ func (e *EasyTier) ensureStarted(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return icontext.TCPDialError(ctx, ctx.Err())
+			return ctx.Err()
 		case <-e.ctx.Done():
 			return errEasyTierClosed
 		case <-readyCh:
@@ -214,6 +214,7 @@ func (e *EasyTier) signalReady() {
 	e.mu.Lock()
 	e.signalReadyLocked()
 	e.mu.Unlock()
+	lanpreconnect.Default.Changed(e)
 }
 
 func (e *EasyTier) signalReadyLocked() {
@@ -457,22 +458,16 @@ func resolvePublicIPv4(ctx context.Context, host string) (netip.Addr, error) {
 }
 
 func (e *EasyTier) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	ctx, cancel := icontext.WithTCPDialBudget(ctx)
-	defer cancel()
-	defer func() { err = icontext.TCPDialError(ctx, err) }()
-	if err = icontext.BeginTCPPreparation(ctx); err != nil {
-		return nil, err
-	}
 	host := metadata.Host
 	if host == "" && metadata.DstIP.IsValid() {
 		host = metadata.DstIP.String()
 	}
+	if target, parseErr := netip.ParseAddr(host); parseErr == nil {
+		observeLANDial(ctx, e, target)
+	}
 	instance, ip, err := e.prepareTarget(ctx, host)
 	if err != nil {
 		return nil, err
-	}
-	if err = icontext.BeginTCPConnection(ctx); err != nil {
-		return nil, fmt.Errorf("easytier: prepare %s: %w", host, err)
 	}
 	address := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", metadata.DstPort))
 	conn, err := instance.Dial(ctx, "tcp4", address)
@@ -503,7 +498,7 @@ func (e *EasyTier) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 	if pc == nil {
 		return nil, errors.New("packetConn is nil")
 	}
-	return NewPacketConn(pc, e), nil
+	return newLANPacketConn(ctx, pc, e, e), nil
 }
 
 func (e *EasyTier) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
@@ -513,12 +508,47 @@ func (e *EasyTier) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
 			return fmt.Errorf("can't resolve ip: %w", err)
 		}
 		metadata.DstIP = ip
-		return nil
+		return metadata.TargetIPFamily.Check(ip)
 	}
+	metadata.DstIP = metadata.DstIP.Unmap()
 	if metadata.DstIP.IsValid() && !metadata.DstIP.Is4() {
 		return fmt.Errorf("easytier: overlay dial supports IPv4 only")
 	}
-	return nil
+	return metadata.TargetIPFamily.Check(metadata.DstIP.Unmap())
+}
+
+// PrepareLAN starts the native connectors before business traffic. Existing
+// SDK route queries can wait for propagation but cannot actively probe an
+// arbitrary gateway; no host/port probe is manufactured to hide that limit.
+func (e *EasyTier) PrepareLAN(ctx context.Context, target netip.Addr) error {
+	if target.IsValid() {
+		if !lanpreconnect.IsLAN(target) || !target.Unmap().Is4() {
+			return errors.New("easytier: LAN preparation requires an IPv4 private target")
+		}
+		_, _, err := e.prepareTarget(ctx, target.Unmap().String())
+		return err
+	}
+	return e.ensureStarted(ctx)
+}
+
+func (e *EasyTier) ResolveProxyTarget(ctx context.Context, metadata *C.Metadata) error {
+	if metadata.TargetIPFamily == C.TargetIPv6 {
+		return fmt.Errorf("%w: EasyTier supports IPv4 targets only", C.ErrTargetIPFamily)
+	}
+	if err := e.ensureStarted(ctx); err != nil {
+		return err
+	}
+	if metadata.Host != "" {
+		ip, err := e.resolveIPv4(ctx, metadata.Host)
+		if err != nil {
+			return err
+		}
+		metadata.DstIP = ip
+	}
+	if !metadata.DstIP.Unmap().Is4() || resolver.IsFakeIP(metadata.DstIP) {
+		return fmt.Errorf("%w: EasyTier requires a real IPv4 target", C.ErrTargetIPFamily)
+	}
+	return metadata.TargetIPFamily.Check(metadata.DstIP.Unmap())
 }
 
 func (e *EasyTier) ProxyInfo() C.ProxyInfo {
@@ -532,6 +562,7 @@ func (e *EasyTier) IsL3Protocol(*C.Metadata) bool {
 }
 
 func (e *EasyTier) Close() error {
+	lanpreconnect.Default.Forget(e)
 	e.cancel()
 	if e.unregister != nil {
 		e.unregister()

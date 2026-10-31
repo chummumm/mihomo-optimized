@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
+	"github.com/metacubex/mihomo/common/contextutils"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/lanpreconnect"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/slowdown"
@@ -34,6 +36,7 @@ import (
 	"github.com/metacubex/sing/common/debug"
 	E "github.com/metacubex/sing/common/exceptions"
 	M "github.com/metacubex/sing/common/metadata"
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -49,7 +52,7 @@ type wireguardGoDevice interface {
 
 type WireGuard struct {
 	*Base
-	bind      *wireguard.ClientBind
+	bind      *wireGuardClientBind
 	device    wireguardGoDevice
 	tunDevice wireguardDevice
 	resolver  resolver.Resolver
@@ -57,8 +60,10 @@ type WireGuard struct {
 	runCtx        context.Context
 	runCancel     context.CancelFunc
 	deviceMutex   sync.Mutex
+	lanControlMu  sync.Mutex
+	lanControl    *wireGuardLANControlTask
 	initOk        atomic.Bool
-	initMutex     sync.Mutex
+	initMutex     *semaphore.Weighted
 	initErr       error
 	option        WireGuardOption
 	connectAddr   M.Socksaddr
@@ -230,6 +235,7 @@ var _ ipStack = (wireguard.Device)(nil)
 
 type ipStackNetDialer struct {
 	stack ipStack
+	lan   lanpreconnect.Preparer
 }
 
 var _ dialer.NetDialer = (*ipStackNetDialer)(nil)
@@ -238,6 +244,9 @@ func (d ipStackNetDialer) DialContext(ctx context.Context, network, address stri
 	dst, err := netip.ParseAddrPort(address)
 	if err != nil {
 		return nil, fmt.Errorf("invalid address %q: %w", address, err)
+	}
+	if d.lan != nil {
+		observeLANDial(ctx, d.lan, dst.Addr())
 	}
 	switch {
 	case strings.HasPrefix(network, "tcp"):
@@ -353,6 +362,7 @@ func (option WireGuardOption) Prefixes() ([]netip.Prefix, error) {
 
 func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 	outbound := &WireGuard{
+		initMutex: semaphore.NewWeighted(1),
 		Base: NewBase(BaseOption{
 			Name:         option.Name,
 			Addr:         net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
@@ -365,7 +375,7 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		}),
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
-	singDialer := proxydialer.NewSingDialer(proxydialer.NewSlowDownDialer(outbound.dialer, slowdown.New()))
+	singDialer := proxydialer.NewSingDialer(wireGuardUnderlayDialer{proxydialer.NewSlowDownDialer(outbound.dialer, slowdown.New())})
 
 	var reserved [3]uint8
 	if len(option.Reserved) > 0 {
@@ -384,11 +394,11 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		}
 	}
 	outbound.runCtx, outbound.runCancel = context.WithCancel(context.Background())
-	outbound.bind = wireguard.NewClientBind(outbound.runCtx, wgSingErrorHandler{outbound.Name()}, singDialer, isConnect, outbound.connectAddr.AddrPort(), reserved)
-
-	if outbound.bind == nil {
+	clientBind := wireguard.NewClientBind(outbound.runCtx, wgSingErrorHandler{outbound.Name()}, singDialer, isConnect, outbound.connectAddr.AddrPort(), reserved)
+	if clientBind == nil {
 		return nil, E.New("failed to create wireguard client bind")
 	}
+	outbound.bind = &wireGuardClientBind{ClientBind: clientBind, ctx: outbound.runCtx}
 
 	var err error
 	outbound.localPrefixes, err = option.Prefixes()
@@ -509,6 +519,12 @@ func (w *WireGuard) resolve(ctx context.Context, address M.Socksaddr) (netip.Add
 }
 
 func (w *WireGuard) init(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := contextutils.AfterFunc(w.runCtx, cancel)
+	defer func() { stop(); cancel() }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	err := w.init0(ctx)
 	if err != nil {
 		return err
@@ -521,8 +537,10 @@ func (w *WireGuard) init0(ctx context.Context) (err error) {
 	if w.initOk.Load() {
 		return nil
 	}
-	w.initMutex.Lock()
-	defer w.initMutex.Unlock()
+	if err := w.initMutex.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer w.initMutex.Release(1)
 	// double check like sync.Once
 	if w.initOk.Load() {
 		return nil
@@ -804,7 +822,14 @@ func (w *WireGuard) genIpcConf(ctx context.Context, updateOnly bool) (string, er
 
 // Close implements C.ProxyAdapter
 func (w *WireGuard) Close() error {
+	lanpreconnect.Default.Forget(w)
 	w.runCancel()
+	// Native SendBuffers holds the device's network read lock during a write.
+	// Close the physical carrier first so a blocked UDP-over-TCP write cannot
+	// keep native Close waiting forever for the corresponding write lock.
+	if w.bind != nil {
+		_ = w.bind.Close()
+	}
 	w.deviceMutex.Lock()
 	wgDevice := w.device
 	w.deviceMutex.Unlock()
@@ -816,6 +841,9 @@ func (w *WireGuard) Close() error {
 
 func (w *WireGuard) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
 	var conn net.Conn
+	if metadata.Host == "" {
+		observeLANDial(ctx, w, metadata.DstIP)
+	}
 	if err = w.init(ctx); err != nil {
 		return nil, err
 	}
@@ -826,7 +854,7 @@ func (w *WireGuard) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 		}
 		options := w.DialOptions()
 		options = append(options, dialer.WithResolver(r))
-		options = append(options, dialer.WithNetDialer(ipStackNetDialer{stack: w.tunDevice}))
+		options = append(options, dialer.WithNetDialer(ipStackNetDialer{stack: w.tunDevice, lan: w}))
 		conn, err = dialer.NewDialer(options...).DialContext(ctx, "tcp", metadata.RemoteAddress())
 	} else {
 		conn, err = w.tunDevice.DialTCP(ctx, "tcp", netip.AddrPort{}, metadata.AddrPort())
@@ -856,7 +884,7 @@ func (w *WireGuard) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	if pc == nil {
 		return nil, E.New("packetConn is nil")
 	}
-	return NewPacketConn(pc, w), nil
+	return newLANPacketConn(ctx, pc, w, w), nil
 }
 
 func (w *WireGuard) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
@@ -871,7 +899,18 @@ func (w *WireGuard) ResolveUDP(ctx context.Context, metadata *C.Metadata) error 
 		}
 		metadata.DstIP = ip
 	}
-	return nil
+	return metadata.TargetIPFamily.Check(metadata.DstIP.Unmap())
+}
+
+func (w *WireGuard) ResolveProxyTarget(ctx context.Context, metadata *C.Metadata) error {
+	if err := w.init(ctx); err != nil {
+		return err
+	}
+	r := w.resolver
+	if r == nil {
+		r = resolver.DefaultResolver
+	}
+	return ResolveProxyTarget(ctx, metadata, r, w.prefer)
 }
 
 // ProxyInfo implements C.ProxyAdapter

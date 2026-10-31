@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/component/easytier"
-	icontext "github.com/metacubex/mihomo/context"
 
 	corehost "github.com/easytier/easytier/easytier-go"
 )
@@ -66,7 +65,7 @@ func (e *EasyTier) routeSnapshot(ctx context.Context, instance easyTierInstance)
 		e.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return nil, icontext.TCPDialError(ctx, ctx.Err())
+			return nil, ctx.Err()
 		case <-e.ctx.Done():
 			return nil, errEasyTierClosed
 		case <-done:
@@ -113,7 +112,7 @@ func (e *EasyTier) prepareTarget(ctx context.Context, host string) (easyTierInst
 	defer ticker.Stop()
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, netip.Addr{}, fmt.Errorf("easytier: wait for route to %s: %w", host, icontext.TCPDialError(ctx, err))
+			return nil, netip.Addr{}, fmt.Errorf("easytier: wait for route to %s: %w", host, err)
 		}
 		e.mu.Lock()
 		instance, changed, closed := e.instance, e.readyCh, e.closed
@@ -141,6 +140,9 @@ func (e *EasyTier) prepareTarget(ctx context.Context, host string) (easyTierInst
 						}
 						resolveOverlay = false
 					}
+				}
+				if ip.IsValid() {
+					observeLANDial(ctx, e, ip)
 				}
 				if ip.IsValid() && snapshot.readyFor(ip, e.option) {
 					e.mu.Lock()

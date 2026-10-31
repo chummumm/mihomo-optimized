@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/metacubex/mihomo/component/iface"
+	"github.com/metacubex/mihomo/component/lanpreconnect"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/log"
 
@@ -36,8 +37,11 @@ type defaultInterfaceChangeHandler struct {
 
 func newDefaultInterfaceChangeHandler() *defaultInterfaceChangeHandler {
 	return &defaultInterfaceChangeHandler{
-		flushCache:       iface.FlushCache,
-		resetConnections: resolver.ResetConnection,
+		flushCache: iface.FlushCache,
+		resetConnections: func() {
+			resolver.ResetConnection()
+			lanpreconnect.NetworkChanged()
+		},
 	}
 }
 

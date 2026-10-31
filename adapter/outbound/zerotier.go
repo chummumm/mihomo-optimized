@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/iface"
+	"github.com/metacubex/mihomo/component/lanpreconnect"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
@@ -1258,6 +1259,7 @@ func (d zeroTierNetDialer) DialContext(ctx context.Context, network, address str
 	if err != nil {
 		return nil, err
 	}
+	observeLANDial(ctx, d.zeroTier, destination.Addr())
 	_, device, err := d.zeroTier.networkStackFor(destination.Addr())
 	if err != nil {
 		return nil, err
@@ -1266,6 +1268,9 @@ func (d zeroTierNetDialer) DialContext(ctx context.Context, network, address str
 }
 
 func (z *ZeroTier) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	if metadata.Host == "" {
+		observeLANDial(ctx, z, metadata.DstIP)
+	}
 	if err = z.ensureStarted(ctx); err != nil {
 		return nil, err
 	}
@@ -1313,7 +1318,7 @@ func (z *ZeroTier) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 	if packetConn == nil {
 		return nil, errors.New("packetConn is nil")
 	}
-	return NewPacketConn(&zeroTierPacketConn{PacketConn: packetConn, validateDestination: func(destination netip.Addr) error {
+	return newLANPacketConn(ctx, &zeroTierPacketConn{PacketConn: packetConn, validateDestination: func(destination netip.Addr) error {
 		currentLink, currentDevice, validateErr := z.networkStackFor(destination)
 		if validateErr != nil {
 			return validateErr
@@ -1322,7 +1327,7 @@ func (z *ZeroTier) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 			return errors.New("ZeroTier stack changed while packet connection was active")
 		}
 		return nil
-	}}, z), nil
+	}}, z, z), nil
 }
 
 func (z *ZeroTier) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
@@ -1340,7 +1345,36 @@ func (z *ZeroTier) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
 		}
 		metadata.DstIP = ip
 	}
+	return metadata.TargetIPFamily.Check(metadata.DstIP.Unmap())
+}
+
+func (z *ZeroTier) PrepareLAN(ctx context.Context, target netip.Addr) error {
+	if target.IsValid() && !lanpreconnect.IsLAN(target) {
+		return errors.New("zerotier: LAN preparation requires a private target")
+	}
+	if err := z.ensureStarted(ctx); err != nil {
+		return err
+	}
+	if target.IsValid() {
+		_, _, err := z.networkStackFor(target.Unmap())
+		return err
+	}
+	// The current iplink API has no standalone neighbor preparation method.
+	// Joining/configuring is proactive; native ARP/NDP remains owned by iplink.
 	return nil
+}
+
+func (z *ZeroTier) ResolveProxyTarget(ctx context.Context, metadata *C.Metadata) error {
+	if err := z.ensureStarted(ctx); err != nil {
+		return err
+	}
+	z.stateMu.RLock()
+	r := z.resolver
+	z.stateMu.RUnlock()
+	if r == nil {
+		r = resolver.DefaultResolver
+	}
+	return ResolveProxyTarget(ctx, metadata, r, z.prefer)
 }
 
 func (z *ZeroTier) ProxyInfo() C.ProxyInfo {
@@ -1354,6 +1388,7 @@ func (z *ZeroTier) IsL3Protocol(*C.Metadata) bool {
 }
 
 func (z *ZeroTier) Close() error {
+	lanpreconnect.Default.Forget(z)
 	// Cancel and close the physical transport before waiting for operationMu so
 	// an in-flight startup dial or wire write cannot prevent its own shutdown.
 	z.cancel()

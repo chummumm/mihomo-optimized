@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"runtime"
 	"sync"
 	"syscall"
@@ -12,6 +13,7 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/lanpreconnect"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
@@ -311,6 +313,16 @@ type packetConn struct {
 	connID      string
 	adapterAddr string
 	resolveUDP  func(ctx context.Context, metadata *C.Metadata) error
+	observeLAN  lanpreconnect.Preparer
+}
+
+func (c *packetConn) WriteTo(payload []byte, destination net.Addr) (int, error) {
+	if c.observeLAN != nil {
+		if address, ok := destination.(*net.UDPAddr); ok {
+			lanpreconnect.Default.Observe(c.observeLAN, address.AddrPort().Addr())
+		}
+	}
+	return c.EnhancePacketConn.WriteTo(payload, destination)
 }
 
 func (c *packetConn) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
@@ -348,7 +360,7 @@ func (c *packetConn) Upstream() any {
 }
 
 func (c *packetConn) WriterReplaceable() bool {
-	return true
+	return c.observeLAN == nil
 }
 
 func (c *packetConn) ReaderReplaceable() bool {
@@ -369,9 +381,23 @@ func NewPacketConn(pc net.PacketConn, a ProxyAdapter) C.PacketConn {
 	default:
 		epc = N.NewDeadlineEnhancePacketConn(epc) // most conn from outbound can't handle readDeadline correctly
 	}
-	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), a.ResolveUDP}
+	cpc := &packetConn{EnhancePacketConn: epc, adapterName: a.Name(), connID: utils.NewUUIDV4().String(), adapterAddr: a.Addr(), resolveUDP: a.ResolveUDP}
 	cpc.AppendToChains(a)
 	return cpc
+}
+
+func newLANPacketConn(ctx context.Context, pc net.PacketConn, a ProxyAdapter, preparer lanpreconnect.Preparer) C.PacketConn {
+	cpc := NewPacketConn(pc, a).(*packetConn)
+	if lanpreconnect.Selected(ctx, preparer) {
+		cpc.observeLAN = preparer
+	}
+	return cpc
+}
+
+// Observe only concrete destination addresses at the L3 dial boundary. A
+// hostname resolved only for rule matching is not a preconnection hint.
+func observeLANDial(ctx context.Context, preparer lanpreconnect.Preparer, address netip.Addr) {
+	lanpreconnect.Observe(ctx, preparer, address)
 }
 
 type AddRef interface {
@@ -384,6 +410,8 @@ type autoCloseProxyAdapter struct {
 	closeErr         error
 	dnsStatsIdentity string
 }
+
+func (p *autoCloseProxyAdapter) UnderlyingProxyAdapter() C.ProxyAdapter { return p.ProxyAdapter }
 
 func (p *autoCloseProxyAdapter) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
 	c, err := p.ProxyAdapter.DialContext(ctx, metadata)
