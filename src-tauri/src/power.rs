@@ -7,7 +7,7 @@ use std::{ffi::c_void, sync::Arc};
 use windows_sys::Win32::{
     System::Power::{
         PowerRegisterSuspendResumeNotification, PowerUnregisterSuspendResumeNotification,
-        DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS,
+        DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS, HPOWERNOTIFY,
     },
     UI::WindowsAndMessaging::{
         DEVICE_NOTIFY_CALLBACK, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
@@ -15,7 +15,7 @@ use windows_sys::Win32::{
 };
 
 pub struct Registration {
-    handle: *mut c_void,
+    handle: HPOWERNOTIFY,
     context: *const PowerSignal,
 }
 
@@ -44,7 +44,12 @@ impl Registration {
                 format!("无法注册系统恢复通知（系统错误：{status}）"),
             ));
         }
-        Ok(Self { handle, context })
+        // windows-sys exposes the register output as void**, but the unregister
+        // input as pointer-sized HPOWERNOTIFY. Preserve the opaque bits once.
+        Ok(Self {
+            handle: handle as HPOWERNOTIFY,
+            context,
+        })
     }
 }
 

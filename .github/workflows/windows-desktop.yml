@@ -131,7 +131,7 @@ jobs:
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./listener ./listener/sing_tun ./hub/executor ./hub/route ./component/lanpreconnect -run 'Desktop|LAN'
       - name: Verify proxy IP destinations and DNS address-family output
         working-directory: core-src
-        run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./adapter ./adapter/provider ./dns ./config -run 'ProxyTarget|ProxyForceIP|TargetIPFamily|AnswerIPFamily'
+        run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./adapter ./adapter/provider ./dns ./config ./tunnel -run 'ProxyTarget|ProxyForceIP|TargetIPFamily|AnswerIPFamily|ProviderTargetFamily'
       - name: Verify EasyTier background preparation before delayed LAN traffic
         working-directory: core-src
         env:
