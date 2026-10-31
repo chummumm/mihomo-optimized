@@ -1071,10 +1071,10 @@ impl CoreSupervisor {
                 ))
             }
             "unavailable" => {
-                return Err(fatal(
+                return Err(ReadinessFailure::Temporary(AppError::new(
                     "tun_health_unavailable",
-                    "无法核验 TUN 实际状态，未盲目重启",
-                ))
+                    "暂时无法核验 TUN 实际状态，保留内核并继续检查",
+                )))
             }
             "disabled" if self.tun => {
                 return Err(fatal("tun_not_enabled", "托管 TUN 未启用，请检查运行配置"))
@@ -1143,10 +1143,13 @@ impl CoreSupervisor {
                 "tun_ownership_conflict",
                 "TUN 恢复遇到资源所有权冲突，未接管外部资源",
             )),
-            Some("unavailable") => Err(fatal(
-                "tun_recovery_unavailable",
-                "无法安全恢复 TUN，请检查恢复日志",
-            )),
+            Some("unavailable") => {
+                self.tun_health = Some("unavailable".into());
+                Err(ReadinessFailure::Temporary(AppError::new(
+                    "tun_recovery_unavailable",
+                    "暂时无法安全恢复 TUN，保留内核并继续检查",
+                )))
+            }
             _ => Err(fatal(
                 "core_controller_incompatible",
                 "本地内核返回无效恢复结果",
@@ -1178,10 +1181,17 @@ impl CoreSupervisor {
                 ))?;
             }
             Err(ReadinessFailure::Temporary(error)) => {
-                let busy = matches!(error.code.as_str(), "core_executor_busy" | "core_not_ready");
-                if self.health_deferred && busy {
+                let observe_only = matches!(
+                    error.code.as_str(),
+                    "core_executor_busy"
+                        | "core_not_ready"
+                        | "tun_health_unavailable"
+                        | "tun_recovery_unavailable"
+                );
+                if self.health_deferred && observe_only {
                     // This window has ended. Keep only the ordinary low-rate
                     // monitor, without a new window, restart or resource work.
+                    self.recovery = None;
                     self.error_code = Some(error.code);
                     self.error = Some(error.message);
                     return Ok(());
@@ -1197,9 +1207,10 @@ impl CoreSupervisor {
                     serde_json::json!({"generation":self.recovery_generation,"code":error.code,"exhausted":exhausted}),
                 );
                 if exhausted {
-                    if busy {
+                    if observe_only {
                         // A responding executor may still own a legitimate
-                        // configuration operation. Never kill it as a network failure.
+                        // operation, or Windows may temporarily fail to enumerate
+                        // its devices/routes. Neither proves this process is broken.
                         self.recovery = None;
                         self.health_deferred = true;
                         self.error_code = Some(error.code);
@@ -1443,6 +1454,7 @@ mod tests {
         HealthDegraded,
         HealthConflict,
         HealthUnavailable,
+        HealthRecoveryUnavailableOnce,
         HealthBusyOnce,
         HealthBusyUntilReleased,
         HealthNeedsRestart,
@@ -1457,6 +1469,7 @@ mod tests {
         config_reads: Arc<AtomicUsize>,
         recovery_reads: Arc<AtomicUsize>,
         health_busy: Arc<AtomicBool>,
+        health_unavailable: Arc<AtomicBool>,
         finished: Arc<AtomicBool>,
         server: Option<thread::JoinHandle<()>>,
         _occupied_port: Option<TcpListener>,
@@ -1493,6 +1506,7 @@ mod tests {
                     | ReadinessScenario::HealthDegraded
                     | ReadinessScenario::HealthConflict
                     | ReadinessScenario::HealthUnavailable
+                    | ReadinessScenario::HealthRecoveryUnavailableOnce
                     | ReadinessScenario::HealthBusyOnce
                     | ReadinessScenario::HealthBusyUntilReleased
                     | ReadinessScenario::HealthNeedsRestart
@@ -1522,10 +1536,15 @@ mod tests {
                 scenario,
                 ReadinessScenario::HealthBusyUntilReleased
             )));
+            let health_unavailable = Arc::new(AtomicBool::new(matches!(
+                scenario,
+                ReadinessScenario::HealthUnavailable
+            )));
             let stop = finished.clone();
             let reads = config_reads.clone();
             let recoveries = recovery_reads.clone();
             let busy = health_busy.clone();
+            let unavailable = health_unavailable.clone();
             let server = thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     let (mut stream, _) = match listener.accept() {
@@ -1575,13 +1594,16 @@ mod tests {
                             health_enabled,
                             "legacy core must not receive a health request"
                         );
-                        let state = match scenario {
-                            ReadinessScenario::HealthConflict => "conflict",
-                            ReadinessScenario::HealthUnavailable => "unavailable",
-                            ReadinessScenario::HealthDegraded
-                            | ReadinessScenario::HealthNeedsRestart
-                            | ReadinessScenario::HealthDisabledAfterRepair => "degraded",
-                            _ => "healthy",
+                        let state = if unavailable.load(Ordering::SeqCst) {
+                            "unavailable"
+                        } else {
+                            match scenario {
+                                ReadinessScenario::HealthConflict => "conflict",
+                                ReadinessScenario::HealthDegraded
+                                | ReadinessScenario::HealthNeedsRestart
+                                | ReadinessScenario::HealthDisabledAfterRepair => "degraded",
+                                _ => "healthy",
+                            }
                         };
                         if busy.load(Ordering::SeqCst) {
                             (503, "{}".into())
@@ -1596,6 +1618,12 @@ mod tests {
                         let attempt = recoveries.fetch_add(1, Ordering::SeqCst);
                         if matches!(scenario, ReadinessScenario::HealthBusyOnce) && attempt == 0 {
                             (503, "{}".into())
+                        } else if matches!(
+                            scenario,
+                            ReadinessScenario::HealthRecoveryUnavailableOnce
+                        ) && attempt == 0
+                        {
+                            (200, serde_json::json!({"pid":pid,"status":"unavailable","tun":{"enabled":true,"state":"unavailable","repairable":false}}).to_string())
                         } else {
                             let status =
                                 if matches!(scenario, ReadinessScenario::HealthNeedsRestart) {
@@ -1651,6 +1679,7 @@ mod tests {
                 config_reads,
                 recovery_reads,
                 health_busy,
+                health_unavailable,
                 finished,
                 server: Some(server),
                 _occupied_port: occupied_port,
@@ -1721,21 +1750,82 @@ mod tests {
     }
 
     #[test]
-    fn foreign_or_unknown_tun_stops_automatic_repair_without_killing_core() {
-        for scenario in [
-            ReadinessScenario::HealthConflict,
-            ReadinessScenario::HealthUnavailable,
-        ] {
-            let mut fixture = ReadinessFixture::new(scenario);
-            let pid = fixture.core.child.as_ref().unwrap().id();
-            fixture.core.request_reconcile(1).unwrap();
+    fn foreign_tun_stops_automatic_repair_without_killing_core() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthConflict);
+        let pid = fixture.core.child.as_ref().unwrap().id();
+        fixture.core.request_reconcile(1).unwrap();
+        let status = fixture.core.poll().unwrap();
+        assert!(!status.running && !status.recovering);
+        assert!(fixture.core.health_blocked);
+        assert_eq!(status.pid, Some(pid));
+        assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 0);
+        assert!(fixture.core.restarts.is_empty());
+        assert!(fixture.core.restart_at.is_none());
+    }
+
+    #[test]
+    fn unavailable_tun_is_only_observed_until_healthy_without_restarting() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthUnavailable);
+        let pid = fixture.core.child.as_ref().unwrap().id();
+        fixture.core.request_reconcile(1).unwrap();
+        for attempt in 0..3 {
             let status = fixture.core.poll().unwrap();
-            assert!(!status.running && !status.recovering);
+            assert!(!status.running);
+            assert_eq!(status.recovering, attempt < 2);
             assert_eq!(status.pid, Some(pid));
+            assert_eq!(status.tun_health.as_deref(), Some("unavailable"));
             assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 0);
-            assert!(fixture.core.restarts.is_empty());
-            assert!(fixture.core.restart_at.is_none());
         }
+        assert!(fixture.core.health_deferred && !fixture.core.health_blocked);
+        let reads = fixture.config_reads.load(Ordering::SeqCst);
+        for _ in 0..5 {
+            fixture.core.poll().unwrap();
+        }
+        assert_eq!(fixture.config_reads.load(Ordering::SeqCst), reads);
+        // Another resume must not turn a finished window into unlimited fast
+        // polling. It still cannot repair while native ownership is unknown.
+        fixture.core.request_reconcile(2).unwrap();
+        fixture.core.poll().unwrap();
+        assert!(fixture.core.health_deferred && fixture.core.recovery.is_none());
+        assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 0);
+        fixture
+            .core
+            .observe_health(lifecycle::awake_now().unwrap())
+            .unwrap();
+        assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 0);
+        fixture.health_unavailable.store(false, Ordering::SeqCst);
+        fixture
+            .core
+            .observe_health(lifecycle::awake_now().unwrap())
+            .unwrap();
+        let status = fixture.core.status();
+        assert!(status.running && !status.recovering);
+        assert_eq!(status.pid, Some(pid));
+        assert_eq!(status.tun_health.as_deref(), Some("healthy"));
+        assert!(status.error.is_none() && status.error_code.is_none());
+        assert!(fixture.core.restarts.is_empty() && fixture.core.restart_at.is_none());
+        // Only after GET confirms health may resume notify the paired core to
+        // requeue LAN work; a healthy TUN is kept by that endpoint's contract.
+        assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unavailable_during_recovery_is_observed_again_without_restarting() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthRecoveryUnavailableOnce);
+        let pid = fixture.core.child.as_ref().unwrap().id();
+        fixture.core.request_reconcile(1).unwrap();
+        let status = fixture.core.poll().unwrap();
+        assert!(status.recovering && !status.running);
+        assert!(!fixture.core.health_blocked);
+        assert_eq!(status.tun_health.as_deref(), Some("unavailable"));
+        assert_eq!(
+            status.error_code.as_deref(),
+            Some("tun_recovery_unavailable")
+        );
+        let status = fixture.core.poll().unwrap();
+        assert!(status.running && !status.recovering);
+        assert_eq!(status.pid, Some(pid));
+        assert!(fixture.core.restarts.is_empty() && fixture.core.restart_at.is_none());
     }
 
     #[test]
