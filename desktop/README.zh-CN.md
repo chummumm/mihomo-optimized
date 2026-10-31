@@ -2,6 +2,16 @@
 
 Windows 客户端使用 C# WPF 原生控件和 Fluent 主题，包含主页、代理、连接、DNS、规则、日志、配置编辑与设置。Rust 后台管理本项目的 Mihomo 二开内核、系统代理、TUN 服务和更新。Windows 界面与网页面板分别构建，网页面板继续使用原有 React 实现。
 
+## 0.2.5 睡眠恢复、LAN 预连接与代理目标 IP
+
+配套内核更新为 **1.0.23**。服务心跳期限改用不计睡眠 / 休眠时间的活动时钟，并绑定经过认证的宿主进程身份；恢复后重新核对实际内核 PID、认证接口、监听端口及本程序拥有的 TUN 设备、地址和路由。健康内核保留，确认局部 TUN 资源失效时才修复，网络暂未恢复或状态未知不直接触发重启。用户手动停止优先于后台恢复，旧宿主退出确认后才替换断开的本地通道。
+
+撤回上一版 EasyTier 请求内的 15 秒准备加 5 秒连接预算，业务拨号恢复原有 5 秒期限，保留路由及并发正确性修复。改为只对 RFC1918 IPv4 / ULA IPv6 业务目标启动后台准备，覆盖 EasyTier、WireGuard / AmneziaWG、Tailscale、ZeroTier、OpenVPN；不增加节点配置，不扫描网段或重放 UDP。未知冷目标第一次连接仍可能超时，后续请求可复用原生已建立路径。
+
+同时加入 issue #61 的可选 `proxy-force-ip`、节点 `target-ip-family` 与按域名限定的 `dns.answer-ip-family-policy`。TCP / UDP 代理目标可使用本地取得的真实 IP，规则和日志域名保留，`normal` 模式继续可用。地址族限制显式配置，不把一次失败推断为远端缺少 IPv4 / IPv6。详见[代理目标 IP](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.23/docs/proxy-force-ip.md)和 [LAN 预连接](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.23/docs/lan-preconnect.md)。
+
+自动验收包括活动时钟、恢复与停止竞态、真实 Windows TUN 路由移除后修复、健康实例 PID 保留，以及宿主通道替换。CI 不等于实际设备的 S3 / S4 / Modern Standby 验收；现场睡眠恢复结果仍需以设备实测为准。
+
 ## 0.2.4 首次连接与窗口状态修复
 
 配套内核更新为 **1.0.22**。EasyTier 保留按需启动与实例复用，将首次组网准备和 TCP 建连分开计时：组网准备最多 15 秒，目标路由就绪后 TCP 建连最多 5 秒，整次请求不超过 20 秒；调用方更短的期限继续生效，普通连接仍使用原来的 5 秒。就绪检查覆盖实际目标和可用下一跳，支持经中继转发，并修复并发启动时可能错过状态通知的问题。
@@ -30,7 +40,7 @@ Windows 验收增加同一 runner、同尺寸、同 DPI 和同测试数据下的
 
 ## 原生 Fluent 功能
 
-本版本将最终 Fluent 设计中的布局、操作和状态处理迁移到 C# WPF。`mihomo-optimized.exe` 是原生 Windows 界面，`mihomo-desktop-host.exe` 保留配置、内核生命周期、系统代理和可信更新逻辑；受限 TUN 服务由 `mihomo-desktop-service.exe` 承担，实际代理转发由 Go 编写的 `mihomo-core.exe` 完成。配套内核为固定来源的 1.0.22，网页面板继续独立使用 React。
+本版本将最终 Fluent 设计中的布局、操作和状态处理迁移到 C# WPF。`mihomo-optimized.exe` 是原生 Windows 界面，`mihomo-desktop-host.exe` 保留配置、内核生命周期、系统代理和可信更新逻辑；受限 TUN 服务由 `mihomo-desktop-service.exe` 承担，实际代理转发由 Go 编写的 `mihomo-core.exe` 完成。配套内核为固定来源的 1.0.23，网页面板继续独立使用 React。
 
 - **窗口与导航**：48 像素自定义标题栏、返回、窗口最小化/最大化/关闭，展开、紧凑和窄窗覆盖式导航。Windows 11 支持时使用系统 Mica 背景与 Acrylic 浮层，Windows 10 或关闭透明效果时使用同色实底。窗口仍支持原生拖动、调整大小与贴靠；高对比度和关闭动画设置由系统控制。
 - **主页与托盘**：主页显示 4 个当前出口摘要，托盘显示 3 个，包含实际叶节点和延迟，点击进入对应策略组。主页提供启动/停止/重启、运行模式、系统代理、TUN、局域网和开机启动；托盘提供快速开关、流量和内核电源操作。

@@ -1,6 +1,7 @@
 use crate::{
     config,
     error::{AppError, Result},
+    lifecycle::{self, RecoveryWindow, StopReason, HEALTH_INTERVAL},
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -225,13 +226,22 @@ pub struct Controller {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct CoreStatus {
     pub running: bool,
     pub controller: Option<Controller>,
     pub version: Option<String>,
     pub error: Option<String>,
     pub restart_count: usize,
+    pub lifecycle_api: u32,
+    pub desired_running: bool,
+    pub recovering: bool,
+    pub recovery_generation: u64,
+    pub stop_reason: Option<StopReason>,
+    pub error_code: Option<String>,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub tun_health: Option<String>,
 }
 
 pub struct CoreSupervisor {
@@ -252,6 +262,15 @@ pub struct CoreSupervisor {
     failed_recoveries: usize,
     termination_unconfirmed: bool,
     restart_at: Option<Instant>,
+    recovery: Option<RecoveryWindow>,
+    recovery_generation: u64,
+    last_health_check: Duration,
+    health_blocked: bool,
+    health_deferred: bool,
+    stop_reason: Option<StopReason>,
+    error_code: Option<String>,
+    exit_code: Option<i32>,
+    tun_health: Option<String>,
 }
 
 pub fn http_client() -> Result<Client> {
@@ -267,6 +286,40 @@ enum ReadinessFailure {
     Fatal(AppError),
 }
 
+enum HealthCheck {
+    Ready,
+    NeedsRestart,
+}
+
+fn verify_managed_identity(
+    info: &serde_json::Value,
+    expected_pid: Option<u32>,
+) -> std::result::Result<(), ReadinessFailure> {
+    let fatal = |code, message| ReadinessFailure::Fatal(AppError::new(code, message));
+    if info.get("managed").and_then(serde_json::Value::as_bool) != Some(true)
+        || info.get("api_version").and_then(serde_json::Value::as_u64) != Some(1)
+    {
+        return Err(fatal("core_controller_incompatible", "本地控制协议不兼容"));
+    }
+    if info.get("pid").and_then(serde_json::Value::as_u64) != expected_pid.map(u64::from) {
+        return Err(fatal(
+            "core_controller_identity",
+            "本地控制接口进程与自有内核不一致",
+        ));
+    }
+    match info.get("state").and_then(serde_json::Value::as_str) {
+        Some("running") => Ok(()),
+        Some("loading" | "stopping") => Err(ReadinessFailure::Temporary(AppError::new(
+            "core_not_ready",
+            "本地内核正在应用配置或停止",
+        ))),
+        _ => Err(fatal(
+            "core_controller_incompatible",
+            "本地内核返回未知运行状态",
+        )),
+    }
+}
+
 /// Only transport failures and temporary HTTP failures can be retried. Responses
 /// that disprove the controller's identity/protocol must never become readiness.
 fn read_readiness_json(
@@ -274,6 +327,16 @@ fn read_readiness_json(
     controller: &Controller,
     endpoint: &str,
     deadline: Instant,
+) -> std::result::Result<serde_json::Value, ReadinessFailure> {
+    read_managed_json(client, controller, endpoint, deadline, reqwest::Method::GET)
+}
+
+fn read_managed_json(
+    client: &Client,
+    controller: &Controller,
+    endpoint: &str,
+    deadline: Instant,
+    method: reqwest::Method,
 ) -> std::result::Result<serde_json::Value, ReadinessFailure> {
     let temporary = |reason: String| {
         ReadinessFailure::Temporary(AppError::new(
@@ -285,7 +348,7 @@ fn read_readiness_json(
         .map_err(|_| temporary("已到本次操作截止时间".into()))?
         .min(CONTROL_TIMEOUT);
     let response = client
-        .get(format!("{}{endpoint}", controller.url))
+        .request(method, format!("{}{endpoint}", controller.url))
         .timeout(timeout)
         .bearer_auth(&controller.secret)
         .send()
@@ -310,7 +373,17 @@ fn read_readiness_json(
             format!("就绪检查 {endpoint}：本地控制接口鉴权失败（HTTP {status}）"),
         )));
     }
-    if matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
+    if matches!(endpoint, "/desktop/health" | "/desktop/recover")
+        && matches!(status.as_u16(), 409 | 503)
+    {
+        return Err(ReadinessFailure::Temporary(AppError::new(
+            "core_executor_busy",
+            "内核配置执行器暂忙，正在等待本地状态稳定",
+        )));
+    }
+    if matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+        || endpoint == "/desktop/recover" && status.as_u16() == 409
+    {
         return Err(temporary(format!("本地控制接口暂不可用（HTTP {status}）")));
     }
     if !status.is_success() {
@@ -402,16 +475,39 @@ impl CoreSupervisor {
             failed_recoveries: 0,
             termination_unconfirmed: false,
             restart_at: None,
+            recovery: None,
+            recovery_generation: 0,
+            last_health_check: Duration::ZERO,
+            health_blocked: false,
+            health_deferred: false,
+            stop_reason: None,
+            error_code: None,
+            exit_code: None,
+            tun_health: None,
         }
     }
 
     pub fn status(&self) -> CoreStatus {
         CoreStatus {
-            running: self.child.is_some() && !self.termination_unconfirmed,
+            running: self.child.is_some()
+                && !self.termination_unconfirmed
+                && !self.health_blocked
+                && !self.health_deferred
+                && self.recovery.is_none(),
             controller: self.controller.clone(),
             version: self.version.clone(),
             error: self.error.clone(),
             restart_count: self.restarts.len(),
+            lifecycle_api: 1,
+            desired_running: self.desired_running,
+            recovering: self.recovery.is_some()
+                || self.desired_running && self.restart_at.is_some(),
+            recovery_generation: self.recovery_generation,
+            stop_reason: self.stop_reason,
+            error_code: self.error_code.clone(),
+            pid: self.child.as_ref().map(Child::id),
+            exit_code: self.exit_code,
+            tun_health: self.tun_health.clone(),
         }
     }
 
@@ -425,6 +521,11 @@ impl CoreSupervisor {
         self.restart_at = None;
         self.desired_running = true;
         self.error = None;
+        self.error_code = None;
+        self.stop_reason = None;
+        self.health_blocked = false;
+        self.health_deferred = false;
+        self.recovery = None;
         if let Err(error) = self.spawn_with_budget(&budget) {
             self.controller = None;
             #[cfg(windows)]
@@ -433,6 +534,7 @@ impl CoreSupervisor {
             }
             self.desired_running = false;
             self.error = Some(error.message.clone());
+            self.error_code = Some(error.code.clone());
             return Err(error);
         }
         Ok(self.status())
@@ -522,6 +624,17 @@ impl CoreSupervisor {
                 });
         }
         self.error = None;
+        self.error_code = None;
+        self.stop_reason = None;
+        self.health_blocked = false;
+        self.health_deferred = false;
+        self.recovery = None;
+        self.last_health_check = lifecycle::awake_now()?;
+        crate::diagnostics::record(
+            &self.logs,
+            "core_ready",
+            serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"tun":self.tun}),
+        );
         Ok(())
     }
 
@@ -895,13 +1008,249 @@ impl CoreSupervisor {
         Ok(self.status())
     }
 
+    pub fn request_reconcile(&mut self, generation: u64) -> Result<()> {
+        if !self.desired_running || self.child.is_none() || self.health_blocked {
+            return Ok(());
+        }
+        self.recovery_generation = self.recovery_generation.max(generation);
+        if let Some(recovery) = &mut self.recovery {
+            recovery.coalesce(self.recovery_generation);
+        } else {
+            self.recovery = Some(RecoveryWindow::new(
+                self.recovery_generation,
+                lifecycle::awake_now()?,
+            ));
+        }
+        crate::diagnostics::record(
+            &self.logs,
+            "core_reconcile",
+            serde_json::json!({"generation":self.recovery_generation,"corePid":self.child.as_ref().map(Child::id),"tun":self.tun}),
+        );
+        Ok(())
+    }
+
+    fn check_local_health(
+        &mut self,
+        reconcile: bool,
+    ) -> std::result::Result<HealthCheck, ReadinessFailure> {
+        let fatal = |code, message| ReadinessFailure::Fatal(AppError::new(code, message));
+        let controller = self
+            .controller
+            .clone()
+            .ok_or_else(|| fatal("core_controller_missing", "缺少自有内核控制连接"))?;
+        let client = http_client().map_err(ReadinessFailure::Fatal)?;
+        // A local observation is bounded as a whole. It never opens an Internet
+        // connection or borrows another resource/bootstrap operation budget.
+        let deadline = Instant::now() + CONTROL_TIMEOUT * 3;
+        let info = read_readiness_json(&client, &controller, "/desktop", deadline)?;
+        let pid = self.child.as_ref().map(Child::id);
+        verify_managed_identity(&info, pid)?;
+        let expected = config::parse(self.source.as_deref().unwrap_or_default())
+            .map_err(ReadinessFailure::Fatal)?;
+        self.verify_listeners(&client, &controller, &expected, deadline)?;
+        let capabilities = &info["capabilities"];
+        if capabilities["tun_health"].as_bool() != Some(true) {
+            self.tun_health = self.tun.then(|| "unsupported".into());
+            return Ok(HealthCheck::Ready);
+        }
+        let health = read_readiness_json(&client, &controller, "/desktop/health", deadline)?;
+        verify_managed_identity(&health, pid)?;
+        let state = health["tun"]["state"].as_str().unwrap_or("invalid");
+        if health["tun"]["enabled"].as_bool() != Some(self.tun) {
+            return Err(fatal(
+                "tun_configuration_mismatch",
+                "TUN 实际启用状态与自有运行模式不一致",
+            ));
+        }
+        self.tun_health = Some(state.into());
+        match state {
+            "conflict" => {
+                return Err(fatal(
+                    "tun_ownership_conflict",
+                    "TUN 设备或路由所有权冲突，未接管外部资源",
+                ))
+            }
+            "unavailable" => {
+                return Err(fatal(
+                    "tun_health_unavailable",
+                    "无法核验 TUN 实际状态，未盲目重启",
+                ))
+            }
+            "disabled" if self.tun => {
+                return Err(fatal("tun_not_enabled", "托管 TUN 未启用，请检查运行配置"))
+            }
+            "disabled" | "healthy" | "degraded" => {}
+            _ => {
+                return Err(fatal(
+                    "core_controller_incompatible",
+                    "本地内核返回无效 TUN 健康状态",
+                ))
+            }
+        }
+        if state == "degraded" && health["tun"]["repairable"].as_bool() != Some(true) {
+            return Err(fatal(
+                "tun_not_repairable",
+                "TUN 状态异常且无法安全自动修复",
+            ));
+        }
+        if !reconcile && state != "degraded" {
+            return Ok(HealthCheck::Ready);
+        }
+        if capabilities["tun_repair"].as_bool() != Some(true) {
+            return if state == "degraded" {
+                Err(fatal(
+                    "tun_repair_unsupported",
+                    "配套内核不支持安全修复 TUN",
+                ))
+            } else {
+                Ok(HealthCheck::Ready)
+            };
+        }
+        // The paired core serializes repair and only touches its owned resources.
+        // On a healthy resume this also invalidates/requeues background LAN work.
+        let recovered = read_managed_json(
+            &client,
+            &controller,
+            "/desktop/recover",
+            deadline,
+            reqwest::Method::POST,
+        )?;
+        if recovered["pid"].as_u64() != pid.map(u64::from) {
+            return Err(fatal(
+                "core_controller_identity",
+                "恢复结果的进程与自有内核不一致",
+            ));
+        }
+        match recovered["status"].as_str() {
+            Some("healthy" | "repaired") => {
+                self.tun_health = recovered["tun"]["state"].as_str().map(str::to_owned);
+                if !matches!(self.tun_health.as_deref(), Some("healthy" | "disabled")) {
+                    return Err(fatal("tun_recovery_unconfirmed", "TUN 修复结果未确认健康"));
+                }
+                if recovered["tun"]["enabled"].as_bool() != Some(self.tun)
+                    || self.tun && self.tun_health.as_deref() != Some("healthy")
+                {
+                    return Err(fatal(
+                        "tun_recovery_unconfirmed",
+                        "TUN 修复后启用状态与运行模式不一致",
+                    ));
+                }
+                self.verify_listeners(&client, &controller, &expected, deadline)?;
+                Ok(HealthCheck::Ready)
+            }
+            Some("needs_restart") => Ok(HealthCheck::NeedsRestart),
+            Some("conflict") => Err(fatal(
+                "tun_ownership_conflict",
+                "TUN 恢复遇到资源所有权冲突，未接管外部资源",
+            )),
+            Some("unavailable") => Err(fatal(
+                "tun_recovery_unavailable",
+                "无法安全恢复 TUN，请检查恢复日志",
+            )),
+            _ => Err(fatal(
+                "core_controller_incompatible",
+                "本地内核返回无效恢复结果",
+            )),
+        }
+    }
+
+    fn observe_health(&mut self, now: Duration) -> Result<()> {
+        self.last_health_check = now;
+        let reconciling = self.recovery.is_some();
+        match self.check_local_health(reconciling || self.health_deferred) {
+            Ok(HealthCheck::Ready) => {
+                if reconciling || self.health_deferred {
+                    crate::diagnostics::record(
+                        &self.logs,
+                        "core_recovered",
+                        serde_json::json!({"generation":self.recovery_generation,"corePid":self.child.as_ref().map(Child::id),"tunHealth":self.tun_health}),
+                    );
+                    self.error = None;
+                    self.error_code = None;
+                }
+                self.recovery = None;
+                self.health_deferred = false;
+            }
+            Ok(HealthCheck::NeedsRestart) => {
+                self.schedule_health_restart(AppError::new(
+                    "tun_restart_required",
+                    "内核确认 TUN 需要重启，正在恢复",
+                ))?;
+            }
+            Err(ReadinessFailure::Temporary(error)) => {
+                let busy = matches!(error.code.as_str(), "core_executor_busy" | "core_not_ready");
+                if self.health_deferred && busy {
+                    // This window has ended. Keep only the ordinary low-rate
+                    // monitor, without a new window, restart or resource work.
+                    self.error_code = Some(error.code);
+                    self.error = Some(error.message);
+                    return Ok(());
+                }
+                self.health_deferred = false;
+                let exhausted = self
+                    .recovery
+                    .get_or_insert_with(|| RecoveryWindow::new(self.recovery_generation, now))
+                    .failed(lifecycle::awake_now()?);
+                crate::diagnostics::record(
+                    &self.logs,
+                    "core_health_retry",
+                    serde_json::json!({"generation":self.recovery_generation,"code":error.code,"exhausted":exhausted}),
+                );
+                if exhausted {
+                    if busy {
+                        // A responding executor may still own a legitimate
+                        // configuration operation. Never kill it as a network failure.
+                        self.recovery = None;
+                        self.health_deferred = true;
+                        self.error_code = Some(error.code);
+                        self.error = Some(error.message);
+                    } else {
+                        self.schedule_health_restart(error)?;
+                    }
+                } else {
+                    self.error_code = Some(error.code);
+                    self.error = Some(error.message);
+                }
+            }
+            Err(ReadinessFailure::Fatal(error)) => {
+                crate::diagnostics::record(
+                    &self.logs,
+                    "core_health_blocked",
+                    serde_json::json!({"generation":self.recovery_generation,"code":error.code,"corePid":self.child.as_ref().map(Child::id)}),
+                );
+                self.recovery = None;
+                self.health_blocked = true;
+                self.health_deferred = false;
+                self.error_code = Some(error.code);
+                self.error = Some(error.message);
+            }
+        }
+        Ok(())
+    }
+
+    fn schedule_health_restart(&mut self, error: AppError) -> Result<()> {
+        // stop_for confirms this owned process has exited before a later poll
+        // may spawn. The intervening user Stop cancels the pending recovery.
+        self.stop_for(StopReason::HealthFailure)?;
+        self.desired_running = true;
+        self.error_code = Some(error.code);
+        self.error = Some(error.message);
+        self.restart_at = Some(Instant::now() + Duration::from_secs(1));
+        Ok(())
+    }
+
     pub fn poll(&mut self) -> Result<CoreStatus> {
         if let Some(child) = self.child.as_mut() {
-            if child
+            if let Some(exit) = child
                 .try_wait()
                 .map_err(|e| AppError::io("无法读取内核状态", e))?
-                .is_some()
             {
+                self.exit_code = exit.code();
+                crate::diagnostics::record(
+                    &self.logs,
+                    "core_exit",
+                    serde_json::json!({"corePid":child.id(),"exitCode":exit.code(),"desiredRunning":self.desired_running}),
+                );
                 self.child = None;
                 self.controller = None;
                 self.termination_unconfirmed = false;
@@ -910,9 +1259,12 @@ impl CoreSupervisor {
                     self.job = None;
                 }
                 if self.desired_running {
+                    self.stop_reason = Some(StopReason::UnexpectedExit);
+                    self.error_code = Some("core_unexpected_exit".into());
                     self.error = Some("内核意外退出，正在准备恢复".into());
                     self.restart_at = Some(Instant::now() + Duration::from_secs(1));
                 }
+                self.recovery = None;
             }
         }
         while self
@@ -929,6 +1281,8 @@ impl CoreSupervisor {
             if self.failed_recoveries >= MAX_RESTARTS || self.restarts.len() >= MAX_RESTARTS {
                 self.desired_running = false;
                 self.restart_at = None;
+                self.stop_reason = Some(StopReason::RecoveryExhausted);
+                self.error_code = Some("core_recovery_exhausted".into());
                 self.error = Some(
                     "内核连续恢复失败或在 60 秒内重启 3 次，已停止自动重启，请检查配置与资源来源"
                         .into(),
@@ -944,6 +1298,7 @@ impl CoreSupervisor {
                         self.failed_recoveries += 1;
                         self.controller = None;
                         self.error = Some(error.message);
+                        self.error_code = Some(error.code);
                         if !self.termination_unconfirmed {
                             self.restart_at = Some(
                                 Instant::now() + Duration::from_secs(1 << self.restarts.len()),
@@ -953,12 +1308,37 @@ impl CoreSupervisor {
                 }
             }
         }
+        if self.child.is_some()
+            && self.desired_running
+            && !self.health_blocked
+            && !self.termination_unconfirmed
+        {
+            let now = lifecycle::awake_now()?;
+            if self.recovery.is_some()
+                || now.saturating_sub(self.last_health_check) >= HEALTH_INTERVAL
+            {
+                self.observe_health(now)?;
+            }
+        }
         Ok(self.status())
     }
 
     pub fn stop(&mut self) -> Result<()> {
+        self.stop_for(StopReason::UserStop)
+    }
+
+    pub fn stop_for(&mut self, reason: StopReason) -> Result<()> {
+        crate::diagnostics::record(
+            &self.logs,
+            "core_stop",
+            serde_json::json!({"reason":reason,"corePid":self.child.as_ref().map(Child::id),"generation":self.recovery_generation}),
+        );
+        self.stop_reason = Some(reason);
         self.desired_running = false;
         self.restart_at = None;
+        self.recovery = None;
+        self.health_blocked = false;
+        self.health_deferred = false;
         if self.child.is_some() {
             if let Some(controller) = &self.controller {
                 if let Ok(client) = http_client() {
@@ -1059,6 +1439,15 @@ mod tests {
         InvalidJson,
         WrongPid,
         IncompatibleApi,
+        HealthHealthy,
+        HealthDegraded,
+        HealthConflict,
+        HealthUnavailable,
+        HealthBusyOnce,
+        HealthBusyUntilReleased,
+        HealthNeedsRestart,
+        HealthWrongRecoveryPid,
+        HealthDisabledAfterRepair,
     }
 
     struct ReadinessFixture {
@@ -1066,6 +1455,8 @@ mod tests {
         controller: Controller,
         source: String,
         config_reads: Arc<AtomicUsize>,
+        recovery_reads: Arc<AtomicUsize>,
+        health_busy: Arc<AtomicBool>,
         finished: Arc<AtomicBool>,
         server: Option<thread::JoinHandle<()>>,
         _occupied_port: Option<TcpListener>,
@@ -1096,6 +1487,21 @@ mod tests {
             let pid = child.id();
             let mut core = CoreSupervisor::new(PathBuf::new(), PathBuf::new(), PathBuf::new());
             core.child = Some(child);
+            let health_enabled = matches!(
+                scenario,
+                ReadinessScenario::HealthHealthy
+                    | ReadinessScenario::HealthDegraded
+                    | ReadinessScenario::HealthConflict
+                    | ReadinessScenario::HealthUnavailable
+                    | ReadinessScenario::HealthBusyOnce
+                    | ReadinessScenario::HealthBusyUntilReleased
+                    | ReadinessScenario::HealthNeedsRestart
+                    | ReadinessScenario::HealthWrongRecoveryPid
+                    | ReadinessScenario::HealthDisabledAfterRepair
+            );
+            core.tun = health_enabled;
+            core.desired_running = true;
+            core.controller = Some(controller.clone());
             let occupied_port = matches!(scenario, ReadinessScenario::PortConflict)
                 .then(|| TcpListener::bind(("127.0.0.1", 0)).unwrap());
             let requested_port = occupied_port
@@ -1111,8 +1517,15 @@ mod tests {
             };
             let finished = Arc::new(AtomicBool::new(false));
             let config_reads = Arc::new(AtomicUsize::new(0));
+            let recovery_reads = Arc::new(AtomicUsize::new(0));
+            let health_busy = Arc::new(AtomicBool::new(matches!(
+                scenario,
+                ReadinessScenario::HealthBusyUntilReleased
+            )));
             let stop = finished.clone();
             let reads = config_reads.clone();
+            let recoveries = recovery_reads.clone();
+            let busy = health_busy.clone();
             let server = thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     let (mut stream, _) = match listener.accept() {
@@ -1156,7 +1569,50 @@ mod tests {
                         } else {
                             1
                         };
-                        (200, serde_json::json!({"managed":true,"api_version":api,"state":"running","pid":reported_pid}).to_string())
+                        (200, serde_json::json!({"managed":true,"api_version":api,"state":"running","pid":reported_pid,"capabilities":{"tun_health":health_enabled,"tun_repair":health_enabled}}).to_string())
+                    } else if request.starts_with("get /desktop/health ") {
+                        assert!(
+                            health_enabled,
+                            "legacy core must not receive a health request"
+                        );
+                        let state = match scenario {
+                            ReadinessScenario::HealthConflict => "conflict",
+                            ReadinessScenario::HealthUnavailable => "unavailable",
+                            ReadinessScenario::HealthDegraded
+                            | ReadinessScenario::HealthNeedsRestart
+                            | ReadinessScenario::HealthDisabledAfterRepair => "degraded",
+                            _ => "healthy",
+                        };
+                        if busy.load(Ordering::SeqCst) {
+                            (503, "{}".into())
+                        } else {
+                            (200, serde_json::json!({"managed":true,"api_version":1,"state":"running","pid":pid,"tun":{"enabled":true,"state":state,"repairable":state=="degraded"}}).to_string())
+                        }
+                    } else if request.starts_with("post /desktop/recover ") {
+                        assert!(
+                            health_enabled,
+                            "legacy core must not receive a recovery request"
+                        );
+                        let attempt = recoveries.fetch_add(1, Ordering::SeqCst);
+                        if matches!(scenario, ReadinessScenario::HealthBusyOnce) && attempt == 0 {
+                            (503, "{}".into())
+                        } else {
+                            let status =
+                                if matches!(scenario, ReadinessScenario::HealthNeedsRestart) {
+                                    "needs_restart"
+                                } else {
+                                    "repaired"
+                                };
+                            let reported_pid =
+                                if matches!(scenario, ReadinessScenario::HealthWrongRecoveryPid) {
+                                    pid + 1
+                                } else {
+                                    pid
+                                };
+                            let enabled =
+                                !matches!(scenario, ReadinessScenario::HealthDisabledAfterRepair);
+                            (200, serde_json::json!({"pid":reported_pid,"status":status,"tun":{"enabled":enabled,"state":if enabled { "healthy" } else { "disabled" },"repairable":false}}).to_string())
+                        }
                     } else {
                         assert!(request.starts_with("get /configs "));
                         let attempt = reads.fetch_add(1, Ordering::SeqCst);
@@ -1187,11 +1643,14 @@ mod tests {
                     let _ = stream.write_all(response.as_bytes());
                 }
             });
+            core.source = Some(format!("mixed-port: {requested_port}\n"));
             Self {
                 core,
                 controller,
                 source: format!("mixed-port: {requested_port}\n"),
                 config_reads,
+                recovery_reads,
+                health_busy,
                 finished,
                 server: Some(server),
                 _occupied_port: occupied_port,
@@ -1229,6 +1688,159 @@ mod tests {
         fixture.wait(Duration::from_secs(2)).unwrap();
         assert_eq!(fixture.config_reads.load(Ordering::SeqCst), 2);
         assert_eq!(fixture.core.child.as_ref().unwrap().id(), original_pid);
+    }
+
+    #[test]
+    fn healthy_resume_keeps_pid_and_calls_recover_only_when_requested() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthHealthy);
+        let pid = fixture.core.child.as_ref().unwrap().id();
+        assert!(matches!(
+            fixture.core.check_local_health(false),
+            Ok(HealthCheck::Ready)
+        ));
+        assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 0);
+        fixture.core.request_reconcile(7).unwrap();
+        let status = fixture.core.poll().unwrap();
+        assert!(status.running && !status.recovering);
+        assert_eq!(status.pid, Some(pid));
+        assert_eq!(status.recovery_generation, 7);
+        assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 1);
+        assert!(fixture.core.restarts.is_empty());
+    }
+
+    #[test]
+    fn degraded_owned_tun_uses_repair_without_restarting_process() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthDegraded);
+        let pid = fixture.core.child.as_ref().unwrap().id();
+        assert!(matches!(
+            fixture.core.check_local_health(false),
+            Ok(HealthCheck::Ready)
+        ));
+        assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.core.child.as_ref().unwrap().id(), pid);
+    }
+
+    #[test]
+    fn foreign_or_unknown_tun_stops_automatic_repair_without_killing_core() {
+        for scenario in [
+            ReadinessScenario::HealthConflict,
+            ReadinessScenario::HealthUnavailable,
+        ] {
+            let mut fixture = ReadinessFixture::new(scenario);
+            let pid = fixture.core.child.as_ref().unwrap().id();
+            fixture.core.request_reconcile(1).unwrap();
+            let status = fixture.core.poll().unwrap();
+            assert!(!status.running && !status.recovering);
+            assert_eq!(status.pid, Some(pid));
+            assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 0);
+            assert!(fixture.core.restarts.is_empty());
+            assert!(fixture.core.restart_at.is_none());
+        }
+    }
+
+    #[test]
+    fn temporary_busy_recovers_in_the_same_generation_and_process() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthBusyOnce);
+        let pid = fixture.core.child.as_ref().unwrap().id();
+        fixture.core.request_reconcile(1).unwrap();
+        assert!(fixture.core.poll().unwrap().recovering);
+        fixture.core.request_reconcile(2).unwrap();
+        let recovered = fixture.core.poll().unwrap();
+        assert!(recovered.running && !recovered.recovering);
+        assert_eq!(recovered.pid, Some(pid));
+        assert_eq!(recovered.recovery_generation, 2);
+        assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn exhausted_busy_window_keeps_low_rate_observation_and_eventually_same_pid() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthBusyUntilReleased);
+        let pid = fixture.core.child.as_ref().unwrap().id();
+        fixture.core.request_reconcile(1).unwrap();
+        // Exhaust the bounded observation window while the executor genuinely
+        // answers Busy. It must become a visible error, not a permanent latch
+        // and not an excuse to terminate a legitimate configuration operation.
+        for _ in 0..3 {
+            fixture.core.poll().unwrap();
+        }
+        let deferred = fixture.core.status();
+        assert!(!deferred.running && !deferred.recovering);
+        assert!(fixture.core.health_deferred && !fixture.core.health_blocked);
+        assert_eq!(deferred.pid, Some(pid));
+        let reads = fixture.config_reads.load(Ordering::SeqCst);
+        for _ in 0..5 {
+            fixture.core.poll().unwrap();
+        }
+        assert_eq!(
+            fixture.config_reads.load(Ordering::SeqCst),
+            reads,
+            "ordinary polls must honor the normal health interval"
+        );
+        fixture
+            .core
+            .observe_health(lifecycle::awake_now().unwrap())
+            .unwrap();
+        assert!(fixture.core.health_deferred && fixture.core.recovery.is_none());
+        fixture.health_busy.store(false, Ordering::SeqCst);
+        // Run the next scheduled observation without making the test sleep.
+        fixture
+            .core
+            .observe_health(lifecycle::awake_now().unwrap())
+            .unwrap();
+        let ready = fixture.core.status();
+        assert!(ready.running && !ready.recovering);
+        assert_eq!(ready.pid, Some(pid));
+        assert!(ready.error.is_none() && ready.error_code.is_none());
+        assert!(fixture.core.restarts.is_empty() && fixture.core.restart_at.is_none());
+        assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn recovery_rejects_foreign_pid_or_disabled_tun_and_honors_explicit_restart_result() {
+        for scenario in [
+            ReadinessScenario::HealthWrongRecoveryPid,
+            ReadinessScenario::HealthDisabledAfterRepair,
+        ] {
+            let mut fixture = ReadinessFixture::new(scenario);
+            assert!(matches!(
+                fixture.core.check_local_health(true),
+                Err(ReadinessFailure::Fatal(_))
+            ));
+            assert!(fixture.core.restart_at.is_none());
+        }
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthNeedsRestart);
+        assert!(matches!(
+            fixture.core.check_local_health(true),
+            Ok(HealthCheck::NeedsRestart)
+        ));
+    }
+
+    #[test]
+    fn legacy_core_does_not_receive_new_health_or_recovery_endpoints() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::DisconnectOnce);
+        assert!(matches!(
+            fixture.core.check_local_health(true),
+            Err(ReadinessFailure::Temporary(_))
+        ));
+        assert!(matches!(
+            fixture.core.check_local_health(true),
+            Ok(HealthCheck::Ready)
+        ));
+        assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn explicit_stop_cancels_a_pending_recovery_and_late_resume() {
+        let mut core = CoreSupervisor::new(PathBuf::new(), PathBuf::new(), PathBuf::new());
+        core.desired_running = true;
+        core.restart_at = Some(Instant::now());
+        core.recovery = Some(RecoveryWindow::new(1, Duration::ZERO));
+        core.stop().unwrap();
+        core.request_reconcile(2).unwrap();
+        let status = core.poll().unwrap();
+        assert!(!status.running && !status.recovering && !status.desired_running);
+        assert_eq!(status.stop_reason, Some(StopReason::UserStop));
+        assert!(core.restart_at.is_none() && core.recovery.is_none());
     }
 
     #[test]

@@ -75,7 +75,7 @@ internal sealed class TrayController : IDisposable
         menu.Opening += (_, _) => { flyout?.HideFlyout(); Refresh(); };
         L.Changed += Refresh; Refresh();
     }
-    private bool IsRunning => session.Status.Text("phase") == "running";
+    private bool IsRunning => session.Status.Text("phase") is "running" or "recovering";
     private async Task Run(string command, object? args = null, bool reportError = true)
     {
         if (commandBusy) return;
@@ -108,12 +108,13 @@ internal sealed class TrayController : IDisposable
     public void Refresh()
     {
         string phase = session.Status.Text("phase");
-        bool idle = session.Ready && !session.IsUpdating && session.BusyCommand is null && !commandBusy && phase is not ("starting" or "stopping" or "connecting");
-        stateItem.Text = L.T(phase switch { "running" => "内核运行中", "starting" => "正在启动内核…", "stopping" => "正在停止内核…", "error" => "内核需要处理", "stopped" => "内核已停止", _ => "正在连接…" });
+        bool idle = session.Ready && !session.IsUpdating && session.BusyCommand is null && !commandBusy && phase is not ("starting" or "stopping" or "connecting" or "recovering");
+        bool canStopRecovery = phase == "recovering" && !session.IsUpdating && session.BusyCommand is null && !commandBusy;
+        stateItem.Text = L.T(phase switch { "running" => "内核运行中", "starting" => "正在启动内核…", "recovering" => "正在恢复内核…", "stopping" => "正在停止内核…", "error" => "内核需要处理", "stopped" => "内核已停止", _ => "正在连接…" });
         icon.Text = "Mihomo Optimized · " + stateItem.Text;
         openItem.Text = L.T("打开主界面"); coreItem.Text = L.T(IsRunning ? "停止内核" : "启动内核"); restartItem.Text = L.T("重启内核");
         proxyItem.Text = L.T("系统代理"); tunItem.Text = L.T("TUN 模式"); restoreItem.Text = L.T("停止代理并恢复网络"); exitItem.Text = L.T("退出");
-        coreItem.Enabled = restoreItem.Enabled = idle; restartItem.Enabled = idle && IsRunning;
+        coreItem.Enabled = restoreItem.Enabled = idle || canStopRecovery; restartItem.Enabled = idle && IsRunning;
         proxyItem.Enabled = idle && session.Status.Get("capabilities").Bool("systemProxy"); tunItem.Enabled = idle && session.Status.Get("capabilities").Bool("tun");
         proxyItem.Checked = session.Status.Bool("systemProxy"); tunItem.Checked = session.Status.Bool("tun");
         exitItem.Enabled = !session.IsUpdating;
@@ -263,7 +264,7 @@ internal sealed class TrayWindow : Window
         var rates = Ui.Column(Rate("arrow-down", down), uploadRate); rates.MinWidth = 92; rates.VerticalAlignment = VerticalAlignment.Center; footerGrid.Children.Add(rates); Grid.SetColumn(sparkline, 1); footerGrid.Children.Add(sparkline);
         var powerContents = new Grid(); powerContents.Children.Add(powerIcon); powerContents.Children.Add(powerProgress);
         power = FluentControls.IconButton("power", "启动内核", "TrayPower", 36); power.Content = powerContents; power.Style = FluentControls.Style("Button"); power.Padding = new Thickness(0); power.VerticalAlignment = VerticalAlignment.Center;
-        power.Click += async (_, _) => await Run(Running ? "desktop_stop" : "desktop_start"); Grid.SetColumn(power, 2); footerGrid.Children.Add(power);
+        power.Click += async (_, _) => await Run(Running || session.Status.Text("phase") == "recovering" ? "desktop_stop" : "desktop_start"); Grid.SetColumn(power, 2); footerGrid.Children.Add(power);
         var footer = new Border { Child = footerGrid, Padding = new Thickness(16, 12, 12, 12), BorderThickness = new Thickness(0, 1, 0, 0) }; footer.SetResourceReference(Border.BorderBrushProperty, "DividerBrush"); footer.SetResourceReference(Border.BackgroundProperty, "DialogTopBrush"); Grid.SetRow(footer, 2); ClientArea.Children.Add(footer);
         backdrop = new NativeBackdrop(this, ClientArea, session, transient: true);
         IsVisibleChanged += (_, _) =>
@@ -322,18 +323,20 @@ internal sealed class TrayWindow : Window
         try
         {
             bool running = Running; string phase = session.Status.Text("phase", fallback: "connecting");
-            bool busy = phase is "starting" or "stopping" or "connecting";
+            bool recovering = phase == "recovering";
+            bool busy = phase is "starting" or "stopping" or "connecting" or "recovering";
             if (controller != Controller || !running && runtimeReady)
             {
                 controller = Controller; runtimeReady = false; allowLan = false; exitSnapshot = ProxyExitSnapshot.Empty;
                 sparkline.Clear(); ByteReading.SetRate(down, 0); ByteReading.SetRate(up, 0);
             }
-            string label = L.T(phase switch { "running" => "运行中", "starting" => "正在启动…", "stopping" => "正在停止…", "error" => "需要处理", "stopped" => "已停止", _ => "正在连接…" });
+            string label = L.T(phase switch { "running" => "运行中", "starting" => "正在启动…", "recovering" => "正在恢复…", "stopping" => "正在停止…", "error" => "需要处理", "stopped" => "已停止", _ => "正在连接…" });
             string modeLabel = L.T(mode.Mode switch { "global" => "全局模式", "direct" => "直连模式", _ => "规则模式" }); state.Text = label + (running ? " · " + modeLabel : "");
             stateDot.SetResourceReference(Shape.FillProperty, running ? "SuccessBrush" : busy ? "WarningBrush" : phase == "error" ? "DangerBrush" : "TextTertiaryBrush");
             bool interactive = session.Ready && !busy && !outerBusy && !changing && !session.IsUpdating && session.BusyCommand is null;
             proxy.IsChecked = session.Status.Bool("systemProxy"); tun.IsChecked = session.Status.Bool("tun"); lan.IsChecked = allowLan;
             power.IsEnabled = interactive; proxy.IsEnabled = interactive && session.Status.Get("capabilities").Bool("systemProxy"); tun.IsEnabled = interactive && session.Status.Get("capabilities").Bool("tun"); lan.IsEnabled = mode.IsEnabled = interactive && running && runtimeReady && !session.IsDirty;
+            if (recovering) power.IsEnabled = !session.IsUpdating && session.BusyCommand is null && !outerBusy && !changing;
             foreach (var item in new[] { proxy, tun, lan }) if (item.Content is FluentIcon glyph) glyph.Filled = item.IsChecked == true;
             exits.Visibility = running ? Visibility.Visible : Visibility.Collapsed; stopped.Visibility = running ? Visibility.Collapsed : Visibility.Visible; exits.Update(exitSnapshot.Summaries.Take(3));
             stoppedTitle.Text = busy ? label : L.T("内核未运行"); stoppedHint.Text = session.Status.Text("lastError", fallback: busy ? L.T("首次启动可能需要更长时间，请稍候。") : L.T("启动后即可切换模式、出口与快捷开关。"));
@@ -341,7 +344,7 @@ internal sealed class TrayWindow : Window
             powerProgress.IsActive = busy || outerBusy || changing; powerIcon.Visibility = powerProgress.IsActive ? Visibility.Collapsed : Visibility.Visible;
             FluentControlState.SetKind(power, running ? "Primary" : "Button");
             powerProgress.SetResourceReference(FluentProgressRing.ForegroundProperty, running ? "AccentTextBrush" : "AccentBrush");
-            L.Bind(power, AutomationProperties.NameProperty, running ? "停止内核" : "启动内核"); L.Bind(power, ToolTipProperty, running ? "停止内核" : "启动内核");
+            L.Bind(power, AutomationProperties.NameProperty, running || recovering ? "停止内核" : "启动内核"); L.Bind(power, ToolTipProperty, running || recovering ? "停止内核" : "启动内核");
         }
         finally { applying = false; }
     }

@@ -18,12 +18,13 @@ Windows 界面改为 C# WPF 原生控件与 Fluent 主题。安装版和便携�
 - 从旧版升级时，先保存配置并从托盘退出旧程序，再运行完整安装包。配置仍位于 `%LOCALAPPDATA%\\Mihomo Optimized`，覆盖安装和卸载均保留用户配置。
 - 首次使用在配置页导入自己的 YAML 或订阅，然后启动内核并按需开启系统代理 / TUN。
 
-### 本版修复
+### 本版修复与新增
 
-- **EasyTier 首次连接**：内核将按需组网准备与 TCP 拨号分开计时，准备最多 15 秒，目标路由就绪后建连最多 5 秒，整次请求最多 20 秒。普通连接仍为 5 秒，调用方更短的期限继续生效。就绪检查涵盖目标路由和实际下一跳，支持经中继转发，并修复并发启动时可能错过通知的问题。实例建立后继续复用。
-- **Windows 顶部栏显示**：首次显示前按当前显示器的工作区和 DPI 调整窗口，避免高缩放、较矮屏幕或多显示器环境中标题栏被裁掉。恢复窗口、显示器及工作区变化时重新校正，保留系统最大化、贴靠和正常窗口位置。
-- **配置保存提示**：保存成功只显示约 2.5 秒的短通知，关闭编辑器、切页或重新打开时不再复现旧绿条。待应用和应用失败继续作为独立状态保留，从文件重新读取同一修订不会清除它们，实际应用成功后才解除。
-- **回归验收**：增加首次显示时真实标题栏边界检查、保存后关闭重开及重读失败状态的 UI Automation 验证，以及 EasyTier 阶段期限、并发初始化和延迟中继路由的测试。具体执行结果见本次提交的 Actions 记录。
+- **Windows 睡眠 / 休眠恢复**：服务心跳租约使用不计睡眠时间的活动时钟，并持续确认经过认证的宿主进程。恢复后检查实际内核 PID、认证接口、监听端口及自有 TUN 的身份、地址和路由；健康实例保留，确认局部资源失效时才修复。用户手动停止取消后续恢复，网络离线和无法确认的状态不会直接导致盲目重启。
+- **桌面通道恢复**：宿主通道故障后先确认旧宿主退出，再建立新宿主与新状态代次；保留用户运行意图，停止操作不被迟到的恢复结果覆盖。
+- **LAN 后台预连接**：移除上一版 EasyTier 请求内 15 秒准备加 5 秒拨号预算，业务拨号恢复原有 5 秒期限。后台只为 RFC1918 / ULA 业务目标准备 EasyTier、WireGuard / AmneziaWG、Tailscale、ZeroTier、OpenVPN 的原生通道，不增加节点字段，不扫描网段或重放 UDP。保留已有路由、下一跳和并发正确性修复；未知冷目标首次请求仍可能超时。
+- **issue #61 代理目标 IP**：可选顶层 `proxy-force-ip` 让 TCP / UDP 代理协议携带真实目标 IP，保留规则和日志域名；增加节点 `target-ip-family` 与按域名限定的 `dns.answer-ip-family-policy`。DIRECT 和 `normal` 模式继续保留，地址族策略显式配置，不由一次超时或 DNS 查询出口猜测远端能力。
+- **回归验收**：新增真实代理协议目标检查、DNS 答案保护、LAN 并发与取消、Windows 活动时钟及用户停止竞态，并在 Windows smoke 中验证健康内核 PID 保留、删除自有 TUN 路由后的修复和宿主通道替换。实际 S3 / S4 / Modern Standby 硬件睡眠验收不由 CI 替代；具体自动测试结果见本次提交的 Actions。
 
 ### 保留的界面与动效更新
 
@@ -76,6 +77,8 @@ Windows 工作流继续要求真实内核与资源引导测试、原生 Rust 回
 - [桌面和网页源码](https://github.com/{info['repository']}/tree/{info['uiCommit']})
 - [固定内核源码](https://github.com/{info['repository']}/tree/{info['coreCommit']})
 - [资源引导配置](https://github.com/{info['repository']}/blob/{info['coreCommit']}/docs/resource-bootstrap.md)
+- [LAN 预连接](https://github.com/{info['repository']}/blob/{info['coreCommit']}/docs/lan-preconnect.md)
+- [代理目标 IP 与 DNS 地址族](https://github.com/{info['repository']}/blob/{info['coreCommit']}/docs/proxy-force-ip.md)
 
 正式发行附带 `SHA256SUMS`、`build-info.json` 与 `.sigstore.json`。GitHub 构建证明用于验证来源；本发行没有 Windows Authenticode 发布者证书签名。桌面版使用独立的 `mihomo-desktop-v*` 标签，不改变服务端内核的 Latest 入口。
 ''')

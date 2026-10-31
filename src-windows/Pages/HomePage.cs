@@ -227,10 +227,11 @@ public sealed class HomePage : NativePage
             controller = ControllerIdentity; runtimeReady = false; exitSnapshot = ProxyExitSnapshot.Empty; chart.Clear(); ByteReading.SetRate(up, 0); ByteReading.SetRate(down, 0);
             processes = connections = 0; downloaded = uploaded = 0; port = 0; allowLan = false;
         }
-        bool busy = state is "starting" or "stopping" or "connecting";
+        bool recovering = state == "recovering";
+        bool busy = state is "starting" or "stopping" or "connecting" or "recovering";
         bool interactive = Session.Ready && !busy && !Session.IsUpdating && Session.BusyCommand is null && pending.Length == 0;
         modes.SetMode(runtimeMode);
-        phase.Text = L.T(state switch { "running" => "已连接", "starting" => "正在启动", "stopping" => "正在停止", "error" => "运行异常", "stopped" => "未运行", _ => "正在连接…" });
+        phase.Text = L.T(state switch { "running" => "已连接", "starting" => "正在启动", "recovering" => "正在恢复", "stopping" => "正在停止", "error" => "运行异常", "stopped" => "未运行", _ => "正在连接…" });
         phase.SetResourceReference(TextBlock.ForegroundProperty, state == "error" ? "DangerBrush" : "TextPrimaryBrush");
         bool failed = state == "error";
         heroImage.SetResourceReference(Image.SourceProperty, failed ? "ColorIcon.warning.48" : "ColorIcon.globe-shield.48");
@@ -244,6 +245,7 @@ public sealed class HomePage : NativePage
         description.Text = state switch
         {
             "starting" => L.T("首次启动可能需要更长时间，请稍候。"),
+            "recovering" => L.T("正在核验本地内核与网络设备，可随时停止恢复。"),
             "stopping" => L.T("正在关闭连接并恢复系统代理设置。"),
             "running" => mode + (selected is null ? "" : " · " + exitSnapshot.Main!.Group + " → " + selected + (exitSnapshot.Main.Delay > 0 ? $" · {exitSnapshot.Main.Delay:0} ms" : "")),
             "connecting" => L.T("读取本地内核状态…"),
@@ -255,12 +257,13 @@ public sealed class HomePage : NativePage
         coreVersion.TextTrimming = TextTrimming.CharacterEllipsis; coreVersion.MaxWidth = 180; coreVersion.TextWrapping = TextWrapping.NoWrap;
         proxyAddress.Text = port > 0 ? "127.0.0.1:" + port : "—";
         coreError.Text = status.Text("lastError"); coreError.Visibility = coreError.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
-        start.Visibility = running || state == "stopping" ? Visibility.Collapsed : Visibility.Visible;
-        stop.Visibility = running || state == "stopping" ? Visibility.Visible : Visibility.Collapsed;
+        start.Visibility = running || recovering || state == "stopping" ? Visibility.Collapsed : Visibility.Visible;
+        stop.Visibility = running || recovering || state == "stopping" ? Visibility.Visible : Visibility.Collapsed;
         // Keep the disabled restart action exposed during preparation so keyboard,
         // screen-reader and automation clients can observe that it is unavailable.
         restart.Visibility = running || state is "starting" or "stopping" ? Visibility.Visible : Visibility.Collapsed;
         start.IsEnabled = interactive && !running; stop.IsEnabled = restart.IsEnabled = interactive && running;
+        if (recovering) stop.IsEnabled = !Session.IsUpdating && Session.BusyCommand is null && pending.Length == 0;
         modes.IsEnabled = interactive && running && runtimeReady;
         proxy.SetState(status.Bool("systemProxy"), !running && status.Bool("systemProxy") ? L.T("内核启动后生效") : status.Bool("systemProxy") ? L.F("端口 {0}", port > 0 ? port.ToString(CultureInfo.CurrentCulture) : "—") : L.T("已关闭"), interactive && status.Get("capabilities").Bool("systemProxy"), pending == "proxy");
         tun.SetState(status.Bool("tun"), status.Bool("tun") ? L.T(running ? "已开启" : "内核启动后生效") : !status.Get("service").Bool("installed") ? L.T("需要安装系统服务") : L.T("已关闭"), interactive && status.Get("capabilities").Bool("tun"), pending == "tun");

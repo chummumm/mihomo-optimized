@@ -237,7 +237,7 @@ public partial class MainWindow : Window
     private void UpdateStatus()
     {
         string phase = session.Status.Text("phase", fallback: "connecting");
-        string label = phase switch { "running" => "运行中", "starting" => "正在启动…", "stopping" => "正在停止…", "stopped" => "已停止", "error" => "需要处理", _ => "正在连接…" };
+        string label = phase switch { "running" => "运行中", "starting" => "正在启动…", "recovering" => "正在恢复…", "stopping" => "正在停止…", "stopped" => "已停止", "error" => "需要处理", _ => "正在连接…" };
         PhaseText.Text = L.T(label);
         PhaseText.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush");
         CoreStatusDot.SetResourceReference(ShellVisuals.BackgroundProperty, phase == "running" ? "SuccessBrush" : phase == "error" ? "DangerBrush" : phase is "starting" or "stopping" ? "WarningBrush" : "TextTertiaryBrush");
@@ -247,7 +247,7 @@ public partial class MainWindow : Window
         CoreGlyph.Visibility = phase == "running" ? Visibility.Collapsed : Visibility.Visible;
         CoreGlyph.Kind = phase == "error" ? "warning" : "power";
         CoreGlyph.SetResourceReference(Control.ForegroundProperty, phase == "error" ? "DangerBrush" : "TextSecondaryBrush");
-        CoreProgress.IsActive = phase is "starting" or "stopping";
+        CoreProgress.IsActive = phase is "starting" or "stopping" or "recovering";
         string version = ShortVersion(session.Status.Text("coreVersion")); VersionText.Text = version.Length > 0 ? L.F("内核 {0}", version) : "—";
         AutomationProperties.SetName(CoreCardButton, L.T("本地内核") + " · " + PhaseText.Text);
         CoreCardButton.ToolTip = PhaseText.Text + " · " + VersionText.Text;

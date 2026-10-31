@@ -8,6 +8,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../../src-windows/Services/HostChannel.cs" Link="HostChannel.cs" />
+    <Compile Include="../../../src-windows/Services/HostRecoveryIntent.cs" Link="HostRecoveryIntent.cs" />
     <Compile Include="../../../src-windows/Services/InstanceBroker.cs" Link="InstanceBroker.cs" />
     <Compile Include="../../../src-windows/Services/DnsPageIndex.cs" Link="DnsPageIndex.cs" />
     <Compile Include="../../../src-windows/Services/WindowPlacementGeometry.cs" Link="WindowPlacementGeometry.cs" />
