@@ -29,14 +29,15 @@ internal sealed class HostChannel : IAsyncDisposable
     private Task? reader;
     private Exception? failure;
     private long sequence;
-    private int disposed;
+    private readonly object disposeGate = new();
+    private Task? disposal;
     private volatile bool closing;
     public event Action<string, JsonElement>? Event;
     public event Action<Exception>? Disconnected;
 
     public HostChannel() => lifetimeToken = lifetime.Token;
 
-    public void Start()
+    public void Start(bool allowAutostart = true)
     {
         if (process is not null) throw new InvalidOperationException("后台已经启动");
         string executable = Path.Combine(AppContext.BaseDirectory, "mihomo-desktop-host.exe");
@@ -56,6 +57,7 @@ internal sealed class HostChannel : IAsyncDisposable
         start.ArgumentList.Add("--stdio");
         start.ArgumentList.Add("--parent-pid");
         start.ArgumentList.Add(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        if (!allowAutostart) start.ArgumentList.Add("--no-autostart");
         process = Process.Start(start) ?? throw new DesktopException("host_start_failed", "无法启动桌面后台");
         reader = ReadAsync(process, lifetimeToken);
         // Diagnostics can contain paths; drain stderr without forwarding potentially sensitive text into the UI.
@@ -168,9 +170,13 @@ internal sealed class HostChannel : IAsyncDisposable
 
     public void ExpectExit() => closing = true;
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+        lock (disposeGate) return new ValueTask(disposal ??= DisposeCoreAsync());
+    }
+
+    private async Task DisposeCoreAsync()
+    {
         closing = true;
         lifetime.Cancel();
         CloseInput();
@@ -186,6 +192,14 @@ internal sealed class HostChannel : IAsyncDisposable
                 // The independent proxy watchdog and update monitor must survive host failure.
                 try { process.Kill(entireProcessTree: false); }
                 catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception) { }
+                using var confirmation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                try { await process.WaitForExitAsync(confirmation.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException)
+                {
+                    // Keep the owned handle and the fault latch. A caller must
+                    // not start a replacement while the old host may be alive.
+                    throw new DesktopException("host_termination_unconfirmed", "无法确认旧桌面后台已退出，已停止自动恢复。");
+                }
             }
             if (reader is not null) try { await reader.ConfigureAwait(false); } catch (OperationCanceledException) { }
             process.Dispose();

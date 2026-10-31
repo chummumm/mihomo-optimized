@@ -4,6 +4,7 @@ use crate::{
     commands,
     desktop::{DesktopManager, DesktopStatus, HostState},
     error::{AppError, Result},
+    lifecycle::PowerSignal,
     protocol::{self, Request},
     windows,
 };
@@ -15,7 +16,7 @@ use std::{
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc, Mutex,
     },
@@ -65,9 +66,17 @@ pub struct HostContext {
     output: SyncSender<Message>,
     published: Arc<Mutex<Option<DesktopStatus>>>,
     pub owner: Arc<UiProcess>,
+    pub runtime_generation: Arc<AtomicU64>,
+    pub stop_pending: Arc<AtomicUsize>,
 }
 
 impl HostContext {
+    pub fn generation(&self) -> u64 {
+        self.runtime_generation.load(Ordering::Acquire)
+    }
+    pub fn owner_alive(&self) -> bool {
+        !self.owner.exited()
+    }
     pub fn emit<T: Serialize>(&self, event: &str, data: T) {
         let _ = self.output.send(Message::Event(serde_json::json!({
             "event": event,
@@ -212,7 +221,15 @@ pub fn run() -> Result<()> {
     if let Some(result) = maintenance_command(&args) {
         std::process::exit(result?);
     }
-    let pid = match args.as_slice() {
+    let no_autostart = args
+        .last()
+        .is_some_and(|argument| argument == "--no-autostart");
+    let runtime_args = if no_autostart {
+        &args[..args.len() - 1]
+    } else {
+        &args[..]
+    };
+    let pid = match runtime_args {
         [mode, parent, pid] if mode == "--stdio" && parent == "--parent-pid" => pid
             .parse::<u32>()
             .map_err(|_| AppError::new("desktop_parent_invalid", "桌面父进程编号无效"))?,
@@ -230,9 +247,13 @@ pub fn run() -> Result<()> {
         output: output.clone(),
         published: Arc::new(Mutex::new(None)),
         owner,
+        runtime_generation: Arc::new(AtomicU64::new(0)),
+        stop_pending: Arc::new(AtomicUsize::new(0)),
     };
+    let power = Arc::new(PowerSignal::default());
+    let _power_registration = crate::power::Registration::new(power.clone())?;
     let mut manager = DesktopManager::new(context.clone())?;
-    let start = manager.prepare_startup();
+    let start = manager.prepare_startup(!no_autostart);
     let state = HostState(Arc::new(Mutex::new(manager)));
     let (work, requests) = mpsc::sync_channel(WORK_QUEUE_CAPACITY);
     let stopping = Arc::new(AtomicBool::new(false));
@@ -259,13 +280,26 @@ pub fn run() -> Result<()> {
     thread::Builder::new()
         .name("desktop-heartbeat".into())
         .spawn(move || {
+            let mut generation = power.generation();
             while !poll_stopping.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_secs(2));
+                // Frequent wake checks do not increase the normal heartbeat rate.
+                for _ in 0..20 {
+                    if power.generation() != generation {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
                 if poll_stopping.load(Ordering::Acquire) {
                     break;
                 }
                 if let Ok(mut manager) = poll_state.0.try_lock() {
-                    manager.poll();
+                    if power.generation() != generation {
+                        generation = power.generation();
+                        manager.request_reconcile(generation);
+                    }
+                    if !power.suspended() {
+                        manager.poll();
+                    }
                 }
             }
         })
@@ -344,18 +378,39 @@ fn protocol_loop(
                     ))
                 } else {
                     let id = request.id;
+                    let stops = matches!(request.method.as_str(), "desktop_stop" | "desktop_exit");
+                    let invalidates = stops
+                        || matches!(
+                            request.method.as_str(),
+                            "desktop_start"
+                                | "desktop_restart"
+                                | "desktop_set_tun"
+                                | "desktop_reload_config"
+                                | "desktop_install_update"
+                        );
+                    if invalidates {
+                        context.runtime_generation.fetch_add(1, Ordering::AcqRel);
+                    }
+                    if stops {
+                        context.stop_pending.fetch_add(1, Ordering::AcqRel);
+                    }
                     match work.try_send(request) {
                         Ok(()) => {
                             pending.insert(id);
                             None
                         }
-                        Err(TrySendError::Full(_)) => Some(reply(
-                            Some(id),
-                            Err(AppError::new(
-                                "desktop_busy",
-                                "已有桌面操作正在进行，请稍后重试",
-                            )),
-                        )),
+                        Err(TrySendError::Full(_)) => {
+                            if stops {
+                                context.stop_pending.fetch_sub(1, Ordering::AcqRel);
+                            }
+                            Some(reply(
+                                Some(id),
+                                Err(AppError::new(
+                                    "desktop_busy",
+                                    "已有桌面操作正在进行，请稍后重试",
+                                )),
+                            ))
+                        }
                         Err(TrySendError::Disconnected(_)) => {
                             return Err(AppError::new("state_unavailable", "桌面操作线程已退出"))
                         }
@@ -415,6 +470,9 @@ fn operations(
                     break;
                 }
                 let result = commands::dispatch(&state, &context, &request.method, request.params);
+                if matches!(request.method.as_str(), "desktop_stop" | "desktop_exit") {
+                    context.stop_pending.fetch_sub(1, Ordering::AcqRel);
+                }
                 let exit = result
                     .as_ref()
                     .ok()

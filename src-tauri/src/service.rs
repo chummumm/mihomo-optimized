@@ -2,7 +2,8 @@ use crate::{
     config,
     core::CoreSupervisor,
     error::{AppError, Result},
-    service_ipc::{Reply, Request, Server},
+    lifecycle::{OwnerLease, PowerSignal, StopReason, SystemAwakeClock},
+    service_ipc::{AuthenticatedOwner, Reply, Request, Server},
     windows,
 };
 use serde::Serialize;
@@ -18,8 +19,9 @@ use std::{
 };
 use windows_service::{
     service::{
-        Service, ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl,
-        ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+        PowerEventParam, Service, ServiceAccess, ServiceControl, ServiceControlAccept,
+        ServiceErrorControl, ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState,
+        ServiceStatus, ServiceType,
     },
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
@@ -404,7 +406,9 @@ fn report_status(
             service_type: ServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted: if state == ServiceState::Running {
-                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+                ServiceControlAccept::STOP
+                    | ServiceControlAccept::SHUTDOWN
+                    | ServiceControlAccept::POWER_EVENT
             } else {
                 ServiceControlAccept::empty()
             },
@@ -423,12 +427,25 @@ fn report_status(
 fn run_service() -> Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     let stop_handler = stopping.clone();
+    let power = Arc::new(PowerSignal::default());
+    let power_handler = power.clone();
     let handle = service_control_handler::register(SERVICE_NAME, move |control| match control {
         ServiceControl::Stop | ServiceControl::Shutdown => {
             stop_handler.store(true, Ordering::SeqCst);
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+        ServiceControl::PowerEvent(event) => {
+            match event {
+                PowerEventParam::Suspend => power_handler.suspend(),
+                PowerEventParam::ResumeAutomatic | PowerEventParam::ResumeCritical => {
+                    power_handler.resume(true)
+                }
+                PowerEventParam::ResumeSuspend => power_handler.resume(false),
+                _ => {}
+            }
+            ServiceControlHandlerResult::NoError
+        }
         _ => ServiceControlHandlerResult::NotImplemented,
     })
     .map_err(service_error)?;
@@ -452,38 +469,119 @@ fn run_service() -> Result<()> {
             return Err(AppError::new("invalid_owner", "服务所有者记录损坏"));
         }
         windows::allow_service_identity_query(owner)?;
-        let server = Server::new(owner.into(), directory.join("mihomo-desktop-host.exe"))?;
+        let host_path = directory.join("mihomo-desktop-host.exe");
+        let server = Server::new(owner.into(), host_path.clone())?;
         let mut core = CoreSupervisor::new(
             directory.join("mihomo-core.exe"),
             data.join("runtime"),
             data.join("logs"),
         );
-        let mut last_seen = Instant::now();
+        let mut lease = OwnerLease::new(SystemAwakeClock)?;
+        let mut active_owner: Option<AuthenticatedOwner> = None;
+        let mut power_generation = power.generation();
         report_status(&handle, ServiceState::Running)?;
         while !stopping.load(Ordering::SeqCst) {
-            if let Some(request) = server.receive()? {
-                let reply = match request {
-                    Request::Start { config } => core.start(config, true),
-                    Request::Stop => core.stop().map(|_| core.status()),
-                    Request::Reload { config } => core.reload(config),
+            let resumed = power.generation() != power_generation;
+            if resumed {
+                power_generation = power.generation();
+            }
+            if let Some(authenticated) = active_owner.as_ref() {
+                let valid = if resumed {
+                    authenticated.verify(owner, &host_path).is_ok()
+                } else {
+                    authenticated.alive()
+                };
+                if !valid {
+                    crate::diagnostics::record(
+                        &data.join("logs"),
+                        "service_owner_lost",
+                        serde_json::json!({"ownerPid":authenticated.pid,"generation":power_generation}),
+                    );
+                    core.stop_for(StopReason::OwnerLost)?;
+                    active_owner = None;
+                } else if resumed {
+                    lease.resume_verified()?;
+                    core.request_reconcile(power_generation)?;
+                }
+            }
+            if resumed {
+                crate::diagnostics::record(
+                    &data.join("logs"),
+                    "service_resume",
+                    serde_json::json!({"generation":power_generation,"ownerPid":active_owner.as_ref().map(|owner|owner.pid),"leaseAgeMs":lease.elapsed()?.as_millis()}),
+                );
+            }
+            if let Some(authenticated) = server.receive()? {
+                if active_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.alive() && owner.pid != authenticated.owner.pid)
+                {
+                    let _ = server.respond(Reply::from_result(Err(AppError::new(
+                        "service_owner_busy",
+                        "现有桌面后台仍拥有服务，请先完全退出旧实例",
+                    ))));
+                    continue;
+                }
+                let is_start = matches!(&authenticated.request, Request::Start { .. });
+                let is_owner = active_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.pid == authenticated.owner.pid);
+                let reply = match authenticated.request {
+                    Request::Start { config } => {
+                        active_owner = Some(authenticated.owner);
+                        core.start(config, true)
+                    }
+                    Request::Stop => {
+                        let result = core.stop_for(StopReason::UserStop);
+                        if result.is_ok() {
+                            active_owner = None;
+                        }
+                        result.map(|_| core.status())
+                    }
+                    Request::Reload { config } if is_owner => core.reload(config),
+                    Request::Reload { .. } => Err(AppError::new(
+                        "service_owner_required",
+                        "只有当前桌面后台可以重载内核",
+                    )),
                     // Automatic recovery can prepare resources for the full
                     // configured budget. Run it only inside an authenticated
                     // heartbeat, whose client already uses that response budget.
-                    Request::Status => core.poll(),
+                    Request::Status if is_owner => core.poll(),
+                    Request::Status => Ok(core.status()),
+                    Request::Reconcile { generation } if is_owner => {
+                        core.request_reconcile(generation).and_then(|_| core.poll())
+                    }
+                    Request::Reconcile { .. } => Err(AppError::new(
+                        "service_owner_required",
+                        "只有当前桌面后台可以恢复内核",
+                    )),
                 };
-                last_seen = Instant::now();
+                if is_owner || is_start {
+                    lease.renew()?;
+                }
                 let _ = server.respond(Reply::from_result(reply));
             }
             // A vanished or crashed UI must not leave privileged routing running forever.
-            if last_seen.elapsed() > Duration::from_secs(20) {
-                core.stop()?;
+            if active_owner.is_some() && lease.expired()? {
+                crate::diagnostics::record(
+                    &data.join("logs"),
+                    "service_lease_expired",
+                    serde_json::json!({"ownerPid":active_owner.as_ref().map(|owner|owner.pid),"leaseAgeMs":lease.elapsed()?.as_millis(),"generation":power_generation}),
+                );
+                let reason = if core.status().stop_reason == Some(StopReason::UserStop) {
+                    StopReason::UserStop
+                } else {
+                    StopReason::LeaseExpired
+                };
+                core.stop_for(reason)?;
+                active_owner = None;
             }
             // Do not start recovery outside a request: that would block the next
             // pipe connection and let the UI lease expire while work is ongoing.
             thread::sleep(Duration::from_millis(25));
         }
         report_status(&handle, ServiceState::StopPending)?;
-        core.stop()?;
+        core.stop_for(StopReason::Shutdown)?;
         Ok(())
     })();
     let final_status = report_status(&handle, ServiceState::Stopped);

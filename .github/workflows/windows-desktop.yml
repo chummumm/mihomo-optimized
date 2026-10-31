@@ -123,14 +123,25 @@ jobs:
         # Reduce contention around the pinned tests' short wall-clock deadlines.
         # Keep every package, assertion, deadline and uncached execution intact.
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./component/desktop ./component/resource ./component/http ./component/dialer ./component/resolver ./component/profile/cachefile ./adapter/provider ./adapter/outboundgroup ./config ./hub/executor ./hub/route . -run 'Desktop|ResourceBootstrap|ReadSelectedSnapshot'
-      - name: Verify EasyTier first-dial readiness and shared TCP deadlines
+      - name: Verify EasyTier LAN preparation and ordinary TCP deadlines
         working-directory: core-src
-        run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./component/easytier ./context ./adapter/outbound ./tunnel -run 'EasyTier|DialBudget'
-      - name: Verify a single EasyTier dial waits for a delayed relay route
+        run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./component/easytier ./context ./adapter/outbound ./tunnel -run 'EasyTier|DialBudget|TCPDial|TCPFirst|LAN'
+      - name: Verify Windows TUN health, recovery and native route inspection
+        working-directory: core-src
+        run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./listener ./listener/sing_tun ./hub/executor ./hub/route ./component/lanpreconnect -run 'Desktop|LAN'
+      - name: Verify proxy IP destinations and DNS address-family output
+        working-directory: core-src
+        run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./adapter ./adapter/provider ./dns ./config ./tunnel -run 'ProxyTarget|ProxyForceIP|TargetIPFamily|AnswerIPFamily|ProviderTargetFamily'
+      - name: Verify EasyTier background preparation before delayed LAN traffic
         working-directory: core-src
         env:
           MIHOMO_EASYTIER_INTEGRATION: '1'
-        run: go test -p 1 -tags with_gvisor -count=1 -v -timeout=60s ./adapter/outbound -run '^TestEasyTierFirstDialWaitsForDelayedRelayRoute$'
+        run: go test -p 1 -tags with_gvisor -count=1 -v -timeout=120s ./adapter/outbound -run '^(TestEasyTierFirstDialWaitsForDelayedRelayRoute|TestLANEasyTierSubnetPreparesBeforeBusiness)$'
+      - name: Verify native WireGuard and AmneziaWG preparation before business traffic
+        working-directory: core-src
+        env:
+          MIHOMO_LAN_INTEGRATION: '1'
+        run: go test -p 1 -tags with_gvisor -count=1 -v -timeout=90s ./adapter/outbound -run '^TestLANWireGuardNativePreparationBeforeBusiness$'
       - name: Install pinned Rust compiler
         run: rustup toolchain install 1.99.1 --profile minimal
       - name: Cache Rust dependencies

@@ -35,7 +35,7 @@ internal static class ProcessFixtures
                     Console.WriteLine(JsonSerializer.Serialize(new { id, result = new { exiting = true } }));
                     return;
                 }
-                Console.WriteLine(JsonSerializer.Serialize(new { id, result = new { count = ++count } }));
+                Console.WriteLine(JsonSerializer.Serialize(new { id, result = new { count = ++count, pid = Environment.ProcessId, noAutostart = Environment.GetCommandLineArgs().Contains("--no-autostart") } }));
             }
             catch (JsonException) { Console.WriteLine("invalid-json"); }
         }
@@ -92,6 +92,21 @@ internal static class ProcessFixtures
                 using var deadline = new CancellationTokenSource(5000);
                 await ExpectFailure(host.CallAsync(method, null, deadline.Token));
                 await ExpectFailure(host.CallAsync("desktop_status", null, deadline.Token));
+            }
+            await using (var failed = new HostChannel())
+            {
+                failed.Start();
+                using var deadline = new CancellationTokenSource(5000);
+                var before = await failed.CallAsync("desktop_status", null, deadline.Token);
+                using var oldProcess = Process.GetProcessById(before.GetProperty("pid").GetInt32());
+                await ExpectFailure(failed.CallAsync("desktop_bad_frame", null, deadline.Token));
+                await failed.DisposeAsync();
+                if (!oldProcess.HasExited) throw new Exception("Channel disposal did not confirm old host exit");
+                await using var replacement = new HostChannel();
+                replacement.Start(allowAutostart: false);
+                var after = await replacement.CallAsync("desktop_status", null, deadline.Token);
+                if (!after.GetProperty("noAutostart").GetBoolean()) throw new Exception("Replacement host could autostart before reconciling user intent");
+                await ExpectFailure(failed.CallAsync("desktop_status", null, deadline.Token));
             }
             await using (var host = new HostChannel())
             {

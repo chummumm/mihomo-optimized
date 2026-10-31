@@ -20,7 +20,14 @@ namespace Mihomo.Desktop.Services;
 
 public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
 {
-    private readonly HostChannel host = new();
+    private HostChannel host = new();
+    private readonly HostRecoveryIntent runIntent = new();
+    private readonly Queue<long> hostRestarts = new();
+    private Task? hostRecovery;
+    private TaskCompletionSource<HostChannel>? replacementReady;
+    private int failedHostRecoveries;
+    private int statusTimeouts;
+    private bool hostRecoveryBlocked;
     private readonly HttpClient http = new(new SocketsHttpHandler { UseProxy = false, AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds(10) }) { Timeout = Timeout.InfiniteTimeSpan };
     private readonly CancellationTokenSource lifetime = new();
     private CancellationTokenSource controllerLifetime = new();
@@ -53,6 +60,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public string RuntimeMode { get; private set; } = "";
     public bool Ready { get; private set; }
     public bool IsExiting => exiting;
+    public bool IsRecoveringHost => hostRecovery is { IsCompleted: false };
     public bool IsUpdating { get; private set; }
     public event PropertyChangedEventHandler? PropertyChanged;
     public event EventHandler? StatusChanged;
@@ -77,16 +85,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
 
     public AppSession()
     {
-        host.Event += OnHostEvent;
-        host.Disconnected += error => Dispatch(() =>
-        {
-            if (exiting) return;
-            Ready = false;
-            SetRuntimeSnapshotState(false, "");
-            Status = JsonSerializer.SerializeToElement(new { phase = "error", lastError = error.Message });
-            StatusChanged?.Invoke(this, EventArgs.Empty);
-            Notify(error.Message, true);
-        });
+        AttachHost(host);
         try
         {
             if (File.Exists(appearancePath))
@@ -118,9 +117,9 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             host.Start();
             started = true;
             ApplyTheme();
+            _ = PollAsync();
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
             ApplyStatus(await host.CallAsync("desktop_status", null, timeout.Token));
-            _ = PollAsync();
             _ = CheckUpdateOnLaunchAsync();
         }
         catch (Exception error)
@@ -137,6 +136,15 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     {
         if (method == "desktop_install_update") return await InstallUpdateAsync(args, cancellationToken);
         RejectDuringUpdate(method);
+        if (IsRecoveringHost && method == "desktop_status") return Status.Clone();
+        if (IsRecoveringHost && method is not ("desktop_stop" or "desktop_exit"))
+            throw new DesktopException("host_recovering", "桌面后台正在恢复，请稍候。");
+        if (method is "desktop_stop" or "desktop_exit")
+        {
+            if (method == "desktop_stop") runIntent.Request(false);
+            if (replacementReady is { } ready && IsRecoveringHost)
+                await ready.Task.WaitAsync(cancellationToken);
+        }
         if (method == "desktop_set_dirty")
         {
             var parameters = JsonSerializer.SerializeToElement(args, HostChannel.JsonOptions);
@@ -145,7 +153,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             await SetDirtyAsync(value.GetBoolean()).WaitAsync(cancellationToken);
             return JsonSerializer.SerializeToElement<object?>(null);
         }
-        await CurrentDirtySync().WaitAsync(cancellationToken);
+        if (method != "desktop_stop") await CurrentDirtySync().WaitAsync(cancellationToken);
         RejectDuringUpdate(method);
         if (method == "desktop_check_update")
         {
@@ -156,23 +164,28 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             or "desktop_set_tun" or "desktop_set_system_proxy" or "desktop_install_service" or "desktop_uninstall_service";
         if (runtimeAction)
         {
-            if (BusyCommand is not null) throw new DesktopException("desktop_busy", "另一项桌面操作正在进行中，请稍候。");
+            if (BusyCommand is not null && method != "desktop_stop") throw new DesktopException("desktop_busy", "另一项桌面操作正在进行中，请稍候。");
             BusyCommand = method;
+            if (method is "desktop_start" or "desktop_restart") runIntent.Request(true);
+            else if (method == "desktop_set_system_proxy" && JsonSerializer.SerializeToElement(args, HostChannel.JsonOptions).TryGetProperty("enabled", out var proxyEnabled) && proxyEnabled.ValueKind == JsonValueKind.True)
+                runIntent.Request(true);
+            else if (method != "desktop_stop") runIntent.Invalidate();
             StatusChanged?.Invoke(this, EventArgs.Empty);
         }
         bool runtimeWrite = runtimeAction || method is "desktop_patch_config" or "desktop_save_config" or "desktop_import_config" or "desktop_import_config_url";
         if (runtimeWrite) ChangeRuntimeSnapshotWrites(1);
         try
         {
-            JsonElement result = await host.CallAsync(method, args, cancellationToken);
-            if (result.ValueKind == JsonValueKind.Object && result.TryGetProperty("phase", out _)) ApplyStatus(result);
+            var channel = host;
+            JsonElement result = await channel.CallAsync(method, args, cancellationToken);
+            if (ReferenceEquals(channel, host) && result.ValueKind == JsonValueKind.Object && result.TryGetProperty("phase", out _)) ApplyStatus(result);
             if (method == "desktop_exit" && result.ValueKind == JsonValueKind.Object && result.TryGetProperty("exiting", out var leaving) && leaving.ValueKind == JsonValueKind.True) ExpectExit();
             return result;
         }
         finally
         {
             if (runtimeWrite) ChangeRuntimeSnapshotWrites(-1);
-            if (runtimeAction) { BusyCommand = null; StatusChanged?.Invoke(this, EventArgs.Empty); }
+            if (runtimeAction && BusyCommand == method) { BusyCommand = null; StatusChanged?.Invoke(this, EventArgs.Empty); }
         }
     }
 
@@ -190,6 +203,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         // The host cannot cancel an accepted installation. Keep the edit lock
         // until its real result, even if the initiating page is hidden.
         IsUpdating = true;
+        runIntent.Invalidate();
         StatusChanged?.Invoke(this, EventArgs.Empty);
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsUpdating)));
         try
@@ -238,6 +252,8 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         Dispatch(() =>
         {
             Status = status.Clone();
+            if (Status.TryGetProperty("desiredRunning", out var desired) && desired.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                runIntent.ObserveInitial(desired.GetBoolean());
             string identity = Status.TryGetProperty("controller", out var controller) && controller.ValueKind == JsonValueKind.Object
                 ? HostChannel.Text(controller, "url") + "\n" + HostChannel.Text(controller, "secret") : "";
             if (identity != controllerIdentity)
@@ -269,6 +285,89 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         Dispatch(() => HostEvent?.Invoke(name, data));
     }
 
+    private void AttachHost(HostChannel channel)
+    {
+        channel.Event += (name, data) => Dispatch(() => { if (ReferenceEquals(host, channel) && !IsRecoveringHost) OnHostEvent(name, data); });
+        channel.Disconnected += error => Dispatch(() => BeginHostRecovery(channel, error));
+    }
+
+    private void HostUnavailable(string phase, Exception? error)
+    {
+        // Preserve harmless display fields, withdraw the controller immediately.
+        var fields = Status.EnumerateObject().ToDictionary(item => item.Name, item => item.Value.Clone());
+        fields["phase"] = JsonSerializer.SerializeToElement(phase);
+        fields["controller"] = JsonSerializer.SerializeToElement<object?>(null);
+        fields["desiredRunning"] = JsonSerializer.SerializeToElement(runIntent.DesiredRunning);
+        fields["lastError"] = JsonSerializer.SerializeToElement(error?.Message);
+        fields["errorCode"] = JsonSerializer.SerializeToElement(error is DesktopException desktop ? desktop.Code : null);
+        ApplyStatus(JsonSerializer.SerializeToElement(fields));
+        Ready = false;
+        StatusChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void BeginHostRecovery(HostChannel failed, Exception error)
+    {
+        if (exiting || !ReferenceEquals(host, failed) || IsRecoveringHost) return;
+        long now = Environment.TickCount64;
+        while (hostRestarts.TryPeek(out long at) && now - at > 60_000) hostRestarts.Dequeue();
+        if (IsUpdating || hostRecoveryBlocked || failedHostRecoveries >= 3 || hostRestarts.Count >= 3)
+        {
+            HostUnavailable("error", error);
+            return;
+        }
+        hostRestarts.Enqueue(now);
+        replacementReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        hostRecovery = RecoverHostAsync(failed, replacementReady);
+    }
+
+    private async Task RecoverHostAsync(HostChannel failed, TaskCompletionSource<HostChannel> ready)
+    {
+        // Let BeginHostRecovery publish its task before any event can reenter.
+        await Task.Yield();
+        HostUnavailable("recovering", null);
+        try
+        {
+            await failed.DisposeAsync(); // Includes confirmed old-process exit.
+            if (exiting || IsUpdating) throw new OperationCanceledException();
+            var replacement = new HostChannel();
+            AttachHost(replacement);
+            host = replacement;
+            replacement.Start(allowAutostart: false);
+            using (var handshake = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token))
+            {
+                handshake.CancelAfter(TimeSpan.FromSeconds(20));
+                var status = await replacement.CallAsync("desktop_status", null, handshake.Token);
+                if (status.TryGetProperty("desiredRunning", out var desired) && desired.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                    runIntent.ObserveInitial(desired.GetBoolean());
+            }
+            ready.TrySetResult(replacement);
+            long revision = runIntent.Revision;
+            JsonElement observed;
+            if (runIntent.CanResume(revision))
+            {
+                observed = await replacement.CallAsync("desktop_start", null, lifetime.Token);
+                // A Stop accepted while startup was in flight remains decisive.
+                if (!runIntent.CanResume(revision))
+                    observed = await replacement.CallAsync("desktop_stop", null, lifetime.Token);
+            }
+            else observed = await replacement.CallAsync("desktop_stop", null, lifetime.Token);
+            if (!exiting && ReferenceEquals(host, replacement))
+            {
+                ApplyStatus(observed);
+                dirtySync = replacement.CallAsync("desktop_set_dirty", new { dirty }, lifetime.Token);
+                await dirtySync;
+                failedHostRecoveries = statusTimeouts = 0;
+            }
+        }
+        catch (Exception error)
+        {
+            failedHostRecoveries++;
+            if (error is DesktopException { Code: "host_termination_unconfirmed" }) hostRecoveryBlocked = true;
+            ready.TrySetException(error);
+            if (!exiting) HostUnavailable("error", error);
+        }
+    }
+
     private async Task PollAsync()
     {
         try
@@ -276,11 +375,16 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
             while (await timer.WaitForNextTickAsync(lifetime.Token))
             {
+                if (IsRecoveringHost || exiting) continue;
+                var channel = host;
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
                 timeout.CancelAfter(TimeSpan.FromSeconds(8));
-                try { ApplyStatus(await host.CallAsync("desktop_status", null, timeout.Token)); }
-                catch (OperationCanceledException) when (!lifetime.IsCancellationRequested) { }
-                catch (DesktopException) { if (!Ready) break; }
+                try { var status = await channel.CallAsync("desktop_status", null, timeout.Token); if (ReferenceEquals(host, channel)) { statusTimeouts = 0; ApplyStatus(status); } }
+                catch (OperationCanceledException) when (!lifetime.IsCancellationRequested)
+                {
+                    if (++statusTimeouts >= 3) BeginHostRecovery(channel, new DesktopException("host_timeout", "桌面后台连续未响应，正在重新连接。"));
+                }
+                catch (DesktopException error) { BeginHostRecovery(channel, error); }
             }
         }
         catch (OperationCanceledException) { }
@@ -308,7 +412,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         try
         {
             await Task.Delay(TimeSpan.FromSeconds(5), lifetime.Token);
-            while (!launchCheckConsumed && (HostChannel.Text(Status, "phase") is "connecting" or "starting" or "stopping" || IsDirty || IsUpdating))
+            while (!launchCheckConsumed && (HostChannel.Text(Status, "phase") is "connecting" or "starting" or "stopping" or "recovering" || IsDirty || IsUpdating))
                 await Task.Delay(TimeSpan.FromSeconds(2), lifetime.Token);
             if (launchCheckConsumed) return;
             launchCheckConsumed = true;
@@ -600,7 +704,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public void Navigate(string key) => Dispatch(() => NavigateRequested?.Invoke(key));
     public void Navigate(NavigationTarget target) => Dispatch(() => NavigateTargetRequested?.Invoke(target));
     public void RequestExit() => Dispatch(() => ExitRequested?.Invoke());
-    public void ExpectExit() { exiting = true; SetRuntimeSnapshotState(false, ""); host.ExpectExit(); }
+    public void ExpectExit() { exiting = true; runIntent.Request(false); SetRuntimeSnapshotState(false, ""); host.ExpectExit(); }
     private static void Dispatch(Action action)
     {
         if (Application.Current.Dispatcher.CheckAccess()) action();
@@ -614,6 +718,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
         lifetime.Cancel();
         controllerLifetime.Cancel();
         SystemEvents.UserPreferenceChanged -= OnSystemThemeChanged;
+        if (hostRecovery is not null) await hostRecovery;
         await host.DisposeAsync();
         http.Dispose();
         controllerLifetime.Dispose();

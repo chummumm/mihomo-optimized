@@ -3,6 +3,7 @@ use crate::{
     core::{self, Controller, CoreStatus, CoreSupervisor},
     error::{AppError, Result},
     host::HostContext,
+    lifecycle::{self, RecoveryWindow, StopReason},
     proxy::SystemProxy,
     service::{self, ServiceStatusView},
     service_ipc::{Client as ServiceClient, Request},
@@ -10,8 +11,10 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
+    collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{atomic::Ordering, Arc, Mutex},
+    time::Duration,
 };
 
 #[derive(Clone)]
@@ -23,6 +26,7 @@ pub enum Phase {
     Stopped,
     Starting,
     Running,
+    Recovering,
     Stopping,
     Error,
 }
@@ -52,6 +56,11 @@ pub struct DesktopStatus {
     pub service: ServiceStatusView,
     pub capabilities: Capabilities,
     pub app_version: String,
+    pub desired_running: bool,
+    pub stop_reason: Option<StopReason>,
+    pub error_code: Option<String>,
+    pub recovery_generation: u64,
+    pub tun_health: Option<String>,
 }
 
 enum RunningCore {
@@ -74,6 +83,12 @@ pub struct DesktopManager {
     pub dirty: bool,
     pub exiting: bool,
     updating: bool,
+    run_intent: bool,
+    resume_pending: Option<u64>,
+    communication_recovery: Option<RecoveryWindow>,
+    lease_recovery_pending: Option<u64>,
+    lease_restarts: VecDeque<Duration>,
+    applied_config: Option<String>,
 }
 
 impl DesktopManager {
@@ -93,6 +108,7 @@ impl DesktopManager {
         if let Err(error) = proxy.restore() {
             last_error = Some(error.message);
         }
+        let run_intent = preferences.desired_running;
         Ok(Self {
             app,
             directory,
@@ -108,12 +124,18 @@ impl DesktopManager {
             dirty: false,
             exiting: false,
             updating: false,
+            run_intent,
+            resume_pending: None,
+            communication_recovery: None,
+            lease_recovery_pending: None,
+            lease_restarts: VecDeque::new(),
+            applied_config: None,
         })
     }
 
     /// Publish Starting before the worker can enter resource preparation.
-    pub fn prepare_startup(&mut self) -> bool {
-        let should_start = self.preferences.desired_running;
+    pub fn prepare_startup(&mut self, allow_start: bool) -> bool {
+        let should_start = allow_start && self.preferences.desired_running;
         if should_start {
             self.phase = Phase::Starting;
             self.last_error = None;
@@ -151,6 +173,14 @@ impl DesktopManager {
                 service_management: true,
             },
             app_version: env!("CARGO_PKG_VERSION").into(),
+            desired_running: self.run_intent,
+            stop_reason: self.core_status.stop_reason,
+            error_code: self.core_status.error_code.clone(),
+            recovery_generation: self
+                .core_status
+                .recovery_generation
+                .max(self.resume_pending.unwrap_or(0)),
+            tun_health: self.core_status.tun_health.clone(),
         }
     }
 
@@ -192,6 +222,9 @@ impl DesktopManager {
             return Ok(());
         }
         self.phase = Phase::Starting;
+        self.run_intent = true;
+        self.lease_recovery_pending = None;
+        self.communication_recovery = None;
         self.last_error = None;
         self.publish();
         let result = (|| {
@@ -222,6 +255,7 @@ impl DesktopManager {
             };
             self.running = Some(running);
             self.core_status = status;
+            self.applied_config = Some(content.clone());
             self.applied_proxy_port = config::mixed_port(&content).ok();
             if !self.core_status.running {
                 return Err(AppError::new("core_start_failed", "内核尚未就绪"));
@@ -252,6 +286,15 @@ impl DesktopManager {
     }
 
     pub fn stop(&mut self, persist: bool) -> Result<()> {
+        self.resume_pending = None;
+        self.lease_recovery_pending = None;
+        self.communication_recovery = None;
+        if persist {
+            // Persist the user's intent even if a later OS cleanup needs retry.
+            self.run_intent = false;
+            self.preferences.desired_running = false;
+            self.persist()?;
+        }
         self.proxy.restore()?;
         self.phase = Phase::Stopping;
         self.publish();
@@ -264,6 +307,8 @@ impl DesktopManager {
         }
         self.running = None;
         self.core_status = CoreStatus::default();
+        self.core_status.stop_reason = Some(StopReason::UserStop);
+        self.applied_config = None;
         self.applied_proxy_port = None;
         self.phase = Phase::Stopped;
         self.last_error = None;
@@ -435,6 +480,7 @@ impl DesktopManager {
             }
         };
         self.core_status = status;
+        self.applied_config = Some(content.clone());
         self.last_error = None;
         self.applied_proxy_port = config::mixed_port(&content).ok();
         if self.preferences.system_proxy {
@@ -503,26 +549,65 @@ impl DesktopManager {
     }
 
     pub fn poll(&mut self) {
-        if self.updating || self.exiting {
+        if self.updating
+            || self.exiting
+            || self.app.stop_pending.load(Ordering::Acquire) != 0
+            || !self.app.owner_alive()
+        {
             return;
         }
+        let generation = self.app.generation();
+        if let Some(pending) = self.lease_recovery_pending.take() {
+            if pending == generation && self.run_intent {
+                self.recover_lease(generation);
+                return;
+            }
+        }
+        let resume = self.resume_pending.take();
         let result = match self.running.as_mut() {
-            Some(RunningCore::Direct(core)) => core.poll(),
-            Some(RunningCore::Service(client)) => client.call(&Request::Status),
+            Some(RunningCore::Direct(core)) => {
+                if let Some(resume) = resume {
+                    let _ = core.request_reconcile(resume);
+                }
+                core.poll()
+            }
+            Some(RunningCore::Service(client)) => {
+                if let Some(resume) = resume.filter(|_| self.core_status.lifecycle_api >= 1) {
+                    client.call(&Request::Reconcile { generation: resume })
+                } else {
+                    client.call(&Request::Status)
+                }
+            }
             None => {
                 self.publish();
                 return;
             }
         };
+        // A queued Stop/Exit supersedes observations started before that action.
+        if generation != self.app.generation() || self.app.stop_pending.load(Ordering::Acquire) != 0
+        {
+            return;
+        }
         match result {
             Ok(status) => {
+                self.communication_recovery = None;
                 // A failed service query preserves the last process status, but
                 // withdraws the controller and restores our system proxy. The
                 // next confirmed Running observation must also restore the user's
                 // preference when that last process status was already running.
                 let recovered = self.phase != Phase::Running && status.running;
-                self.phase = if status.running {
+                self.phase = if status.recovering {
+                    Phase::Recovering
+                } else if status.running {
                     Phase::Running
+                } else if matches!(
+                    status.stop_reason,
+                    Some(StopReason::UserStop | StopReason::Shutdown)
+                ) {
+                    Phase::Stopped
+                } else if status.stop_reason == Some(StopReason::LeaseExpired) && self.run_intent {
+                    self.lease_recovery_pending = Some(generation);
+                    Phase::Recovering
                 } else {
                     Phase::Error
                 };
@@ -541,11 +626,118 @@ impl DesktopManager {
                 }
             }
             Err(error) => {
-                self.phase = Phase::Error;
+                let temporary = matches!(
+                    error.code.as_str(),
+                    "service_unavailable" | "service_timeout" | "io_error"
+                );
+                let now = lifecycle::awake_now().unwrap_or_default();
+                let exhausted = self
+                    .communication_recovery
+                    .get_or_insert_with(|| RecoveryWindow::new(generation, now))
+                    .failed(now);
+                self.phase = if temporary && !exhausted {
+                    Phase::Recovering
+                } else {
+                    Phase::Error
+                };
+                self.core_status.error_code = Some(error.code.clone());
+                crate::diagnostics::record(
+                    &self.logs,
+                    "service_observation_failed",
+                    serde_json::json!({"generation":generation,"code":error.code,"exhausted":exhausted}),
+                );
                 self.last_error = Some(error.message);
                 self.core_status.controller = None;
                 let _ = self.proxy.restore();
             }
+        }
+        self.publish();
+    }
+
+    pub fn request_reconcile(&mut self, generation: u64) {
+        if !self.run_intent
+            || self.updating
+            || self.exiting
+            || self.app.stop_pending.load(Ordering::Acquire) != 0
+        {
+            return;
+        }
+        self.resume_pending = Some(self.resume_pending.unwrap_or(0).max(generation));
+        if self.running.is_some() {
+            self.phase = Phase::Recovering;
+        }
+        crate::diagnostics::record(
+            &self.logs,
+            "desktop_resume",
+            serde_json::json!({"generation":generation,"ownerPid":self.app.owner.pid,"desiredRunning":self.run_intent,"tun":self.preferences.tun}),
+        );
+        self.publish();
+    }
+
+    fn recover_lease(&mut self, generation: u64) {
+        let result = (|| {
+            let now = lifecycle::awake_now()?;
+            while self
+                .lease_restarts
+                .front()
+                .is_some_and(|last| now.saturating_sub(*last) > Duration::from_secs(60))
+            {
+                self.lease_restarts.pop_front();
+            }
+            if self.lease_restarts.len() >= 3 {
+                return Err(AppError::new(
+                    "lease_recovery_exhausted",
+                    "服务租约连续恢复失败，已停止自动恢复",
+                ));
+            }
+            let source = self.applied_config.clone().ok_or_else(|| {
+                AppError::new(
+                    "recovery_config_missing",
+                    "缺少已应用的配置，请手动启动内核",
+                )
+            })?;
+            let Some(RunningCore::Service(client)) = self.running.as_ref() else {
+                return Err(AppError::new(
+                    "recovery_owner_missing",
+                    "服务恢复所属实例已变更",
+                ));
+            };
+            self.lease_restarts.push_back(now);
+            let status = client.call(&Request::Start { config: source })?;
+            if generation != self.app.generation()
+                || self.app.stop_pending.load(Ordering::Acquire) != 0
+            {
+                return Ok(());
+            }
+            self.core_status = status;
+            if !self.core_status.running {
+                return Err(AppError::new(
+                    "core_recovery_failed",
+                    "服务恢复后内核尚未就绪",
+                ));
+            }
+            self.phase = Phase::Running;
+            self.last_error = None;
+            if self.preferences.system_proxy {
+                if let Some(port) = self.applied_proxy_port {
+                    self.proxy.enable(port)?;
+                }
+            }
+            Ok(())
+        })();
+        if generation != self.app.generation() || self.app.stop_pending.load(Ordering::Acquire) != 0
+        {
+            return;
+        }
+        if let Err(error) = result {
+            self.phase = Phase::Error;
+            self.core_status.error_code = Some(error.code.clone());
+            self.last_error = Some(error.message);
+            crate::diagnostics::record(
+                &self.logs,
+                "lease_recovery_failed",
+                serde_json::json!({"generation":generation,"code":error.code}),
+            );
         }
         self.publish();
     }
@@ -558,8 +750,8 @@ impl DesktopManager {
             );
             return Ok(false);
         }
-        self.stop(false)?;
         self.exiting = true;
+        self.stop(false)?;
         Ok(true)
     }
 }

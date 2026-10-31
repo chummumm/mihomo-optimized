@@ -69,7 +69,7 @@ public sealed class DesktopRecovery : NativePage
         startProgress.SetResourceReference(FluentProgressRing.ForegroundProperty, "TextSecondaryBrush");
         startContent.Children.Add(startGlyph); startContent.Children.Add(startProgress); startContent.Children.Add(startLabel);
         start.Content = startContent;
-        start.Click += async (_, _) => { if (start.IsEnabled) await RunCommandAsync("desktop_start"); };
+        start.Click += async (_, _) => { if (start.IsEnabled) await RunCommandAsync(Session.Status.Text("phase") == "recovering" ? "desktop_stop" : "desktop_start"); };
         retry = CreateButton("update", "刷新状态", "RecoveryRefreshStatus");
         retry.Click += async (_, _) => await RunCommandAsync("desktop_status");
         var settings = CreateButton("nav-settings", "打开设置", "RecoverySettings");
@@ -133,17 +133,23 @@ public sealed class DesktopRecovery : NativePage
         if (!lastStatus.Equals(Session.Status)) { lastStatus = Session.Status; operationError = ""; }
         string phase = Session.Status.Text("phase");
         string detail = Session.Status.Text("lastError", fallback: operationError);
-        bool hasStatus = Session.Ready && phase != "connecting";
+        bool recovering = phase == "recovering";
+        bool hasStatus = (Session.Ready || recovering) && phase != "connecting";
         bool connectionFailed = !hasStatus && (phase == "error" || detail.Length > 0);
         bool connecting = !hasStatus && !connectionFailed;
         bool commandBusy = !string.IsNullOrEmpty(Session.BusyCommand) || localCommand == "desktop_start";
-        bool busy = commandBusy || phase is "starting" or "stopping";
+        bool busy = commandBusy || phase is "starting" or "stopping" or "recovering";
         string title = "本机内核尚未运行";
         string description = "已有配置时，可从顶部启动内核；首次使用请在设置中导入完整配置。";
         if (!hasStatus)
         {
             title = connectionFailed ? "无法读取本机状态" : "正在连接桌面服务…";
             description = connectionFailed ? ConnectionError : "正在读取本机内核状态，请稍候。";
+        }
+        else if (recovering)
+        {
+            title = "正在恢复本机内核";
+            description = "正在核验本地内核与网络设备，可随时停止恢复。";
         }
         else if (phase == "starting")
         {
@@ -171,6 +177,10 @@ public sealed class DesktopRecovery : NativePage
         progress.IsActive = busy || connecting;
         glyph.Visibility = progress.IsActive ? Visibility.Collapsed : Visibility.Visible;
         start.IsEnabled = hasStatus && !busy && phase != "running" && !Session.IsUpdating;
+        if (recovering) start.IsEnabled = !commandBusy && !Session.IsUpdating;
+        startLabel.Text = L.T(recovering ? "停止内核" : "启动内核");
+        startGlyph.Kind = recovering ? "stop" : "play";
+        AutomationProperties.SetName(start, startLabel.Text);
         bool starting = localCommand == "desktop_start" || Session.BusyCommand == "desktop_start";
         startGlyph.Visibility = starting ? Visibility.Collapsed : Visibility.Visible;
         startProgress.IsActive = starting;

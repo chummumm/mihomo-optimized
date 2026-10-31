@@ -5,6 +5,11 @@ public static partial class L
     static partial void RegisterRecovery(Dictionary<string, string> catalog)
     {
         catalog["正在连接桌面服务…"] = "Connecting to desktop service…";
+        catalog["正在恢复"] = "Recovering";
+        catalog["正在恢复…"] = "Recovering…";
+        catalog["正在恢复内核…"] = "Recovering the core…";
+        catalog["正在恢复本机内核"] = "Recovering the local core";
+        catalog["正在核验本地内核与网络设备，可随时停止恢复。"] = "Checking the local core and network device. You can stop recovery at any time.";
         catalog["正在读取本机内核状态，请稍候。"] = "Reading the local core status. Please wait.";
         catalog["正在启动本机内核"] = "Starting the local core";
         catalog["正在校验配置、准备所需资源并等待内核就绪。首次启动可能需要更长时间，请稍候。"] = "Validating configuration, preparing required resources, and waiting for the core to become ready. The first start may take longer. Please wait.";

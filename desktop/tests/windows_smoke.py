@@ -884,8 +884,30 @@ class NativeDriver:
         return result
 
     def navigate(self, page: str) -> None:
-        self.invoke("native_navigate", {"page": page}, timeout=10)
-        wait_until(lambda: self.snapshot().get("page") == page, "native_navigation_failed", 10)
+        result = self.invoke("native_navigate", {"page": page}, timeout=10)
+        last_snapshot = {}
+
+        def arrived() -> bool:
+            nonlocal last_snapshot
+            last_snapshot = self.snapshot()
+            return last_snapshot.get("page") == page
+
+        def failure(code: str) -> SmokeFailure:
+            return SmokeFailure(code, uia={"action": "navigate", "requestedPage": page,
+                "navigated": isinstance(result, dict) and result.get("navigated") is True,
+                "snapshot": {key: last_snapshot[key] for key in
+                    ("ready", "visible", "phase", "page", "busy", "editorOpen") if key in last_snapshot}})
+
+        if not isinstance(result, dict) or result.get("navigated") is not True:
+            with contextlib.suppress(Exception):
+                last_snapshot = self.snapshot()
+            raise failure("native_navigation_rejected")
+        try:
+            wait_until(arrived, "native_navigation_failed", 10)
+        except SmokeFailure as error:
+            if str(error) == "native_navigation_failed":
+                raise failure("native_navigation_failed") from None
+            raise
 
     def gui_timeout_probe(self) -> dict:
         """One bounded WM_NULL probe, independent of UIA and the command pipe."""
@@ -2167,6 +2189,27 @@ class Acceptance:
         driver.ui("EditConfig", "invoke")
         clean_editor_notice("native_editor_reopen")
         driver.ui("CloseEditor", "invoke")
+        # WPF's UIA Invoke queues the click at Input priority and returns before
+        # that click must run. The independent command pipe must observe closure
+        # before sending a single navigation; it must never retry a rejected one.
+        close_state = {}
+
+        def editor_closed_for_navigation() -> bool:
+            snapshot = driver.snapshot()
+            close_state["snapshot"] = {key: snapshot[key] for key in
+                ("phase", "page", "busy", "editorOpen") if key in snapshot}
+            if snapshot.get("editorOpen") is not False:
+                return False
+            editor = driver.ui("ConfigEditor")
+            close_state["editor"] = {key: editor[key] for key in ("found", "offscreen") if key in editor}
+            return editor.get("found") is False or editor.get("offscreen") is True
+
+        try:
+            wait_until(editor_closed_for_navigation, "native_editor_did_not_close", 15)
+        except SmokeFailure as error:
+            if str(error) == "native_editor_did_not_close":
+                raise SmokeFailure("native_editor_did_not_close", uia={"action": "wait_editor_closed", **close_state}) from None
+            raise
         driver.navigate("home")
         driver.navigate("profiles")
         driver.ui("EditConfig", "invoke")
@@ -2692,6 +2735,100 @@ class Acceptance:
         self.owned_children[identity.pid] = identity
         return result
 
+    def local_health_request(self, status: dict, endpoint: str, method: str = "GET") -> dict:
+        require(endpoint in ("/desktop/health", "/desktop/recover")
+                and method in ("GET", "POST"), "health_probe_endpoint_invalid")
+        controller = status.get("controller") or {}
+        url = urlsplit(controller.get("url", ""))
+        secret = controller.get("secret", "")
+        require(url.scheme == "http" and url.hostname == "127.0.0.1" and url.port
+                and not url.username and not url.password and len(secret) >= 16,
+                "health_probe_controller_invalid")
+
+        def observe():
+            connection = http.client.HTTPConnection("127.0.0.1", url.port, timeout=4)
+            try:
+                connection.request(method, endpoint, headers={"Authorization": "Bearer " + secret,
+                                                              "Connection": "close"})
+                response = connection.getresponse()
+                content = response.read(65537)
+                require(len(content) <= 65536 and secret.encode() not in content, "health_probe_response_invalid")
+                if response.status in (409, 503):
+                    return None
+                require(response.status == 200, "health_probe_http_failure")
+                return json.loads(content)
+            finally:
+                connection.close()
+        return wait_until(observe, "health_probe_busy_timeout", 15)
+
+    def check_local_resume_health(self, running: dict, *, remove_route: bool = False) -> None:
+        """Exercise the local resume boundary; this is not a simulated OS sleep."""
+        self.stage = "local_tun_recovery" if remove_route else "local_healthy_resume"
+        before = self.managed_core(running)
+        require(before.get("capabilities", {}).get("tun_health") is True
+                and before.get("capabilities", {}).get("tun_repair") is True,
+                "paired_core_health_capability_missing")
+        health = self.local_health_request(running, "/desktop/health")
+        require(health.get("pid") == before["pid"] and health.get("state") == "running"
+                and health.get("tun", {}).get("state") == ("healthy" if running.get("tun") else "disabled"),
+                "initial_local_health_not_ready")
+        recovered = self.local_health_request(running, "/desktop/recover", "POST")
+        require(recovered.get("pid") == before["pid"] and recovered.get("status") == "healthy",
+                "healthy_resume_changed_core_or_device")
+        evidence = {"sameCorePid": True, "healthyKept": True, "realSleep": False}
+        if remove_route:
+            device = health["tun"]
+            require(device.get("device") == "MihomoSmokeTun" and isinstance(device.get("index"), int)
+                    and device["index"] > 0, "route_probe_tun_identity_invalid")
+            script = Path(__file__).with_name("remove-owned-smoke-route.ps1").resolve()
+            result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                     "-File", str(script), "-InterfaceIndex", str(device["index"])],
+                                    capture_output=True, text=True, encoding="utf-8", errors="strict", timeout=20,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+            require(result.returncode == 0, "owned_route_fault_injection_failed")
+            removed = json.loads(result.stdout)
+            require(removed.get("removed") is True and removed.get("interfaceIndex") == device["index"]
+                    and removed.get("prefix") == TUN_TARGET + "/32", "owned_route_fault_not_confirmed")
+            observed = self.local_health_request(running, "/desktop/health")
+            # The host's periodic local observation may repair before this call.
+            # Either path must retain the process and restore the real data path.
+            repaired = self.local_health_request(running, "/desktop/recover", "POST")
+            require(repaired.get("pid") == before["pid"] and repaired.get("status") in ("healthy", "repaired")
+                    and repaired.get("tun", {}).get("state") == "healthy", "owned_route_not_recovered")
+            wait_until(self.socks.roundtrip, "route_recovery_data_path_failed")
+            evidence.update({"ownedRouteRemoved": True, "stateAfterRemoval": observed.get("tun", {}).get("state"),
+                             "repairResult": repaired.get("status"), "realTunForwarding": True})
+        after = self.phase("running")
+        require(self.managed_core(after)["pid"] == before["pid"], "local_recovery_restarted_healthy_core")
+        self.report[self.stage] = evidence
+        self.mark(self.stage)
+
+    def check_host_channel_recovery(self, running: dict) -> None:
+        self.stage = "host_channel_recovery"
+        before = self.managed_core(running)
+        hosts = self.processes.at_paths([self.host])
+        require(len(hosts) == 1, "host_recovery_owner_not_unique")
+        previous = hosts[0]
+        self.owned_children[previous.pid] = previous
+        self.processes.kill(previous)
+
+        def restored():
+            try:
+                current = self.status()
+            except SmokeFailure as error:
+                if str(error) in ("native_host_disconnected", "native_host_protocol_error", "native_host_unavailable", "native_host_recovering"):
+                    return None
+                raise
+            hosts_now = self.processes.at_paths([self.host])
+            return current if current.get("phase") == "running" and len(hosts_now) == 1 and hosts_now[0].pid != previous.pid else None
+
+        recovered = wait_until(restored, "host_channel_not_replaced", 60)
+        require(self.processes.identity(previous.pid) != previous, "old_host_survived_replacement")
+        require(self.managed_core(recovered)["pid"] != before["pid"], "dead_host_core_was_not_reconciled")
+        require(self.processes.identity(self.gui.pid) == self.gui, "host_recovery_restarted_gui")
+        self.report[self.stage] = {"oldHostExitConfirmed": True, "newChannelReady": True, "sameGui": True}
+        self.mark(self.stage)
+
     def capture_children(self) -> None:
         roots = [self.gui] if self.gui else []
         if self.driver and self.driver.process.poll() is None:
@@ -2941,6 +3078,8 @@ class Acceptance:
 
         self.check_native_titlebar_pointer()
         self.check_native_redesign_ui(valid, base)
+        self.check_local_resume_health(self.phase("running"))
+        self.check_host_channel_recovery(self.phase("running"))
 
         self.stage = "tun_forwarding"
         self.driver.invoke("desktop_stop")
@@ -2978,6 +3117,8 @@ class Acceptance:
             self.mark("resource_bootstrap_service")
             self.mark("tun_service_identity")
             self.check_service_proxy_recovery(tun, mixed)
+            self.check_local_resume_health(self.phase("running"), remove_route=True)
+            tun = self.phase("running")
 
             # A recovery must run inside an already authenticated heartbeat.
             # Otherwise its >20s preparation would block the next pipe connect
@@ -3211,6 +3352,7 @@ def main() -> int:
             required = {"native_uia_json_contract", "native_host_parent_binding", "update_cache_cleanup", "native_startup_window_bounds", "automatic_startup_ready", "startup_recovery", "config_revision", "system_proxy_restore", "autostart_restore",
                         "single_instance_and_native_ui", "native_titlebar_pointer", "native_redesign_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
+                        "local_healthy_resume", "local_tun_recovery", "host_channel_recovery",
                         "resource_bootstrap_recovery", "system_proxy_service_recovery"}
             acceptance.report["passed"] = all(acceptance.report["tests"].get(name) is True for name in required) and not acceptance.report["diagnostics"]
             (artifacts / "verification.json").write_text(json.dumps(acceptance.report, indent=2) + "\n", encoding="utf-8")

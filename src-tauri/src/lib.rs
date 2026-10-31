@@ -4,11 +4,15 @@ pub mod config;
 pub mod core;
 #[cfg(all(windows, feature = "desktop"))]
 pub mod desktop;
+pub mod diagnostics;
 pub mod error;
 #[cfg(windows)]
 mod firewall;
 #[cfg(all(windows, feature = "desktop"))]
 mod host;
+pub mod lifecycle;
+#[cfg(windows)]
+mod power;
 pub mod protocol;
 #[cfg(windows)]
 pub mod proxy;

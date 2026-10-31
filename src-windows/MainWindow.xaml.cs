@@ -237,7 +237,7 @@ public partial class MainWindow : Window
     private void UpdateStatus()
     {
         string phase = session.Status.Text("phase", fallback: "connecting");
-        string label = phase switch { "running" => "运行中", "starting" => "正在启动…", "stopping" => "正在停止…", "stopped" => "已停止", "error" => "需要处理", _ => "正在连接…" };
+        string label = phase switch { "running" => "运行中", "starting" => "正在启动…", "recovering" => "正在恢复…", "stopping" => "正在停止…", "stopped" => "已停止", "error" => "需要处理", _ => "正在连接…" };
         PhaseText.Text = L.T(label);
         PhaseText.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush");
         CoreStatusDot.SetResourceReference(ShellVisuals.BackgroundProperty, phase == "running" ? "SuccessBrush" : phase == "error" ? "DangerBrush" : phase is "starting" or "stopping" ? "WarningBrush" : "TextTertiaryBrush");
@@ -247,7 +247,7 @@ public partial class MainWindow : Window
         CoreGlyph.Visibility = phase == "running" ? Visibility.Collapsed : Visibility.Visible;
         CoreGlyph.Kind = phase == "error" ? "warning" : "power";
         CoreGlyph.SetResourceReference(Control.ForegroundProperty, phase == "error" ? "DangerBrush" : "TextSecondaryBrush");
-        CoreProgress.IsActive = phase is "starting" or "stopping";
+        CoreProgress.IsActive = phase is "starting" or "stopping" or "recovering";
         string version = ShortVersion(session.Status.Text("coreVersion")); VersionText.Text = version.Length > 0 ? L.F("内核 {0}", version) : "—";
         AutomationProperties.SetName(CoreCardButton, L.T("本地内核") + " · " + PhaseText.Text);
         CoreCardButton.ToolTip = PhaseText.Text + " · " + VersionText.Text;
@@ -746,7 +746,7 @@ public partial class MainWindow : Window
             case "native_arm_motion": return NativeMotionCapture.Arm(this, args);
             case "native_motion_status": return NativeMotionCapture.Status();
             case "native_snapshot":
-                return new { ready = session.Ready, visible = IsVisible, phase = session.Status.Text("phase"), page = currentPage, routeScrollOffset = activePage?.RouteScrollOffset ?? 0, error = session.Status.Text("lastError") is { Length: > 0 } coreError ? coreError : Notifications.IsErrorVisible ? Notifications.VisibleMessageText : "", busy = preparingExit || session.BusyCommand is not null || session.Status.Text("phase") is "starting" or "stopping", navigationMode, navigationOverlay = overlayOpen, material = backdrop.Material, customTitleBar = true, canGoBack = BackButton.IsEnabled, language = session.Language, theme = session.Theme, captureKind = "wpf-visual-tree", trayVisible = tray.IsFlyoutVisible, searchVisible = searchWindow?.IsVisible == true, search = new { input = SearchButton.Describe(), window = searchWindow?.Describe() } };
+                return new { ready = session.Ready, visible = IsVisible, phase = session.Status.Text("phase"), page = currentPage, editorOpen = EditorOpen, routeScrollOffset = activePage?.RouteScrollOffset ?? 0, error = session.Status.Text("lastError") is { Length: > 0 } coreError ? coreError : Notifications.IsErrorVisible ? Notifications.VisibleMessageText : "", busy = preparingExit || session.BusyCommand is not null || session.Status.Text("phase") is "starting" or "stopping", navigationMode, navigationOverlay = overlayOpen, material = backdrop.Material, customTitleBar = true, canGoBack = BackButton.IsEnabled, language = session.Language, theme = session.Theme, captureKind = "wpf-visual-tree", trayVisible = tray.IsFlyoutVisible, searchVisible = searchWindow?.IsVisible == true, search = new { input = SearchButton.Describe(), window = searchWindow?.Describe() } };
             case "native_navigate":
                 return new { navigated = await NavigateAsync(new NavigationTarget(args.Text("page"), EmptyNull(args.Text("target")), EmptyNull(args.Text("query")), EmptyNull(args.Text("action")))) };
             case "native_show": ShowMain(); return new { visible = IsVisible };

@@ -25,10 +25,16 @@ use windows_sys::Win32::{
         CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
         PIPE_ACCESS_DUPLEX,
     },
-    System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-        GetNamedPipeServerProcessId, PeekNamedPipe, SetNamedPipeHandleState, PIPE_NOWAIT,
-        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+    System::{
+        Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+            GetNamedPipeServerProcessId, PeekNamedPipe, SetNamedPipeHandleState, PIPE_NOWAIT,
+            PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+        },
+        Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE,
+        },
     },
 };
 
@@ -44,7 +50,7 @@ fn operation_timeout(request: &Request, current: Duration) -> Result<Duration> {
         }
         // Status can observe a bounded automatic core recovery, so it must use
         // the active configuration's budget rather than the old fixed 90s wait.
-        Request::Status => Ok(current),
+        Request::Status | Request::Reconcile { .. } => Ok(current),
         Request::Stop => Ok(Duration::from_secs(30)),
     }
 }
@@ -69,6 +75,43 @@ pub enum Request {
     Stop,
     Reload { config: String },
     Status,
+    Reconcile { generation: u64 },
+}
+
+pub struct AuthenticatedOwner {
+    pub pid: u32,
+    handle: OwnedHandle,
+}
+
+impl AuthenticatedOwner {
+    pub fn alive(&self) -> bool {
+        unsafe {
+            WaitForSingleObject(self.handle.as_raw_handle(), 0)
+                == windows_sys::Win32::Foundation::WAIT_TIMEOUT
+        }
+    }
+
+    pub fn verify(&self, sid: &str, executable: &Path) -> Result<()> {
+        if !self.alive() {
+            return Err(AppError::new(
+                "service_owner_lost",
+                "已认证的桌面后台已经退出",
+            ));
+        }
+        let (actual_path, actual_sid) = windows::process_handle_identity(&self.handle)?;
+        if actual_sid != sid || !same_file(&actual_path, executable) {
+            return Err(AppError::new(
+                "service_owner_changed",
+                "服务所属桌面后台身份不匹配",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub struct AuthenticatedRequest {
+    pub request: Request,
+    pub owner: AuthenticatedOwner,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -145,7 +188,11 @@ impl Client {
             if GetNamedPipeServerProcessId(handle.as_raw_handle(), &mut pid) == 0 {
                 return Err(windows::last_error("无法验证 TUN 服务"));
             }
-            let actual = windows::process_path(pid)?
+            let actual = windows::process_path(pid)
+                .map_err(|mut error| {
+                    error.code = "service_identity_failed".into();
+                    error
+                })?
                 .canonicalize()
                 .map_err(|e| AppError::io("无法验证 TUN 服务路径", e))?;
             let expected = self
@@ -254,7 +301,7 @@ impl Server {
         }
     }
 
-    pub fn receive(&self) -> Result<Option<Request>> {
+    pub fn receive(&self) -> Result<Option<AuthenticatedRequest>> {
         let connected =
             unsafe { ConnectNamedPipe(self.handle.as_raw_handle(), std::ptr::null_mut()) };
         if connected == 0 {
@@ -273,16 +320,25 @@ impl Server {
             if unsafe { GetNamedPipeClientProcessId(self.handle.as_raw_handle(), &mut pid) } == 0 {
                 return Err(windows::last_error("无法验证服务调用者"));
             }
-            let (path, sid) = windows::process_identity(pid)?;
-            if sid != self.owner_sid || !same_file(&path, &self.expected_gui) {
-                return Err(AppError::new(
-                    "service_access_denied",
-                    "仅允许已安装的主程序管理本用户服务",
-                ));
+            let raw = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    0,
+                    pid,
+                )
+            };
+            if raw.is_null() {
+                return Err(windows::last_error("无法保留服务所有者身份"));
             }
+            let owner = AuthenticatedOwner {
+                pid,
+                handle: unsafe { OwnedHandle::from_raw_handle(raw) },
+            };
+            owner.verify(&self.owner_sid, &self.expected_gui)?;
             let bytes = read_message(self.handle.as_raw_handle(), Duration::from_secs(6))?;
-            serde_json::from_slice::<Request>(&bytes)
-                .map_err(|_| AppError::new("service_protocol", "无效的服务操作"))
+            let request = serde_json::from_slice::<Request>(&bytes)
+                .map_err(|_| AppError::new("service_protocol", "无效的服务操作"))?;
+            Ok(AuthenticatedRequest { request, owner })
         })();
         match validated {
             Ok(request) => Ok(Some(request)),
