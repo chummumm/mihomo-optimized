@@ -281,11 +281,13 @@ pub fn http_client() -> Result<Client> {
         .map_err(|_| AppError::new("http_init_failed", "无法初始化本地控制连接"))
 }
 
+#[cfg_attr(test, derive(Debug))]
 enum ReadinessFailure {
     Temporary(AppError),
     Fatal(AppError),
 }
 
+#[cfg_attr(test, derive(Debug))]
 enum HealthCheck {
     Ready,
     NeedsRestart,
@@ -1475,6 +1477,19 @@ mod tests {
         _occupied_port: Option<TcpListener>,
     }
 
+    fn configure_readiness_fixture_stream(stream: &std::net::TcpStream) {
+        // Windows accept inherits the nonblocking listener mode. HTTP headers
+        // can arrive after accept or in fragments, so the fixture must wait for
+        // them within its existing timeout instead of discarding WouldBlock.
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+    }
+
     impl ReadinessFixture {
         fn new(scenario: ReadinessScenario) -> Self {
             let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1555,12 +1570,7 @@ mod tests {
                         }
                         Err(error) => panic!("fixture accept failed: {error}"),
                     };
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(1)))
-                        .unwrap();
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(1)))
-                        .unwrap();
+                    configure_readiness_fixture_stream(&stream);
                     let mut request = Vec::new();
                     let mut byte = [0_u8];
                     while request.len() < 4096 && !request.ends_with(b"\r\n\r\n") {
@@ -1711,6 +1721,55 @@ mod tests {
     }
 
     #[test]
+    fn readiness_fixture_waits_for_delayed_header_fragments() {
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        // Model Windows' accepted mode on every platform, then use the exact
+        // configuration applied by ReadinessFixture to its real HTTP sockets.
+        stream.set_nonblocking(true).unwrap();
+        let mut empty = [0_u8];
+        assert_eq!(
+            stream.read(&mut empty).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        configure_readiness_fixture_stream(&stream);
+        let prefix = b"GET /desktop/health HTTP/1.1\r\nAuthorization: Bearer ";
+        let suffix = b"readiness-fixture-secret\r\n\r\n";
+        client.write_all(prefix).unwrap();
+        let (prefix_sent, prefix_read) = mpsc::channel();
+        let (finished, received) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut headers = vec![0; prefix.len()];
+            stream.read_exact(&mut headers).unwrap();
+            prefix_sent.send(()).unwrap();
+            let mut tail = vec![0; suffix.len()];
+            let result = stream.read_exact(&mut tail).map(|()| {
+                headers.extend_from_slice(&tail);
+                headers
+            });
+            let _ = finished.send(result);
+        });
+        prefix_read.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Only after the server has consumed the first fragment do we delay
+        // the rest. A nonblocking read would already have returned WouldBlock.
+        let pending = received.recv_timeout(Duration::from_millis(50));
+        assert!(
+            matches!(&pending, Err(mpsc::RecvTimeoutError::Timeout)),
+            "fixture discarded a delayed header fragment: {pending:?}"
+        );
+        client.write_all(suffix).unwrap();
+        let headers = received
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(headers, [prefix.as_slice(), suffix.as_slice()].concat());
+        server.join().unwrap();
+    }
+
+    #[test]
     fn readiness_retries_one_listener_disconnect_without_restarting() {
         let mut fixture = ReadinessFixture::new(ReadinessScenario::DisconnectOnce);
         let original_pid = fixture.core.child.as_ref().unwrap().id();
@@ -1741,10 +1800,13 @@ mod tests {
     fn degraded_owned_tun_uses_repair_without_restarting_process() {
         let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthDegraded);
         let pid = fixture.core.child.as_ref().unwrap().id();
-        assert!(matches!(
-            fixture.core.check_local_health(false),
-            Ok(HealthCheck::Ready)
-        ));
+        let observed = fixture.core.check_local_health(false);
+        assert!(
+            matches!(&observed, Ok(HealthCheck::Ready)),
+            "health fixture returned {observed:?}; config reads={}, recovery reads={}",
+            fixture.config_reads.load(Ordering::SeqCst),
+            fixture.recovery_reads.load(Ordering::SeqCst)
+        );
         assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.core.child.as_ref().unwrap().id(), pid);
     }
