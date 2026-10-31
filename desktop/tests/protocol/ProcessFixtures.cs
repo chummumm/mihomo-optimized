@@ -201,13 +201,74 @@ internal static class ProcessFixtures
         return Process.Start(start) ?? throw new Exception("Cannot start broker fixture");
     }
 
+    private static bool IsLockedFixtureError(Exception error) => OperatingSystem.IsWindows()
+        && error is IOException or UnauthorizedAccessException
+        && (error.HResult & 0xffff) is 5 or 32 or 33;
+
+    private static async Task DeleteExitedBrokerFixtureAsync(string directory)
+    {
+        // Process exit and disposal have already been confirmed. Windows may
+        // still temporarily deny deleting the image; never accept a leaked
+        // directory or retry a different filesystem failure indefinitely.
+        var elapsed = Stopwatch.StartNew();
+        while (true)
+        {
+            try { Directory.Delete(directory, true); return; }
+            catch (Exception error) when (IsLockedFixtureError(error) && elapsed.Elapsed < TimeSpan.FromSeconds(2))
+            {
+                await Task.Delay(50);
+            }
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static async Task TestBrokerCleanupAsync()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "MihomoBrokerCleanupTest-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string file = Path.Combine(directory, "locked.exe");
+        try
+        {
+            Task deletion;
+            using (var held = new FileStream(file, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+            {
+                deletion = DeleteExitedBrokerFixtureAsync(directory);
+                if (deletion.IsCompleted)
+                {
+                    await deletion;
+                    throw new Exception("Fixture cleanup did not wait for an exclusively held file");
+                }
+                if (!Directory.Exists(directory)) throw new Exception("Fixture cleanup removed a locked directory");
+            }
+            await deletion.WaitAsync(TimeSpan.FromSeconds(5));
+            if (Directory.Exists(directory)) throw new Exception("Fixture cleanup left its directory after the lock was released");
+
+            Directory.CreateDirectory(directory);
+            using (var held = new FileStream(file, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+            {
+                bool rejected = false;
+                try { await DeleteExitedBrokerFixtureAsync(directory).WaitAsync(TimeSpan.FromSeconds(5)); }
+                catch (Exception error) when (IsLockedFixtureError(error)) { rejected = true; }
+                if (!rejected) throw new Exception("Fixture cleanup accepted a permanently held file");
+                if (!Directory.Exists(directory)) throw new Exception("Failed fixture cleanup concealed its locked directory");
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) await DeleteExitedBrokerFixtureAsync(directory);
+        }
+        Console.WriteLine("Native Windows fixture cleanup: released lock deleted; persistent lock failed within its bound.");
+    }
+
     [SupportedOSPlatform("windows")]
     public static async Task TestBrokerAsync()
     {
+        await TestBrokerCleanupAsync();
         string ui = CopyAppHost(AppContext.BaseDirectory, "mihomo-optimized.exe");
         string otherDirectory = Path.Combine(Path.GetTempPath(), "MihomoBrokerTest-" + Guid.NewGuid().ToString("N"));
         string otherUi = CopyAppHost(otherDirectory, "mihomo-optimized.exe");
         using var deadline = new CancellationTokenSource(30000);
+        bool brokerProcessesExited = false;
         try
         {
             string scope = Guid.NewGuid().ToString("N");
@@ -256,12 +317,14 @@ internal static class ProcessFixtures
                 if (observed != "NO_COMMAND" || foreignServer.ExitCode != 0)
                     throw new Exception($"Foreign-path server received a command or failed (observed {observed}, exit {foreignServer.ExitCode}): " + await foreignServer.StandardError.ReadToEndAsync(deadline.Token));
             }
+            brokerProcessesExited = true;
             Console.WriteLine("Native Windows instance broker: client rejected another installation's server before transmitting any command.");
         }
         finally
         {
             File.Delete(ui);
-            Directory.Delete(otherDirectory, true);
+            if (brokerProcessesExited) await DeleteExitedBrokerFixtureAsync(otherDirectory);
+            else Directory.Delete(otherDirectory, true);
         }
     }
 }
