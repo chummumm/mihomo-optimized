@@ -64,6 +64,57 @@ type wireGuardLANControl interface {
 	SendKeepalive()
 }
 
+type wireGuardLANControlTask struct {
+	key  string
+	done chan struct{}
+	err  error
+}
+
+// The native control call may write through an existing UDP-over-TCP carrier.
+// A caller's deadline must not get stuck inside that write. Keep at most one
+// such call per instance; later generations join it rather than spawning more.
+// Its lifetime belongs to the instance, which closes bind IO before the device.
+func (w *WireGuard) runLANControl(ctx context.Context, key string, control func() error) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := w.runCtx.Err(); err != nil {
+			return err
+		}
+		w.lanControlMu.Lock()
+		task := w.lanControl
+		if task == nil {
+			task = &wireGuardLANControlTask{key: key, done: make(chan struct{})}
+			w.lanControl = task
+			go func() {
+				err := w.runCtx.Err()
+				if err == nil {
+					err = control()
+				}
+				w.lanControlMu.Lock()
+				task.err = err
+				if w.lanControl == task {
+					w.lanControl = nil
+				}
+				close(task.done)
+				w.lanControlMu.Unlock()
+			}()
+		}
+		w.lanControlMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-w.runCtx.Done():
+			return w.runCtx.Err()
+		case <-task.done:
+			if task.key == key {
+				return task.err
+			}
+		}
+	}
+}
+
 func wireGuardControlPeer(dev wireguardGoDevice, publicKey string) (wireGuardLANControl, error) {
 	switch d := dev.(type) {
 	case *device.Device:
@@ -151,24 +202,29 @@ func (w *WireGuard) PrepareLAN(ctx context.Context, target netip.Addr) error {
 	w.deviceMutex.Lock()
 	dev := w.device
 	w.deviceMutex.Unlock()
-	// tun.Start emits an asynchronous EventUp. An explicit native handshake
-	// can otherwise race Bind.Open and reach an uninitialized bind context.
-	// Up is idempotent and serialized by the native device in all engines.
-	if native, ok := dev.(interface{ Up() error }); ok {
-		if err := native.Up(); err != nil {
-			return err
-		}
-	}
 	for _, key := range keys {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		peer, err := wireGuardControlPeer(dev, key)
+		err := w.runLANControl(ctx, key, func() error {
+			// tun.Start emits an asynchronous EventUp. Up is idempotent and
+			// serialized; confirm Bind.Open before an explicit control packet.
+			if native, ok := dev.(interface{ Up() error }); ok {
+				if err := native.Up(); err != nil {
+					return err
+				}
+			}
+			peer, err := wireGuardControlPeer(dev, key)
+			if err != nil {
+				return err
+			}
+			// This native empty keepalive also initiates a missing handshake.
+			peer.SendKeepalive()
+			return nil
+		})
 		if err != nil {
 			return err
 		}
-		// This is a native empty keepalive, not a fabricated business packet.
-		peer.SendKeepalive()
 		if wireGuardRecentHandshake(dev, key, time.Now()) {
 			continue
 		}

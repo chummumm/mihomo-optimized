@@ -405,6 +405,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 	if !c.Enable {
 		resolver.DefaultResolver = nil
 		resolver.DefaultHostMapper = nil
+		lanpreconnect.SetFakeIPPolicy(nil)
 		resolver.DefaultService = nil
 		resolver.ProxyServerHostResolver = nil
 		resolver.DirectHostResolver = nil
@@ -475,6 +476,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 
 	resolver.DefaultResolver = r
 	resolver.DefaultHostMapper = m
+	lanpreconnect.SetFakeIPPolicy(m.IsFakeIP)
 	resolver.DefaultService = s
 	resolver.UseSystemHosts = c.UseSystemHosts
 

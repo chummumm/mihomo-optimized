@@ -5,7 +5,6 @@ import (
 	"sort"
 
 	"github.com/metacubex/mihomo/component/lanpreconnect"
-	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 )
 
@@ -26,7 +25,7 @@ func privateLANPrefix(prefix netip.Prefix) bool {
 	if !prefix.IsValid() {
 		return false
 	}
-	if resolver.IsFakeIP(prefix.Masked().Addr().Unmap()) {
+	if !lanpreconnect.IsLAN(prefix.Masked().Addr()) {
 		return false
 	}
 	for _, private := range []netip.Prefix{

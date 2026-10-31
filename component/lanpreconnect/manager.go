@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/log"
 )
 
@@ -94,13 +93,6 @@ func New() *Manager {
 }
 
 var Default = New()
-
-// IsLAN uses the actual numeric destination, never a node's server address or
-// a DNS lookup performed solely for preconnection. Mapped IPv4 is normalized.
-func IsLAN(ip netip.Addr) bool {
-	ip = ip.Unmap()
-	return ip.IsPrivate() && !resolver.IsFakeIP(ip)
-}
 
 // Replace applies a completed configuration generation. No parsing/check path
 // should call it. Old work is canceled before the new intents become runnable.

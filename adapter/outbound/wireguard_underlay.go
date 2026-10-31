@@ -4,9 +4,36 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 
 	C "github.com/metacubex/mihomo/constant"
+	wireguard "github.com/metacubex/sing-wireguard"
+	wgconn "github.com/metacubex/wireguard-go/conn"
 )
+
+// Closing the carrier outside native Device.Close must also serialize with an
+// asynchronous EventUp. Once the instance is canceled, a late Open may not
+// revive its bind. Normal native rebinds remain possible while it is running.
+type wireGuardClientBind struct {
+	*wireguard.ClientBind
+	ctx context.Context
+	mu  sync.Mutex
+}
+
+func (b *wireGuardClientBind) Open(port uint16) ([]wgconn.ReceiveFunc, uint16, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	return b.ClientBind.Open(port)
+}
+
+func (b *wireGuardClientBind) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.ClientBind.Close()
+}
 
 // Native WireGuard keeps its bind for the instance lifetime. Each attempt to
 // establish that shared carrier still needs a finite deadline, including when

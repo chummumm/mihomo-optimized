@@ -6,8 +6,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/metacubex/mihomo/component/resolver"
 )
 
 type testPreparer struct {
@@ -47,15 +45,11 @@ func TestLANScope(t *testing.T) {
 	}
 }
 
-type privateFakeRange struct{ resolver.Enhancer }
-
-func (privateFakeRange) IsFakeIP(ip netip.Addr) bool {
-	return netip.MustParsePrefix("192.168.250.0/24").Contains(ip.Unmap())
-}
 func TestLANExcludesConfiguredPrivateFakePool(t *testing.T) {
-	old := resolver.DefaultHostMapper
-	resolver.DefaultHostMapper = privateFakeRange{}
-	defer func() { resolver.DefaultHostMapper = old }()
+	old := currentFakeIPPolicy.Load()
+	defer currentFakeIPPolicy.Store(old)
+	pool := netip.MustParsePrefix("192.168.250.0/24")
+	SetFakeIPPolicy(pool.Contains)
 	if IsLAN(netip.MustParseAddr("192.168.250.7")) || IsLAN(netip.MustParseAddr("::ffff:192.168.250.7")) {
 		t.Fatal("configured private fake pool admitted as real LAN")
 	}

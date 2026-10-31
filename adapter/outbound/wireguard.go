@@ -52,7 +52,7 @@ type wireguardGoDevice interface {
 
 type WireGuard struct {
 	*Base
-	bind      *wireguard.ClientBind
+	bind      *wireGuardClientBind
 	device    wireguardGoDevice
 	tunDevice wireguardDevice
 	resolver  resolver.Resolver
@@ -60,6 +60,8 @@ type WireGuard struct {
 	runCtx        context.Context
 	runCancel     context.CancelFunc
 	deviceMutex   sync.Mutex
+	lanControlMu  sync.Mutex
+	lanControl    *wireGuardLANControlTask
 	initOk        atomic.Bool
 	initMutex     *semaphore.Weighted
 	initErr       error
@@ -392,11 +394,11 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		}
 	}
 	outbound.runCtx, outbound.runCancel = context.WithCancel(context.Background())
-	outbound.bind = wireguard.NewClientBind(outbound.runCtx, wgSingErrorHandler{outbound.Name()}, singDialer, isConnect, outbound.connectAddr.AddrPort(), reserved)
-
-	if outbound.bind == nil {
+	clientBind := wireguard.NewClientBind(outbound.runCtx, wgSingErrorHandler{outbound.Name()}, singDialer, isConnect, outbound.connectAddr.AddrPort(), reserved)
+	if clientBind == nil {
 		return nil, E.New("failed to create wireguard client bind")
 	}
+	outbound.bind = &wireGuardClientBind{ClientBind: clientBind, ctx: outbound.runCtx}
 
 	var err error
 	outbound.localPrefixes, err = option.Prefixes()
@@ -822,6 +824,12 @@ func (w *WireGuard) genIpcConf(ctx context.Context, updateOnly bool) (string, er
 func (w *WireGuard) Close() error {
 	lanpreconnect.Default.Forget(w)
 	w.runCancel()
+	// Native SendBuffers holds the device's network read lock during a write.
+	// Close the physical carrier first so a blocked UDP-over-TCP write cannot
+	// keep native Close waiting forever for the corresponding write lock.
+	if w.bind != nil {
+		_ = w.bind.Close()
+	}
 	w.deviceMutex.Lock()
 	wgDevice := w.device
 	w.deviceMutex.Unlock()
