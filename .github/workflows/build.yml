@@ -369,7 +369,13 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.23
+              printf '%s\n\n' '## 本次更新：1.0.24
+
+          - 修复 issue #67：开启 proxy-force-ip 时，显式 DNS 代理出口及 Global / respect-rules 路径可能把 DoH 自身域名重新交给业务 DNS，导致解析失败和节点测速超时。
+          - DNS 上游目标使用对应的独立引导解析器，保留节点地址族约束；作用域按上游域名限定，不影响代理节点、链式代理下一跳或协议私有解析器。
+          - 覆盖 TCP、UDP 和 packet 拨号入口，保留 DoH URL、HTTP Host、TLS SNI 及证书校验。现有 DNS 选池和传输选路语义保持不变。
+
+          ## 1.0.23：LAN 后台预连接、代理目标 IP 与 Windows 恢复
 
           - LAN 后台预连接只针对 RFC1918 IPv4 / ULA IPv6 业务目标，覆盖 EasyTier、WireGuard / AmneziaWG、Tailscale、ZeroTier 和 OpenVPN；沿用现有规则、稳定选组和实际目标，不增加节点字段，不扫描网段或重放 UDP。
           - 回退 EasyTier 请求内 15 秒准备加 5 秒拨号的延长预算，业务恢复原有 5 秒期限；保留路由、实际下一跳、共享初始化、取消和关闭保护。后台先准备通道，未知冷目标的第一次请求仍可能超时。
@@ -477,4 +483,3 @@ jobs:
           else
             printf 'Build %s is not current main (%s); Latest is unchanged.\n' "$BUILD_SHA" "$current_main"
           fi
-

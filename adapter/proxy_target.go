@@ -108,7 +108,13 @@ func (a *proxyTargetAdapter) target(ctx context.Context, original *C.Metadata) (
 		return m, candidates, nil
 	}
 	r := resolver.DefaultResolver
-	if m.ProxyTransport || icontext.DNSBootstrap(ctx) {
+	if upstream, ok := resolver.DNSUpstreamResolver(ctx, m.Host); ok && !m.ProxyTransport {
+		// DNS transport targets use their configured bootstrap resolver, with
+		// this leaf's family policy. A chained proxy next hop is a separate
+		// target and must keep ProxyServerHostResolver even for the same host.
+		r = upstream
+		ctx = icontext.WithDNSBootstrap(ctx)
+	} else if m.ProxyTransport || icontext.DNSBootstrap(ctx) {
 		r = resolver.ProxyServerHostResolver
 		ctx = icontext.WithDNSBootstrap(ctx)
 	}

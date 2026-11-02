@@ -83,6 +83,7 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 	if err != nil {
 		return nil, err
 	}
+	ctx = resolver.WithDNSUpstreamResolver(ctx, metadata.Host, r)
 	if !strings.Contains(network, "tcp") {
 		metadata.NetWork = C.UDP
 		if !metadata.Resolved() {
@@ -191,6 +192,7 @@ func (d *DNSDialer) ListenPacket(ctx context.Context, network, addr string) (net
 	if err != nil {
 		return nil, err
 	}
+	ctx = resolver.WithDNSUpstreamResolver(ctx, metadata.Host, r)
 	if !metadata.Resolved() {
 		// udp must resolve host first
 		dstIP, err := resolver.ResolveIPWithResolver(ctx, metadata.Host, r)
