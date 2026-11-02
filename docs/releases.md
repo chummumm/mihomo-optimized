@@ -2,6 +2,12 @@
 
 项目使用独立版本 **`mihomo-optimized-vX.Y.Z`**，首版为 `mihomo-optimized-v1.0.0`。`main` 的源码、依赖或构建配置变更在全部测试和完整编译成功后生成固定提交的 GitHub Release。Latest 仅在该构建仍对应当前 `main` 时更新；PR 只做合并前检查，不生成正式发布包。纯文档变更不消耗版本号，也不触发自动发布。
 
+## 1.0.24：代理 DNS 上游引导解析修复
+
+修复 issue [#67](https://github.com/chummumm/mihomo-optimized/issues/67)：开启 `proxy-force-ip` 时，显式指定 DNS 代理出口或在 Global 模式下使用 `respect-rules`，DNS 服务器自身的域名可能重新进入业务 DNS，导致 DoH 解析失败及节点延迟测试超时。DNS 拨号现在将对应的引导解析器传递到强制 IP 目标解析，按实际节点的地址族限制选择真实地址，不再依赖临时 hosts 映射。
+
+作用域仅限当前 DNS 上游域名，代理节点和链式代理下一跳继续使用其原有解析器。覆盖 TCP、UDP 和 QUIC 所用的 packet 拨号入口，保留 DoH URL、HTTP Host、TLS SNI 与证书校验。现有 `dns-rule-routing`、`nameserver-policy` 和 DNS 传输选路语义保持不变，本次不包含附加的独立选路需求。
+
 ## 1.0.23：LAN 后台预连接、代理目标 IP 与 Windows 恢复
 
 回退 `1.0.22` 引入的 EasyTier 请求内 15 秒准备加 5 秒建连预算，普通请求恢复原有 5 秒期限。保留目标路由、下一跳、并发初始化与关闭保护，改为只对 RFC1918 / ULA 业务目标进行后台准备；覆盖 EasyTier、WireGuard / AmneziaWG、Tailscale、ZeroTier 和 OpenVPN，不新增节点预连接字段，不扫描 LAN 或重放业务数据。现有规则、稳定选组、实际目标、配置及网络变化共同维护准备范围，详见 [LAN 预连接](lan-preconnect.md)。
@@ -331,4 +337,3 @@ external-ui-update-interval: 24 # 面板检查间隔，采用相同单位和范�
 下载并校验对应平台的新归档或 native 包，按原安装方式替换并重启，确认 `mihomo -v` 显示新系列，然后启用 YAML 自动更新。没有新增旧名 bridge Release 或复制旧资产；历史 tag 和文件不修改。
 
 新更新器仍能读取历史 `vX.Y.Z-optimized-N` / `vX.Y.Z-dns-optimized-N` 与 `mihomo-` / `mihomo-dns-` 归档，便于显式维护操作。新系列被视为比所有旧系列更新，自动更新不会退回旧系列。历史兼容只对已安装新更新器的程序生效；`force` 不会绕过 tag 格式、归档或 SHA256 校验。
-
