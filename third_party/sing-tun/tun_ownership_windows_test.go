@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/metacubex/sing-tun/internal/wintun"
 )
@@ -21,9 +22,107 @@ func (a *failingOwnedAdapter) StartSession(uint32) (wintun.Session, error) {
 func (a *failingOwnedAdapter) Close() error { a.closed++; return nil }
 func (*failingOwnedAdapter) LUID() uint64   { return 123 }
 
+func TestDesktopExclusiveAdapterChecksAliasBeforeCreate(t *testing.T) {
+	originalCreate, originalAliases := createWindowsAdapter, listWindowsInterfaceAliases
+	t.Cleanup(func() {
+		createWindowsAdapter = originalCreate
+		listWindowsInterfaceAliases = originalAliases
+	})
+	lookupFailure := errors.New("interface enumeration failed")
+	createFailure := errors.New("driver create reached")
+	for _, test := range []struct {
+		name         string
+		aliases      []string
+		lookupErr    error
+		wantErr      error
+		wantAttempts int
+		wantWait     time.Duration
+	}{
+		{name: "existing alias", aliases: []string{"Ethernet", "owned-adapter"}, wantErr: os.ErrExist, wantWait: 500 * time.Millisecond},
+		{name: "case-insensitive alias", aliases: []string{"OWNED-Adapter"}, wantErr: os.ErrExist, wantWait: 500 * time.Millisecond},
+		{name: "lookup failure", lookupErr: lookupFailure, wantErr: lookupFailure},
+		{name: "alias absent", aliases: []string{"Ethernet", "another-adapter"}, wantErr: createFailure, wantAttempts: 1},
+		{name: "empty interface table", wantErr: createFailure, wantAttempts: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			lookedUp, attempts := false, 0
+			started := time.Unix(0, 0)
+			current := started
+			listWindowsInterfaceAliases = func() ([]string, error) {
+				lookedUp = true
+				return test.aliases, test.lookupErr
+			}
+			createWindowsAdapter = func(options Options) (windowsAdapter, error) {
+				attempts++
+				if !lookedUp || options.Name != "owned-adapter" {
+					t.Fatal("adapter creation preceded the alias check or changed the requested name")
+				}
+				return nil, createFailure
+			}
+			device, err := newWindowsExclusive(Options{Name: "owned-adapter"}, func() time.Time { return current }, func(delay time.Duration) {
+				if delay <= 0 || delay > 50*time.Millisecond || current.Sub(started)+delay > 500*time.Millisecond {
+					t.Fatalf("alias grace exceeded its fixed deadline: elapsed=%s delay=%s", current.Sub(started), delay)
+				}
+				current = current.Add(delay)
+			})
+			if device != nil || !lookedUp || !errors.Is(err, test.wantErr) || attempts != test.wantAttempts || current.Sub(started) != test.wantWait {
+				t.Fatalf("unexpected alias guard result: device=%v err=%v attempts=%d lookup=%v waited=%s", device, err, attempts, lookedUp, current.Sub(started))
+			}
+		})
+	}
+}
+
+func TestDesktopExclusiveAdapterWaitsForAliasRemoval(t *testing.T) {
+	originalCreate, originalAliases := createWindowsAdapter, listWindowsInterfaceAliases
+	t.Cleanup(func() {
+		createWindowsAdapter = originalCreate
+		listWindowsInterfaceAliases = originalAliases
+	})
+	lookupFailure := errors.New("interface enumeration failed during removal")
+	createFailure := errors.New("driver create reached")
+	for _, test := range []struct {
+		name         string
+		lookupErr    error
+		wantErr      error
+		wantAttempts int
+	}{
+		{name: "alias disappears", wantErr: createFailure, wantAttempts: 1},
+		{name: "lookup fails during grace", lookupErr: lookupFailure, wantErr: lookupFailure},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			current := time.Unix(0, 0)
+			lookups, attempts := 0, 0
+			listWindowsInterfaceAliases = func() ([]string, error) {
+				lookups++
+				if lookups == 1 {
+					return []string{"owned-adapter"}, nil
+				}
+				return []string{"unrelated-adapter"}, test.lookupErr
+			}
+			createWindowsAdapter = func(Options) (windowsAdapter, error) {
+				attempts++
+				if lookups != 2 {
+					t.Fatal("adapter creation began before confirmed alias removal")
+				}
+				return nil, createFailure
+			}
+			device, err := newWindowsExclusive(Options{Name: "owned-adapter"}, func() time.Time { return current }, func(delay time.Duration) {
+				current = current.Add(delay)
+			})
+			if device != nil || !errors.Is(err, test.wantErr) || attempts != test.wantAttempts || lookups != 2 || current.Sub(time.Unix(0, 0)) != 50*time.Millisecond {
+				t.Fatalf("unexpected alias removal result: device=%v err=%v attempts=%d lookups=%d elapsed=%s", device, err, attempts, lookups, current.Sub(time.Unix(0, 0)))
+			}
+		})
+	}
+}
+
 func TestDesktopExclusiveAdapterNeverOpensExisting(t *testing.T) {
-	original := createWindowsAdapter
-	t.Cleanup(func() { createWindowsAdapter = original })
+	originalCreate, originalAliases := createWindowsAdapter, listWindowsInterfaceAliases
+	t.Cleanup(func() {
+		createWindowsAdapter = originalCreate
+		listWindowsInterfaceAliases = originalAliases
+	})
+	listWindowsInterfaceAliases = func() ([]string, error) { return nil, nil }
 	for _, failure := range []error{os.ErrExist, os.ErrPermission, errors.New("driver unavailable")} {
 		attempts := 0
 		createWindowsAdapter = func(Options) (windowsAdapter, error) { attempts++; return nil, failure }
@@ -35,8 +134,12 @@ func TestDesktopExclusiveAdapterNeverOpensExisting(t *testing.T) {
 }
 
 func TestDesktopFailedSessionClosesOwnedAdapterBeforeRetry(t *testing.T) {
-	original := createWindowsAdapter
-	t.Cleanup(func() { createWindowsAdapter = original })
+	originalCreate, originalAliases := createWindowsAdapter, listWindowsInterfaceAliases
+	t.Cleanup(func() {
+		createWindowsAdapter = originalCreate
+		listWindowsInterfaceAliases = originalAliases
+	})
+	listWindowsInterfaceAliases = func() ([]string, error) { return nil, nil }
 	failure := errors.New("driver session failure")
 	previous := &failingOwnedAdapter{err: failure}
 	createWindowsAdapter = func(Options) (windowsAdapter, error) { return previous, nil }

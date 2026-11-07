@@ -374,7 +374,10 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.26
+              printf '%s\n\n' '## 本次更新：1.0.27
+
+          - Windows 创建 TUN 前只读检查已有接口别名，同名冲突或枚举失败会停止创建，避免已知冲突触发 Wintun 内部重命名其他网卡。预检查不修改已有接口；它不原子保留名称，其他程序同时创建同名接口仍受原生 API 的并发边界限制。
+          - 本版完整保留以下 1.0.26 的 Wi-Fi 与 TUN 恢复修复，并由桌面 0.2.6 固定使用。
 
           - 修复 TUN 恢复占用原生锁时 /configs 查询被阻塞、桌面误判内核停止的问题。配置与健康使用带时间和代次的快照，查询不等待网卡创建或关闭。
           - 新增后台串行恢复操作、幂等请求编号和进程内保留的可查询结果。创建失败及丢失 HTTP 回复不再丢失失败状态，API 1 与旧 TUN 状态枚举保持兼容。
@@ -382,7 +385,7 @@ jobs:
           - 配套桌面 0.2.6 将状态、心跳、启停任务分离，恢复和资源等待可被停止指令取消。请用完整安装包一并更新界面、宿主、服务和固定内核。
           - 回归覆盖快照、幂等、失败、取消和 Windows 原地修复。真实 AP 漫游及 S3 / S4 / Modern Standby 硬件场景仍需设备实测；现有连接可能因源地址变化断开。
 
-          [恢复协议](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.26/docs/desktop-managed.md) · [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.26/docs/releases.md)
+          [恢复协议](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.27/docs/desktop-managed.md) · [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.27/docs/releases.md)
 
           ## 1.0.25：DNS 上游连接独立按规则选路
 

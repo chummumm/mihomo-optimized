@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,20 @@ var createWindowsAdapter = func(options Options) (windowsAdapter, error) {
 	return wintun.CreateAdapter(options.Name, TunnelType, generateGUIDByDeviceName(options.Name))
 }
 
+var listWindowsInterfaceAliases = func() ([]string, error) {
+	interfaces, err := winipcfg.GetIfTable2Ex(winipcfg.MibIfEntryNormal)
+	if err != nil {
+		return nil, err
+	}
+	aliases := make([]string, len(interfaces))
+	for i := range interfaces {
+		// Do not filter by link or administrative state: a down or hidden
+		// interface reported by Windows still owns its alias.
+		aliases[i] = interfaces[i].Alias()
+	}
+	return aliases, nil
+}
+
 func New(options Options) (WinTun, error) {
 	if options.FileDescriptor != 0 {
 		return nil, os.ErrInvalid
@@ -69,11 +84,46 @@ func New(options Options) (WinTun, error) {
 	return configureWindowsAdapter(options, adapter)
 }
 
-// NewExclusive never attaches to an adapter created by another instance. A
-// failed create must not turn into a name-based open followed by reconfiguration.
+// NewExclusive checks for an existing interface before creation and never
+// attaches to an adapter after a failed create. The read-only alias check does
+// not atomically reserve the name against another process creating an interface.
 func NewExclusive(options Options) (WinTun, error) {
+	return newWindowsExclusive(options, time.Now, time.Sleep)
+}
+
+func newWindowsExclusive(options Options, now func() time.Time, wait func(time.Duration)) (WinTun, error) {
 	if options.FileDescriptor != 0 {
 		return nil, os.ErrInvalid
+	}
+	// Wintun 0.14.1 can rename a foreign interface when assigning a duplicate
+	// alias. Allow asynchronous removal after process exit a short grace period,
+	// but never enter Wintun creation while the alias is still reported. A
+	// persistent conflict is not a retryable driver error for the caller.
+	aliasDeadline := now().Add(500 * time.Millisecond)
+	for {
+		aliases, err := listWindowsInterfaceAliases()
+		if err != nil {
+			return nil, fmt.Errorf("check existing adapter %q: %w", options.Name, err)
+		}
+		exists := false
+		for _, alias := range aliases {
+			if strings.EqualFold(alias, options.Name) {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			break
+		}
+		remaining := aliasDeadline.Sub(now())
+		if remaining <= 0 {
+			return nil, fmt.Errorf("adapter %q already exists: %w", options.Name, os.ErrExist)
+		}
+		delay := 50 * time.Millisecond
+		if remaining < delay {
+			delay = remaining
+		}
+		wait(delay)
 	}
 	adapter, err := createWindowsAdapter(options)
 	if err != nil {
