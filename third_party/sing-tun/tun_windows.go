@@ -85,8 +85,9 @@ func New(options Options) (WinTun, error) {
 }
 
 // NewExclusive checks for an existing interface before creation and never
-// attaches to an adapter after a failed create. The read-only alias check does
-// not atomically reserve the name against another process creating an interface.
+// attaches to an adapter after a failed create. Only an exact product-owned
+// software-device instance proven non-present may be re-enumerated by Create.
+// The read-only alias check does not reserve names against other applications.
 func NewExclusive(options Options) (WinTun, error) {
 	return newWindowsExclusive(options, time.Now, time.Sleep)
 }
@@ -96,9 +97,10 @@ func newWindowsExclusive(options Options, now func() time.Time, wait func(time.D
 		return nil, os.ErrInvalid
 	}
 	// Wintun 0.14.1 can rename a foreign interface when assigning a duplicate
-	// alias. Allow asynchronous removal after process exit a short grace period,
-	// but never enter Wintun creation while the alias is still reported. A
-	// persistent conflict is not a retryable driver error for the caller.
+	// alias. Allow asynchronous removal a short grace period. A crash can leave
+	// a non-present software device registered indefinitely; only the exact
+	// product identity and definitive native phantom state permit re-enumeration.
+	// An active, foreign or unknown instance remains a non-retryable conflict.
 	aliasDeadline := now().Add(500 * time.Millisecond)
 	for {
 		aliases, err := listWindowsInterfaceAliases()
@@ -115,9 +117,16 @@ func newWindowsExclusive(options Options, now func() time.Time, wait func(time.D
 		if !exists {
 			break
 		}
+		reenumerate, err := canReenumerateWindowsAlias(options.Name)
+		if err != nil {
+			return nil, fmt.Errorf("adapter %q already exists but its native ownership could not be verified; stop its owner or choose an unused tun.device: %w: %w", options.Name, os.ErrExist, err)
+		}
+		if reenumerate {
+			break
+		}
 		remaining := aliasDeadline.Sub(now())
 		if remaining <= 0 {
-			return nil, fmt.Errorf("adapter %q already exists: %w", options.Name, os.ErrExist)
+			return nil, fmt.Errorf("adapter %q already exists with active, foreign or unverified ownership; stop its owner or choose an unused tun.device: %w", options.Name, os.ErrExist)
 		}
 		delay := 50 * time.Millisecond
 		if remaining < delay {
@@ -125,7 +134,7 @@ func newWindowsExclusive(options Options, now func() time.Time, wait func(time.D
 		}
 		wait(delay)
 	}
-	adapter, err := createWindowsAdapter(options)
+	adapter, err := createExclusiveWindowsAdapter(options)
 	if err != nil {
 		return nil, err
 	}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/metacubex/sing-tun/internal/wintun"
+	"golang.org/x/sys/windows"
 )
 
 type failingOwnedAdapter struct {
@@ -23,11 +24,14 @@ func (a *failingOwnedAdapter) Close() error { a.closed++; return nil }
 func (*failingOwnedAdapter) LUID() uint64   { return 123 }
 
 func TestDesktopExclusiveAdapterChecksAliasBeforeCreate(t *testing.T) {
-	originalCreate, originalAliases := createWindowsAdapter, listWindowsInterfaceAliases
+	originalCreate, originalAliases := createExclusiveWindowsAdapter, listWindowsInterfaceAliases
+	originalProof := canReenumerateWindowsAlias
 	t.Cleanup(func() {
-		createWindowsAdapter = originalCreate
+		createExclusiveWindowsAdapter = originalCreate
 		listWindowsInterfaceAliases = originalAliases
+		canReenumerateWindowsAlias = originalProof
 	})
+	canReenumerateWindowsAlias = func(string) (bool, error) { return false, nil }
 	lookupFailure := errors.New("interface enumeration failed")
 	createFailure := errors.New("driver create reached")
 	for _, test := range []struct {
@@ -52,7 +56,7 @@ func TestDesktopExclusiveAdapterChecksAliasBeforeCreate(t *testing.T) {
 				lookedUp = true
 				return test.aliases, test.lookupErr
 			}
-			createWindowsAdapter = func(options Options) (windowsAdapter, error) {
+			createExclusiveWindowsAdapter = func(options Options) (windowsAdapter, error) {
 				attempts++
 				if !lookedUp || options.Name != "owned-adapter" {
 					t.Fatal("adapter creation preceded the alias check or changed the requested name")
@@ -73,11 +77,14 @@ func TestDesktopExclusiveAdapterChecksAliasBeforeCreate(t *testing.T) {
 }
 
 func TestDesktopExclusiveAdapterWaitsForAliasRemoval(t *testing.T) {
-	originalCreate, originalAliases := createWindowsAdapter, listWindowsInterfaceAliases
+	originalCreate, originalAliases := createExclusiveWindowsAdapter, listWindowsInterfaceAliases
+	originalProof := canReenumerateWindowsAlias
 	t.Cleanup(func() {
-		createWindowsAdapter = originalCreate
+		createExclusiveWindowsAdapter = originalCreate
 		listWindowsInterfaceAliases = originalAliases
+		canReenumerateWindowsAlias = originalProof
 	})
+	canReenumerateWindowsAlias = func(string) (bool, error) { return false, nil }
 	lookupFailure := errors.New("interface enumeration failed during removal")
 	createFailure := errors.New("driver create reached")
 	for _, test := range []struct {
@@ -99,7 +106,7 @@ func TestDesktopExclusiveAdapterWaitsForAliasRemoval(t *testing.T) {
 				}
 				return []string{"unrelated-adapter"}, test.lookupErr
 			}
-			createWindowsAdapter = func(Options) (windowsAdapter, error) {
+			createExclusiveWindowsAdapter = func(Options) (windowsAdapter, error) {
 				attempts++
 				if lookups != 2 {
 					t.Fatal("adapter creation began before confirmed alias removal")
@@ -117,15 +124,18 @@ func TestDesktopExclusiveAdapterWaitsForAliasRemoval(t *testing.T) {
 }
 
 func TestDesktopExclusiveAdapterNeverOpensExisting(t *testing.T) {
-	originalCreate, originalAliases := createWindowsAdapter, listWindowsInterfaceAliases
+	originalCreate, originalAliases := createExclusiveWindowsAdapter, listWindowsInterfaceAliases
+	originalProof := canReenumerateWindowsAlias
 	t.Cleanup(func() {
-		createWindowsAdapter = originalCreate
+		createExclusiveWindowsAdapter = originalCreate
 		listWindowsInterfaceAliases = originalAliases
+		canReenumerateWindowsAlias = originalProof
 	})
+	canReenumerateWindowsAlias = func(string) (bool, error) { return false, nil }
 	listWindowsInterfaceAliases = func() ([]string, error) { return nil, nil }
 	for _, failure := range []error{os.ErrExist, os.ErrPermission, errors.New("driver unavailable")} {
 		attempts := 0
-		createWindowsAdapter = func(Options) (windowsAdapter, error) { attempts++; return nil, failure }
+		createExclusiveWindowsAdapter = func(Options) (windowsAdapter, error) { attempts++; return nil, failure }
 		device, err := NewExclusive(Options{Name: "foreign-adapter"})
 		if device != nil || !errors.Is(err, failure) || attempts != 1 {
 			t.Fatalf("failed create must return directly: device=%v err=%v attempts=%d", device, err, attempts)
@@ -133,20 +143,114 @@ func TestDesktopExclusiveAdapterNeverOpensExisting(t *testing.T) {
 	}
 }
 
-func TestDesktopFailedSessionClosesOwnedAdapterBeforeRetry(t *testing.T) {
-	originalCreate, originalAliases := createWindowsAdapter, listWindowsInterfaceAliases
+func TestDesktopExclusiveAdapterReenumeratesOnlyVerifiedPhantom(t *testing.T) {
+	originalCreate, originalAliases, originalProof := createExclusiveWindowsAdapter, listWindowsInterfaceAliases, canReenumerateWindowsAlias
 	t.Cleanup(func() {
-		createWindowsAdapter = originalCreate
-		listWindowsInterfaceAliases = originalAliases
+		createExclusiveWindowsAdapter, listWindowsInterfaceAliases, canReenumerateWindowsAlias = originalCreate, originalAliases, originalProof
 	})
+	listWindowsInterfaceAliases = func() ([]string, error) { return []string{"owned-adapter"}, nil }
+	proofFailure := errors.New("native identity query failed")
+	createFailure := errors.New("owned instance create reached")
+	for _, test := range []struct {
+		name      string
+		verified  bool
+		proofErr  error
+		wantErr   error
+		wantCalls int
+	}{
+		{name: "verified phantom", verified: true, wantErr: createFailure, wantCalls: 1},
+		{name: "query uncertainty", proofErr: proofFailure, wantErr: proofFailure},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			proofs, calls := 0, 0
+			canReenumerateWindowsAlias = func(name string) (bool, error) {
+				proofs++
+				if name != "owned-adapter" {
+					t.Fatalf("unexpected identity target %q", name)
+				}
+				return test.verified, test.proofErr
+			}
+			createExclusiveWindowsAdapter = func(Options) (windowsAdapter, error) {
+				calls++
+				if proofs != 1 || !test.verified {
+					t.Fatal("creation preceded definitive native identity proof")
+				}
+				return nil, createFailure
+			}
+			device, err := newWindowsExclusive(Options{Name: "owned-adapter"}, time.Now, func(time.Duration) {
+				t.Fatal("verified phantom or failed query must not restart the grace period")
+			})
+			if device != nil || !errors.Is(err, test.wantErr) || calls != test.wantCalls || proofs != 1 {
+				t.Fatalf("unexpected recovery admission: device=%v err=%v creates=%d proofs=%d", device, err, calls, proofs)
+			}
+			if test.proofErr != nil && !errors.Is(err, os.ErrExist) {
+				t.Fatalf("unverified existing alias must retain conflict semantics: %v", err)
+			}
+		})
+	}
+}
+
+func TestDesktopExclusiveAdapterIdentityRejectsForeignAndPresentDevices(t *testing.T) {
+	name := "MihomoOwnershipTest"
+	guid := *generateExclusiveGUIDByDeviceName(name)
+	if guid != *generateExclusiveGUIDByDeviceName(name) || guid == *generateGUIDByDeviceName(name) ||
+		guid == *generateExclusiveGUIDByDeviceName(name + "other") {
+		t.Fatal("exclusive identity must be stable and separate from the generic sing-tun namespace")
+	}
+	owned := windowsAdapterIdentity{
+		InstanceID:   exclusiveWindowsInstanceID(guid),
+		GUID:         guid,
+		Name:         name,
+		TunnelType:   exclusiveWindowsTunnelType,
+		FriendlyName: exclusiveWindowsTunnelType + " Tunnel",
+		HardwareIDs:  []string{"Wintun"},
+		ClassGUID:    windowsNetworkClass,
+		Phantom:      true,
+	}
+	if !owned.permitsReenumeration(name, guid) {
+		t.Fatal("exact product instance with native non-present proof was rejected")
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*windowsAdapterIdentity)
+	}{
+		{"present including down or problem state", func(i *windowsAdapterIdentity) { i.Phantom = false }},
+		{"different actual GUID", func(i *windowsAdapterIdentity) { i.GUID = *generateGUIDByDeviceName(name) }},
+		{"different instance", func(i *windowsAdapterIdentity) { i.InstanceID += "-other" }},
+		{"different alias", func(i *windowsAdapterIdentity) { i.Name += "-other" }},
+		{"legacy generic product", func(i *windowsAdapterIdentity) { i.TunnelType = "Meta" }},
+		{"changed native marker", func(i *windowsAdapterIdentity) { i.FriendlyName = "Foreign Tunnel" }},
+		{"different hardware", func(i *windowsAdapterIdentity) { i.HardwareIDs = []string{"WireGuard"} }},
+		{"ambiguous hardware", func(i *windowsAdapterIdentity) { i.HardwareIDs = []string{"Wintun", "other"} }},
+		{"different device class", func(i *windowsAdapterIdentity) { i.ClassGUID = windows.GUID{} }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := owned
+			test.change(&candidate)
+			if candidate.permitsReenumeration(name, guid) {
+				t.Fatalf("uncertain or foreign identity admitted: %+v", candidate)
+			}
+		})
+	}
+}
+
+func TestDesktopFailedSessionClosesOwnedAdapterBeforeRetry(t *testing.T) {
+	originalCreate, originalAliases := createExclusiveWindowsAdapter, listWindowsInterfaceAliases
+	originalProof := canReenumerateWindowsAlias
+	t.Cleanup(func() {
+		createExclusiveWindowsAdapter = originalCreate
+		listWindowsInterfaceAliases = originalAliases
+		canReenumerateWindowsAlias = originalProof
+	})
+	canReenumerateWindowsAlias = func(string) (bool, error) { return false, nil }
 	listWindowsInterfaceAliases = func() ([]string, error) { return nil, nil }
 	failure := errors.New("driver session failure")
 	previous := &failingOwnedAdapter{err: failure}
-	createWindowsAdapter = func(Options) (windowsAdapter, error) { return previous, nil }
+	createExclusiveWindowsAdapter = func(Options) (windowsAdapter, error) { return previous, nil }
 	if device, err := NewExclusive(Options{Name: "owned-adapter"}); device != nil || !errors.Is(err, failure) || previous.closed != 1 {
 		t.Fatalf("session failure did not release ownership: device=%v err=%v closes=%d", device, err, previous.closed)
 	}
-	createWindowsAdapter = func(Options) (windowsAdapter, error) {
+	createExclusiveWindowsAdapter = func(Options) (windowsAdapter, error) {
 		if previous.closed != 1 {
 			t.Fatal("next create began before the prior adapter closed")
 		}
