@@ -2763,7 +2763,8 @@ class Acceptance:
         self.owned_children[identity.pid] = identity
         return result
 
-    def local_health_request(self, status: dict, endpoint: str, method: str = "GET") -> dict:
+    def local_health_request(self, status: dict, endpoint: str, method: str = "GET", *,
+                             deadline: float | None = None) -> dict:
         require(endpoint in ("/desktop/health", "/desktop/recover")
                 and method in ("GET", "POST"), "health_probe_endpoint_invalid")
         controller = status.get("controller") or {}
@@ -2772,9 +2773,13 @@ class Acceptance:
         require(url.scheme == "http" and url.hostname == "127.0.0.1" and url.port
                 and not url.username and not url.password and len(secret) >= 16,
                 "health_probe_controller_invalid")
+        if deadline is None:
+            deadline = time.monotonic() + 35
 
         def observe():
-            connection = http.client.HTTPConnection("127.0.0.1", url.port, timeout=4)
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "health_probe_busy_timeout")
+            connection = http.client.HTTPConnection("127.0.0.1", url.port, timeout=min(4, remaining))
             try:
                 connection.request(method, endpoint, headers={"Authorization": "Bearer " + secret,
                                                               "Connection": "close"})
@@ -2787,7 +2792,7 @@ class Acceptance:
                 return json.loads(content)
             finally:
                 connection.close()
-        return wait_until(observe, "health_probe_busy_timeout", 35)
+        return wait_until(observe, "health_probe_busy_timeout", max(0, deadline - time.monotonic()))
 
     def check_local_resume_health(self, running: dict, *, remove_route: bool = False) -> None:
         """Exercise the local resume boundary; this is not a simulated OS sleep."""
@@ -2797,10 +2802,27 @@ class Acceptance:
                 and before.get("capabilities", {}).get("tun_repair") is True
                 and before.get("capabilities", {}).get("tun_recovery_operations") is True,
                 "paired_core_health_capability_missing")
-        health = self.local_health_request(running, "/desktop/health")
-        require(health.get("pid") == before["pid"] and health.get("state") == "running"
-                and health.get("tun", {}).get("state") == ("healthy" if running.get("tun") else "disabled"),
-                "initial_local_health_not_ready")
+        def read_health(deadline: float) -> dict:
+            observed = self.local_health_request(running, "/desktop/health", deadline=deadline)
+            require(observed.get("pid") == before["pid"] and observed.get("state") == "running",
+                    "local_health_identity_changed")
+            require(isinstance(observed.get("observed_at"), str), "local_health_observation_missing")
+            return observed
+
+        def wait_for_health(deadline: float, states: set[str], code: str, baseline: str | None = None) -> dict:
+            def ready():
+                observed = read_health(deadline)
+                return observed if (observed.get("stale") is False and observed["observed_at"]
+                                    and observed["observed_at"] != baseline
+                                    and observed.get("tun", {}).get("state") in states) else None
+
+            return wait_until(ready, code, max(0, deadline - time.monotonic()))
+
+        # The first read starts an independent observer and may return the
+        # pending snapshot. All polls share this one deadline, including busy
+        # HTTP replies; each observed snapshot must still belong to this core.
+        expected_health = {"healthy" if running.get("tun") else "disabled"}
+        health = wait_for_health(time.monotonic() + 8, expected_health, "initial_local_health_not_ready")
         recovered = self.local_health_request(running, "/desktop/recover", "POST")
         require(recovered.get("pid") == before["pid"] and recovered.get("status") == "healthy",
                 "healthy_resume_changed_core_or_device")
@@ -2824,16 +2846,23 @@ class Acceptance:
             removed = json.loads(result.stdout)
             require(removed.get("removed") is True and removed.get("interfaceIndex") == device["index"]
                     and removed.get("prefix") == TUN_TARGET + "/32", "owned_route_fault_not_confirmed")
-            observed = self.local_health_request(running, "/desktop/health")
+            observation_deadline = time.monotonic() + 8
+            baseline = read_health(observation_deadline)["observed_at"]
+            observed = wait_for_health(observation_deadline, {"healthy", "degraded"},
+                                       "owned_route_observation_not_refreshed", baseline)
             # The host's periodic local observation may repair before this call.
-            # Either path must retain the process and restore the real data path.
+            # A changed observation rules out treating pre-fault cached health
+            # as repair proof. Either path must restore the real data path.
             repaired = self.local_health_request(running, "/desktop/recover", "POST")
             require(repaired.get("pid") == before["pid"] and repaired.get("status") in ("healthy", "repaired")
                     and repaired.get("tun", {}).get("state") == "healthy", "owned_route_not_recovered")
             wait_until(self.socks.roundtrip, "route_recovery_data_path_failed")
             evidence.update({"ownedRouteRemoved": True, "stateAfterRemoval": observed.get("tun", {}).get("state"),
                              "repairResult": repaired.get("status"), "realTunForwarding": True})
-            verified = self.local_health_request(running, "/desktop/health")
+            observation_deadline = time.monotonic() + 8
+            baseline = read_health(observation_deadline)["observed_at"]
+            verified = wait_for_health(observation_deadline, {"healthy"},
+                                       "owned_route_health_not_confirmed", baseline)
             require(verified.get("tun", {}).get("identity") == identity
                     and verified.get("tun", {}).get("index") == device["index"]
                     and verified.get("tun_generation") == generation and verified.get("creation_count") == creations,
@@ -2850,12 +2879,27 @@ class Acceptance:
             removed_address = json.loads(result.stdout)
             require(removed_address.get("removed") is True and removed_address.get("interfaceIndex") == device["index"]
                     and removed_address.get("address") == "198.18.0.1", "owned_address_fault_not_confirmed")
+            observation_deadline = time.monotonic() + 8
+            baseline = read_health(observation_deadline)["observed_at"]
+            wait_for_health(observation_deadline, {"healthy", "degraded"},
+                            "owned_address_observation_not_refreshed", baseline)
             repaired_address = self.local_health_request(running, "/desktop/recover", "POST")
-            require(repaired_address.get("status") in ("healthy", "repaired"), "owned_address_not_recovered")
+            require(repaired_address.get("pid") == before["pid"]
+                    and repaired_address.get("status") in ("healthy", "repaired")
+                    and repaired_address.get("tun", {}).get("state") == "healthy", "owned_address_not_recovered")
             wait_until(self.socks.roundtrip, "address_recovery_data_path_failed")
+            observation_deadline = time.monotonic() + 8
+            baseline = read_health(observation_deadline)["observed_at"]
+            verified = wait_for_health(observation_deadline, {"healthy"},
+                                       "owned_address_health_not_confirmed", baseline)
+            require(verified.get("tun", {}).get("identity") == identity
+                    and verified.get("tun", {}).get("index") == device["index"]
+                    and verified.get("tun_generation") == generation and verified.get("creation_count") == creations,
+                    "owned_address_repair_recreated_tun")
             evidence.update({"ownedAddressRemoved": True, "addressRepairedInPlace": True})
-        verified = self.local_health_request(running, "/desktop/health")
+        verified = wait_for_health(time.monotonic() + 8, expected_health, "local_health_not_confirmed")
         require(verified.get("tun", {}).get("identity") == identity and verified.get("tun_generation") == generation
+                and verified.get("tun", {}).get("index") == health.get("tun", {}).get("index")
                 and verified.get("creation_count") == creations, "local_recovery_recreated_tun")
         evidence.update({"sameTunIdentity": True, "sameTunGeneration": True, "additionalTunCreations": 0})
         after = self.phase("running")
