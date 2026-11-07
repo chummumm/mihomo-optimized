@@ -77,6 +77,11 @@ func makeDNSRouteKey(ctx context.Context, route *dnsQueryRoute, wire []byte, sha
 }
 
 func dnsQueryFlightKey(ctx context.Context, key string) string {
+	if upstream := queryUpstreamRoute(ctx); upstream != nil && !upstream.cacheable {
+		// Until bootstrap fixes every route, two independent callers cannot
+		// prove that their eventual DNS exits will be the same.
+		key += fmt.Sprintf("|upstream-pending:%p", upstream)
+	}
 	if route := queryRoute(ctx); route != nil && route.origin != nil {
 		return key + "|source-port:" + strconv.Itoa(int(route.origin.SrcPort))
 	}

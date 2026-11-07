@@ -2,6 +2,14 @@
 
 项目使用独立版本 **`mihomo-optimized-vX.Y.Z`**，首版为 `mihomo-optimized-v1.0.0`。`main` 的源码、依赖或构建配置变更在全部测试和完整编译成功后生成固定提交的 GitHub Release。Latest 仅在该构建仍对应当前 `main` 时更新；PR 只做合并前检查，不生成正式发布包。纯文档变更不消耗版本号，也不触发自动发布。
 
+## 1.0.25：DNS 上游连接独立按规则选路
+
+实现 issue [#69](https://github.com/chummumm/mihomo-optimized/issues/69)：新增顶层 `dns-upstream-rule-routing`，默认 `false`，仅在 Rule 模式让内置 DNS 的自动上游按解析器自身域名 / IP 选择实际出口。它与 `dns-rule-routing` 独立；两者同时开启时，业务域名仍决定 direct / main 池、ECS、拒绝与 DIRECT 测速，DNS 连接可另外走代理。支持 UDP、TCP、DoT、DoH / HTTP/3 和 DoQ，以及解析器 IP 的 IP-CIDR / GEOIP 等完整规则。配置示例见 [DNS 上游连接独立选路](dns-proxy.md#dns-上游连接独立选路)。
+
+显式 `#Group` / `#DIRECT` / `#interface` 和适配器优先，`proxy-server-nameserver` / policy 与节点根 bootstrap 保持原有独立引导；Global / Direct 继续使用旧 DNSDialer 行为。解析器规则选中的真实 IP 固定到实际连接，保留 TLS、HTTP 及 ECS 设置。答案、候选、双栈缓存和连接作用域区分业务计划与 DNS 传输计划，后台刷新重新检查当前路由。开关修改需完整配置重载，`PATCH /configs` 不接受修改。
+
+路由准备只读取字面 IP、hosts 和新鲜 bootstrap 缓存。未知解析器域名在实际交换分支中才引导，不阻塞健康上游或提前启动 lazy fallback。本轮作用域未完全冻结时保守跳过共享答案、候选与双栈缓存的读写，并且不登记预取；后续相关引导缓存齐备后恢复复用。持续无法解析的上游可能长期降低所在组合的缓存命中率。
+
 ## 1.0.24：代理 DNS 上游引导解析修复
 
 修复 issue [#67](https://github.com/chummumm/mihomo-optimized/issues/67)：开启 `proxy-force-ip` 时，显式指定 DNS 代理出口或在 Global 模式下使用 `respect-rules`，DNS 服务器自身的域名可能重新进入业务 DNS，导致 DoH 解析失败及节点延迟测试超时。DNS 拨号现在将对应的引导解析器传递到强制 IP 目标解析，按实际节点的地址族限制选择真实地址，不再依赖临时 hosts 映射。

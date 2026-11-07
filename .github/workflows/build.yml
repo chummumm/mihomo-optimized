@@ -369,7 +369,16 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.24
+              printf '%s\n\n' '## 本次更新：1.0.25
+
+          - 实现 issue #69：新增顶层 dns-upstream-rule-routing，默认 false，仅在 Rule 模式让自动 DNS 连接按解析器自身域名 / IP 独立匹配规则。与 dns-rule-routing 同时开启时，业务选池、ECS、拒绝及 DIRECT 测速保持原有依据。
+          - 支持 UDP、TCP、DoT、DoH / HTTP/3、DoQ 和解析器 IP 的 IP-CIDR / GEOIP 等完整规则，实际拨号固定使用匹配的解析器 IP，保留 TLS SNI、证书验证与 HTTP Host。
+          - 显式出口优先；proxy-server-nameserver、节点根 bootstrap 及 Global / Direct 模式保持原行为。配置修改需完整重载，PATCH /configs 不接受该字段。
+          - 准备阶段只读字面 IP、hosts 和新鲜引导缓存，未知域名在实际交换时才解析，不阻塞健康分支或提前启动 lazy fallback。作用域尚未完整冻结的查询不读写共享答案、候选及双栈缓存，也不登记预取；持续故障的解析器可能降低所在组合的缓存复用。
+
+          [配置与边界](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.25/docs/dns-proxy.md#dns-上游连接独立选路) · [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.25/docs/releases.md)
+
+          ## 1.0.24：代理 DNS 上游引导解析修复
 
           - 修复 issue #67：开启 proxy-force-ip 时，显式 DNS 代理出口及 Global / respect-rules 路径可能把 DoH 自身域名重新交给业务 DNS，导致解析失败和节点测速超时。
           - DNS 上游目标使用对应的独立引导解析器，保留节点地址族约束；作用域按上游域名限定，不影响代理节点、链式代理下一跳或协议私有解析器。

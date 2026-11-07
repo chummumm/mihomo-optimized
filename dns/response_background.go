@@ -100,6 +100,9 @@ func (p *dnsResponsePublisher) Close() {
 }
 
 func (c *cacheControl) beginResponseContinuation(ctx context.Context, key string, cancel context.CancelCauseFunc) *dnsResponseContinuation {
+	if !dnsUpstreamCacheable(ctx) {
+		return nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.syncPolicyLocked()

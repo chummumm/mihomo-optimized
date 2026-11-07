@@ -242,18 +242,47 @@ func exchangeNativeTransport(ctx context.Context, message *D.Msg, dc dnsClient) 
 		return nil, net.ErrClosed, true
 	}
 	route := queryRoute(ctx)
-	if state == nil || state.bound || route == nil || icontext.DNSBootstrap(ctx) || !dialer.Automatic() {
+	upstream := queryUpstreamRoute(ctx)
+	if state == nil || state.bound || !dialer.Automatic() {
+		return nil, nil, false
+	}
+	if upstream == nil && (route == nil || icontext.DNSBootstrap(ctx)) {
 		return nil, nil, false
 	}
 	// Port 53 uses the same frozen transport pool as encrypted DNS. Logical
 	// query trackers remain separate from persistent DNS-TRANSPORT sockets.
-	if route.err != nil {
+	if route != nil && route.err != nil {
 		return nil, route.err, true
 	}
-	if route.plan == nil {
+	if route != nil && route.plan != nil {
+		if kind := route.plan.Type(); kind == C.Reject || kind == C.RejectDrop {
+			// An explicit sibling may answer a mixed query, but an automatic
+			// upstream must still obey the business query's rejection.
+			return nil, errors.New("automatic native DNS business route is rejected"), true
+		}
+	}
+	var plan *tunnel.DNSRoutingPlan
+	if upstream != nil {
+		selection, ok := upstream.plans[dialer]
+		if !ok {
+			return nil, errors.New("DNS upstream was not included in this query's routing snapshot"), true
+		}
+		var err error
+		planning := ctx
+		if route != nil && route.origin != nil {
+			planning = icontext.WithDNSRoutingMetadata(ctx, route.origin)
+		}
+		plan, err = selection.resolve(planning, dialer)
+		if err != nil {
+			return nil, err, true
+		}
+	} else {
+		plan = route.plan
+	}
+	if plan == nil {
 		return nil, errors.New("native DNS has no routing plan"), true
 	}
-	if kind := route.plan.Type(); kind == C.Reject || kind == C.RejectDrop {
+	if kind := plan.Type(); kind == C.Reject || kind == C.RejectDrop {
 		return nil, errors.New("automatic native DNS route is rejected"), true
 	}
 	state.mu.Lock()
@@ -270,19 +299,27 @@ func exchangeNativeTransport(ctx context.Context, message *D.Msg, dc dnsClient) 
 	stop := context.AfterFunc(pool.lifetime, cancel)
 	defer stop()
 	defer cancel()
-	entry, err := pool.acquire(ctx, route.plan.NativeTransportKey(), func() dnsClient { return cloneNativeClient(dc, route.plan, pool.lifetime) })
+	entry, err := pool.acquire(ctx, plan.NativeTransportKey(), func() dnsClient { return cloneNativeClient(dc, plan, pool.lifetime) })
 	if err != nil {
 		return nil, err, true
 	}
 	defer pool.release(entry)
-	ctx, tracker, err := route.plan.TrackNativeQuery(ctx, endpoint, network, message.Len())
-	if err != nil {
-		return nil, err, true
+	var tracker *tunnel.DNSNativeQueryTracker
+	if !icontext.DNSBootstrap(ctx) {
+		ctx, tracker, err = plan.TrackNativeQuery(ctx, endpoint, network, message.Len())
+		if err != nil {
+			return nil, err, true
+		}
+		defer tracker.Close()
 	}
-	defer tracker.Close()
 	answer, err := entry.client.ExchangeContext(ctx, message)
 	if errors.Is(context.Cause(ctx), tunnel.ErrDNSNativeQueryClosed) {
-		route.closed.Store(true)
+		if route != nil {
+			route.closed.Store(true)
+		}
+		if upstream != nil {
+			upstream.closed.Store(true)
+		}
 		return nil, tunnel.ErrDNSNativeQueryClosed, true
 	}
 	if err == nil {
@@ -299,11 +336,14 @@ func exchangeNativeTransport(ctx context.Context, message *D.Msg, dc dnsClient) 
 	if err != nil {
 		return nil, err, true
 	}
-	tracker.DownloadTotal.Add(int64(answer.Len()))
+	if tracker != nil {
+		tracker.DownloadTotal.Add(int64(answer.Len()))
+	}
 	return answer, nil, true
 }
 
 func dnsQueryClosed(ctx context.Context) bool {
 	route := queryRoute(ctx)
-	return route != nil && route.closed.Load()
+	upstream := queryUpstreamRoute(ctx)
+	return (route != nil && route.closed.Load()) || (upstream != nil && upstream.closed.Load())
 }

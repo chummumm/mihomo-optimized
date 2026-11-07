@@ -156,7 +156,7 @@ func (c *cacheControl) ServeStale(expire, now time.Time) (bool, uint32) {
 // Refresh admits one bounded request-triggered refresh, independently of the
 // Prefetch option. The old request's rule plan is never reused by the worker.
 func (c *cacheControl) Refresh(ctx context.Context, query *D.Msg, key string) {
-	if query == nil || len(query.Question) != 1 || cacheBackground(ctx) {
+	if query == nil || len(query.Question) != 1 || cacheBackground(ctx) || !dnsUpstreamCacheable(ctx) {
 		return
 	}
 	ctx, _ = cacheRefreshContext(ctx)
@@ -203,6 +203,9 @@ func cacheRefreshContext(ctx context.Context) (context.Context, bool) {
 // Store is the sole generation-aware write hook. Clear holds the same mutex,
 // so a response from an older query cannot refill the cache after it was cleared.
 func (c *cacheControl) Store(ctx context.Context, key string, question D.Question, message *D.Msg) bool {
+	if !dnsUpstreamCacheable(ctx) {
+		return false
+	}
 	if message == nil {
 		return false
 	}
@@ -351,6 +354,11 @@ func (c *cacheControl) run(job cacheRefreshJob) {
 	// resulting key/pool may differ; exchangeWithoutCache writes its new key.
 	ctx, reply, err := c.r.prepareDNSRouting(ctx, job.query)
 	if err != nil || reply != nil {
+		c.removeJobHot(job)
+		return
+	}
+	ctx, err = c.r.prepareDNSUpstreamRouting(ctx, job.query)
+	if err != nil {
 		c.removeJobHot(job)
 		return
 	}

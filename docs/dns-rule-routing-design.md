@@ -4,6 +4,8 @@
 
 顶层 `dns-rule-routing` 默认关闭，开启后复用已有业务 `rules` / `rule-providers`。内置 DNS 需要真实解析时取得一次 QNAME 路由计划，以实际叶子选择 `direct-nameserver` 或 `nameserver`；hosts 与 FakeIP 先按原有顺序处理。原生自动上游包括配置的 UDP / TCP 任意端口、DoT、DoH（HTTP/2 / HTTP/3）和 DoQ；普通代理入站不再自动识别或接管目标 53 的 DNS。无需 SmartDNS、独立 DNS 域名策略表或专用监听类型。
 
+顶层 `dns-upstream-rule-routing` 独立控制解析器连接，默认关闭，仅在 Rule 模式启用。业务 QNAME 计划负责选池、拒绝及 DIRECT 优选；开启新开关后，各自动上游根据解析器自身域名 / IP 取得独立传输计划，不覆盖业务计划。关闭 `dns-rule-routing` 而只开启新开关时，保留原 DNS 选池与域名策略。两个开关均通过完整配置重载应用，`PATCH /configs` 不接受修改。
+
 用户配置和示例见 [使用说明](dns-proxy.md)、[原生 DNS 示例](dns-proxy.example.yaml)。本功能只提供文档描述的选路、IP 优选和缓存控制，不声称完整实现 SmartDNS 的配置、插件或所有行为。
 
 ## 1. 入口和优先级
@@ -50,6 +52,16 @@ SRC-IP 是入口实际取得的来源。客户端直接访问 DNS 监听或入�
 
 直连查询失败不得改用代理 main / fallback。代理查询保留 fallback-lazy-query 和 IP 过滤行为。同一逻辑查询的重试、并发 main / fallback、UDP→TCP 均不得再次推进选组；非 IP 查询不纳入原本不会使用的 fallback。
 
+### 可选的解析器连接计划
+
+`dns-upstream-rule-routing` 开启时，所选自动客户端分别冻结解析器连接计划。匹配元数据为独立的 `Inner` / `DNS-TRANSPORT` 身份，包含解析器域名、真实 IP、实际端口和配置对应的传输类型，不继承业务来源、进程、SpecialProxy 或业务目标 IP。使用普通完整规则求值，支持 IP-CIDR / GEOIP / ASN、classical provider 与组合规则；地址先由独立 bootstrap 取得，规则匹配本身不得再次发起业务解析。冻结的 IP 必须用于真实拨号，原生协议仍保留解析器 SNI、HTTP Host 和证书校验。可协商 HTTP/1.1、HTTP/2、HTTP/3 的 DoH 按 TCP 建计划，强制 `#h3=true` 才按 UDP；后续 H3 协商和 UDP→TCP 重试沿用该出口，不再次匹配 NETWORK，实际 UDP 拨号仍校验冻结的 UDP 能力。
+
+准备阶段无网络 I/O，只可使用字面 IP、hosts 或 bootstrap 解析器当前作用域中仍新鲜的缓存。地址未知时保留待解析状态，在对应上游实际 Exchange 分支中引导并冻结一次；并行的健康上游和未被启用的 lazy fallback 不等待它。冻结结果供同一逻辑查询的重试、UDP→TCP 和相关辅助查询复用；并发初始化、取消及迟到结果不能改变已发布的缓存身份。
+
+新传输计划覆盖 UDP、TCP、DoT、DoH / HTTP/3、DoQ 的业务 nameserver / direct / fallback / default 路径。显式 `#Group` / `#DIRECT` / `#interface` 及适配器优先，`#RULES` 属于自动范围。业务 REJECT / DROP 在自动分支仍优先，即使所选池含可继续回答的显式分支，也不能让自动分支借上游计划恢复查询。DIRECT 测速、双栈优选和池的 ECS 始终以业务计划为准，不以 DNS 连接的代理类型重新分类。
+
+`proxy-server-nameserver` / policy 和节点根 bootstrap 保持独立，不自动加入解析器规则层；节点引导不能借业务 default 的规则出口连接自身。Global / Direct 不建立这一层计划，保留原 DNSDialer / respect-rules。新开关关闭时，原 QNAME 传输计划及其缓存路径保持原语义。
+
 ### 普通代理转发与显式劫持
 
 通过普通代理访问解析器时，目标地址来自客户端代理请求，Mihomo 不读取其中的 DNS Question，不进行逐包 / 逐帧 QNAME 路由，也不改投原生 direct / main 池。该连接与其他普通代理流量使用相同的解析、匹配和转发行为。
@@ -58,9 +70,9 @@ SRC-IP 是入口实际取得的来源。客户端直接访问 DNS 监听或入�
 
 ## 4. DNS 设置与基础解析
 
-开启时停用 nameserver-policy、direct-nameserver-follow-policy、fallback-filter.domain / geosite，也不加载这些停用字段专属 provider / geosite。Global / Direct 不恢复这些字段；关闭开关并完整重载后恢复原配置。
+开启 `dns-rule-routing` 时停用 nameserver-policy、direct-nameserver-follow-policy、fallback-filter.domain / geosite，也不加载这些停用字段专属 provider / geosite。Global / Direct 不恢复这些字段；关闭该开关并完整重载后恢复原配置。单独开启 `dns-upstream-rule-routing` 不停用这些业务域名策略。
 
-保留 nameserver、direct-nameserver、实际 main 路径的 fallback / IP 过滤、hosts、系统 hosts、缓存及回答类型控制。自动原生交换用 QNAME 计划代替按解析器地址执行的 respect-rules / #RULES 二次选择。基础 TLS / HTTP / QUIC 客户端保留解析器的服务器名、证书验证和协议设置，不把业务 QNAME 用作实际拨号目标或 TLS 名称。
+保留 nameserver、direct-nameserver、实际 main 路径的 fallback / IP 过滤、hosts、系统 hosts、缓存及回答类型控制。`dns-upstream-rule-routing` 关闭时，自动原生交换用 QNAME 计划代替按解析器地址执行的 respect-rules / #RULES 二次选择；开启时使用上述独立解析器计划。基础 TLS / HTTP / QUIC 客户端保留解析器的服务器名、证书验证和协议设置，不把业务 QNAME 用作实际拨号目标或 TLS 名称。
 
 proxy-server-nameserver 及其 policy 保持节点解析作用。未配置时使用独立 default bootstrap，不能退回正在建立的业务代理。FakeIP 可与内置 DNS 自动路由同时开启，配置层不关闭任一功能，也不改变 fake-ip-filter 的黑名单、白名单或规则模式。normal 与 redir-host 都可使用原生优化，区别在于是否保留真实 IP 的历史域名映射。
 
@@ -99,6 +111,10 @@ DO / CD 查询、AD / RRSIG / SIG / TSIG 保护、截断或不匹配回答跳过
 ## 7. 缓存和后台任务
 
 作用域包含 Question / EDNS 等查询内容（事务 ID 除外）、池和上游集合、实际组 / 叶子身份、来源、进程、认证、入站、子规则和固定出站。每次先用真实来源端口执行当前规则并检查动作，不能用旧成功回答绕过 REJECT / DROP。仅成功且全部自动的路由允许同作用域的回答跨临时源端口复用；在途 singleflight 仍按来源端口隔离，保留独立取消语义。物理连接池合并同叶子不会放宽这些正式答案缓存作用域。
+
+启用上游独立选路后，作用域还包含本次相关上游各自的冻结出口与解析器 IP，保留客户端包装参数（含 ECS）、业务池和原业务计划。每次缓存读取前用当前规则重新确定可无 I/O 取得的计划；后台刷新同样重新准备，不能沿用旧的解析器出口快照。连接复用身份也包含冻结的解析器地址。
+
+只要任一相关自动上游地址未知，本轮就标记为作用域不完整，整轮不读写共享正式答案、候选答案及双栈比较缓存，也不登记预取。实际交换可继续；之后补齐的计划不能追溯把本轮改成可缓存查询。后续请求在相关 bootstrap 缓存新鲜并全部可确定时才恢复共享缓存。无效或持续不可解析的服务器可能长期降低所在组合的缓存复用；不采用随机键写入无法命中的条目，也不为保证缓存而增加全体 bootstrap 等待屏障。本地强制 SOA 在上游计划准备之前完成。
 
 `serve-expired` 缺省 true；`serve-expired-ttl` 以秒计，0 不限制过期年龄；`serve-expired-reply-ttl` 缺省 1 秒，可设 0。过期回答 TTL 不能延长原记录的实际过期点。允许过期回答时触发有界后台更新；关闭或超过允许年龄时前台重新查询。
 

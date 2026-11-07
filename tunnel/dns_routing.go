@@ -47,10 +47,13 @@ func dnsRoutingMetadata(qname string, origin *C.Metadata) *C.Metadata {
 // DNSRoutingPlan freezes one query's rule/group choice across resolver cache
 // lookup, main/fallback races and a possible retry using another transport.
 type DNSRoutingPlan struct {
-	route   dnsProxyRoute
-	origin  *C.Metadata
-	epoch   uint64
-	inbound bool
+	route  dnsProxyRoute
+	origin *C.Metadata
+	// upstream is set only for independently routed resolver connections. It
+	// pins the same destination IP used by IP/GEOIP rules through the dial.
+	upstream *C.Metadata
+	epoch    uint64
+	inbound  bool
 }
 
 func PrepareDNSRouting(ctx context.Context, qname string, origin *C.Metadata) (*DNSRoutingPlan, error) {
