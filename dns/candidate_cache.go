@@ -135,14 +135,14 @@ type dnsCandidateClient struct {
 func (c *dnsCandidateClient) Unwrap() dnsClient { return c.dnsClient }
 func (c *dnsCandidateClient) ExchangeContext(ctx context.Context, query *D.Msg) (*D.Msg, error) {
 	route := queryRoute(ctx)
-	if route == nil || route.err != nil || route.plan == nil {
+	if route == nil || route.err != nil || route.plan == nil || !dnsUpstreamCacheable(ctx) {
 		return c.dnsClient.ExchangeContext(ctx, query)
 	}
 	wire, err := query.Pack()
 	if err != nil {
 		return nil, err
 	}
-	key := makeDNSRouteKey(ctx, route, wire, true) + "|candidate-pool:" + c.poolKey + "|server:" + c.serverKey
+	key := dnsUpstreamCacheKey(ctx, makeDNSRouteKey(ctx, route, wire, true)) + "|candidate-pool:" + c.poolKey + "|server:" + c.serverKey
 	cached, generation, receivedAt, sources := c.cache.getWithSources(key)
 	if cached != nil {
 		if hasDNSAnswerLifetimes(ctx) {
@@ -170,7 +170,7 @@ func (c *dnsCandidateClient) ExchangeContext(ctx context.Context, query *D.Msg) 
 // there is no first-caller cancellation propagated to another query.
 func (s *directSpeedChecker) shareCandidateClients(ctx context.Context, clients []dnsClient) []dnsClient {
 	route := queryRoute(ctx)
-	if s == nil || s.candidates == nil || route == nil || route.err != nil || route.plan == nil {
+	if s == nil || s.candidates == nil || route == nil || route.err != nil || route.plan == nil || !dnsUpstreamCacheable(ctx) {
 		return clients
 	}
 	if t := route.plan.Type(); t != C.Direct && t != C.Compatible {

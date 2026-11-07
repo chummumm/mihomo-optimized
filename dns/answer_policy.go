@@ -45,7 +45,7 @@ func (p AnswerPolicy) enabled() bool {
 // EDNS or signed queries through the upstream question-only cache/flight key.
 func (r *Resolver) cacheKey(ctx context.Context, query *D.Msg) string {
 	key := dnsCacheKey(ctx, query.Question[0])
-	if queryRoute(ctx) != nil || !r.answerPolicy.enabled() {
+	if queryRoute(ctx) != nil || (!r.answerPolicy.enabled() && queryUpstreamRoute(ctx) == nil) {
 		return key
 	}
 	copy := query.Copy()

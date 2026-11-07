@@ -2,7 +2,7 @@
 
 开启顶层 `dns-rule-routing: true` 后，Mihomo 的内置 DNS 在需要真实解析时，用 Question 中的域名匹配已有 `rules` / `rule-providers`，取得一次实际出站，再选择 DNS 上游池。hosts 与 FakeIP 的本地回答保持优先。无需 SmartDNS，也无需维护另一份 DNS 域名规则。
 
-原生上游支持配置的 UDP / TCP 任意端口、DoT、DoH、DoH 的 HTTP/3 和 DoQ。**IP 测速与双栈优选只用于实际 DIRECT / Compatible，代理路径不做本地 IP 探测。** 普通代理入站不再自动识别和接管目标 53 的 DNS 报文；需要按查询域名分流时，使用内置 DNS 监听或显式 DNS 劫持。
+原生上游支持配置的 UDP / TCP 任意端口、DoT、DoH、DoH 的 HTTP/3 和 DoQ。**IP 测速与双栈优选只用于业务实际选择 DIRECT / Compatible 的路径，业务走代理时不做本地 IP 探测。** 普通代理入站不再自动识别和接管目标 53 的 DNS 报文；需要按查询域名分流时，使用内置 DNS 监听或显式 DNS 劫持。
 
 ```yaml
 mode: rule
@@ -20,6 +20,8 @@ dns:
 以上均为文档保留地址，使用前须替换成可达的 DNS 服务器。建议把国内解析器放入 `direct-nameserver`，海外解析器放入 `nameserver`；程序根据实际出站类型选池，不根据这些地址推测国家或地区。完整示例见 [dns-proxy.example.yaml](dns-proxy.example.yaml)，其中保留原 mixed 入口，并显式开启可选的 IP 测速、预取和过期回答设置。
 
 开关默认 `false`。内置 DNS 可使用 `normal`、`redir-host` 或 `fake-ip`；从内核 `mihomo-optimized-v1.0.3` 起，FakeIP 与 DNS 分流可以同时开启，只有需要真实解析的查询才进入 DNS 分流。
+
+从 `1.0.25` 起，可另行开启顶层 `dns-upstream-rule-routing`，让 DNS 服务器连接独立匹配规则，业务选池仍由 `dns-rule-routing` 决定。新开关默认 `false`，示例与兼容边界见 [DNS 上游连接独立选路](#dns-上游连接独立选路)。
 
 ## FakeIP 与真实查询的优先级
 
@@ -101,6 +103,8 @@ dns:
 
 `dns.listen`、TUN DNS 劫持以及适用的内部解析，在需要真实查询时共用已有 QNAME 选路核心。在 Rule 模式中，先选出实际叶子，再按下表处理：
 
+表中传输行为采用默认的 `dns-upstream-rule-routing: false`；另行开启该开关时，池的选择保持不变，实际 DNS 连接改用各解析器自己的规则结果。
+
 | 选路结果 | 内置 DNS 上游与传输 |
 | --- | --- |
 | 实际叶子是 DIRECT 或 Compatible，且 `direct-nameserver` 非空 | 只使用直连池，通过本次选中的实际出站交换；失败不借用 nameserver / fallback |
@@ -179,9 +183,9 @@ rules:
 
 节点域名、解析器自身域名使用独立 bootstrap。`proxy-server-nameserver` 继续供节点解析；未配置时，启用本功能使用独立 `default-nameserver`，不会回到待建立的业务代理中引导自己。普通出站已确定实际叶子后，其内部目标解析继承该叶子和接口 / mark，不重跑业务规则；可依据该叶子选择 DNS 池。
 
-Global / Direct 模式不建立自动 QNAME 计划。内置 DNS 继续原 `respect-rules` 语义：`false` 不会因 Global 模式强制走 GLOBAL，`true` 仍交给原 DNSDialer。自动范围内的 `respect-rules` / `#RULES` 则由 QNAME 计划接管，不再按解析器地址进行第二次选路。
+Global / Direct 模式不建立自动 QNAME 计划。内置 DNS 继续原 `respect-rules` 语义：`false` 不会因 Global 模式强制走 GLOBAL，`true` 仍交给原 DNSDialer。Rule 模式中，`dns-upstream-rule-routing` 关闭时，自动范围内的 `respect-rules` / `#RULES` 由 QNAME 计划接管；开启时改按下节所述的解析器地址计划传输。
 
-开启总开关时，以下业务域名策略停用，也不加载其专属 provider / geosite 条件：
+开启 `dns-rule-routing` 时，以下业务域名策略停用，也不加载其专属 provider / geosite 条件：
 
 - `nameserver-policy`
 - `direct-nameserver-follow-policy`
@@ -192,9 +196,54 @@ Global / Direct 模式不建立自动 QNAME 计划。内置 DNS 继续原 `respe
 
 hosts、系统 hosts、回答类型控制、`proxy-server-nameserver-policy` 等原有基础能力仍保留。该功能不是 SmartDNS 全部配置或行为的兼容实现。
 
+## DNS 上游连接独立选路
+
+顶层 `dns-upstream-rule-routing` 从 `1.0.25` 起提供，默认 `false`，仅在 Rule 模式对内置 DNS 的自动上游生效。它匹配 DNS 服务器自己的域名、引导解析得到的真实 IP、实际端口和配置对应的传输类型，再冻结该服务器本次使用的实际出口。UDP / TCP 任意端口、DoT、DoH（含 HTTP/3）和 DoQ 都适用；原有 TLS SNI、证书校验、HTTP Host、URL 与 ECS 参数保留。
+
+两个顶层开关分别控制业务选池和 DNS 连接：
+
+| `dns-rule-routing` | `dns-upstream-rule-routing` | Rule 模式的行为 |
+| --- | --- | --- |
+| `false` | `false` | 原有 DNS 池、策略与传输配置 |
+| `true` | `false` | 按业务域名选池，自动 DNS 传输继承业务实际出口 |
+| `false` | `true` | 保留原有 DNS 选池和域名策略，只让自动 DNS 连接按解析器地址匹配规则；不会单独开启业务 DIRECT 测速 |
+| `true` | `true` | 按业务域名选池及执行拒绝 / 测速策略，DNS 连接再按解析器地址选择独立出口 |
+
+下面是合并到现有配置的片段。`Proxy` 表示已经存在的代理策略组或节点，需替换为自己的名称；域名、IP 和 ECS 网段都是文档示例，需替换为实际可达且支持相应参数的 DNS 服务：
+
+```yaml
+mode: rule
+dns-rule-routing: true
+dns-upstream-rule-routing: true
+dns:
+  enable: true
+  default-nameserver: [192.0.2.53]
+  proxy-server-nameserver: [192.0.2.53]
+  direct-nameserver:
+    - "https://dns.example/dns-query#ecs=203.0.113.0/24&ecs-override=true"
+  nameserver:
+    - "https://other-dns.example/dns-query"
+rules:
+  - DOMAIN,dns.example,Proxy
+  - DOMAIN,business.example,DIRECT
+  - MATCH,Proxy
+```
+
+查询 `business.example` 时，业务规则选择 DIRECT，因此使用 `direct-nameserver` 及其 ECS；连接 `dns.example` 时，解析器域名规则选择 `Proxy`。符合条件的答案仍按业务 DIRECT 出口执行本地 IP 测速，DNS 请求经代理传输不会把业务池改成 `nameserver`，也不会绕过业务 REJECT / REJECT-DROP。业务实际走代理时，即使 DNS 连接选择 DIRECT，也不会因此开启业务 IP 测速。
+
+DNS 连接使用完整的普通规则匹配，可使用域名、`IP-CIDR` / `IP-CIDR6`、GEOIP、ASN、规则集及组合规则；IP 条件判断的是解析器实际地址。它使用独立的 `DNS-TRANSPORT` 内部连接身份，不沿用业务查询的来源、进程、固定出口或业务目标 IP。匹配时选中的解析器 IP 固定到实际拨号，避免规则判断的 IP 与连接目标不同；同一服务器的重试和 UDP→TCP 不重新选择出口。业务 QNAME 匹配仍遵守前文的未知目标 IP 规则。
+
+`NETWORK` 依据配置对应的传输类型建立一次计划：普通 UDP、DoQ 和强制 `#h3=true` 的 DoH 按 UDP，TCP、DoT 及可协商 HTTP/1.1、HTTP/2、HTTP/3 的 DoH 按 TCP。后续协商到 HTTP/3 或由 UDP 截断重试 TCP 时沿用已冻结出口，不按新协议再次选路；实际使用 UDP 时仍检查该出口的 UDP 能力。
+
+自动范围覆盖业务解析所用的 `nameserver`、`direct-nameserver`、适用的 `fallback` 和 `default-nameserver`。`#Group`、`#DIRECT`、`#interface` 及显式适配器优先，保留其既有传输配置；`#RULES` 仍属于自动范围。`proxy-server-nameserver`、其 policy 和节点的根 bootstrap 不被新开关接管，继续按原配置解析节点及解析器自身域名，避免代理连接依赖自身 DNS 的循环。Global / Direct 模式保持原 DNSDialer / `respect-rules` 行为。
+
+准备本次路由与缓存作用域时，只读取字面 IP、hosts 或仍新鲜的 bootstrap 缓存，不发起网络解析。尚未知地址的解析器在实际参与交换的分支中才引导解析，不要求健康上游等待其他服务器，未使用的 lazy fallback 也不会提前解析。只要本次相关上游尚未全部冻结，整轮查询就保守地跳过共享答案缓存、候选缓存和双栈比较缓存的读写，也不登记预取；正常网络查询与答案处理继续运行。后续查询在 bootstrap 缓存新鲜、相关上游均可确定时恢复缓存复用。持续无法解析的服务器可能使包含它的整个组合持续降低缓存命中率；这不会用另一条旧路由的缓存补齐未知身份。
+
+修改任一顶层开关都需完整重载配置。`GET /configs` 返回已生效值，`PATCH /configs` 不接受这两个字段；使用 `PUT /configs` 或原有完整重载入口应用。
+
 ## 可选 IP 测速
 
-测速只为内置 DNS 已确定的 DIRECT / Compatible 路径优选返回的 A / AAAA 地址。所选上游集合必须全部属于自动范围；使用 DoH、DoT、DoQ 或非 53 端口不会单独禁止测速。代理路径、显式或未接入自动路由的传输跳过。从 `1.0.13` 起，`speed-check-mode` 缺省采用 `auto`；顶层 `dns-rule-routing` 默认仍为 `false`，测速策略不会自行开启 DNS 自动选路。
+测速只为内置 DNS 已确定的业务 DIRECT / Compatible 路径优选返回的 A / AAAA 地址，开启上游独立选路后也以业务计划为准。所选上游集合必须全部属于自动范围；使用 DoH、DoT、DoQ 或非 53 端口不会单独禁止测速。业务代理路径、显式或未接入自动路由的传输跳过。从 `1.0.13` 起，`speed-check-mode` 缺省采用 `auto`；顶层 `dns-rule-routing` 默认仍为 `false`，测速策略不会自行开启 DNS 自动选路。
 
 ```yaml
 dns:
@@ -440,7 +489,7 @@ payload:
 
 关闭一条这样的逻辑查询会中断该交换，不关闭同一 HTTP/2 或 QUIC 连接上的其他查询，也不触发该查询的自动重试或后台刷新。正常完成后逻辑记录离开活动列表，共享传输可以继续存在。经普通代理转发的 DNS 显示为普通连接，不再生成逐查询 QNAME 记录。普通 SSH 的反向映射或嗅探显示不在本功能修改范围内。
 
-更改 `dns-rule-routing` 应重新加载完整配置。`GET /configs` 返回生效值，`PATCH /configs` 不接受该字段；可通过原 `PUT /configs` 完整重载。省略开关等同于关闭。DNS 接入使用已有 `dns.listen` 或显式 TUN DNS 劫持。
+更改 `dns-rule-routing` 或 `dns-upstream-rule-routing` 应重新加载完整配置。`GET /configs` 返回生效值，`PATCH /configs` 不接受这两个字段；可通过原 `PUT /configs` 完整重载。省略任一开关等同于关闭该开关。DNS 接入使用已有 `dns.listen` 或显式 TUN DNS 劫持。
 
 完整配置重载（`PUT /configs` 或 SIGHUP）会重建当前配置的主、直连、节点域名和 bootstrap 解析器的答案缓存，以及候选缓存、测速和预取状态，即使 DNS 配置内容没有变化也一样。真实 IP → 域名映射按上述黑名单约束继承；fake-IP 有单独的继承与持久化逻辑。`PATCH /configs` 修改部分运行设置不等于完整重载，`force=true` 也不是“强制清空全部 DNS 缓存”的开关。客户端系统和浏览器自己的 DNS 缓存不受内核 reload 控制。
 

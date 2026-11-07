@@ -24,7 +24,11 @@ import (
 // scopes. It excludes QNAME/source-port, which those callers supply separately.
 // Do not weaken these existing scopes when optimizing connection reuse.
 func (p *DNSRoutingPlan) TransportKey() string {
-	return fmt.Sprintf("%s|%d|%v|%v|%d", p.CacheKey(), p.Type(), p.route.proxy.ProxyInfo(), p.route.udpSupportError, p.epoch)
+	key := fmt.Sprintf("%s|%d|%v|%v|%d", p.CacheKey(), p.Type(), p.route.proxy.ProxyInfo(), p.route.udpSupportError, p.epoch)
+	if p.upstream != nil {
+		key += fmt.Sprintf("|upstream:%s|%s|%d", p.upstream.Host, p.upstream.AddrPort(), p.upstream.NetWork)
+	}
+	return key
 }
 
 // NativeTransportKey identifies the selected physical outbound for a configured
@@ -32,6 +36,10 @@ func (p *DNSRoutingPlan) TransportKey() string {
 // rule/group does not require another TLS/HTTP/QUIC connection. The upstream
 // address, TLS options and protocol are isolated by the owning dnsClient.
 func (p *DNSRoutingPlan) NativeTransportKey() string {
+	endpoint := ""
+	if p.upstream != nil {
+		endpoint = "|upstream:" + p.upstream.AddrPort().String()
+	}
 	leaf := p.route.proxy
 	if proxy, ok := leaf.(C.Proxy); ok {
 		// Providers/groups may expose different history wrappers around the
@@ -52,12 +60,12 @@ func (p *DNSRoutingPlan) NativeTransportKey() string {
 	// identity. Unresolved/opaque groups receive the same conservative policy.
 	if !p.route.udpSupportFrozen || info.DialerProxy != "" || leaf.Type() == C.Relay || leaf.Type() == C.Selector ||
 		leaf.Type() == C.URLTest || leaf.Type() == C.Fallback || leaf.Type() == C.LoadBalance {
-		return fmt.Sprintf("native-route:%s|interface:%q|mark:%d", p.TransportKey(), iface, mark)
+		return fmt.Sprintf("native-route:%s|interface:%q|mark:%d", p.TransportKey(), iface, mark) + endpoint
 	}
 	// UDP authorization remains part of the selection snapshot. A TCP-only
 	// group cannot borrow a UDP-capable group's existing HTTP/3/QUIC client.
 	return fmt.Sprintf("native-leaf:%T:%p|%d|%#v|udp:%t|epoch:%d|interface:%q|mark:%d",
-		leaf, leaf, leaf.Type(), info, p.route.udpSupportError == nil, p.epoch, iface, mark)
+		leaf, leaf, leaf.Type(), info, p.route.udpSupportError == nil, p.epoch, iface, mark) + endpoint
 }
 
 func (p *DNSRoutingPlan) nativeDestination(ctx context.Context, network, addr string, bootstrap resolver.Resolver) (*C.Metadata, error) {
@@ -79,6 +87,16 @@ func (p *DNSRoutingPlan) nativeDestination(ctx context.Context, network, addr st
 	}
 	if metadata.DstPort == 0 {
 		return nil, errors.New("native DNS transport requires a destination port")
+	}
+	if p.upstream != nil {
+		matches := metadata.DstIP.IsValid() && metadata.DstIP == p.upstream.DstIP
+		if metadata.Host != "" {
+			matches = strings.EqualFold(metadata.Host, p.upstream.Host)
+		}
+		if metadata.DstPort != p.upstream.DstPort || !matches {
+			return nil, errors.New("DNS upstream plan belongs to another resolver endpoint")
+		}
+		metadata.DstIP = p.upstream.DstIP
 	}
 	if !metadata.DstIP.IsValid() {
 		address, err := resolver.ResolveIPWithResolver(icontext.WithDNSBootstrap(ctx), metadata.Host, bootstrap)

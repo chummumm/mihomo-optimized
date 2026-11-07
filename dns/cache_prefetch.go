@@ -127,7 +127,7 @@ func (r *Resolver) directDNSQueryEligible(ctx context.Context, query *D.Msg) boo
 // activates one. Internal/bootstrap queries and background refreshes never add
 // heat, and a source's first successful real query already has finite credit.
 func (c *cacheControl) Observe(ctx context.Context, query *D.Msg, key string) context.Context {
-	if !c.options.Prefetch || cacheBackground(ctx) || icontext.DNSBootstrap(ctx) || !icontext.DNSRoutingInbound(ctx) || !c.r.directDNSQueryEligible(ctx, query) {
+	if !c.options.Prefetch || cacheBackground(ctx) || !dnsUpstreamCacheable(ctx) || icontext.DNSBootstrap(ctx) || !icontext.DNSRoutingInbound(ctx) || !c.r.directDNSQueryEligible(ctx, query) {
 		return ctx
 	}
 	request, ok := newCachePrefetchRequest(ctx, query)

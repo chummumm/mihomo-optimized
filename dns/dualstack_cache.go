@@ -83,7 +83,7 @@ func (r *Resolver) cacheableDualStackAnswer(ctx context.Context, query, message 
 // but must use distinct full wire-question keys. No group is selected again.
 func otherFamilyCacheContext(ctx context.Context, query *D.Msg) (context.Context, bool) {
 	route := queryRoute(ctx)
-	if route == nil || route.plan == nil || route.err != nil || route.origin == nil {
+	if route == nil || route.plan == nil || route.err != nil || route.origin == nil || !dnsUpstreamCacheable(ctx) {
 		return ctx, false
 	}
 	wire, err := query.Pack()

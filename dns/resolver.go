@@ -58,6 +58,7 @@ type Resolver struct {
 	policy                []dnsPolicy
 	defaultResolver       *Resolver
 	ruleRouting           bool
+	upstreamRuleRouting   bool
 	bootstrap             bool
 	clientOwner           *resolverClientOwner
 }
@@ -207,13 +208,17 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 	if forcedSOAQuestion(ctx, m) && r.answerPolicy.forcesQtype(m.Question[0].Qtype) {
 		return r.answerPolicy.forcedSOAReply(ctx, m), nil
 	}
+	ctx, err = r.prepareDNSUpstreamRouting(ctx, m)
+	if err != nil {
+		return nil, err
+	}
 	continueFetch := false
 	key := r.cacheKey(ctx, m)
 	if r.cacheControl != nil {
 		ctx = r.cacheControl.Observe(ctx, m, key)
 	}
 	defer func() {
-		if !cacheBackground(ctx) && !dnsQueryClosed(ctx) && (continueFetch || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+		if dnsUpstreamCacheable(ctx) && !cacheBackground(ctx) && !dnsQueryClosed(ctx) && (continueFetch || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
 			if r.cacheControl != nil {
 				r.cacheControl.Refresh(ctx, m, key)
 				return
@@ -228,6 +233,7 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 
 	domain := msgToDomain(m)
 	msg, expireTime, hit := getMsgFromCache(r.cache, key)
+	hit = hit && dnsUpstreamCacheable(ctx)
 	staleTTL := uint32(1)
 	now := time.Now()
 	if hit && expireTime.Before(now) && r.cacheControl != nil {
@@ -309,7 +315,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 			result = ageDNSAnswerAfterPolicy(ctx, original, result)
 			inheritDNSAnswerSources(ctx, result, original)
 			inheritDNSLocalAnswer(ctx, result, original)
-			if cache {
+			if cache && dnsUpstreamCacheable(ctx) {
 				cacheAnswer := result
 				if dnsDualStackSelectionFor(ctx, original) != nil {
 					cacheAnswer = r.cacheableDualStackAnswer(ctx, m, original)
@@ -599,6 +605,9 @@ func (r *Resolver) Close() {
 		r.cacheControl.Close()
 	}
 	if r != nil {
+		if r.defaultResolver != nil {
+			r.defaultResolver.Close()
+		}
 		if r.clientOwner != nil {
 			r.clientOwner.close()
 			return
@@ -691,6 +700,7 @@ type Policy struct {
 
 type Config struct {
 	RuleRouting          bool
+	UpstreamRuleRouting  bool
 	Main, Fallback       []NameServer
 	Default              []NameServer
 	ProxyServer          []NameServer
@@ -773,24 +783,43 @@ func NewResolver(config Config) (rs Resolvers) {
 		// validated beforehand. Invalid programmatic options never enable probes.
 		log.Warnln("[DNS] speed check disabled: %v", checkErr)
 	}
-	defaultResolver := &Resolver{
+	bootstrapResolver := &Resolver{
 		bootstrap:   true,
 		main:        transform(config.Default, nil),
 		cache:       config.newCache(),
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 	}
-	owner := &resolverClientOwner{clients: append([]dnsClient(nil), defaultResolver.main...)}
-	defaultResolver.clientOwner = owner
+	owner := &resolverClientOwner{clients: append([]dnsClient(nil), bootstrapResolver.main...)}
+	bootstrapResolver.clientOwner = owner
+	defaultResolver := bootstrapResolver
+	if config.UpstreamRuleRouting {
+		// Business DNS may reach default-nameserver through a proxy. Resolving
+		// that proxy, including its own DNS server's hostname, must retain a
+		// separate root which never inherits this automatic transport policy.
+		defaultResolver = &Resolver{
+			clientOwner:         owner,
+			bootstrap:           true,
+			upstreamRuleRouting: true,
+			main:                transform(config.Default, nil),
+			cache:               config.newCache(),
+			ipv6Timeout:         time.Duration(config.IPv6Timeout) * time.Millisecond,
+		}
+		owner.clients = append(owner.clients, defaultResolver.main...)
+	}
 
 	var nameServerCache []struct {
 		NameServer
 		dnsClient
+		bootstrap *Resolver
 	}
-	cacheTransform := func(nameserver []NameServer) (result []dnsClient) {
+	cacheTransform := func(nameserver []NameServer, bootstrap *Resolver) (result []dnsClient) {
 	LOOP:
 		for _, ns := range nameserver {
 			var dc dnsClient
 			for _, nsc := range nameServerCache {
+				if nsc.bootstrap != bootstrap {
+					continue
+				}
 				if nsc.NameServer.Equal(ns) {
 					result = append(result, nsc.dnsClient)
 					continue LOOP // exact match wins: reuse the wrapped client as-is
@@ -802,7 +831,7 @@ func NewResolver(config Config) (rs Resolvers) {
 			if dc != nil { // reuse raw transport, re-wrap the client
 				dc = rewrapClient(dc, ns.Params)
 			} else { // no reusable transport: build from scratch
-				built := transform([]NameServer{ns}, defaultResolver)
+				built := transform([]NameServer{ns}, bootstrap)
 				if len(built) == 0 {
 					continue
 				}
@@ -812,13 +841,14 @@ func NewResolver(config Config) (rs Resolvers) {
 			nameServerCache = append(nameServerCache, struct {
 				NameServer
 				dnsClient
-			}{NameServer: ns, dnsClient: dc})
+				bootstrap *Resolver
+			}{NameServer: ns, dnsClient: dc, bootstrap: bootstrap})
 			result = append(result, dc)
 		}
 		return
 	}
 
-	makePolicy := func(policies []Policy) (dnsPolicies []dnsPolicy) {
+	makePolicy := func(policies []Policy, bootstrap *Resolver) (dnsPolicies []dnsPolicy) {
 		var triePolicy *trie.DomainTrie[[]dnsClient]
 		insertPolicy := func(policy dnsPolicy) {
 			if triePolicy != nil {
@@ -833,12 +863,12 @@ func NewResolver(config Config) (rs Resolvers) {
 
 		for _, policy := range policies {
 			if policy.Matcher != nil {
-				insertPolicy(domainMatcherPolicy{matcher: policy.Matcher, dnsClients: cacheTransform(policy.NameServers)})
+				insertPolicy(domainMatcherPolicy{matcher: policy.Matcher, dnsClients: cacheTransform(policy.NameServers, bootstrap)})
 			} else {
 				if triePolicy == nil {
 					triePolicy = trie.New[[]dnsClient]()
 				}
-				if err := triePolicy.Insert(policy.Domain, cacheTransform(policy.NameServers)); err != nil {
+				if err := triePolicy.Insert(policy.Domain, cacheTransform(policy.NameServers, bootstrap)); err != nil {
 					log.Warnln("[DNS] skip invalid nameserver policy: %s", err)
 				}
 			}
@@ -848,38 +878,40 @@ func NewResolver(config Config) (rs Resolvers) {
 	}
 
 	r := &Resolver{
-		clientOwner: owner,
-		ruleRouting: config.RuleRouting,
-		ipv6:        config.IPv6,
-		main:        cacheTransform(config.Main),
-		cache:       config.newCache(),
-		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
-		policy:      makePolicy(config.Policy),
+		clientOwner:         owner,
+		ruleRouting:         config.RuleRouting,
+		upstreamRuleRouting: config.UpstreamRuleRouting,
+		ipv6:                config.IPv6,
+		main:                cacheTransform(config.Main, defaultResolver),
+		cache:               config.newCache(),
+		ipv6Timeout:         time.Duration(config.IPv6Timeout) * time.Millisecond,
+		policy:              makePolicy(config.Policy, defaultResolver),
 	}
 	r.defaultResolver = defaultResolver
 	rs.Resolver = r
-	rs.BootstrapResolver = defaultResolver
+	rs.BootstrapResolver = bootstrapResolver
 
 	if len(config.ProxyServer) != 0 {
 		rs.ProxyResolver = &Resolver{
 			clientOwner: owner,
 			bootstrap:   true,
 			ipv6:        config.IPv6,
-			main:        cacheTransform(config.ProxyServer),
+			main:        cacheTransform(config.ProxyServer, bootstrapResolver),
 			cache:       config.newCache(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
-			policy:      makePolicy(config.ProxyServerPolicy),
+			policy:      makePolicy(config.ProxyServerPolicy, bootstrapResolver),
 		}
 	}
 
 	if len(config.DirectServer) != 0 {
 		rs.DirectResolver = &Resolver{
-			clientOwner: owner,
-			ruleRouting: config.RuleRouting,
-			ipv6:        config.IPv6,
-			main:        cacheTransform(config.DirectServer),
-			cache:       config.newCache(),
-			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
+			clientOwner:         owner,
+			ruleRouting:         config.RuleRouting,
+			upstreamRuleRouting: config.UpstreamRuleRouting,
+			ipv6:                config.IPv6,
+			main:                cacheTransform(config.DirectServer, defaultResolver),
+			cache:               config.newCache(),
+			ipv6Timeout:         time.Duration(config.IPv6Timeout) * time.Millisecond,
 		}
 		if config.DirectFollowPolicy {
 			rs.DirectResolver.policy = r.policy
@@ -888,7 +920,7 @@ func NewResolver(config Config) (rs Resolvers) {
 	}
 
 	if len(config.Fallback) != 0 {
-		r.fallback = cacheTransform(config.Fallback)
+		r.fallback = cacheTransform(config.Fallback, defaultResolver)
 		r.fallbackIPFilters = config.FallbackIPFilter
 		r.fallbackDomainFilters = config.FallbackDomainFilter
 		r.fallbackLazyQuery = config.FallbackLazyQuery
@@ -904,6 +936,9 @@ func NewResolver(config Config) (rs Resolvers) {
 	// Infrastructure lookups stay independent; no proactive probes or prefetch
 	// are inherited from ordinary business-domain tuning.
 	defaultResolver.cacheControl = newCacheControl(defaultResolver, nil)
+	if bootstrapResolver != defaultResolver {
+		bootstrapResolver.cacheControl = newCacheControl(bootstrapResolver, nil)
+	}
 	if rs.ProxyResolver != nil {
 		rs.ProxyResolver.cacheControl = newCacheControl(rs.ProxyResolver, nil)
 	}

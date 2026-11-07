@@ -33,6 +33,15 @@ type systemClient struct {
 }
 
 func (c *systemClient) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
+	if route := queryUpstreamRoute(ctx); route != nil {
+		if snapshot, ok := route.systems[c]; ok {
+			if snapshot.err != nil {
+				return nil, snapshot.err
+			}
+			msg, _, err = batchExchange(ctx, snapshot.clients, m)
+			return
+		}
+	}
 	dnsClients, err := c.getDnsClients()
 	if len(dnsClients) == 0 && len(c.defaultNS) > 0 && !errors.Is(err, net.ErrClosed) {
 		dnsClients = c.defaultNS

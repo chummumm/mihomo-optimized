@@ -2,9 +2,11 @@
 
 基于 [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) 稳定版维护的独立派生内核，让 DNS 查询直接复用已有业务分流规则。**不需要 SmartDNS，也不需要再维护一份 DNS 域名策略。** 本项目不是 MetaCubeX 官方发行版。
 
-**原生 DNS 上游支持 UDP、TCP、DoH、DoT、DoQ 和 DoH 的 HTTP/3。IP 测速与双栈优选只用于实际 DIRECT / Compatible 路径，走代理节点的 DNS 回答不测速。** `speed-check-mode` 缺省使用 `auto`，在开启 DNS 自动选路且符合直连自动上游池条件时测速；双栈优选与主动预取默认关闭。
+**原生 DNS 上游支持 UDP、TCP、DoH、DoT、DoQ 和 DoH 的 HTTP/3。IP 测速与双栈优选只用于业务实际选择 DIRECT / Compatible 的路径，业务走代理节点时不测速。** `speed-check-mode` 缺省使用 `auto`，在开启 DNS 自动选路且符合直连自动上游池条件时测速；双栈优选与主动预取默认关闭。
 
 [下载 Releases](https://github.com/chummumm/mihomo-optimized/releases) · [构建状态](https://github.com/chummumm/mihomo-optimized/actions/workflows/build.yml) · [完整配置说明](docs/dns-proxy.md) · [验证记录](docs/dns-rule-routing-validation.md)
+
+**1.0.25 新增：** [DNS 上游连接独立按规则选路](docs/dns-proxy.md#dns-上游连接独立选路)。顶层 `dns-upstream-rule-routing` 默认 `false`；在 Rule 模式开启后，业务域名仍可选择直连池及其 ECS，DNS 服务器自身的域名 / IP 则可通过规则走代理。该开关与 `dns-rule-routing` 独立，显式出口和节点引导解析保持原有边界，修改后需完整重载。
 
 **1.0.23 新增：** [LAN 后台预连接](docs/lan-preconnect.md) · [代理目标 IP 与 DNS 地址族策略（issue #61）](docs/proxy-force-ip.md) · [Windows 桌面恢复协议](docs/desktop-managed.md#local-health-and-resume-recovery)。`normal` 模式继续保留；LAN 预连接不增加节点配置。
 
@@ -22,7 +24,7 @@
 
 判断依据是**策略组最终选择的实际出口类型**，组名和节点名不参与这个判断。组切到 DIRECT 就走直连池，选择代理节点就走代理池。`direct-nameserver` 为空时，保留原 `nameserver` / `fallback` 行为。
 
-一次逻辑查询只选一次实际出口；上游重试、main / fallback 和 UDP 截断后的 TCP 重试沿用它。直连池失败不会偷偷借用代理池。缓存按解析器池、实际出口、来源等作用域隔离，切组不会混用另一个出口的回答。
+一次逻辑查询只选择一次业务实际出口；默认情况下，上游重试、main / fallback 和 UDP 截断后的 TCP 重试沿用它。另行开启 `dns-upstream-rule-routing` 时，各自动 DNS 上游按自身地址冻结独立的传输出口，业务选池和拒绝 / 测速依据保持不变。直连池失败不会偷偷借用代理池。缓存按解析器池、业务及 DNS 传输出口、来源等作用域隔离，切组不会混用另一个出口的回答。
 
 DNS 分流通过内置解析器提供，普通代理连接保持原转发行为：
 
@@ -41,7 +43,7 @@ UDP、TCP 和 DoT 上游在实际出口固定时共享连接，多个查询通�
 
 新增的 DNS 面板数据由本机控制器提供，查询记录、趋势和上游统计只保存在进程内存中，不写数据库或日志文件，也不发送遥测。无需维护第二份分流规则；观测不会改变 DNS 回答和出口选择。优化范围、缓存安全边界及测试方式见 [DNS 性能说明](docs/dns-performance.md)。
 
-正式版本采用 **`mihomo-optimized-vX.Y.Z`**，当前为 `mihomo-optimized-v1.0.23`。tag、发行标题、`version.txt` 和运行内核版本一致；`PROJECT_VERSION` 记录独立项目版本，上游 mihomo 的版本与提交另存于 `UPSTREAM_VERSION` / `UPSTREAM_COMMIT`。源码哈希保留在 BUILDINFO 中。**旧版 `v1.19.32-optimized-N` 及更早内核首次切换到新系列，需要手动安装一次**；新系列随后可通过 YAML 启用内核后台检查和更新，详见[更新说明](docs/releases.md#内核自动更新)。
+正式版本采用 **`mihomo-optimized-vX.Y.Z`**，当前源码版本为 `mihomo-optimized-v1.0.25`。tag、发行标题、`version.txt` 和运行内核版本一致；`PROJECT_VERSION` 记录独立项目版本，上游 mihomo 的版本与提交另存于 `UPSTREAM_VERSION` / `UPSTREAM_COMMIT`。源码哈希保留在 BUILDINFO 中。**旧版 `v1.19.32-optimized-N` 及更早内核首次切换到新系列，需要手动安装一次**；新系列随后可通过 YAML 启用内核后台检查和更新，详见[更新说明](docs/releases.md#内核自动更新)。
 
 ## 启动资源下载
 
@@ -378,7 +380,7 @@ FakeIP 的 IPv6 与 HTTPS / SVCB 处理也保持原行为：应使用虚拟地�
 
 ## 可选 DNS 设置
 
-以下字段均放在原 `dns:` 下；顶层 `dns-rule-routing` 的默认值是 `false`。
+以下表格中的字段均放在原 `dns:` 下。`dns-rule-routing` 与 `dns-upstream-rule-routing` 则放在 YAML 顶层，默认均为 `false`：前者按业务域名选池，后者按 DNS 服务器地址选择传输出口。两者可同时开启，配置示例与冷启动缓存边界见 [DNS 上游连接独立选路](docs/dns-proxy.md#dns-上游连接独立选路)。
 
 | 观测与映射字段 | 默认值 | 生效条件与关闭方式 |
 | --- | --- | --- |

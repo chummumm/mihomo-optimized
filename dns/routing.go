@@ -170,10 +170,11 @@ func (r *Resolver) prepareDNSRouting(ctx context.Context, message *D.Msg) (conte
 }
 
 func dnsCacheKey(ctx context.Context, question D.Question) string {
+	key := question.String()
 	if route := queryRoute(ctx); route != nil && !icontext.DNSBootstrap(ctx) {
-		return route.key
+		key = route.key
 	}
-	return question.String()
+	return dnsUpstreamCacheKey(ctx, key)
 }
 
 func (c *client) exchangeRouted(ctx context.Context, message *D.Msg, route *dnsQueryRoute) (response *D.Msg, err error) {
