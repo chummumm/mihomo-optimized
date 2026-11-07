@@ -1555,12 +1555,12 @@ dns:
   enable: true
   ipv6: false
   enhanced-mode: redir-host
+  fake-ip-range: 198.18.0.1/16
   nameserver: [1.1.1.1]
 tun:
   enable: false
   device: MihomoSmokeTun
   stack: mixed
-  inet4-address: ['198.18.0.1/30']
   route-address: ['{TUN_TARGET}/32']
   dns-hijack: []
 proxies:
@@ -2572,9 +2572,10 @@ class Acceptance:
         require(result.returncode == 0, "supervisor_service_" + action + "_failed")
 
     def service_process_access(self) -> dict:
-        """Exercise the owner-only query grant without using any mutation right."""
+        """Exercise the owner's identity and liveness grant without mutation rights."""
         import pywintypes
         import win32api
+        import win32event
         import win32security
         import win32service
 
@@ -2605,13 +2606,34 @@ class Acceptance:
 
         denied = {"terminate": 0x0001, "vmRead": 0x0010, "vmWrite": 0x0020,
                   "duplicateHandle": 0x0040, "writeDacl": 0x00040000}
+        denied_token = {"duplicate": win32security.TOKEN_DUPLICATE,
+                        "assignPrimary": win32security.TOKEN_ASSIGN_PRIMARY,
+                        "adjustPrivileges": win32security.TOKEN_ADJUST_PRIVILEGES}
         win32security.ImpersonateLoggedOnUser(self.desktop.token)
         try:
             # The effective thread token now has the same restrictions as GUI.
-            process = win32api.OpenProcess(0x1000, False, pid)
+            # Match the client's retained QUERY_LIMITED | SYNCHRONIZE handle.
+            process = win32api.OpenProcess(0x1000 | 0x100000, False, pid)
             try:
                 require(self.processes.from_handle(int(process), pid) == identity,
                         "service_query_limited_identity_mismatch")
+                require(win32event.WaitForSingleObject(process, 0) == win32event.WAIT_TIMEOUT,
+                        "service_identity_wait_not_alive")
+                token = win32security.OpenProcessToken(process, win32security.TOKEN_QUERY)
+                try:
+                    user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+                    require(win32security.ConvertSidToStringSid(user) == "S-1-5-18",
+                            "service_filtered_token_identity_mismatch")
+                finally:
+                    token.Close()
+                for name, access in denied_token.items():
+                    try:
+                        unexpected = win32security.OpenProcessToken(process, access)
+                    except pywintypes.error as error:
+                        require(error.winerror == 5, "service_token_probe_unexpected_error_" + name)
+                    else:
+                        unexpected.Close()
+                        raise SmokeFailure("service_excess_token_access_" + name)
             finally:
                 process.Close()
             for name, access in denied.items():
@@ -2626,7 +2648,9 @@ class Acceptance:
             win32security.RevertToSelf()
         self.service_identity = identity
         return {"serviceAccount": "LocalSystem", "caller": "same_sid_filtered_primary",
-                "queryLimitedInformation": True, "deniedRights": list(denied)}
+                "queryLimitedInformation": True, "synchronize": True,
+                "zeroTimeWaitAlive": True, "tokenQuery": True,
+                "deniedRights": list(denied), "deniedTokenRights": list(denied_token)}
 
     def check_service_proxy_recovery(self, running: dict, mixed: int) -> None:
         """Briefly deny identity queries to this fixture's service, then restore.

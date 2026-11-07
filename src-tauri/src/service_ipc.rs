@@ -36,10 +36,7 @@ use windows_sys::Win32::{
             GetNamedPipeServerProcessId, PeekNamedPipe, SetNamedPipeHandleState, PIPE_NOWAIT,
             PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
         },
-        Threading::{
-            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE,
-        },
+        Threading::{OpenProcess, WaitForSingleObject},
     },
 };
 
@@ -111,13 +108,7 @@ impl AuthenticatedOwner {
     #[cfg(test)]
     pub(crate) fn current_for_test() -> Self {
         let pid = std::process::id();
-        let raw = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                0,
-                pid,
-            )
-        };
+        let raw = unsafe { OpenProcess(windows::PROCESS_IDENTITY_ACCESS, 0, pid) };
         assert!(!raw.is_null());
         Self {
             pid,
@@ -387,11 +378,7 @@ impl Client {
             if GetNamedPipeServerProcessId(handle.as_raw_handle(), &mut pid) == 0 {
                 return Err(windows::last_error("无法验证 TUN 服务"));
             }
-            let raw = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                0,
-                pid,
-            );
+            let raw = OpenProcess(windows::PROCESS_IDENTITY_ACCESS, 0, pid);
             if raw.is_null() {
                 let mut error = windows::last_error("无法保留 TUN 服务身份");
                 error.code = "service_identity_failed".into();
@@ -538,13 +525,7 @@ impl Server {
             if unsafe { GetNamedPipeClientProcessId(self.handle.as_raw_handle(), &mut pid) } == 0 {
                 return Err(windows::last_error("无法验证服务调用者"));
             }
-            let raw = unsafe {
-                OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                    0,
-                    pid,
-                )
-            };
+            let raw = unsafe { OpenProcess(windows::PROCESS_IDENTITY_ACCESS, 0, pid) };
             if raw.is_null() {
                 return Err(windows::last_error("无法保留服务所有者身份"));
             }

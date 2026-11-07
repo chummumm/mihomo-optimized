@@ -21,8 +21,9 @@ use windows_sys::Win32::{
             TRUSTEE_IS_USER, TRUSTEE_W,
         },
         GetTokenInformation, IsValidAcl, SetFileSecurityW, TokenUser, DACL_SECURITY_INFORMATION,
-        NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+        NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER,
     },
+    Storage::FileSystem::{READ_CONTROL, WRITE_DAC},
     System::{
         Com::CoTaskMemFree,
         JobObjects::{
@@ -32,7 +33,7 @@ use windows_sys::Win32::{
         },
         Threading::{
             GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-            PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
         },
     },
     UI::Shell::{
@@ -40,6 +41,11 @@ use windows_sys::Win32::{
         ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     },
 };
+
+/// The retained identity handle permits image queries and observing process exit.
+/// The service grant and its clients must use the same read-only access mask.
+pub(crate) const PROCESS_IDENTITY_ACCESS: u32 =
+    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
 
 pub fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
@@ -147,23 +153,47 @@ pub fn process_path(pid: u32) -> Result<PathBuf> {
     }
 }
 
-/// Let the configured desktop user authenticate this SYSTEM service's image path.
-/// Merge only limited process-query access; retain the existing DACL entries,
-/// owner, token permissions and integrity label. Call before accepting clients.
+/// Let the configured desktop user authenticate this SYSTEM service's image,
+/// token SID and retained process lifetime. Merge only process query/wait and
+/// token query access; retain all existing entries, owners and integrity labels.
+/// Call before accepting clients, and never grant token mutation or duplication.
 pub fn allow_service_identity_query(owner_sid: &str) -> Result<()> {
     unsafe {
         let mut sid = std::ptr::null_mut();
         if ConvertStringSidToSidW(wide(owner_sid).as_ptr(), &mut sid) == 0 {
             return Err(last_error("无法读取服务查询用户"));
         }
+        let result = (|| {
+            // A process DACL grant does not grant access to its separate token
+            // object. The ordinary desktop user must be able to read TokenUser
+            // to confirm LocalSystem without acquiring an impersonation token.
+            let mut raw_token = std::ptr::null_mut();
+            if OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | READ_CONTROL | WRITE_DAC,
+                &mut raw_token,
+            ) == 0
+            {
+                return Err(last_error("无法读取服务令牌访问控制"));
+            }
+            let token = OwnedHandle::from_raw_handle(raw_token);
+            grant_service_identity_access(token.as_raw_handle(), sid, TOKEN_QUERY)?;
+            // GetCurrentProcess returns a pseudo handle; it must not be closed.
+            grant_service_identity_access(GetCurrentProcess(), sid, PROCESS_IDENTITY_ACCESS)
+        })();
+        LocalFree(sid);
+        result
+    }
+}
+
+fn grant_service_identity_access(object: HANDLE, sid: PSID, access: u32) -> Result<()> {
+    unsafe {
         let mut descriptor = std::ptr::null_mut();
         let mut old_acl = std::ptr::null_mut();
         let mut new_acl = std::ptr::null_mut();
         let result = (|| {
-            // GetCurrentProcess returns a pseudo handle; it must not be closed.
-            let process = GetCurrentProcess();
             let code = GetSecurityInfo(
-                process,
+                object,
                 SE_KERNEL_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
@@ -174,18 +204,18 @@ pub fn allow_service_identity_query(owner_sid: &str) -> Result<()> {
             );
             if code != 0 {
                 return Err(AppError::io(
-                    "无法读取服务进程访问控制",
+                    "无法读取服务身份访问控制",
                     std::io::Error::from_raw_os_error(code as i32),
                 ));
             }
             if old_acl.is_null() || IsValidAcl(old_acl) == 0 || (*old_acl).AceCount == 0 {
                 return Err(AppError::new(
                     "service_identity_acl_invalid",
-                    "服务进程访问控制无效，已停止启动",
+                    "服务身份访问控制无效，已停止启动",
                 ));
             }
             let entry = EXPLICIT_ACCESS_W {
-                grfAccessPermissions: PROCESS_QUERY_LIMITED_INFORMATION,
+                grfAccessPermissions: access,
                 grfAccessMode: GRANT_ACCESS,
                 grfInheritance: NO_INHERITANCE,
                 Trustee: TRUSTEE_W {
@@ -199,7 +229,7 @@ pub fn allow_service_identity_query(owner_sid: &str) -> Result<()> {
             let code = SetEntriesInAclW(1, &entry, old_acl, &mut new_acl);
             if code != 0 {
                 return Err(AppError::io(
-                    "无法合并服务进程查询权限",
+                    "无法合并服务身份查询权限",
                     std::io::Error::from_raw_os_error(code as i32),
                 ));
             }
@@ -207,11 +237,11 @@ pub fn allow_service_identity_query(owner_sid: &str) -> Result<()> {
             if new_acl.is_null() || IsValidAcl(new_acl) == 0 {
                 return Err(AppError::new(
                     "service_identity_acl_invalid",
-                    "服务进程查询权限无效，已停止启动",
+                    "服务身份查询权限无效，已停止启动",
                 ));
             }
             let code = SetSecurityInfo(
-                process,
+                object,
                 SE_KERNEL_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
@@ -221,7 +251,7 @@ pub fn allow_service_identity_query(owner_sid: &str) -> Result<()> {
             );
             if code != 0 {
                 return Err(AppError::io(
-                    "无法设置服务进程查询权限",
+                    "无法设置服务身份查询权限",
                     std::io::Error::from_raw_os_error(code as i32),
                 ));
             }
@@ -230,7 +260,6 @@ pub fn allow_service_identity_query(owner_sid: &str) -> Result<()> {
         // old_acl is owned by descriptor, not a separate allocation.
         LocalFree(new_acl.cast());
         LocalFree(descriptor);
-        LocalFree(sid);
         result
     }
 }
