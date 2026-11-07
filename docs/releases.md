@@ -2,6 +2,18 @@
 
 项目使用独立版本 **`mihomo-optimized-vX.Y.Z`**，首版为 `mihomo-optimized-v1.0.0`。`main` 的源码、依赖或构建配置变更在全部测试和完整编译成功后生成固定提交的 GitHub Release。Latest 仅在该构建仍对应当前 `main` 时更新；PR 只做合并前检查，不生成正式发布包。纯文档变更不消耗版本号，也不触发自动发布。
 
+## 1.0.26：Wi-Fi 切换与 Windows TUN 恢复
+
+修复 TUN 恢复期间 `/configs` 等待原生设备锁、桌面误判内核无响应后重启的问题。TUN 请求配置、实际应用配置和健康观察改为独立快照；健康读取不执行设备操作，也不会等待正在关闭或创建的网卡。健康观察保留采样时间和过期标记，无法确认的状态不等于进程退出。
+
+恢复操作在后台串行执行，带进程实例、配置代次、TUN 代次和幂等请求编号。已接受的操作可以查询，重复请求不会重复创建设备；关闭旧 TUN 后创建失败会保留明确失败状态，丢失 HTTP 回复也不会丢掉恢复结论。原 API 1 和 TUN 状态枚举保持兼容，新增能力通过 `tun_recovery_operations` 检测，接口见[桌面受管协议](desktop-managed.md#local-health-and-resume-recovery)。
+
+Windows 对确认归属的 TUN 地址、自动路由缺失优先原地补齐，核对实际句柄的 LUID、接口索引、地址前缀、DAD 状态和路由下一跳。普通 Wi-Fi / 有线切换仅刷新底层网络连接，不要求重建 TUN。仅在本进程的设备失效时进入受控重建；同名其他网卡和身份不确定的资源不被接管或删除。固定保留 sing-tun v0.4.28，仅补独占创建入口、失败清理和句柄身份读取，避免创建失败后打开其他实例的同名网卡。
+
+配套 Windows 桌面 **0.2.6** 将状态、心跳和启停任务分开，停止指令可中断资源准备和恢复等待，旧任务不得重新拉起已经停止的内核。应使用完整桌面安装包一并升级界面、宿主、服务和固定内核。内核单独升级仍兼容旧桌面的 API 1，但完整的服务取消与界面状态修复需要配套桌面。
+
+自动回归检查慢创建时的查询响应、失败与丢回复、幂等与取消、Windows 地址和路由原地修复，以及同 PID / 同 TUN 身份 / 零新增创建次数。Windows CI 包含真实 TUN 转发和资源准备期间停止；它不能替代真实无线网卡的 AP 漫游、DHCP 变化和 S3 / S4 / Modern Standby 硬件实测。切换出口时，已有 TCP 等连接仍可能因源地址变化中断。
+
 ## 1.0.25：DNS 上游连接独立按规则选路
 
 实现 issue [#69](https://github.com/chummumm/mihomo-optimized/issues/69)：新增顶层 `dns-upstream-rule-routing`，默认 `false`，仅在 Rule 模式让内置 DNS 的自动上游按解析器自身域名 / IP 选择实际出口。它与 `dns-rule-routing` 独立；两者同时开启时，业务域名仍决定 direct / main 池、ECS、拒绝与 DIRECT 测速，DNS 连接可另外走代理。支持 UDP、TCP、DoT、DoH / HTTP/3 和 DoQ，以及解析器 IP 的 IP-CIDR / GEOIP 等完整规则。配置示例见 [DNS 上游连接独立选路](dns-proxy.md#dns-上游连接独立选路)。

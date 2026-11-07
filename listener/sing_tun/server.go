@@ -38,16 +38,17 @@ var InterfaceName = "Meta"
 var EnforceBindInterface = false
 
 type Listener struct {
-	closed        bool
-	options       LC.Tun
-	handler       *ListenerHandler
-	tunName       string
-	tunIndex      int
-	deviceID      uint64
-	routePrefixes []netip.Prefix
-	routeGateway4 netip.Addr
-	routeGateway6 netip.Addr
-	addrStr       string
+	closed          bool
+	options         LC.Tun
+	handler         *ListenerHandler
+	tunName         string
+	tunIndex        int
+	deviceID        uint64
+	addressPrefixes []netip.Prefix
+	routePrefixes   []netip.Prefix
+	routeGateway4   netip.Addr
+	routeGateway6   netip.Addr
+	addrStr         string
 
 	tunIf    tun.Tun
 	tunStack tun.Stack
@@ -517,11 +518,13 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		return
 	}
 
+	// Start may open one IP-family listener before another stage fails. Keep
+	// the partially started stack owned by the deferred cleanup as well.
+	l.tunStack = tunStack
 	err = tunStack.Start()
 	if err != nil {
 		return
 	}
-	l.tunStack = tunStack
 
 	if l.autoRedirect != nil {
 		if len(l.options.RouteAddressSet) > 0 && len(l.routeAddressSet) == 0 {

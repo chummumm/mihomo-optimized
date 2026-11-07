@@ -104,13 +104,16 @@ func TestDesktopManagedContracts(t *testing.T) {
 		}
 	}
 	assertState("running")
-	for _, path := range []string{"/desktop", "/desktop/health", "/configs/file", "/upgrade/check"} {
+	for _, path := range []string{"/desktop", "/desktop/health", "/desktop/recovery/unknown", "/configs/file", "/upgrade/check"} {
 		if w := request(http.MethodGet, path, "", false); w.Code != http.StatusUnauthorized {
 			t.Fatalf("missing authentication accepted at %s: %d", path, w.Code)
 		}
 	}
 	if w := request(http.MethodPost, "/desktop/recover", "", false); w.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated recovery accepted: %d %s", w.Code, w.Body.String())
+	}
+	if w := request(http.MethodPost, "/desktop/recovery", "{}", false); w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated recovery operation accepted: %d %s", w.Code, w.Body.String())
 	}
 	for _, body := range []string{"{}", " ", "{\"tun\":true}"} {
 		if w := request(http.MethodPost, "/desktop/recover", body, true); w.Code != http.StatusBadRequest {
@@ -123,6 +126,7 @@ func TestDesktopManagedContracts(t *testing.T) {
 	if w := request(http.MethodGet, "/desktop/health", "", true); w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Body.String(), "\"state\":\"disabled\"") {
 		t.Fatalf("disabled TUN health is incorrect: %d %s", w.Code, w.Body.String())
 	}
+	assertDesktopRecoveryOperationContract(t, request)
 	for _, origin := range []string{"http://localhost:3000", "https://untrusted.example"} {
 		r := httptest.NewRequest(http.MethodGet, "/desktop", nil)
 		r.Header.Set("Authorization", "Bearer "+secret)
@@ -242,4 +246,67 @@ func TestDesktopManagedContracts(t *testing.T) {
 		t.Fatalf("configuration reopened after shutdown: %v", err)
 	}
 	assertState("stopping")
+}
+
+func assertDesktopRecoveryOperationContract(t *testing.T, request func(string, string, string, bool) *httptest.ResponseRecorder) {
+	t.Helper()
+	for _, body := range []string{
+		"", "{}", "null", "[]", "{}{}", strings.Repeat("x", 1025),
+		`{"request_id":"valid","config_generation":0}`,
+		`{"request_id":"valid","config_generation":0,"tun_generation":0,"force":true}`,
+		`{"request_id":"invalid id","config_generation":0,"tun_generation":0}`,
+		`{"request_id":"valid","config_generation":-1,"tun_generation":0}`,
+	} {
+		if response := request(http.MethodPost, "/desktop/recovery", body, true); response.Code != http.StatusBadRequest {
+			t.Fatalf("invalid operation request was accepted: body=%q status=%d response=%s", body, response.Code, response.Body.String())
+		}
+	}
+	var health struct {
+		CoreInstance     string `json:"core_instance"`
+		ConfigGeneration uint64 `json:"config_generation"`
+		TunGeneration    uint64 `json:"tun_generation"`
+		ObservedAt       string `json:"observed_at"`
+	}
+	response := request(http.MethodGet, "/desktop/health", "", true)
+	if err := json.Unmarshal(response.Body.Bytes(), &health); err != nil || health.CoreInstance == "" || health.ObservedAt == "" {
+		t.Fatalf("health omitted lifetime or observation identity: %s (%v)", response.Body.String(), err)
+	}
+	payload := executor.DesktopRecoveryRequest{RequestID: "route-contract", ConfigGeneration: health.ConfigGeneration, TunGeneration: health.TunGeneration}
+	body, _ := json.Marshal(payload)
+	if response := request(http.MethodPost, "/desktop/recovery?force=true", string(body), true); response.Code != http.StatusBadRequest {
+		t.Fatalf("operation accepted query override: %d %s", response.Code, response.Body.String())
+	}
+	response = request(http.MethodPost, "/desktop/recovery", string(body), true)
+	var result struct {
+		Operation executor.DesktopRecoveryOperation `json:"operation"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != http.StatusAccepted || result.Operation.ID == "" || result.Operation.CoreInstance != health.CoreInstance || result.Operation.RequestID != payload.RequestID {
+		t.Fatalf("invalid accepted operation: status=%d body=%s err=%v", response.Code, response.Body.String(), err)
+	}
+	id := result.Operation.ID
+	deadline := time.Now().Add(3 * time.Second)
+	for result.Operation.Phase == "running" && time.Now().Before(deadline) {
+		response = request(http.MethodGet, "/desktop/recovery/"+id, "", true)
+		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != http.StatusOK {
+			t.Fatalf("operation query failed: status=%d body=%s err=%v", response.Code, response.Body.String(), err)
+		}
+		if result.Operation.Phase == "running" {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if result.Operation.Phase == "running" || result.Operation.FinishedAt == "" {
+		t.Fatalf("disabled TUN operation did not finish: %+v", result.Operation)
+	}
+	response = request(http.MethodPost, "/desktop/recovery", string(body), true)
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != http.StatusOK || result.Operation.ID != id || result.Operation.Phase == "running" {
+		t.Fatalf("lost response retry did not reuse terminal operation: status=%d body=%s err=%v", response.Code, response.Body.String(), err)
+	}
+	payload.TunGeneration++
+	body, _ = json.Marshal(payload)
+	if response := request(http.MethodPost, "/desktop/recovery", string(body), true); response.Code != http.StatusConflict {
+		t.Fatalf("idempotency key retargeted another device: %d %s", response.Code, response.Body.String())
+	}
+	if response := request(http.MethodGet, "/desktop/recovery/not-retained", "", true); response.Code != http.StatusNotFound {
+		t.Fatalf("unknown operation was not rejected: %d %s", response.Code, response.Body.String())
+	}
 }

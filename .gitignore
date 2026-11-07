@@ -2,6 +2,7 @@
 *.exe
 *.exe~
 *.dll
+!third_party/sing-tun/internal/wintun/*/wintun.dll
 *.so
 *.dylib
 bin/*

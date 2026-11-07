@@ -1,6 +1,7 @@
 package listener
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -111,6 +112,10 @@ func lookupTunInterface(name string) (*net.Interface, error) {
 }
 
 func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) (err error) {
+	return ReCreateTunContext(context.Background(), tunConf, tunnel)
+}
+
+func ReCreateTunContext(ctx context.Context, tunConf LC.Tun, tunnel C.Tunnel) (err error) {
 	transparentListenersMu.Lock()
 	defer transparentListenersMu.Unlock()
 	defer func() {
@@ -122,10 +127,24 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) (err error) {
 		}
 	}()
 
-	return recreateTunLocked(tunConf, tunnel, false)
+	return recreateTunContextLocked(ctx, tunConf, tunnel, false)
 }
 
 func recreateTunLocked(tunConf LC.Tun, tunnel C.Tunnel, repair bool) error {
+	return recreateTunContextLocked(context.Background(), tunConf, tunnel, repair)
+}
+
+func recreateTunContextLocked(ctx context.Context, tunConf LC.Tun, tunnel C.Tunnel, repair bool) (err error) {
+	defer func() {
+		tunTransition = ""
+		if err != nil && tunLister == nil && LastTunConf.Enable {
+			tunFailure = err
+		}
+		publishTunStateLocked()
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	tunConf = tunConf.Clone()
 	managed := transparentConfig().Enable
 	if managed {
@@ -139,6 +158,8 @@ func recreateTunLocked(tunConf LC.Tun, tunnel C.Tunnel, repair bool) error {
 		}
 		return nil
 	}
+	tunTransition = "replacing"
+	publishTunStateLocked()
 	if (managed || repair) && tunConf.Enable && tunConf.FileDescriptor == 0 && tunConf.Device != "" {
 		device, lookupErr := tunInterfaceByName(tunConf.Device)
 		if lookupErr != nil && !errors.Is(lookupErr, errTunDeviceMissing) {
@@ -154,13 +175,23 @@ func recreateTunLocked(tunConf LC.Tun, tunnel C.Tunnel, repair bool) error {
 		_, lookupErr := tunInterfaceByName(tunLister.DeviceName())
 		missing = errors.Is(lookupErr, errTunDeviceMissing)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	closeErr := closeTunListenerLocked()
 	if closeErr != nil && (tunLister != nil || !missing) {
 		return closeErr
 	}
-	LastTunConf = tunConf.Clone()
+	if !tunConf.Equal(LastTunConf) {
+		tunConfigGeneration++
+	}
+	LastTunConf, tunFailure = tunConf.Clone(), nil
+	publishTunStateLocked()
 	if !tunConf.Enable {
 		return closeErr
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(closeErr, err)
 	}
 
 	options := tunConf.Clone()
@@ -169,11 +200,20 @@ func recreateTunLocked(tunConf LC.Tun, tunnel C.Tunnel, repair bool) error {
 		// complete request through this same guarded replacement path.
 		options.Inet6Address = nil
 	}
+	tunCreationCount++
+	publishTunStateLocked()
 	lister, err := newTunListener(options, tunnel)
 	if err != nil {
 		return errors.Join(closeErr, err)
 	}
 	tunLister = lister
+	tunGeneration++
+	if err := ctx.Err(); err != nil {
+		// Never publish a late-created listener after the owning operation was
+		// cancelled. Keep ownership through its guarded cleanup, including when
+		// the native Close itself needs the supervisor's process deadline.
+		return errors.Join(closeErr, err, closeTunListenerLocked())
+	}
 	log.Infoln("[TUN] Tun adapter listening at: %s", tunLister.Address())
 	return closeErr
 }
@@ -207,6 +247,13 @@ func closeTunListenerLocked() error {
 	if err := beforeTunClose(); err != nil {
 		return fmt.Errorf("preserve current TUN: install routing blackhole before close: %w", err)
 	}
+	previousTransition := tunTransition
+	tunTransition = "closing"
+	publishTunStateLocked()
+	defer func() {
+		tunTransition = previousTransition
+		publishTunStateLocked()
+	}()
 	err := tunLister.Close()
 	tunLister = nil
 	return err

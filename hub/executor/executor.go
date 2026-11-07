@@ -63,6 +63,7 @@ var stopping atomic.Bool
 // restart preparation. Shutdown performs the serialized resource cleanup.
 func RequestShutdown() {
 	stopping.Store(true)
+	desktopRecoveries.cancel()
 	resource.CancelBootstraps()
 	lanpreconnect.Default.Stop()
 }
@@ -211,7 +212,7 @@ func ApplyConfig(cfg *config.Config, force bool) error {
 	updateDNS(cfg.DNS, cfg.General.IPv6)
 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
 	applyErr := updateListeners(cfg.General, cfg.Listeners, force, wasManaged)
-	applyErr = errors.Join(applyErr, updateTun(cfg.General)) // tun should not care "force"
+	applyErr = errors.Join(applyErr, listener.ReCreateTunContext(resourceCtx, cfg.General.Tun, tunnel.Tunnel)) // tun should not care "force"
 	updateIPTables(cfg)
 	updateTunnels(cfg.Tunnels)
 
@@ -356,10 +357,6 @@ func updateListeners(general *config.General, listeners map[string]C.InboundList
 	listener.ReCreateVmess(general.VmessConfig, tunnel.Tunnel)
 	listener.ReCreateTuic(general.TuicServer, tunnel.Tunnel)
 	return err
-}
-
-func updateTun(general *config.General) error {
-	return listener.ReCreateTun(general.Tun, tunnel.Tunnel)
 }
 
 func updateExperimental(c *config.Experimental) {

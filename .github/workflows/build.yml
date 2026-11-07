@@ -294,6 +294,11 @@ jobs:
         run: go test -tags with_gvisor -count=1 -timeout=5m ./hub/route -run 'ConfigFile|UIUpdater|UnifiedUpgrade|UpgradeSchedule'
       - name: Verify desktop supervisor authentication, confinement and lifecycle contracts
         run: go test -tags with_gvisor -count=1 -timeout=3m ./component/desktop ./hub/route . -run Desktop
+      - name: Verify TUN snapshots, recovery operations and native Windows resource repair
+        run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./listener ./listener/sing_tun ./hub/executor ./hub/route -run 'Desktop|TunHealth|TunRecovery'
+      - name: Verify exclusive Windows adapter creation and deterministic cleanup
+        if: runner.os == 'Windows'
+        run: go test -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun -run Desktop
       - name: Verify native startup resource routing, cache isolation and cancellation
         run: go test -tags with_gvisor -count=1 -timeout=5m ./adapter/provider ./adapter/outboundgroup ./component/profile/cachefile ./component/dialer ./component/http ./component/resolver ./config ./hub/executor ./hub/route . -run 'ResourceBootstrap|ReadSelectedSnapshot'
 
@@ -369,7 +374,17 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.25
+              printf '%s\n\n' '## 本次更新：1.0.26
+
+          - 修复 TUN 恢复占用原生锁时 /configs 查询被阻塞、桌面误判内核停止的问题。配置与健康使用带时间和代次的快照，查询不等待网卡创建或关闭。
+          - 新增后台串行恢复操作、幂等请求编号和进程内保留的可查询结果。创建失败及丢失 HTTP 回复不再丢失失败状态，API 1 与旧 TUN 状态枚举保持兼容。
+          - Windows 缺失的自有 TUN 地址和路由优先原地补齐，校验实际句柄 LUID、接口索引、DAD 和下一跳；正常 Wi-Fi 切换保留内核与 TUN。固定的 sing-tun v0.4.28 补丁拒绝接管同名外部网卡，并确定性释放失败创建的资源。
+          - 配套桌面 0.2.6 将状态、心跳、启停任务分离，恢复和资源等待可被停止指令取消。请用完整安装包一并更新界面、宿主、服务和固定内核。
+          - 回归覆盖快照、幂等、失败、取消和 Windows 原地修复。真实 AP 漫游及 S3 / S4 / Modern Standby 硬件场景仍需设备实测；现有连接可能因源地址变化断开。
+
+          [恢复协议](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.26/docs/desktop-managed.md) · [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.26/docs/releases.md)
+
+          ## 1.0.25：DNS 上游连接独立按规则选路
 
           - 实现 issue #69：新增顶层 dns-upstream-rule-routing，默认 false，仅在 Rule 模式让自动 DNS 连接按解析器自身域名 / IP 独立匹配规则。与 dns-rule-routing 同时开启时，业务选池、ECS、拒绝及 DIRECT 测速保持原有依据。
           - 支持 UDP、TCP、DoT、DoH / HTTP/3、DoQ 和解析器 IP 的 IP-CIDR / GEOIP 等完整规则，实际拨号固定使用匹配的解析器 IP，保留 TLS SNI、证书验证与 HTTP Host。

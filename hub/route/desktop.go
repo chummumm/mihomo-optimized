@@ -1,6 +1,8 @@
 package route
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -21,6 +23,8 @@ func desktopRouter() http.Handler {
 	r.Get("/", getDesktopStatus)
 	r.Get("/health", getDesktopHealth)
 	r.Post("/recover", recoverDesktop)
+	r.Post("/recovery", startDesktopRecovery)
+	r.Get("/recovery/{id}", getDesktopRecovery)
 	r.Post("/shutdown", shutdownDesktop)
 	return r
 }
@@ -37,7 +41,8 @@ func getDesktopStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	render.JSON(w, r, render.M{
 		"managed": true, "api_version": 1, "state": state,
-		"pid": os.Getpid(), "platform": runtime.GOOS, "arch": runtime.GOARCH,
+		"core_instance": executor.DesktopCoreInstance(),
+		"pid":           os.Getpid(), "platform": runtime.GOOS, "arch": runtime.GOARCH,
 		"core_version": C.Version, "controller": address, "config_path": C.Path.Config(),
 		"update_owner": "desktop",
 		"capabilities": render.M{
@@ -46,13 +51,14 @@ func getDesktopStatus(w http.ResponseWriter, r *http.Request) {
 			"core_update": false, "ui_update": false, "self_restart": false,
 			"shutdown": true, "unified_update_scope": "rules_and_geodata",
 			"tun_health": runtime.GOOS == "windows", "tun_repair": runtime.GOOS == "windows",
+			"tun_recovery_operations": runtime.GOOS == "windows",
 		},
 	})
 }
 
 func getDesktopHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	health, err := executor.InspectDesktopHealth(r.Context())
+	health, err := executor.InspectDesktopObservation(r.Context())
 	if err != nil {
 		renderDesktopRecoveryError(w, r, err)
 		return
@@ -64,7 +70,57 @@ func getDesktopHealth(w http.ResponseWriter, r *http.Request) {
 	if executor.ShutdownRequested() {
 		state = "stopping"
 	}
-	render.JSON(w, r, render.M{"managed": true, "api_version": 1, "pid": os.Getpid(), "state": state, "tun": health})
+	render.JSON(w, r, render.M{
+		"managed": true, "api_version": 1, "pid": os.Getpid(), "state": state, "tun": health.Tun,
+		"core_instance": health.CoreInstance, "config_generation": health.ConfigGeneration,
+		"tun_generation": health.TunGeneration, "creation_count": health.CreationCount,
+		"observed_at": health.ObservedAt, "stale": health.Stale, "recovery": health.Recovery,
+	})
+}
+
+func startDesktopRecovery(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	// Recovery accepts only an idempotency key and expected generations. It has
+	// no surface for configuration, foreign device names, or force overrides.
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1025))
+	var request struct {
+		RequestID        string  `json:"request_id"`
+		ConfigGeneration *uint64 `json:"config_generation"`
+		TunGeneration    *uint64 `json:"tun_generation"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err != nil || len(body) > 1024 || r.URL.RawQuery != "" || decoder.Decode(&request) != nil ||
+		request.ConfigGeneration == nil || request.TunGeneration == nil {
+		renderDesktopRecoveryError(w, r, executor.ErrRecoveryRequest)
+		return
+	}
+	var trailing any
+	if decoder.Decode(&trailing) != io.EOF {
+		renderDesktopRecoveryError(w, r, executor.ErrRecoveryRequest)
+		return
+	}
+	operation, err := executor.StartDesktopRecovery(r.Context(), executor.DesktopRecoveryRequest{
+		RequestID: request.RequestID, ConfigGeneration: *request.ConfigGeneration, TunGeneration: *request.TunGeneration,
+	})
+	if err != nil {
+		renderDesktopRecoveryError(w, r, err)
+		return
+	}
+	if operation.Phase == "running" {
+		render.Status(r, http.StatusAccepted)
+	}
+	render.JSON(w, r, render.M{"operation": operation})
+}
+
+func getDesktopRecovery(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	operation, err := executor.GetDesktopRecovery(chi.URLParam(r, "id"))
+	if err != nil {
+		renderDesktopRecoveryError(w, r, err)
+		return
+	}
+	render.JSON(w, r, render.M{"operation": operation})
 }
 
 func recoverDesktop(w http.ResponseWriter, r *http.Request) {
@@ -85,7 +141,11 @@ func recoverDesktop(w http.ResponseWriter, r *http.Request) {
 
 func renderDesktopRecoveryError(w http.ResponseWriter, r *http.Request, err error) {
 	status := http.StatusServiceUnavailable
-	if errors.Is(err, executor.ErrShuttingDown) || errors.Is(err, executor.ErrCoreNotReady) {
+	if errors.Is(err, executor.ErrRecoveryRequest) {
+		status = http.StatusBadRequest
+	} else if errors.Is(err, executor.ErrRecoveryNotFound) {
+		status = http.StatusNotFound
+	} else if errors.Is(err, executor.ErrShuttingDown) || errors.Is(err, executor.ErrCoreNotReady) || errors.Is(err, executor.ErrRecoverySuperseded) {
 		status = http.StatusConflict
 	} else {
 		w.Header().Set("Retry-After", "1")

@@ -7,10 +7,12 @@ import (
 )
 
 func TestDesktopRecoveryDoesNotWaitBehindConfig(t *testing.T) {
+	manager, _ := isolateDesktopRecovery(t)
+	manager.ready = func() bool { return true }
 	mux.Lock()
 	defer mux.Unlock()
-	if _, err := InspectDesktopHealth(context.Background()); !errors.Is(err, ErrRecoveryBusy) {
-		t.Fatalf("health query did not report busy: %v", err)
+	if _, err := InspectDesktopHealth(context.Background()); err != nil {
+		t.Fatalf("read-only health snapshot waited for configuration: %v", err)
 	}
 	if _, err := RecoverDesktop(context.Background()); !errors.Is(err, ErrRecoveryBusy) {
 		t.Fatalf("recovery did not report busy: %v", err)

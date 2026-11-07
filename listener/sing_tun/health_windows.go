@@ -68,7 +68,12 @@ func (l *Listener) captureDeviceHealth(options tun.Options) error {
 	if err != nil {
 		return fmt.Errorf("capture TUN identity: %w", err)
 	}
+	owned, ok := l.tunIf.(interface{ InterfaceLUID() uint64 })
+	if !ok || owned.InterfaceLUID() == 0 || owned.InterfaceLUID() != identity {
+		return errors.New("created TUN handle does not match the named interface")
+	}
 	l.deviceID = identity
+	l.addressPrefixes = append(append([]netip.Prefix(nil), options.Inet4Address...), options.Inet6Address...)
 	if !options.AutoRoute {
 		return nil
 	}
@@ -79,6 +84,9 @@ func (l *Listener) captureDeviceHealth(options tun.Options) error {
 	l.routeGateway4, l.routeGateway6 = options.Inet4GatewayAddr(), options.Inet6GatewayAddr()
 	return nil
 }
+
+// DeviceIdentity is stable across underlay changes and local resource repair.
+func (l *Listener) DeviceIdentity() string { return fmt.Sprintf("%016x", l.deviceID) }
 
 // LUID supplements name and ifindex: Windows may recycle an interface index.
 func (l *Listener) CheckDeviceIdentity() (bool, error) {
