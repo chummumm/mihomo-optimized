@@ -1,13 +1,14 @@
 //! Desktop releases are verified against GitHub's OIDC/Sigstore build identity.
 //! No signing key or user GitHub token is shipped with the application.
 use crate::{
-    core::quiet_command,
+    core::{quiet_command, wait_cancellable},
     desktop::HostState,
     error::{AppError, Result},
     host::HostContext,
+    lifecycle::Cancellation,
     update_cache::UpdateWorkspace,
 };
-use reqwest::{blocking::Client, Url};
+use reqwest::{Client, Url};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -152,7 +153,7 @@ fn emit(
     total: Option<u64>,
     message: &str,
 ) {
-    let _ = app.emit(
+    app.emit(
         "desktop-update-progress",
         serde_json::json!({
             "stage": stage, "downloaded": downloaded, "total": total, "message": message
@@ -212,37 +213,56 @@ fn remaining_check_time(deadline: Instant) -> Result<Duration> {
         })
 }
 
-fn api(client: &Client, path: &str, deadline: Instant) -> Result<serde_json::Value> {
+fn api(
+    client: &Client,
+    path: &str,
+    deadline: Instant,
+    cancellation: Option<&Cancellation>,
+) -> Result<serde_json::Value> {
     let remaining = remaining_check_time(deadline)?;
-    let response = client
-        .get(format!("https://api.github.com/repos/{REPOSITORY}/{path}"))
-        // Covers connection through the response body. Pages and tag lookups
-        // share one deadline; installer downloads retain the client timeout.
-        .timeout(remaining)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|_| {
-            AppError::new(
-                "update_check_failed",
-                "无法读取 GitHub 更新信息，请检查网络或稍后重试",
-            )
-        })?;
-    let mut bytes = Vec::new();
-    response
-        .take(8 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| AppError::new("update_check_failed", "更新信息下载中断"))?;
-    if bytes.len() > 8 * 1024 * 1024 {
-        return Err(AppError::new("update_metadata_invalid", "更新信息过大"));
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::new("update_metadata_invalid", "更新信息格式无效"))
+    wait_cancellable(cancellation, deadline, async {
+        let mut response = client
+            .get(format!("https://api.github.com/repos/{REPOSITORY}/{path}"))
+            .timeout(remaining)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|_| {
+                AppError::new(
+                    "update_check_failed",
+                    "无法读取 GitHub 更新信息，请检查网络或稍后重试",
+                )
+            })?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| AppError::new("update_check_failed", "更新信息下载中断"))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > 8 * 1024 * 1024 {
+                return Err(AppError::new("update_metadata_invalid", "更新信息过大"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| AppError::new("update_metadata_invalid", "更新信息格式无效"))
+    })
 }
 
-fn commit_for_tag(client: &Client, tag: &str, deadline: Instant) -> Result<String> {
-    let mut value = api(client, &format!("git/ref/tags/{tag}"), deadline)?;
+fn commit_for_tag(
+    client: &Client,
+    tag: &str,
+    deadline: Instant,
+    cancellation: Option<&Cancellation>,
+) -> Result<String> {
+    let mut value = api(
+        client,
+        &format!("git/ref/tags/{tag}"),
+        deadline,
+        cancellation,
+    )?;
     for _ in 0..4 {
         let object = value
             .get("object")
@@ -255,7 +275,7 @@ fn commit_for_tag(client: &Client, tag: &str, deadline: Instant) -> Result<Strin
             .to_owned();
         match object.get("type").and_then(|v| v.as_str()) {
             Some("commit") => return Ok(sha),
-            Some("tag") => value = api(client, &format!("git/tags/{sha}"), deadline)?,
+            Some("tag") => value = api(client, &format!("git/tags/{sha}"), deadline, cancellation)?,
             _ => break,
         }
     }
@@ -291,7 +311,11 @@ fn asset(release: &Release, name: &str, maximum: u64) -> Result<Asset> {
     Ok(asset.clone())
 }
 
-fn check(app: &HostContext, proxy: Option<String>) -> Result<UpdateInfo> {
+fn check(
+    app: &HostContext,
+    proxy: Option<String>,
+    cancellation: &Cancellation,
+) -> Result<UpdateInfo> {
     let deadline = Instant::now() + CHECK_TIMEOUT;
     *CANDIDATE
         .get_or_init(|| Mutex::new(None))
@@ -307,6 +331,7 @@ fn check(app: &HostContext, proxy: Option<String>) -> Result<UpdateInfo> {
             &client,
             &format!("releases?per_page=100&page={page}"),
             deadline,
+            Some(cancellation),
         )?;
         let page_releases: Vec<Release> = serde_json::from_value(value)
             .map_err(|_| AppError::new("update_metadata_invalid", "版本列表无效"))?;
@@ -343,7 +368,7 @@ fn check(app: &HostContext, proxy: Option<String>) -> Result<UpdateInfo> {
         let name = format!("mihomo-desktop-{version}-windows-x64-setup.exe");
         let candidate = Candidate {
             version: version.to_string(),
-            source_sha: commit_for_tag(&client, &release.tag_name, deadline)?,
+            source_sha: commit_for_tag(&client, &release.tag_name, deadline, Some(cancellation))?,
             installer: asset(release, &name, MAX_INSTALLER)?,
             bundle: asset(release, &format!("{name}.sigstore.json"), MAX_BUNDLE)?,
         };
@@ -383,75 +408,94 @@ fn download(
     asset: &Asset,
     destination: &Path,
     show_progress: bool,
+    cancellation: &Cancellation,
 ) -> Result<()> {
-    let mut response = client
-        .get(&asset.browser_download_url)
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|_| AppError::new("update_download_failed", "更新文件下载失败"))?;
-    if response
-        .content_length()
-        .is_some_and(|length| length != asset.size)
-    {
-        return Err(AppError::new(
-            "update_size_mismatch",
-            "更新文件大小与发布记录不一致",
-        ));
-    }
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .map_err(|e| AppError::io("无法创建更新文件", e))?;
-    let mut downloaded = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut last_emit = Instant::now();
-    loop {
-        let read = response
-            .read(&mut buffer)
-            .map_err(|_| AppError::new("update_download_failed", "更新下载中断，请重试"))?;
-        if read == 0 {
-            break;
-        }
-        downloaded += read as u64;
-        if downloaded > asset.size {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    wait_cancellable(Some(cancellation), deadline, async {
+        let mut response = client
+            .get(&asset.browser_download_url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|_| AppError::new("update_download_failed", "更新文件下载失败"))?;
+        if response
+            .content_length()
+            .is_some_and(|length| length != asset.size)
+        {
             return Err(AppError::new(
                 "update_size_mismatch",
-                "更新文件超过发布记录大小",
+                "更新文件大小与发布记录不一致",
             ));
         }
-        file.write_all(&buffer[..read])
-            .map_err(|e| AppError::io("无法写入更新文件", e))?;
-        if show_progress && last_emit.elapsed() > Duration::from_millis(200) {
-            emit(
-                app,
-                "downloading",
-                Some(downloaded),
-                Some(asset.size),
-                "正在下载桌面更新",
-            );
-            last_emit = Instant::now();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(|e| AppError::io("无法创建更新文件", e))?;
+        let mut downloaded = 0u64;
+        let mut last_emit = Instant::now();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| AppError::new("update_download_failed", "更新下载中断，请重试"))?
+        {
+            downloaded += chunk.len() as u64;
+            if downloaded > asset.size {
+                return Err(AppError::new(
+                    "update_size_mismatch",
+                    "更新文件超过发布记录大小",
+                ));
+            }
+            file.write_all(&chunk)
+                .map_err(|e| AppError::io("无法写入更新文件", e))?;
+            if show_progress && last_emit.elapsed() > Duration::from_millis(200) {
+                emit(
+                    app,
+                    "downloading",
+                    Some(downloaded),
+                    Some(asset.size),
+                    "正在下载桌面更新",
+                );
+                last_emit = Instant::now();
+            }
         }
-    }
-    if downloaded != asset.size {
-        return Err(AppError::new("update_size_mismatch", "更新文件不完整"));
-    }
-    file.sync_all()
-        .map_err(|e| AppError::io("无法保存更新文件", e))?;
-    Ok(())
+        if downloaded != asset.size {
+            return Err(AppError::new("update_size_mismatch", "更新文件不完整"));
+        }
+        file.sync_all()
+            .map_err(|e| AppError::io("无法保存更新文件", e))
+    })
 }
 
-fn verify(app: &HostContext, directory: &Path, candidate: &Candidate) -> Result<()> {
+fn verify(
+    app: &HostContext,
+    directory: &Path,
+    candidate: &Candidate,
+    cancellation: &Cancellation,
+) -> Result<()> {
     let executable = std::env::current_exe().map_err(|e| AppError::io("无法定位验证程序", e))?;
     let verifier = executable
         .parent()
         .ok_or_else(|| AppError::new("update_verifier_missing", "缺少更新验证程序"))?
         .join("mihomo-update-verify.exe");
     let trust = app.resource_directory()?.join("trusted-root.jsonl");
-    verify_at(&verifier, &trust, directory, candidate)
+    verify_at_cancellable(&verifier, &trust, directory, candidate, Some(cancellation))
 }
 
 fn verify_at(verifier: &Path, trust: &Path, directory: &Path, candidate: &Candidate) -> Result<()> {
+    verify_at_cancellable(verifier, trust, directory, candidate, None)
+}
+
+fn verify_at_cancellable(
+    verifier: &Path,
+    trust: &Path,
+    directory: &Path,
+    candidate: &Candidate,
+    cancellation: Option<&Cancellation>,
+) -> Result<()> {
+    if let Some(cancellation) = cancellation {
+        cancellation.check()?;
+    }
     if !verifier.is_file() || !trust.is_file() {
         return Err(AppError::new(
             "update_verifier_missing",
@@ -460,7 +504,7 @@ fn verify_at(verifier: &Path, trust: &Path, directory: &Path, candidate: &Candid
     }
     let result_path = directory.join("verification.json");
     let output = fs::File::create(&result_path).map_err(|e| AppError::io("无法记录验证结果", e))?;
-    let mut command = quiet_command(&verifier);
+    let mut command = quiet_command(verifier);
     command
         .arg("attestation")
         .arg("verify")
@@ -510,6 +554,14 @@ fn verify_at(verifier: &Path, trust: &Path, directory: &Path, candidate: &Candid
         .map_err(|e| AppError::io("无法启动构建签名验证", e))?;
     let started = Instant::now();
     loop {
+        if let Some(error) = cancellation.and_then(|token| token.check().err()) {
+            let _ = child.kill();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            return Err(error);
+        }
         match child
             .try_wait()
             .map_err(|e| AppError::io("无法读取验证结果", e))?
@@ -643,9 +695,9 @@ fn launch_installer(installer: &Path) -> Result<std::os::windows::io::OwnedHandl
                 "安装程序未返回可监护的进程",
             ));
         }
-        return Ok(std::os::windows::io::OwnedHandle::from_raw_handle(
+        Ok(std::os::windows::io::OwnedHandle::from_raw_handle(
             info.hProcess,
-        ));
+        ))
     }
 }
 
@@ -910,21 +962,31 @@ pub(crate) fn take_install_result() -> Option<String> {
     }
 }
 
-pub fn desktop_check_update(app: &HostContext, state: &HostState) -> Result<UpdateInfo> {
+pub fn desktop_check_update(
+    app: &HostContext,
+    state: &HostState,
+    cancellation: &Cancellation,
+) -> Result<UpdateInfo> {
+    cancellation.check()?;
     let _operation = Operation::acquire()?;
     let proxy = state
         .0
         .lock()
         .map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?
         .update_proxy_url();
-    let result = check(app, proxy);
+    let result = check(app, proxy, cancellation);
     if let Err(error) = &result {
         emit(app, "error", None, None, &error.message);
     }
     result
 }
 
-pub fn desktop_install_update(app: &HostContext, state: &HostState) -> Result<()> {
+pub fn desktop_install_update(
+    app: &HostContext,
+    state: &HostState,
+    cancellation: &Cancellation,
+) -> Result<()> {
+    cancellation.check()?;
     let _operation = Operation::acquire()?;
     let manager = &state.0;
     if installed_update_dir(None).is_err() {
@@ -943,6 +1005,7 @@ pub fn desktop_install_update(app: &HostContext, state: &HostState) -> Result<()
         .lock()
         .map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?
         .update_proxy_url();
+    cancellation.check()?;
     let workspace = UpdateWorkspace::create()?;
     let directory = workspace.path();
     let result = (|| {
@@ -960,6 +1023,7 @@ pub fn desktop_install_update(app: &HostContext, state: &HostState) -> Result<()
             &candidate.installer,
             &directory.join(&candidate.installer.name),
             true,
+            cancellation,
         )?;
         download(
             app,
@@ -967,13 +1031,20 @@ pub fn desktop_install_update(app: &HostContext, state: &HostState) -> Result<()
             &candidate.bundle,
             &directory.join(&candidate.bundle.name),
             false,
+            cancellation,
         )?;
         emit(app, "installing", None, None, "正在验证构建签名");
-        verify(app, directory, &candidate)?;
-        let was_running = manager
-            .lock()
-            .map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?
-            .prepare_update()?;
+        verify(app, directory, &candidate, cancellation)?;
+        cancellation.check()?;
+        let was_running = {
+            let mut manager = manager
+                .lock()
+                .map_err(|_| AppError::new("desktop_busy", "桌面状态不可用"))?;
+            manager.begin_operation(cancellation.revision());
+            cancellation.check()?;
+            manager.prepare_update()?
+        };
+        cancellation.check()?;
         if let Err(error) = handoff_to_monitor(app, directory, &candidate) {
             if let Err(recovery) = manager
                 .lock()
@@ -1003,6 +1074,9 @@ pub fn desktop_install_update(app: &HostContext, state: &HostState) -> Result<()
         Ok(())
     })();
     if let Err(error) = &result {
+        if let Ok(mut manager) = manager.lock() {
+            manager.abort_update();
+        }
         emit(app, "error", None, None, &error.message);
     }
     // The monitor owns its lease before handoff succeeds; collection cannot
@@ -1019,8 +1093,8 @@ mod tests {
     fn metadata_requests_refuse_an_exhausted_shared_deadline() {
         let client = client(None).unwrap();
         let deadline = Instant::now();
-        let page = api(&client, "releases?per_page=100&page=2", deadline).unwrap_err();
-        let tag = commit_for_tag(&client, "mihomo-desktop-v9.0.0", deadline).unwrap_err();
+        let page = api(&client, "releases?per_page=100&page=2", deadline, None).unwrap_err();
+        let tag = commit_for_tag(&client, "mihomo-desktop-v9.0.0", deadline, None).unwrap_err();
         for error in [page, tag] {
             assert_eq!(error.code, "update_check_failed");
             assert_eq!(error.message, "检查桌面更新超时，请检查网络或稍后重试");

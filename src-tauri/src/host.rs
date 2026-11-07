@@ -2,23 +2,25 @@
 //! protocol thread can always return the last published status during startup.
 use crate::{
     commands,
+    core::{self, CoreStatus},
     desktop::{DesktopManager, DesktopStatus, HostState},
     error::{AppError, Result},
-    lifecycle::PowerSignal,
+    lifecycle::{Cancellation, PowerSignal},
     protocol::{self, Request},
+    service_ipc::Client as ServiceClient,
     windows,
 };
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     io::BufReader,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, SyncSender, TrySendError},
-        Arc, Mutex,
+        mpsc::{self, Receiver, SyncSender},
+        Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -68,6 +70,13 @@ pub struct HostContext {
     pub owner: Arc<UiProcess>,
     pub runtime_generation: Arc<AtomicU64>,
     pub stop_pending: Arc<AtomicUsize>,
+    pub instance: String,
+    sequence: Arc<AtomicU64>,
+    service: Arc<Mutex<Option<ServiceClient>>>,
+    service_active: Arc<AtomicBool>,
+    service_epoch: Arc<AtomicU64>,
+    service_stop: SyncSender<u64>,
+    stop_intent_revision: Arc<AtomicU64>,
 }
 
 impl HostContext {
@@ -84,9 +93,112 @@ impl HostContext {
         })));
     }
 
-    pub fn publish_status(&self, status: DesktopStatus) {
-        *self.published.lock().unwrap_or_else(|e| e.into_inner()) = Some(status.clone());
-        self.emit("desktop-status", status);
+    pub fn cancellation(&self) -> Cancellation {
+        Cancellation::new(self.runtime_generation.clone(), self.generation())
+    }
+
+    pub fn set_service_client(&self, client: Option<ServiceClient>) {
+        let mut current = self.service.lock().unwrap_or_else(|e| e.into_inner());
+        self.service_epoch.fetch_add(1, Ordering::AcqRel);
+        self.service_active
+            .store(client.is_some(), Ordering::Release);
+        *current = client;
+    }
+
+    pub fn pause_service_observation(&self) {
+        let _client = self.service.lock().unwrap_or_else(|e| e.into_inner());
+        self.service_active.store(false, Ordering::Release);
+        self.service_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn service_observer(&self) -> Option<(ServiceClient, u64)> {
+        let client = self.service.lock().unwrap_or_else(|e| e.into_inner());
+        self.service_active
+            .load(Ordering::Acquire)
+            .then(|| {
+                client
+                    .clone()
+                    .map(|client| (client, self.service_epoch.load(Ordering::Acquire)))
+            })
+            .flatten()
+    }
+
+    pub fn service_client(&self) -> Option<ServiceClient> {
+        self.service
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn publish_status(&self, mut status: DesktopStatus) {
+        let mut published = self.published.lock().unwrap_or_else(|e| e.into_inner());
+        if status.intent_revision != self.generation() {
+            return;
+        }
+        if let Some(current) = published.as_ref() {
+            if status.intent_revision == current.intent_revision
+                && status.service_instance == current.service_instance
+                && status.service_sequence < current.service_sequence
+            {
+                status.preserve_core_observation(current);
+            }
+        }
+        self.stamp_status(&mut status);
+        *published = Some(status.clone());
+        drop(published);
+        self.emit_status(status);
+    }
+
+    fn stamp_status(&self, status: &mut DesktopStatus) {
+        status.status_instance = self.instance.clone();
+        status.status_sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        status.status_stale = status.process_state != "exited"
+            && (status.observed_at == 0
+                || core::observed_now().saturating_sub(status.observed_at) > 30_000);
+    }
+
+    fn emit_status(&self, status: DesktopStatus) {
+        // Status is also readable from the cache. A full event queue must never
+        // block admission of Stop or the independent service heartbeat.
+        let _ = self.output.try_send(Message::Event(
+            serde_json::json!({"event":"desktop-status","data":status}),
+        ));
+    }
+
+    fn publish_stop_intent(&self, revision: u64) {
+        self.stop_intent_revision.store(revision, Ordering::Release);
+        if let Ok(mut status) = self.status() {
+            status.intent_revision = revision;
+            status.desired_running = false;
+            status.phase = crate::desktop::Phase::Stopping;
+            status.operation = Some("stopping".into());
+            status.stop_reason = Some(crate::lifecycle::StopReason::UserStop);
+            self.publish_status(status);
+        }
+        let _ = self.service_stop.try_send(revision);
+    }
+
+    fn publish_service_observation(&self, core: CoreStatus, epoch: u64) {
+        let mut published = self.published.lock().unwrap_or_else(|e| e.into_inner());
+        if core.intent_revision != self.generation()
+            || !self.service_active.load(Ordering::Acquire)
+            || epoch != self.service_epoch.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(status) = published.as_mut() else {
+            return;
+        };
+        if status.service_instance == core.service_instance
+            && core.status_sequence <= status.service_sequence
+        {
+            return;
+        }
+        status.apply_core_observation(&core);
+        self.stamp_status(status);
+        let status = status.clone();
+        drop(published);
+        self.emit_status(status);
     }
 
     pub fn status(&self) -> Result<DesktopStatus> {
@@ -243,25 +355,40 @@ pub fn run() -> Result<()> {
     let owner = Arc::new(authenticate_parent(pid)?);
     let _instance = single_instance()?;
     let (output, messages) = mpsc::sync_channel(16);
+    let (service_stop, service_stops) = mpsc::sync_channel(1);
+    let mut random = [0u8; 16];
+    getrandom::getrandom(&mut random)
+        .map_err(|_| AppError::new("random_failed", "无法建立桌面会话编号"))?;
     let context = HostContext {
         output: output.clone(),
         published: Arc::new(Mutex::new(None)),
         owner,
         runtime_generation: Arc::new(AtomicU64::new(0)),
         stop_pending: Arc::new(AtomicUsize::new(0)),
+        instance: hex::encode(random),
+        sequence: Arc::new(AtomicU64::new(0)),
+        service: Arc::new(Mutex::new(None)),
+        service_active: Arc::new(AtomicBool::new(false)),
+        service_epoch: Arc::new(AtomicU64::new(0)),
+        service_stop,
+        stop_intent_revision: Arc::new(AtomicU64::new(0)),
     };
     let power = Arc::new(PowerSignal::default());
     let _power_registration = crate::power::Registration::new(power.clone())?;
     let mut manager = DesktopManager::new(context.clone())?;
     let start = manager.prepare_startup(!no_autostart);
     let state = HostState(Arc::new(Mutex::new(manager)));
-    let (work, requests) = mpsc::sync_channel(WORK_QUEUE_CAPACITY);
+    let work = Arc::new(WorkQueue::default());
+    let requests = work.clone();
     let stopping = Arc::new(AtomicBool::new(false));
     let worker_state = state.clone();
     let worker_context = context.clone();
     let worker_stopping = stopping.clone();
     let poll_state = state.clone();
     let poll_stopping = stopping.clone();
+    let poll_context = context.clone();
+    let heartbeat_stopping = stopping.clone();
+    let heartbeat_power = power.clone();
     thread::Builder::new()
         .name("desktop-operations".into())
         .spawn(move || {
@@ -274,15 +401,69 @@ pub fn run() -> Result<()> {
             )
         })
         .map_err(|e| AppError::io("无法启动桌面操作线程", e))?;
-    // Subscription/update downloads deliberately release the manager lock.
-    // Keep the authenticated TUN heartbeat alive during that network work;
-    // otherwise the service correctly stops routing after 20 idle seconds.
+    let control_context = context.clone();
+    let control_stopping = stopping.clone();
+    thread::Builder::new()
+        .name("desktop-priority-stop".into())
+        .spawn(move || {
+            while !control_stopping.load(Ordering::Acquire) {
+                match service_stops.recv_timeout(Duration::from_millis(100)) {
+                    Ok(_) => {
+                        let revision = control_context.stop_intent_revision.load(Ordering::Acquire);
+                        if revision == control_context.generation()
+                            && control_context.stop_pending.load(Ordering::Acquire) != 0
+                        {
+                            if let Some((client, epoch)) = control_context.service_observer() {
+                                if let Ok(status) = client.accept_stop(revision) {
+                                    control_context.publish_service_observation(status, epoch);
+                                }
+                            }
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => (),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+        .map_err(|e| AppError::io("无法启动停止控制通道", e))?;
+    // Heartbeats never acquire the manager or lifecycle-worker lock. Start,
+    // reload and automatic resource preparation can all outlive the lease.
     thread::Builder::new()
         .name("desktop-heartbeat".into())
         .spawn(move || {
+            let mut generation = heartbeat_power.generation();
+            while !heartbeat_stopping.load(Ordering::Acquire) {
+                for _ in 0..20 {
+                    if heartbeat_power.generation() != generation {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if heartbeat_stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                let resumed = heartbeat_power.generation() != generation;
+                if resumed {
+                    generation = heartbeat_power.generation();
+                }
+                if !heartbeat_power.suspended() {
+                    if let Some((client, epoch)) = poll_context.service_observer() {
+                        if let Ok(status) = client.heartbeat() {
+                            poll_context.publish_service_observation(status, epoch);
+                        }
+                        if resumed {
+                            let _ = client.reconcile(generation);
+                        }
+                    }
+                }
+            }
+        })
+        .map_err(|e| AppError::io("无法启动服务心跳线程", e))?;
+    thread::Builder::new()
+        .name("desktop-observation".into())
+        .spawn(move || {
             let mut generation = power.generation();
             while !poll_stopping.load(Ordering::Acquire) {
-                // Frequent wake checks do not increase the normal heartbeat rate.
                 for _ in 0..20 {
                     if power.generation() != generation {
                         break;
@@ -292,18 +473,18 @@ pub fn run() -> Result<()> {
                 if poll_stopping.load(Ordering::Acquire) {
                     break;
                 }
-                if let Ok(mut manager) = poll_state.0.try_lock() {
-                    if power.generation() != generation {
-                        generation = power.generation();
-                        manager.request_reconcile(generation);
-                    }
-                    if !power.suspended() {
+                if !power.suspended() {
+                    if let Ok(mut manager) = poll_state.0.try_lock() {
+                        if power.generation() != generation {
+                            generation = power.generation();
+                            manager.request_reconcile(generation);
+                        }
                         manager.poll();
                     }
                 }
             }
         })
-        .map_err(|e| AppError::io("无法启动内核心跳线程", e))?;
+        .map_err(|e| AppError::io("无法启动内核观察线程", e))?;
     thread::Builder::new()
         .name("desktop-input".into())
         .spawn(move || read_requests(output))
@@ -344,7 +525,7 @@ fn protocol_loop(
     state: HostState,
     context: HostContext,
     messages: Receiver<Message>,
-    work: SyncSender<Request>,
+    work: Arc<WorkQueue>,
     stopping: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut stdout = std::io::stdout();
@@ -354,6 +535,7 @@ fn protocol_loop(
     loop {
         if context.owner.exited() && owner_lost_at.is_none() {
             owner_lost_at = Some(Instant::now());
+            context.runtime_generation.fetch_add(1, Ordering::AcqRel);
             stopping.store(true, Ordering::Release);
         }
         if owner_lost_at.is_some_and(|at: Instant| at.elapsed() >= OWNER_EXIT_GRACE) {
@@ -366,6 +548,7 @@ fn protocol_loop(
             Ok(Message::Request(request)) if owner_lost_at.is_none() => {
                 if pending.contains(&request.id) {
                     owner_lost_at = Some(Instant::now());
+                    context.runtime_generation.fetch_add(1, Ordering::AcqRel);
                     stopping.store(true, Ordering::Release);
                     Some(reply(
                         Some(request.id),
@@ -378,42 +561,23 @@ fn protocol_loop(
                     ))
                 } else {
                     let id = request.id;
-                    let stops = matches!(request.method.as_str(), "desktop_stop" | "desktop_exit");
-                    let invalidates = stops
-                        || matches!(
-                            request.method.as_str(),
-                            "desktop_start"
-                                | "desktop_restart"
-                                | "desktop_set_tun"
-                                | "desktop_reload_config"
-                                | "desktop_install_update"
-                        );
-                    if invalidates {
-                        context.runtime_generation.fetch_add(1, Ordering::AcqRel);
-                    }
-                    if stops {
-                        context.stop_pending.fetch_add(1, Ordering::AcqRel);
-                    }
-                    match work.try_send(request) {
-                        Ok(()) => {
+                    match work.enqueue(&context, request) {
+                        Ok(replaced) => {
                             pending.insert(id);
-                            None
-                        }
-                        Err(TrySendError::Full(_)) => {
-                            if stops {
-                                context.stop_pending.fetch_sub(1, Ordering::AcqRel);
+                            if let Some(replaced) = replaced {
+                                pending.remove(&replaced);
+                                Some(reply(
+                                    Some(replaced),
+                                    Err(AppError::new(
+                                        "operation_cancelled",
+                                        "此停止请求已合并到更新的停止指令",
+                                    )),
+                                ))
+                            } else {
+                                None
                             }
-                            Some(reply(
-                                Some(id),
-                                Err(AppError::new(
-                                    "desktop_busy",
-                                    "已有桌面操作正在进行，请稍后重试",
-                                )),
-                            ))
                         }
-                        Err(TrySendError::Disconnected(_)) => {
-                            return Err(AppError::new("state_unavailable", "桌面操作线程已退出"))
-                        }
+                        Err(error) => Some(reply(Some(id), Err(error))),
                     }
                 }
             }
@@ -429,6 +593,7 @@ fn protocol_loop(
             Ok(Message::Event(frame)) => Some(frame),
             Ok(Message::InputClosed) => {
                 owner_lost_at.get_or_insert_with(Instant::now);
+                context.runtime_generation.fetch_add(1, Ordering::AcqRel);
                 stopping.store(true, Ordering::Release);
                 None
             }
@@ -440,16 +605,139 @@ fn protocol_loop(
             if output_open && protocol::write_frame(&mut stdout, &frame).is_err() {
                 output_open = false;
                 owner_lost_at.get_or_insert_with(Instant::now);
+                context.runtime_generation.fetch_add(1, Ordering::AcqRel);
                 stopping.store(true, Ordering::Release);
             }
         }
     }
 }
 
+struct WorkRequest {
+    request: Request,
+    generation: u64,
+    invalidates: bool,
+    stops: bool,
+}
+#[derive(Default)]
+struct Queue {
+    normal: VecDeque<WorkRequest>,
+    stop: Option<WorkRequest>,
+}
+#[derive(Default)]
+struct WorkQueue {
+    queue: Mutex<Queue>,
+    wake: Condvar,
+}
+
+impl WorkQueue {
+    fn enqueue(&self, context: &HostContext, request: Request) -> Result<Option<i64>> {
+        commands::validate_admission(&request.method, &request.params)?;
+        let stops = request.method == "desktop_stop"
+            || request.method == "desktop_exit"
+                && request.params.get("force").and_then(Value::as_bool) == Some(true);
+        if request.method == "desktop_stop" && !request.params.is_empty() {
+            return Err(AppError::new("invalid_arguments", "停止操作参数无效"));
+        }
+        let invalidates = stops
+            || matches!(
+                request.method.as_str(),
+                "desktop_start"
+                    | "desktop_restart"
+                    | "desktop_set_tun"
+                    | "desktop_set_system_proxy"
+                    | "desktop_reload_config"
+                    | "desktop_patch_config"
+                    | "desktop_install_update"
+                    | "desktop_uninstall_service"
+            );
+        let bound = invalidates
+            || matches!(
+                request.method.as_str(),
+                "desktop_import_config_url"
+                    | "desktop_check_update"
+                    | "desktop_install_service"
+                    | "desktop_exit"
+            );
+        let action = request.method.clone();
+        let implicit_start = action == "desktop_set_system_proxy"
+            && request.params.get("enabled").and_then(Value::as_bool) == Some(true);
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if !stops && queue.normal.len() >= WORK_QUEUE_CAPACITY {
+            return Err(AppError::new(
+                "desktop_busy",
+                "已有桌面操作正在进行，请稍后重试",
+            ));
+        }
+        // Admission and generation publication are atomic with worker dequeue.
+        // Rejected requests cannot invalidate a valid operation in flight.
+        let generation = if invalidates {
+            context.runtime_generation.fetch_add(1, Ordering::AcqRel) + 1
+        } else {
+            context.generation()
+        };
+        let work = WorkRequest {
+            request,
+            generation,
+            invalidates: bound,
+            stops,
+        };
+        let replaced = if stops {
+            context.stop_pending.fetch_add(1, Ordering::AcqRel);
+            let previous = queue.stop.replace(work);
+            if previous.is_some() {
+                context.stop_pending.fetch_sub(1, Ordering::AcqRel);
+            }
+            previous.map(|work| work.request.id)
+        } else {
+            queue.normal.push_back(work);
+            None
+        };
+        // Publish accepted intent while dequeue is still excluded. A fast Stop
+        // completion must never be overwritten by its own later admission event.
+        if stops {
+            context.publish_stop_intent(generation);
+        } else if invalidates {
+            if let Ok(mut status) = context.status() {
+                status.intent_revision = generation;
+                if matches!(action.as_str(), "desktop_start" | "desktop_restart") || implicit_start
+                {
+                    status.desired_running = true;
+                    if action != "desktop_set_system_proxy" || status.process_state != "alive" {
+                        status.phase = crate::desktop::Phase::Starting;
+                        status.operation = Some(
+                            if action == "desktop_restart" {
+                                "restarting"
+                            } else {
+                                "starting"
+                            }
+                            .into(),
+                        );
+                    }
+                }
+                context.publish_status(status);
+            }
+        }
+        self.wake.notify_one();
+        Ok(replaced)
+    }
+
+    fn next(&self) -> Option<WorkRequest> {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.stop.is_none() && queue.normal.is_empty() {
+            queue = self
+                .wake
+                .wait_timeout(queue, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        queue.stop.take().or_else(|| queue.normal.pop_front())
+    }
+}
+
 fn operations(
     state: HostState,
     context: HostContext,
-    requests: Receiver<Request>,
+    requests: Arc<WorkQueue>,
     stopping: Arc<AtomicBool>,
     start: bool,
 ) {
@@ -464,40 +752,337 @@ fn operations(
         }
     }
     while !stopping.load(Ordering::Acquire) {
-        match requests.recv_timeout(Duration::from_millis(100)) {
-            Ok(request) => {
-                if stopping.load(Ordering::Acquire) {
-                    break;
-                }
-                let result = commands::dispatch(&state, &context, &request.method, request.params);
-                if matches!(request.method.as_str(), "desktop_stop" | "desktop_exit") {
-                    context.stop_pending.fetch_sub(1, Ordering::AcqRel);
-                }
-                let exit = result
-                    .as_ref()
-                    .ok()
-                    .and_then(|result| result.get("exiting"))
-                    .and_then(Value::as_bool)
-                    == Some(true);
-                let update_exit = exit && request.method == "desktop_install_update";
-                let _ = context.output.send(Message::Reply(request.id, result));
-                if exit {
-                    if update_exit {
-                        context.emit(
-                            "desktop-exit-requested",
-                            serde_json::json!({"reason":"update","force":true}),
-                        );
-                    }
-                    let _ = context.output.send(Message::Exit);
-                    return;
-                }
+        if let Some(work) = requests.next() {
+            if stopping.load(Ordering::Acquire) {
+                break;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            let request = work.request;
+            let stops = work.stops;
+            let result = if work.stops && work.generation != context.generation() {
+                // A later Start may replace the desired state, but it cannot
+                // bypass an already accepted Stop's ownership cleanup barrier.
+                state
+                    .0
+                    .lock()
+                    .map_err(|_| AppError::new("state_unavailable", "桌面状态不可用"))
+                    .and_then(|mut manager| {
+                        manager.begin_operation(context.generation());
+                        manager.stop(false)?;
+                        Err(AppError::new(
+                            "operation_cancelled",
+                            "停止清理已完成，运行意图已被后续指令更新",
+                        ))
+                    })
+            } else if work.invalidates && work.generation != context.generation() {
+                Err(AppError::new(
+                    "operation_cancelled",
+                    "此操作已被更新的用户指令取消",
+                ))
+            } else {
+                commands::dispatch(
+                    &state,
+                    &context,
+                    &request.method,
+                    request.params,
+                    if work.invalidates {
+                        work.generation
+                    } else {
+                        context.generation()
+                    },
+                )
+            };
+            if stops {
+                context.stop_pending.fetch_sub(1, Ordering::AcqRel);
+            }
+            let exit = result
+                .as_ref()
+                .ok()
+                .and_then(|result| result.get("exiting"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let update_exit = exit && request.method == "desktop_install_update";
+            let _ = context.output.send(Message::Reply(request.id, result));
+            if exit {
+                if update_exit {
+                    context.emit(
+                        "desktop-exit-requested",
+                        serde_json::json!({"reason":"update","force":true}),
+                    );
+                }
+                let _ = context.output.send(Message::Exit);
+                return;
+            }
         }
     }
+    context.runtime_generation.fetch_add(1, Ordering::AcqRel);
     if let Ok(mut manager) = state.0.lock() {
+        manager.begin_operation(context.generation());
         let _ = manager.request_exit(true);
     }
     let _ = context.output.send(Message::Exit);
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::desktop::Phase;
+
+    fn context() -> (HostContext, Receiver<Message>, Receiver<u64>) {
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                std::process::id(),
+            )
+        };
+        assert!(!raw.is_null());
+        let (output, messages) = mpsc::sync_channel(1024);
+        let (service_stop, stops) = mpsc::sync_channel(1);
+        let context = HostContext {
+            output,
+            published: Arc::new(Mutex::new(None)),
+            owner: Arc::new(UiProcess {
+                pid: std::process::id(),
+                application: std::env::current_exe().unwrap(),
+                handle: unsafe { OwnedHandle::from_raw_handle(raw) },
+            }),
+            runtime_generation: Arc::new(AtomicU64::new(0)),
+            stop_pending: Arc::new(AtomicUsize::new(0)),
+            instance: "00000000000000000000000000000001".into(),
+            sequence: Arc::new(AtomicU64::new(0)),
+            service: Arc::new(Mutex::new(None)),
+            service_active: Arc::new(AtomicBool::new(false)),
+            service_epoch: Arc::new(AtomicU64::new(0)),
+            service_stop,
+            stop_intent_revision: Arc::new(AtomicU64::new(0)),
+        };
+        context.publish_status(DesktopStatus {
+            process_state: "exited".into(),
+            control_state: "unknown".into(),
+            ..DesktopStatus::default()
+        });
+        (context, messages, stops)
+    }
+
+    fn request(id: i64, method: &str, params: Value) -> Request {
+        Request {
+            id,
+            method: method.into(),
+            params: params.as_object().unwrap().clone(),
+        }
+    }
+
+    #[test]
+    fn full_normal_queue_cannot_reject_stop_or_run_an_older_implicit_start() {
+        let (context, _messages, _stops) = context();
+        let queue = WorkQueue::default();
+        queue
+            .enqueue(
+                &context,
+                request(
+                    1,
+                    "desktop_set_system_proxy",
+                    serde_json::json!({"enabled":true}),
+                ),
+            )
+            .unwrap();
+        for id in 2..=4 {
+            queue
+                .enqueue(
+                    &context,
+                    request(
+                        id,
+                        "desktop_open_directory",
+                        serde_json::json!({"kind":"logs"}),
+                    ),
+                )
+                .unwrap();
+        }
+        let revision = context.generation();
+        assert_eq!(
+            queue
+                .enqueue(&context, request(9, "desktop_start", serde_json::json!({})))
+                .unwrap_err()
+                .code,
+            "desktop_busy"
+        );
+        assert_eq!(
+            context.generation(),
+            revision,
+            "rejected work cannot cancel accepted work"
+        );
+        queue
+            .enqueue(&context, request(5, "desktop_stop", serde_json::json!({})))
+            .unwrap();
+        assert!(!context.status().unwrap().desired_running);
+        assert_eq!(queue.next().unwrap().request.method, "desktop_stop");
+        let old_proxy = queue.next().unwrap();
+        assert!(
+            old_proxy.invalidates && old_proxy.generation < context.generation(),
+            "old proxy enable must be cancelled, not rebound to Stop's generation"
+        );
+    }
+
+    #[test]
+    fn stop_intent_is_published_before_a_fast_worker_can_complete_it() {
+        let (context, _messages, _stops) = context();
+        let queue = Arc::new(WorkQueue::default());
+        let worker_queue = queue.clone();
+        let worker_context = context.clone();
+        let worker = thread::spawn(move || {
+            let stop = loop {
+                if let Some(work) = worker_queue.next() {
+                    break work;
+                }
+            };
+            assert_eq!(
+                worker_context.status().unwrap().phase as u8,
+                Phase::Stopping as u8
+            );
+            let mut status = worker_context.status().unwrap();
+            status.phase = Phase::Stopped;
+            status.operation = None;
+            status.intent_revision = stop.generation;
+            worker_context.publish_status(status);
+        });
+        queue
+            .enqueue(&context, request(1, "desktop_stop", serde_json::json!({})))
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(context.status().unwrap().phase as u8, Phase::Stopped as u8);
+    }
+
+    #[test]
+    fn later_start_keeps_the_accepted_stop_cleanup_barrier() {
+        let (context, _messages, _stops) = context();
+        let queue = WorkQueue::default();
+        queue
+            .enqueue(&context, request(1, "desktop_start", serde_json::json!({})))
+            .unwrap();
+        queue
+            .enqueue(&context, request(2, "desktop_stop", serde_json::json!({})))
+            .unwrap();
+        queue
+            .enqueue(&context, request(3, "desktop_start", serde_json::json!({})))
+            .unwrap();
+        let barrier = queue.next().unwrap();
+        assert!(barrier.stops && barrier.generation < context.generation());
+        assert!(context.status().unwrap().desired_running);
+        assert_eq!(
+            context.stop_intent_revision.load(Ordering::Acquire),
+            2,
+            "old Stop must not be relabelled as the new Start by the service-control thread"
+        );
+        assert_eq!(queue.next().unwrap().request.id, 1);
+        assert_eq!(queue.next().unwrap().request.id, 3);
+    }
+
+    #[test]
+    fn cancelled_exit_confirmation_never_stops_the_runtime_at_admission() {
+        let (context, _messages, _stops) = context();
+        let queue = WorkQueue::default();
+        queue
+            .enqueue(
+                &context,
+                request(1, "desktop_exit", serde_json::json!({"force":false})),
+            )
+            .unwrap();
+        assert_eq!(context.generation(), 0);
+        assert_eq!(context.stop_pending.load(Ordering::Acquire), 0);
+        assert!(!queue.next().unwrap().stops);
+    }
+
+    #[test]
+    fn newer_service_facts_cannot_overwrite_a_later_host_identity_failure() {
+        let (context, _messages, _stops) = context();
+        let mut healthy = context.status().unwrap();
+        healthy.service_instance = Some("service".into());
+        healthy.service_sequence = 2;
+        healthy.process_state = "alive".into();
+        healthy.control_state = "ready".into();
+        healthy.phase = Phase::Running;
+        healthy.pid = Some(111);
+        healthy.controller = Some(crate::core::Controller {
+            url: "http://127.0.0.1:9090".into(),
+            secret: "fixture".into(),
+        });
+        healthy.observed_at = core::observed_now();
+        context.publish_status(healthy.clone());
+        let mut failure = healthy;
+        failure.service_sequence = 1;
+        failure.pid = None;
+        failure.phase = Phase::Error;
+        failure.control_state = "unreachable".into();
+        failure.controller = None;
+        failure.error_code = Some("service_identity_failed".into());
+        failure.last_error = Some("无法保留 TUN 服务身份（系统错误：5）".into());
+        failure.system_proxy = false;
+        context.publish_status(failure);
+        let status = context.status().unwrap();
+        assert_eq!(status.service_sequence, 2);
+        assert_eq!(status.pid, Some(111));
+        assert_eq!(status.phase as u8, Phase::Error as u8);
+        assert_eq!(status.control_state, "unreachable");
+        assert_eq!(
+            status.error_code.as_deref(),
+            Some("service_identity_failed")
+        );
+        assert!(status.controller.is_none());
+        assert!(!status.system_proxy);
+    }
+
+    #[test]
+    fn retired_service_heartbeat_cannot_replace_a_live_direct_process() {
+        let (context, _messages, _stops) = context();
+        context.service_active.store(true, Ordering::Release);
+        context.service_epoch.store(1, Ordering::Release);
+        context.pause_service_observation();
+        let mut direct = context.status().unwrap();
+        direct.phase = Phase::Running;
+        direct.process_state = "alive".into();
+        direct.pid = Some(333);
+        direct.observed_at = core::observed_now();
+        context.publish_status(direct);
+        let before = context.status().unwrap().status_sequence;
+        let old = CoreStatus {
+            process_state: "exited".into(),
+            service_instance: Some("retired-service".into()),
+            status_sequence: 999,
+            ..CoreStatus::default()
+        };
+        context.publish_service_observation(old.clone(), 1);
+        context.service_active.store(true, Ordering::Release);
+        context.service_epoch.store(3, Ordering::Release);
+        context.publish_service_observation(old, 1);
+        let current = context.status().unwrap();
+        assert_eq!(current.pid, Some(333));
+        assert_eq!(current.status_sequence, before);
+    }
+
+    #[test]
+    fn published_observations_are_monotonic_and_stopped_state_does_not_expire() {
+        let (context, _messages, _stops) = context();
+        assert!(!context.status().unwrap().status_stale);
+        let mut workers = Vec::new();
+        for range in [1..51, 51..101] {
+            let context = context.clone();
+            workers.push(thread::spawn(move || {
+                for sequence in range {
+                    let mut status = context.status().unwrap();
+                    status.service_instance = Some("service".into());
+                    status.service_sequence = sequence;
+                    status.observed_at = sequence;
+                    context.publish_status(status);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let final_status = context.status().unwrap();
+        assert_eq!(final_status.service_sequence, 100);
+        assert_eq!(final_status.observed_at, 100);
+        assert_eq!(final_status.status_sequence, 101);
+        assert!(!final_status.status_stale);
+    }
 }

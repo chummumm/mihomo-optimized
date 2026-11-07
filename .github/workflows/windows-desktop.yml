@@ -129,6 +129,11 @@ jobs:
       - name: Verify Windows TUN health, recovery and native route inspection
         working-directory: core-src
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./listener ./listener/sing_tun ./hub/executor ./hub/route ./component/lanpreconnect -run 'Desktop|LAN'
+      - name: Verify exclusive Windows adapter creation and deterministic cleanup
+        working-directory: core-src
+        env:
+          MIHOMO_TUN_INTEGRATION: '1'
+        run: go test -v -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun -run Desktop
       - name: Verify proxy IP destinations and DNS address-family output
         working-directory: core-src
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./adapter ./adapter/provider ./dns ./config ./tunnel -run 'ProxyTarget|ProxyForceIP|TargetIPFamily|AnswerIPFamily|ProviderTargetFamily'
@@ -185,7 +190,7 @@ jobs:
         run: python desktop/tests/core_smoke.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe
       - name: Test real Windows bootstrap groups, offline cache and cancellation
         run: python core-src/scripts/test-resource-bootstrap.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe --report artifacts/verification/resource-bootstrap-core.json
-      - name: Test 0.1.1 uninstall recovery and direct 0.1.7 native migration
+      - name: Test 0.1.1 recovery, 0.1.7 migration and 0.2.5 paired service upgrade
         run: ./desktop/tests/setup-windows.ps1
       - name: Test installed native UI, system proxy, TUN forwarding and cleanup
         run: python desktop/tests/windows_smoke.py

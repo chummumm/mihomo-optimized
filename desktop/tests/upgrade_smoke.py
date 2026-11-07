@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise published 0.1.1 uninstall recovery and direct 0.1.7 migration.
+"""Exercise published 0.1.1 recovery, 0.1.7 migration and 0.2.5 service upgrade.
 
 Only disposable GitHub Actions Windows runners may run this elevated fixture.
 A read handle without FILE_SHARE_DELETE reproduces a leftover old helper after
@@ -50,6 +50,13 @@ PREVIOUS_URL = (
     "mihomo-desktop-v0.1.7/mihomo-desktop-0.1.7-windows-x64-setup.exe"
 )
 PREVIOUS_SHA256 = "7a7a3a0014a00a14d8688fcf556e1fb62016dbec187030e994bb8b4f61c77a4c"
+NATIVE_VERSION = "0.2.5"
+NATIVE_SOURCE = "a7d7fdb686c1835052931935bc5f0399bd8deb81"
+NATIVE_URL = (
+    "https://github.com/chummumm/mihomo-optimized/releases/download/"
+    "mihomo-desktop-v0.2.5/mihomo-desktop-0.2.5-windows-x64-setup.exe"
+)
+NATIVE_SHA256 = "e4b0fcdefc97d32e9a05e4ec1f06b6faf995a4e91fe36bdae51d441120b259f6"
 EXECUTABLES = (
     "mihomo-optimized.exe", "mihomo-core.exe", "mihomo-desktop-service.exe",
     "mihomo-update-verify.exe", "mihomo-desktop-host.exe",
@@ -279,7 +286,7 @@ class UpgradeAcceptance:
                                     "installedBinarySha256": self.expected_hashes,
                                     "runtimeFramework": "WPF", "runtimeFileCount": len(self.expected_hashes)}
 
-    def download_baseline(self, version: str, url: str, checksum: str) -> Path:
+    def download_baseline(self, version: str, url: str, checksum: str, maximum_bytes: int = 64 * 1024 * 1024) -> Path:
         # Keep this outside artifacts/desktop so the candidate remains unique.
         destination = Path("artifacts/legacy").resolve() / f"mihomo-desktop-{version}-windows-x64-setup.exe"
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -292,7 +299,7 @@ class UpgradeAcceptance:
                     size = 0
                     while chunk := response.read(1024 * 1024):
                         size += len(chunk)
-                        require(size <= 64 * 1024 * 1024, "legacy_download_too_large")
+                        require(size <= maximum_bytes, "legacy_download_too_large")
                         require(time.monotonic() - started < 180, "legacy_download_timeout")
                         output.write(chunk)
                 require(digest(temporary) == checksum, "legacy_download_checksum_mismatch")
@@ -545,6 +552,43 @@ class UpgradeAcceptance:
                 "native_migration_service_remove_failed")
         self.assert_no_service()
 
+        # Verify the currently published WPF/service-v1 combination upgrades as
+        # one unit to the new service protocol. Keep the older migration gates.
+        self.stage = "published_0_2_5_install"
+        native = self.download_baseline(NATIVE_VERSION, NATIVE_URL, NATIVE_SHA256, 96 * 1024 * 1024)
+        uninstaller = self.install_dir / "uninstall.exe"
+        require(self.command("before_native_baseline_uninstall", uninstaller, uninstall_command(uninstaller), 180)["exitCode"] == 0,
+                "before_native_baseline_uninstall_failed")
+        self.assert_no_service()
+        self.assert_marker()
+        uninstaller.unlink(missing_ok=True)
+        require(self.command("native_baseline_install", native, ["/S"], 180)["exitCode"] == 0,
+                "native_baseline_install_failed")
+        self.assert_registration(NATIVE_VERSION)
+        native_info = json.loads((self.install_dir / "resources/build-info.json").read_text(encoding="utf-8-sig"))
+        require(native_info.get("desktopVersion") == NATIVE_VERSION and native_info.get("uiCommit") == NATIVE_SOURCE
+                and native_info.get("desktopFramework") == "WPF" and self.host.is_file(), "installed_native_baseline_mismatch")
+        require(native_info.get("companions", {}).get("mihomo-desktop-service-" + TARGET + ".exe") == digest(self.helper),
+                "installed_native_baseline_helper_mismatch")
+        old_native_service = self.install_service("native_baseline_service_install")
+        native_owner = self.owner_file.read_bytes()
+        self.stage = "native_paired_upgrade_from_0_2_5"
+        require(self.command("native_paired_upgrade", self.candidate, ["/S"], 180)["exitCode"] == 0,
+                "native_paired_upgrade_failed")
+        new_native_service = self.running_service()
+        require(new_native_service != old_native_service, "native_old_service_process_survived_upgrade")
+        require(self.owner_file.read_bytes() == native_owner and owned_firewall_rule_count(self.core) == 1,
+                "native_paired_upgrade_changed_owner_or_firewall")
+        self.assert_candidate_files()
+        self.report["nativePreviousRelease"] = {"version": NATIVE_VERSION, "source": NATIVE_SOURCE,
+            "url": NATIVE_URL, "sha256": NATIVE_SHA256, "pidBefore": old_native_service.pid,
+            "pidAfter": new_native_service.pid, "configurationPreserved": True, "ownerSidPreserved": True,
+            "completeCompanionHashesVerified": True}
+        self.mark("published_0_2_5_paired_upgrade")
+        require(self.command("native_paired_service_remove", self.helper, ["--uninstall"])["exitCode"] == 0,
+                "native_paired_service_remove_failed")
+        self.assert_no_service()
+
         self.stage = "candidate_reinstall_for_gui"
         require(self.command("candidate_reinstall", self.candidate, ["/S"], 180)["exitCode"] == 0,
                 "candidate_reinstall_failed")
@@ -663,7 +707,8 @@ def main() -> int:
             required = {"published_baseline_verified", "legacy_service_running", "uninstall_retained_locked_helper",
                         "published_old_helper_failure_reproduced", "candidate_repairs_uninstall_residue",
                         "overwrite_restarts_existing_service", "candidate_application_fully_uninstalled",
-                        "published_0_1_7_direct_upgrade", "candidate_reinstalled_for_gui", "final_cleanup"}
+                        "published_0_1_7_direct_upgrade", "published_0_2_5_paired_upgrade",
+                        "candidate_reinstalled_for_gui", "final_cleanup"}
             acceptance.report["passed"] = (all(acceptance.report["tests"].get(name) is True for name in required)
                                            and not acceptance.report["diagnostics"])
             acceptance.write_report()

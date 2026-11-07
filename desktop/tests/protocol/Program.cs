@@ -11,6 +11,7 @@ if (args.FirstOrDefault() == "--broker-fixture" && OperatingSystem.IsWindows())
 
 WindowPlacementGeometryTests.Run();
 HostRecoveryIntentTests.Run();
+DesktopStatusTests.Run();
 
 static StreamReader Reader(string text) => new(new MemoryStream(Encoding.UTF8.GetBytes(text)), Encoding.UTF8);
 static void Equal<T>(T expected, T actual)

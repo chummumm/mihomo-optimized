@@ -2,6 +2,7 @@
 mod commands;
 pub mod config;
 pub mod core;
+pub mod core_runtime;
 #[cfg(all(windows, feature = "desktop"))]
 pub mod desktop;
 pub mod diagnostics;

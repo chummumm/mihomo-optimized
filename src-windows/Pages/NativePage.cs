@@ -54,9 +54,10 @@ public abstract class NativePage : UserControl
     private readonly TextBlock notice = Ui.Text("");
     private CancellationTokenSource? lifetime;
     private string controllerIdentity = "";
+    private bool runtimeAvailable;
     protected CancellationToken PageToken => lifetime?.Token ?? CancellationToken.None;
     protected bool IsActive => lifetime is { IsCancellationRequested: false };
-    protected bool IsRunning => Session.Status.Text("phase") == "running";
+    protected bool IsRunning => Session.Runtime.RuntimeAvailable;
     private bool IsNarrowWindow => (Window.GetWindow(this)?.ActualWidth ?? ActualWidth) <= 640;
     private double ReservedGutter => reservePageGutter &&
         (!IsNarrowWindow || pageScroll?.ComputedVerticalScrollBarVisibility == Visibility.Visible) ? ScrollbarGutter : 0;
@@ -65,14 +66,10 @@ public abstract class NativePage : UserControl
     protected internal double PageContainerWidth => Math.Max(0, ActualWidth - ReservedGutter);
     protected internal double PageHorizontalPadding => IsNarrowWindow ? 16 : Math.Clamp(PageContainerWidth * .04, 16, 40);
     protected string ControllerIdentity => Session.Status.Get("controller").Text("url") + "\n" + Session.Status.Get("controller").Text("secret");
-    protected string InactiveMessage => L.T(Session.Status.Text("phase") switch
-    {
-        "connecting" => "正在连接本地服务，请稍候。",
-        "starting" => "正在准备启动资源并确认内核就绪，请稍候。",
-        "stopping" => "正在停止内核，请稍候。",
-        "error" => Session.Status.Text("lastError", fallback: "内核需要处理，请在主页查看详细信息。"),
-        _ => "内核未运行，可在主页启动。"
-    });
+    protected string InactiveMessage => L.T(Session.Runtime.StopRequired
+        ? Session.Runtime.Description
+        : Session.Runtime.IsProblem ? Session.Status.Text("lastError", fallback: Session.Runtime.Description)
+        : "内核未运行，可在主页启动。");
     public string Title { get; }
     // The original route animates inside its fixed scrolling viewport. Moving
     // the ScrollViewer itself changes both scrolling targets and the gutter.
@@ -166,6 +163,7 @@ public abstract class NativePage : UserControl
         lifetime = new CancellationTokenSource(); Session.StatusChanged += StatusChanged; L.Changed += OnLanguageChanged;
         var token = lifetime.Token;
         controllerIdentity = ControllerIdentity;
+        runtimeAvailable = IsRunning;
         _ = RunAsync(async () => { await RunAsync(RefreshAsync); if (!token.IsCancellationRequested) await LiveAsync(token); });
     }
     public virtual void Deactivate()
@@ -176,7 +174,11 @@ public abstract class NativePage : UserControl
     {
         OnStatusChanged();
         var current = ControllerIdentity;
-        if (controllerIdentity != current) { controllerIdentity = current; if (IsRunning && IsActive) _ = RunAsync(RefreshAsync); }
+        bool available = IsRunning;
+        bool refresh = controllerIdentity != current || !runtimeAvailable && available;
+        controllerIdentity = current;
+        runtimeAvailable = available;
+        if (refresh && available && IsActive) _ = RunAsync(RefreshAsync);
     }
     protected virtual void OnStatusChanged() { }
     protected virtual void OnLanguageChanged() => OnStatusChanged();

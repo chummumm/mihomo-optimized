@@ -9,7 +9,7 @@ use crate::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{io::Read, sync::TryLockError};
+use std::sync::TryLockError;
 
 fn decode<T: DeserializeOwned>(params: Map<String, Value>) -> Result<T> {
     serde_json::from_value(Value::Object(params))
@@ -74,14 +74,48 @@ struct ExternalUrl {
     url: String,
 }
 
+/// Validate lifecycle arguments before an accepted request can cancel a worker.
+pub fn validate_admission(method: &str, params: &Map<String, Value>) -> Result<()> {
+    match method {
+        "desktop_start"
+        | "desktop_stop"
+        | "desktop_restart"
+        | "desktop_install_update"
+        | "desktop_uninstall_service" => {
+            decode::<Empty>(params.clone())?;
+        }
+        "desktop_set_tun" | "desktop_set_system_proxy" => {
+            decode::<Enabled>(params.clone())?;
+        }
+        "desktop_reload_config" | "desktop_exit" => {
+            decode::<Force>(params.clone())?;
+        }
+        "desktop_patch_config" => {
+            decode::<Patch>(params.clone())?;
+        }
+        _ => (),
+    }
+    Ok(())
+}
+
+struct BoundState<'a> {
+    state: &'a HostState,
+    generation: u64,
+}
+
 fn with_manager<T>(
-    state: &HostState,
+    state: &BoundState<'_>,
     operation: impl FnOnce(&mut DesktopManager) -> Result<T>,
 ) -> Result<T> {
     let mut manager = state
+        .state
         .0
         .lock()
         .map_err(|_| AppError::new("state_unavailable", "桌面状态不可用，请重新启动程序"))?;
+    // Binding and execution share the same manager lock. A background poll can
+    // never upgrade an old command to a newer accepted user's revision.
+    manager.begin_operation(state.generation);
+    manager.operation_cancellation().check()?;
     operation(&mut manager)
 }
 
@@ -104,7 +138,7 @@ pub fn status(
 }
 
 fn core_action(
-    state: &HostState,
+    state: &BoundState<'_>,
     params: Map<String, Value>,
     action: impl FnOnce(&mut DesktopManager) -> Result<()>,
 ) -> Result<Value> {
@@ -120,7 +154,11 @@ pub fn dispatch(
     context: &HostContext,
     method: &str,
     params: Map<String, Value>,
+    generation: u64,
 ) -> Result<Value> {
+    let state = &BoundState { state, generation };
+    let cancellation =
+        crate::lifecycle::Cancellation::new(context.runtime_generation.clone(), generation);
     match method {
         "desktop_start" => core_action(state, params, |manager| manager.start(true)),
         "desktop_stop" => core_action(state, params, |manager| manager.stop(true)),
@@ -202,11 +240,15 @@ pub fn dispatch(
         }
         "desktop_check_update" => {
             decode::<Empty>(params)?;
-            encode(crate::update::desktop_check_update(context, state)?)
+            encode(crate::update::desktop_check_update(
+                context,
+                state.state,
+                &cancellation,
+            )?)
         }
         "desktop_install_update" => {
             decode::<Empty>(params)?;
-            crate::update::desktop_install_update(context, state)?;
+            crate::update::desktop_install_update(context, state.state, &cancellation)?;
             Ok(serde_json::json!({"exiting":true}))
         }
         _ => Err(AppError::new("unknown_method", "不支持的桌面操作")),
@@ -225,52 +267,66 @@ fn ordinary_http_url(input: &str, code: &str, message: &str) -> Result<reqwest::
     Ok(parsed)
 }
 
-fn import_url(state: &HostState, args: ImportUrl) -> Result<Value> {
-    let (proxy, captured_revision) = with_manager(state, |manager| {
-        Ok((manager.update_proxy_url(), manager.read_config()?.revision))
+fn import_url(state: &BoundState<'_>, args: ImportUrl) -> Result<Value> {
+    let (proxy, captured_revision, cancellation) = with_manager(state, |manager| {
+        Ok((
+            manager.update_proxy_url(),
+            manager.read_config()?.revision,
+            manager.operation_cancellation(),
+        ))
     })?;
+    cancellation.check()?;
     let parsed = ordinary_http_url(&args.url, "invalid_url", "订阅必须使用 HTTP 或 HTTPS 地址")?;
-    let mut builder = reqwest::blocking::Client::builder()
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(5));
-    if let Some(proxy) = proxy {
-        builder = builder.proxy(
-            reqwest::Proxy::all(proxy)
-                .map_err(|_| AppError::new("proxy_invalid", "本地代理不可用"))?,
-        );
-    }
-    let client = builder
-        .build()
-        .map_err(|_| AppError::new("download_failed", "无法初始化订阅下载"))?;
-    let response = client
-        .get(parsed)
-        .header("User-Agent", "clash.meta/MihomoOptimizedDesktop")
-        .send()
-        .map_err(|_| AppError::new("download_failed", "订阅下载失败，请检查地址和网络"))?;
-    if !response.status().is_success() {
-        return Err(AppError::new(
-            "download_failed",
-            format!("订阅服务器返回 HTTP {}", response.status().as_u16()),
-        ));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_CONFIG_SIZE as u64)
-    {
-        return Err(AppError::new("config_too_large", "订阅不能超过 4 MiB"));
-    }
-    let mut bytes = Vec::new();
-    response
-        .take((MAX_CONFIG_SIZE + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| AppError::new("download_failed", "订阅下载不完整"))?;
-    if bytes.len() > MAX_CONFIG_SIZE {
-        return Err(AppError::new("config_too_large", "订阅不能超过 4 MiB"));
-    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let bytes = crate::core::wait_cancellable(Some(&cancellation), deadline, async {
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5));
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy)
+                    .map_err(|_| AppError::new("proxy_invalid", "本地代理不可用"))?,
+            );
+        }
+        let client = builder
+            .build()
+            .map_err(|_| AppError::new("download_failed", "无法初始化订阅下载"))?;
+        let mut response = client
+            .get(parsed)
+            .header("User-Agent", "clash.meta/MihomoOptimizedDesktop")
+            .send()
+            .await
+            .map_err(|_| AppError::new("download_failed", "订阅下载失败，请检查地址和网络"))?;
+        if !response.status().is_success() {
+            return Err(AppError::new(
+                "download_failed",
+                format!("订阅服务器返回 HTTP {}", response.status().as_u16()),
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_CONFIG_SIZE as u64)
+        {
+            return Err(AppError::new("config_too_large", "订阅不能超过 4 MiB"));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| AppError::new("download_failed", "订阅下载不完整"))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_CONFIG_SIZE {
+                return Err(AppError::new("config_too_large", "订阅不能超过 4 MiB"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    })?;
     let content = String::from_utf8(bytes)
         .map_err(|_| AppError::new("config_invalid", "订阅必须返回 UTF-8 YAML"))?;
     with_manager(state, |manager| {
+        cancellation.check()?;
         encode(
             manager.import_config(
                 &content,

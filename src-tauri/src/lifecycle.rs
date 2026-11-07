@@ -3,7 +3,10 @@
 use crate::error::{AppError, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -11,6 +14,36 @@ pub const OWNER_LEASE: Duration = Duration::from_secs(20);
 const RESUME_GRACE: Duration = Duration::from_secs(5);
 pub const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 pub const RECOVERY_WINDOW: Duration = Duration::from_secs(20);
+
+/// A lifecycle operation belongs to one accepted user intent. Network events
+/// never advance this counter; an accepted Stop or replacement operation does.
+/// Workers check the token before publishing state and around blocking stages.
+#[derive(Clone)]
+pub struct Cancellation {
+    revision: Arc<AtomicU64>,
+    expected: u64,
+}
+
+impl Cancellation {
+    pub fn new(revision: Arc<AtomicU64>, expected: u64) -> Self {
+        Self { revision, expected }
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.revision.load(Ordering::Acquire) == self.expected {
+            Ok(())
+        } else {
+            Err(AppError::new(
+                "operation_cancelled",
+                "此操作已被新的启动或停止指令取消",
+            ))
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.expected
+    }
+}
 
 pub trait AwakeClock {
     fn now(&self) -> Result<Duration>;
@@ -66,8 +99,8 @@ impl<C: AwakeClock> OwnerLease<C> {
         })
     }
 
-    /// Called only after an authenticated request has completed. Invalid peers,
-    /// power notifications and cached UI status queries cannot renew this lease.
+    /// Called only by an authenticated owner heartbeat or an accepted Start.
+    /// Status reads, invalid peers and power notifications cannot renew it.
     pub fn renew(&mut self) -> Result<()> {
         self.last_seen = self.clock.now()?;
         self.resume_grace_until = None;

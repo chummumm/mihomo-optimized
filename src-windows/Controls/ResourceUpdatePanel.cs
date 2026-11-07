@@ -38,7 +38,7 @@ internal sealed class ResourceUpdatePanel : UserControl
     private long? failedSince;
     private CancellationToken pageToken;
     public bool NeedsRefresh => !busy && !unsupported && (!followExpired && (Active || awaitingRequest is not null) || !Active && Environment.TickCount64 - lastRead >= 30000);
-    private bool Running => session.Status.Text("phase") == "running";
+    private bool Running => session.Runtime.RuntimeAvailable;
     private bool Active => snapshot.Text("state") is "running" or "restarting";
 
     public ResourceUpdatePanel(AppSession session)
@@ -69,13 +69,8 @@ internal sealed class ResourceUpdatePanel : UserControl
         pageToken = token;
         if (!Running)
         {
-            rows.Children.Clear(); sources.Visibility = Visibility.Collapsed; summary.Text = L.T(session.Status.Text("phase") switch
-            {
-                "starting" => "正在准备启动资源并确认内核就绪，请稍候。",
-                "connecting" => "正在连接本地服务，请稍候。",
-                "stopping" => "正在停止内核，请稍候。",
-                _ => "启动内核后可检查并更新规则与 Geo 数据。"
-            });
+            rows.Children.Clear(); sources.Visibility = Visibility.Collapsed;
+            summary.Text = L.T(session.Runtime.StopRequired ? session.Runtime.Description : "启动内核后可检查并更新规则与 Geo 数据。");
         }
         if (Running) sources.Visibility = Visibility.Visible; SetButtons();
     }
@@ -165,7 +160,7 @@ internal sealed class ResourceUpdatePanel : UserControl
     {
         var locked = busy || session.IsUpdating || !Running;
         refresh.IsEnabled = !locked;
-        start.IsEnabled = !locked && !unsupported && !session.IsDirty && (!Active || followExpired);
+        start.IsEnabled = !locked && !session.Runtime.IsWorking && session.BusyCommand is null && !unsupported && !session.IsDirty && (!Active || followExpired);
         var title = busy || Active && !followExpired ? "正在更新资源…" : problem.Length > 0 || awaitingRequest is not null ? "刷新资源更新状态" : "检查并更新资源";
         var progress = busy || Active && !followExpired; var commandState = (progress ? "busy:" : "idle:") + title;
         if (!Equals(start.Tag, commandState))

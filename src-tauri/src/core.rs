@@ -1,7 +1,7 @@
 use crate::{
     config,
     error::{AppError, Result},
-    lifecycle::{self, RecoveryWindow, StopReason, HEALTH_INTERVAL},
+    lifecycle::{self, Cancellation, RecoveryWindow, StopReason, HEALTH_INTERVAL},
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -13,10 +13,11 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(8);
+const TOTAL_STOP_TIMEOUT: Duration = Duration::from_secs(12);
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RESTARTS: usize = 3;
 const RECOVERY_RESERVE: Duration = Duration::from_secs(30);
@@ -78,6 +79,39 @@ fn remaining(deadline: Instant) -> Result<Duration> {
         .checked_duration_since(Instant::now())
         .filter(|value| !value.is_zero())
         .ok_or_else(|| AppError::new("core_operation_timeout", "本次内核操作已超过总时限"))
+}
+
+/// The future is polled by its owning lifecycle thread. Cancellation drops it
+/// (and its sockets) without leaving a background worker behind.
+pub fn wait_cancellable<T>(
+    cancellation: Option<&Cancellation>,
+    deadline: Instant,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    // Reuse one bounded resolver pool. Dropping a per-request runtime can wait
+    // for an OS DNS lookup after its HTTP future was already cancelled.
+    static IO_RUNTIME: std::sync::OnceLock<std::io::Result<tokio::runtime::Runtime>> =
+        std::sync::OnceLock::new();
+    let runtime = IO_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(4)
+                .build()
+        })
+        .as_ref()
+        .map_err(|_| AppError::new("http_init_failed", "无法初始化可取消的操作"))?;
+    let mut operation = Box::pin(operation);
+    loop {
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
+        let slice = remaining(deadline)?.min(Duration::from_millis(50));
+        match runtime.block_on(async { tokio::time::timeout(slice, &mut operation).await }) {
+            Ok(result) => return result,
+            Err(_) => continue,
+        }
+    }
 }
 
 fn duration_argument(duration: Duration) -> String {
@@ -242,6 +276,29 @@ pub struct CoreStatus {
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub tun_health: Option<String>,
+    pub process_state: String,
+    pub control_state: String,
+    pub listeners_ready: Option<bool>,
+    pub operation: Option<String>,
+    pub observed_at: u64,
+    pub service_instance: Option<String>,
+    pub status_sequence: u64,
+    pub intent_revision: u64,
+}
+
+pub fn observed_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+struct TunRecovery {
+    request_id: String,
+    operation_id: Option<String>,
+    core_instance: String,
+    config_generation: u64,
+    tun_generation: u64,
 }
 
 pub struct CoreSupervisor {
@@ -249,6 +306,7 @@ pub struct CoreSupervisor {
     home: PathBuf,
     logs: PathBuf,
     child: Option<Child>,
+    validation_child: Option<Child>,
     #[cfg(windows)]
     job: Option<std::os::windows::io::OwnedHandle>,
     controller: Option<Controller>,
@@ -271,6 +329,11 @@ pub struct CoreSupervisor {
     error_code: Option<String>,
     exit_code: Option<i32>,
     tun_health: Option<String>,
+    control_state: String,
+    listeners_ready: Option<bool>,
+    observed_at: u64,
+    cancellation: Option<Cancellation>,
+    tun_recovery: Option<TunRecovery>,
 }
 
 pub fn http_client() -> Result<Client> {
@@ -291,6 +354,16 @@ enum ReadinessFailure {
 enum HealthCheck {
     Ready,
     NeedsRestart,
+}
+
+fn observation_failure(failure: ReadinessFailure) -> ReadinessFailure {
+    match failure {
+        ReadinessFailure::Temporary(mut error) if error.code == "core_readiness_unavailable" => {
+            error.code = "core_observation_busy".into();
+            ReadinessFailure::Temporary(error)
+        }
+        failure => failure,
+    }
 }
 
 fn verify_managed_identity(
@@ -340,6 +413,17 @@ fn read_managed_json(
     deadline: Instant,
     method: reqwest::Method,
 ) -> std::result::Result<serde_json::Value, ReadinessFailure> {
+    read_managed_json_body(client, controller, endpoint, deadline, method, None)
+}
+
+fn read_managed_json_body(
+    client: &Client,
+    controller: &Controller,
+    endpoint: &str,
+    deadline: Instant,
+    method: reqwest::Method,
+    body: Option<&serde_json::Value>,
+) -> std::result::Result<serde_json::Value, ReadinessFailure> {
     let temporary = |reason: String| {
         ReadinessFailure::Temporary(AppError::new(
             "core_readiness_unavailable",
@@ -349,25 +433,29 @@ fn read_managed_json(
     let timeout = remaining(deadline)
         .map_err(|_| temporary("已到本次操作截止时间".into()))?
         .min(CONTROL_TIMEOUT);
-    let response = client
+    let request = client
         .request(method, format!("{}{endpoint}", controller.url))
         .timeout(timeout)
-        .bearer_auth(&controller.secret)
-        .send()
-        .map_err(|error| {
-            // reqwest's formatted errors may include URLs. Keep only a fixed
-            // category; never copy response bodies or controller secrets.
-            temporary(
-                if error.is_timeout() {
-                    "本地请求超时"
-                } else if error.is_connect() {
-                    "本地连接尚未建立或已被拒绝"
-                } else {
-                    "本地连接中断"
-                }
-                .into(),
-            )
-        })?;
+        .bearer_auth(&controller.secret);
+    let request = if let Some(body) = body {
+        request.json(body)
+    } else {
+        request
+    };
+    let response = request.send().map_err(|error| {
+        // reqwest's formatted errors may include URLs. Keep only a fixed
+        // category; never copy response bodies or controller secrets.
+        temporary(
+            if error.is_timeout() {
+                "本地请求超时"
+            } else if error.is_connect() {
+                "本地连接尚未建立或已被拒绝"
+            } else {
+                "本地连接中断"
+            }
+            .into(),
+        )
+    })?;
     let status = response.status();
     if matches!(status.as_u16(), 401 | 403) {
         return Err(ReadinessFailure::Fatal(AppError::new(
@@ -375,7 +463,8 @@ fn read_managed_json(
             format!("就绪检查 {endpoint}：本地控制接口鉴权失败（HTTP {status}）"),
         )));
     }
-    if matches!(endpoint, "/desktop/health" | "/desktop/recover")
+    if (matches!(endpoint, "/desktop/health" | "/desktop/recover")
+        || endpoint.starts_with("/desktop/recovery"))
         && matches!(status.as_u16(), 409 | 503)
     {
         return Err(ReadinessFailure::Temporary(AppError::new(
@@ -464,6 +553,7 @@ impl CoreSupervisor {
             home,
             logs,
             child: None,
+            validation_child: None,
             #[cfg(windows)]
             job: None,
             controller: None,
@@ -486,7 +576,22 @@ impl CoreSupervisor {
             error_code: None,
             exit_code: None,
             tun_health: None,
+            control_state: "unknown".into(),
+            listeners_ready: None,
+            observed_at: observed_now(),
+            cancellation: None,
+            tun_recovery: None,
         }
+    }
+
+    pub fn set_cancellation(&mut self, cancellation: Cancellation) {
+        self.cancellation = Some(cancellation);
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        self.cancellation
+            .as_ref()
+            .map_or(Ok(()), Cancellation::check)
     }
 
     pub fn status(&self) -> CoreStatus {
@@ -500,22 +605,50 @@ impl CoreSupervisor {
             version: self.version.clone(),
             error: self.error.clone(),
             restart_count: self.restarts.len(),
-            lifecycle_api: 1,
+            lifecycle_api: 2,
             desired_running: self.desired_running,
             recovering: self.recovery.is_some()
                 || self.desired_running && self.restart_at.is_some(),
             recovery_generation: self.recovery_generation,
             stop_reason: self.stop_reason,
             error_code: self.error_code.clone(),
-            pid: self.child.as_ref().map(Child::id),
+            pid: self
+                .child
+                .as_ref()
+                .or(self.validation_child.as_ref())
+                .map(Child::id),
             exit_code: self.exit_code,
             tun_health: self.tun_health.clone(),
+            process_state: if self.termination_unconfirmed {
+                "unknown"
+            } else if self.child.is_some() {
+                "alive"
+            } else {
+                "exited"
+            }
+            .into(),
+            control_state: self.control_state.clone(),
+            listeners_ready: self.listeners_ready,
+            operation: if self.termination_unconfirmed {
+                Some("stopping".into())
+            } else if self.tun_recovery.is_some()
+                || self.error_code.as_deref() == Some("tun_recovery_pending")
+            {
+                Some("recovering_tun".into())
+            } else {
+                None
+            },
+            observed_at: self.observed_at,
+            intent_revision: self.cancellation.as_ref().map_or(0, Cancellation::revision),
+            ..CoreStatus::default()
         }
     }
 
     pub fn start(&mut self, source: String, tun: bool) -> Result<CoreStatus> {
+        self.check_cancelled()?;
         let budget = OperationBudget::new(&source)?;
         self.stop()?;
+        self.check_cancelled()?;
         self.source = Some(source);
         self.tun = tun;
         self.restarts.clear();
@@ -554,16 +687,29 @@ impl CoreSupervisor {
     fn spawn_with_budget(&mut self, budget: &OperationBudget) -> Result<()> {
         let result = self.launch(budget);
         if result.is_err() {
-            let cleanup = self.terminate_child_until(budget.cleanup_deadline());
-            self.controller = None;
-            if let Err(error) = cleanup {
-                return Err(error);
+            if self.validation_child.is_some() && self.termination_unconfirmed {
+                // Validation already consumed its cleanup allowance and retained
+                // the unresolved handle. Do not silently grant another budget.
+                return result;
             }
+            let cleanup = self.terminate_child_until(self.operation_cleanup_deadline(budget));
+            self.controller = None;
+            cleanup?;
         }
         result
     }
 
+    fn operation_cleanup_deadline(&self, budget: &OperationBudget) -> Instant {
+        let deadline = budget.cleanup_deadline();
+        if self.check_cancelled().is_err() {
+            deadline.min(Instant::now() + Duration::from_secs(2))
+        } else {
+            deadline
+        }
+    }
+
     fn launch(&mut self, budget: &OperationBudget) -> Result<()> {
+        self.check_cancelled()?;
         fs::create_dir_all(&self.home).map_err(|e| AppError::io("无法创建运行目录", e))?;
         fs::create_dir_all(&self.logs).map_err(|e| AppError::io("无法创建日志目录", e))?;
         let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -588,6 +734,7 @@ impl CoreSupervisor {
         self.rotate_log()?;
         self.log_start = fs::metadata(self.logs.join("core.log")).map_or(0, |file| file.len());
         self.validate(&controller, budget)?;
+        self.check_cancelled()?;
         let stdout = self.open_log()?;
         let stderr = stdout
             .try_clone()
@@ -610,7 +757,9 @@ impl CoreSupervisor {
             )?);
         }
         self.controller = Some(controller.clone());
+        self.check_cancelled()?;
         self.wait_ready(&controller, &source, budget.work_deadline())?;
+        self.check_cancelled()?;
         if let Ok(timeout) = remaining(budget.work_deadline()) {
             self.version = http_client()?
                 .get(format!("{}/version", controller.url))
@@ -632,6 +781,9 @@ impl CoreSupervisor {
         self.health_deferred = false;
         self.recovery = None;
         self.last_health_check = lifecycle::awake_now()?;
+        self.control_state = "ready".into();
+        self.listeners_ready = Some(true);
+        self.observed_at = observed_now();
         crate::diagnostics::record(
             &self.logs,
             "core_ready",
@@ -694,6 +846,7 @@ impl CoreSupervisor {
         let expected = config::parse(source)?;
         let mut last_failure = None;
         while remaining(deadline).is_ok() {
+            self.check_cancelled()?;
             if let Some(exit) = self
                 .child
                 .as_mut()
@@ -787,7 +940,14 @@ impl CoreSupervisor {
         command
     }
 
-    fn validate(&self, controller: &Controller, budget: &OperationBudget) -> Result<()> {
+    fn validate(&mut self, controller: &Controller, budget: &OperationBudget) -> Result<()> {
+        self.check_cancelled()?;
+        if self.validation_child.is_some() {
+            return Err(AppError::new(
+                "core_termination_unconfirmed",
+                "上次配置校验进程退出尚未确认，不能启动新的校验进程",
+            ));
+        }
         let mut child = self
             .command(controller, budget.resource_remaining()?)
             .arg("-t")
@@ -804,16 +964,20 @@ impl CoreSupervisor {
         let job = match crate::windows::create_kill_job(&child) {
             Ok(job) => job,
             Err(error) => {
-                let deadline = budget.cleanup_deadline();
+                let deadline = self.operation_cleanup_deadline(budget);
                 let kill_error = child.kill().err();
                 let cleanup = confirm_process_exit(&mut child, deadline, kill_error);
                 let _ = finish_diagnostics(stdout, deadline);
                 let _ = finish_diagnostics(stderr, deadline);
-                cleanup?;
+                if let Err(cleanup) = cleanup {
+                    self.retain_validation_child(child, &cleanup);
+                    return Err(cleanup);
+                }
                 return Err(error);
             }
         };
         let result = (|| loop {
+            self.check_cancelled()?;
             if let Some(status) = child
                 .try_wait()
                 .map_err(|e| AppError::io("无法读取配置校验结果", e))?
@@ -836,21 +1000,34 @@ impl CoreSupervisor {
         // extend the shared operation deadline indefinitely.
         #[cfg(windows)]
         drop(job);
-        let deadline = budget.cleanup_deadline();
+        let deadline = self.operation_cleanup_deadline(budget);
         let cleanup = confirm_process_exit(&mut child, deadline, kill_error);
         let stdout = finish_diagnostics(stdout, deadline);
         let stderr = finish_diagnostics(stderr, deadline);
-        cleanup?;
+        if let Err(error) = cleanup {
+            self.retain_validation_child(child, &error);
+            return Err(error);
+        }
         let output = [stdout?, stderr?].join("\n");
         let summary = collect_diagnostics(output.as_bytes());
         self.log_diagnostic(&summary);
         result.map_err(|mut error| {
             if let Some(last) = summary.lines().last() {
-                error.message.push_str("：");
+                error.message.push('：');
                 error.message.push_str(last);
             }
             error
         })
+    }
+
+    fn retain_validation_child(&mut self, child: Child, error: &AppError) {
+        self.validation_child = Some(child);
+        self.termination_unconfirmed = true;
+        self.desired_running = false;
+        self.restart_at = None;
+        self.error = Some(error.message.clone());
+        self.error_code = Some("core_termination_unconfirmed".into());
+        self.observed_at = observed_now();
     }
 
     fn verify_listeners(
@@ -885,6 +1062,14 @@ impl CoreSupervisor {
                 )));
             }
         }
+        if let Some(enabled) = actual["tun"]["enable"].as_bool() {
+            if enabled != self.tun {
+                return Err(ReadinessFailure::Temporary(AppError::new(
+                    "tun_not_ready",
+                    "TUN 实际设备尚未就绪",
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -895,8 +1080,21 @@ impl CoreSupervisor {
         resource_deadline: Instant,
         completion_deadline: Instant,
     ) -> Result<()> {
+        self.check_cancelled()?;
         let resource_remaining = remaining(resource_deadline)?;
-        let response = http_client()?
+        // One local request future remains owned by this operation. Polling it
+        // in short slices lets Stop drop the transport immediately, instead of
+        // waiting for the resource budget or leaving a detached HTTP worker.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| AppError::new("http_init_failed", "无法初始化可取消的本地控制连接"))?;
+        let _entered = runtime.enter();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|_| AppError::new("http_init_failed", "无法初始化本地控制连接"))?;
+        let request = client
             .put(format!("{}/configs?force=true", controller.url))
             .query(&[(
                 "resource-bootstrap-timeout",
@@ -905,15 +1103,40 @@ impl CoreSupervisor {
             .timeout(remaining(completion_deadline)?)
             .bearer_auth(&controller.secret)
             .json(&serde_json::json!({"path": self.home.join("config.yaml").display().to_string()}))
-            .send()
-            .map_err(|_| AppError::new("reload_failed", "运行配置重载超时或连接失败"))?;
-        if !response.status().is_success() {
+            .send();
+        let mut request = Box::pin(async {
+            let mut response = request.await?;
+            let status = response.status();
+            let mut bytes = Vec::new();
+            if !status.is_success() {
+                while let Some(chunk) = response.chunk().await? {
+                    let remaining = (MAX_DIAGNOSTIC_BYTES + 1).saturating_sub(bytes.len());
+                    bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    if bytes.len() > MAX_DIAGNOSTIC_BYTES {
+                        break;
+                    }
+                }
+            }
+            Ok::<_, reqwest::Error>((status, bytes))
+        });
+        let (status, bytes) = loop {
+            self.check_cancelled()?;
+            remaining(completion_deadline)?;
+            match runtime.block_on(async {
+                tokio::time::timeout(Duration::from_millis(50), &mut request).await
+            }) {
+                Ok(result) => {
+                    break result.map_err(|_| {
+                        AppError::new("reload_failed", "运行配置重载超时或连接失败")
+                    })?
+                }
+                Err(_) => continue,
+            }
+        };
+        self.check_cancelled()?;
+        if !status.is_success() {
             // Error bodies are not trusted as display text: YAML and subscription
             // failures elsewhere in the core may contain secrets or full URLs.
-            let mut bytes = Vec::new();
-            let _ = response
-                .take((MAX_DIAGNOSTIC_BYTES + 1) as u64)
-                .read_to_end(&mut bytes);
             let diagnostic = serde_json::from_slice::<serde_json::Value>(&bytes)
                 .ok()
                 .and_then(|body| {
@@ -936,6 +1159,7 @@ impl CoreSupervisor {
     }
 
     pub fn reload(&mut self, source: String) -> Result<CoreStatus> {
+        self.check_cancelled()?;
         let budget = OperationBudget::new(&source)?;
         self.log_start = fs::metadata(self.logs.join("core.log")).map_or(0, |file| file.len());
         if self.child.is_none() {
@@ -967,6 +1191,12 @@ impl CoreSupervisor {
             budget.resources,
             budget.work_deadline(),
         ) {
+            if error.code == "operation_cancelled" {
+                // A cancelled PUT may already be executing in the core. Do not
+                // race it with rollback; confirmed process exit is the barrier.
+                self.stop_for(StopReason::UserStop)?;
+                return Err(error);
+            }
             let rollback_deadline = Instant::now()
                 .checked_add(RECOVERY_RESERVE - CLEANUP_RESERVE)
                 .unwrap_or(budget.work_deadline())
@@ -1007,6 +1237,7 @@ impl CoreSupervisor {
         }
         self.source = Some(source);
         self.error = None;
+        self.observed_at = observed_now();
         Ok(self.status())
     }
 
@@ -1036,32 +1267,74 @@ impl CoreSupervisor {
         reconcile: bool,
     ) -> std::result::Result<HealthCheck, ReadinessFailure> {
         let fatal = |code, message| ReadinessFailure::Fatal(AppError::new(code, message));
+        self.check_cancelled().map_err(ReadinessFailure::Fatal)?;
         let controller = self
             .controller
             .clone()
             .ok_or_else(|| fatal("core_controller_missing", "缺少自有内核控制连接"))?;
         let client = http_client().map_err(ReadinessFailure::Fatal)?;
-        // A local observation is bounded as a whole. It never opens an Internet
-        // connection or borrows another resource/bootstrap operation budget.
         let deadline = Instant::now() + CONTROL_TIMEOUT * 3;
         let info = read_readiness_json(&client, &controller, "/desktop", deadline)?;
         let pid = self.child.as_ref().map(Child::id);
         verify_managed_identity(&info, pid)?;
+        self.control_state = "ready".into();
+        self.check_cancelled().map_err(ReadinessFailure::Fatal)?;
         let expected = config::parse(self.source.as_deref().unwrap_or_default())
             .map_err(ReadinessFailure::Fatal)?;
-        self.verify_listeners(&client, &controller, &expected, deadline)?;
         let capabilities = &info["capabilities"];
         if capabilities["tun_health"].as_bool() != Some(true) {
             self.tun_health = self.tun.then(|| "unsupported".into());
+            self.verify_health_listeners(&client, &controller, &expected, deadline)?;
             return Ok(HealthCheck::Ready);
         }
-        let health = read_readiness_json(&client, &controller, "/desktop/health", deadline)?;
+        // Observe the owned operation before listener configuration. A repair
+        // can legitimately close the device while /desktop remains responsive.
+        let health = read_readiness_json(&client, &controller, "/desktop/health", deadline)
+            .map_err(observation_failure)?;
         verify_managed_identity(&health, pid)?;
+        self.check_cancelled().map_err(ReadinessFailure::Fatal)?;
+        let recovery = &health["recovery"];
+        let recovery_current = recovery.is_object()
+            && recovery["core_instance"].as_str().is_some()
+            && recovery["core_instance"] == health["core_instance"]
+            && health["core_instance"] == info["core_instance"]
+            && recovery["config_generation"].as_u64().is_some()
+            && recovery["config_generation"] == health["config_generation"];
+        if recovery.is_object() && !recovery_current {
+            return Err(fatal(
+                "core_controller_incompatible",
+                "TUN 恢复快照所属实例或配置不匹配",
+            ));
+        }
+        if recovery_current
+            && recovery["phase"].as_str() == Some("running")
+            && recovery["status"].as_str() == Some("running")
+        {
+            self.control_state = "busy".into();
+            self.tun_health = Some("unavailable".into());
+            return Err(ReadinessFailure::Temporary(AppError::new(
+                "tun_recovery_pending",
+                "正在恢复自有 TUN，内核进程继续运行",
+            )));
+        }
+        if recovery_current
+            && recovery["phase"].as_str() == Some("failed")
+            && recovery["status"].as_str() == Some("needs_restart")
+        {
+            self.tun_health = Some("degraded".into());
+            return Ok(HealthCheck::NeedsRestart);
+        }
+        if health["stale"].as_bool() == Some(true) {
+            return Err(ReadinessFailure::Temporary(AppError::new(
+                "tun_health_unavailable",
+                "TUN 状态快照待刷新，保留内核并继续检查",
+            )));
+        }
         let state = health["tun"]["state"].as_str().unwrap_or("invalid");
         if health["tun"]["enabled"].as_bool() != Some(self.tun) {
             return Err(fatal(
                 "tun_configuration_mismatch",
-                "TUN 实际启用状态与自有运行模式不一致",
+                "TUN 运行意图与自有运行模式不一致",
             ));
         }
         self.tun_health = Some(state.into());
@@ -1081,7 +1354,15 @@ impl CoreSupervisor {
             "disabled" if self.tun => {
                 return Err(fatal("tun_not_enabled", "托管 TUN 未启用，请检查运行配置"))
             }
-            "disabled" | "healthy" | "degraded" => {}
+            "disabled" | "healthy"
+                if !reconcile
+                    || capabilities["tun_recovery_operations"].as_bool() == Some(true) =>
+            {
+                self.tun_recovery = None;
+                self.verify_health_listeners(&client, &controller, &expected, deadline)?;
+                return Ok(HealthCheck::Ready);
+            }
+            "disabled" | "healthy" | "degraded" => (),
             _ => {
                 return Err(fatal(
                     "core_controller_incompatible",
@@ -1095,49 +1376,51 @@ impl CoreSupervisor {
                 "TUN 状态异常且无法安全自动修复",
             ));
         }
-        if !reconcile && state != "degraded" {
-            return Ok(HealthCheck::Ready);
-        }
         if capabilities["tun_repair"].as_bool() != Some(true) {
-            return if state == "degraded" {
-                Err(fatal(
-                    "tun_repair_unsupported",
-                    "配套内核不支持安全修复 TUN",
-                ))
-            } else {
-                Ok(HealthCheck::Ready)
-            };
-        }
-        // The paired core serializes repair and only touches its owned resources.
-        // On a healthy resume this also invalidates/requeues background LAN work.
-        let recovered = read_managed_json(
-            &client,
-            &controller,
-            "/desktop/recover",
-            deadline,
-            reqwest::Method::POST,
-        )?;
-        if recovered["pid"].as_u64() != pid.map(u64::from) {
             return Err(fatal(
-                "core_controller_identity",
-                "恢复结果的进程与自有内核不一致",
+                "tun_repair_unsupported",
+                "配套内核不支持安全修复 TUN",
             ));
         }
+        self.check_cancelled().map_err(ReadinessFailure::Fatal)?;
+        let recovered = if capabilities["tun_recovery_operations"].as_bool() == Some(true) {
+            self.read_tun_recovery(&client, &controller, &health, deadline)
+                .map_err(observation_failure)?
+        } else {
+            let recovered = read_managed_json(
+                &client,
+                &controller,
+                "/desktop/recover",
+                deadline,
+                reqwest::Method::POST,
+            )
+            .map_err(observation_failure)?;
+            if recovered["pid"].as_u64() != pid.map(u64::from) {
+                return Err(fatal(
+                    "core_controller_identity",
+                    "恢复结果的进程与自有内核不一致",
+                ));
+            }
+            recovered
+        };
         match recovered["status"].as_str() {
+            Some("running") => {
+                self.control_state = "busy".into();
+                Err(ReadinessFailure::Temporary(AppError::new(
+                    "tun_recovery_pending",
+                    "正在恢复自有 TUN，内核进程继续运行",
+                )))
+            }
             Some("healthy" | "repaired") => {
                 self.tun_health = recovered["tun"]["state"].as_str().map(str::to_owned);
-                if !matches!(self.tun_health.as_deref(), Some("healthy" | "disabled")) {
-                    return Err(fatal("tun_recovery_unconfirmed", "TUN 修复结果未确认健康"));
-                }
-                if recovered["tun"]["enabled"].as_bool() != Some(self.tun)
+                if !matches!(self.tun_health.as_deref(), Some("healthy" | "disabled"))
+                    || recovered["tun"]["enabled"].as_bool() != Some(self.tun)
                     || self.tun && self.tun_health.as_deref() != Some("healthy")
                 {
-                    return Err(fatal(
-                        "tun_recovery_unconfirmed",
-                        "TUN 修复后启用状态与运行模式不一致",
-                    ));
+                    return Err(fatal("tun_recovery_unconfirmed", "TUN 修复结果未确认健康"));
                 }
-                self.verify_listeners(&client, &controller, &expected, deadline)?;
+                self.tun_recovery = None;
+                self.verify_health_listeners(&client, &controller, &expected, deadline)?;
                 Ok(HealthCheck::Ready)
             }
             Some("needs_restart") => Ok(HealthCheck::NeedsRestart),
@@ -1146,6 +1429,7 @@ impl CoreSupervisor {
                 "TUN 恢复遇到资源所有权冲突，未接管外部资源",
             )),
             Some("unavailable") => {
+                self.tun_recovery = None;
                 self.tun_health = Some("unavailable".into());
                 Err(ReadinessFailure::Temporary(AppError::new(
                     "tun_recovery_unavailable",
@@ -1157,6 +1441,137 @@ impl CoreSupervisor {
                 "本地内核返回无效恢复结果",
             )),
         }
+    }
+
+    fn verify_health_listeners(
+        &mut self,
+        client: &Client,
+        controller: &Controller,
+        expected: &serde_yaml::Mapping,
+        deadline: Instant,
+    ) -> std::result::Result<(), ReadinessFailure> {
+        self.check_cancelled().map_err(ReadinessFailure::Fatal)?;
+        match self.verify_listeners(client, controller, expected, deadline) {
+            Ok(()) => {
+                self.listeners_ready = Some(true);
+                Ok(())
+            }
+            // A responsive owned /desktop proves the process has not died. A
+            // temporarily busy listener snapshot must not spend restart budget.
+            Err(ReadinessFailure::Temporary(mut error)) => {
+                error.code = "core_observation_busy".into();
+                self.control_state = "busy".into();
+                Err(ReadinessFailure::Temporary(error))
+            }
+            Err(error) => {
+                self.listeners_ready = Some(false);
+                Err(error)
+            }
+        }
+    }
+
+    fn read_tun_recovery(
+        &mut self,
+        client: &Client,
+        controller: &Controller,
+        health: &serde_json::Value,
+        deadline: Instant,
+    ) -> std::result::Result<serde_json::Value, ReadinessFailure> {
+        let invalid = || {
+            ReadinessFailure::Fatal(AppError::new(
+                "core_controller_incompatible",
+                "TUN 恢复操作协议不兼容",
+            ))
+        };
+        let instance = health["core_instance"].as_str().ok_or_else(invalid)?;
+        let config_generation = health["config_generation"].as_u64().ok_or_else(invalid)?;
+        let tun_generation = health["tun_generation"].as_u64().ok_or_else(invalid)?;
+        let same = self.tun_recovery.as_ref().is_some_and(|operation| {
+            operation.core_instance == instance
+                && operation.config_generation == config_generation
+                && operation.tun_generation == tun_generation
+        });
+        if !same {
+            let mut random = [0u8; 16];
+            getrandom::getrandom(&mut random).map_err(|_| invalid())?;
+            self.tun_recovery = Some(TunRecovery {
+                request_id: hex::encode(random),
+                operation_id: None,
+                core_instance: instance.into(),
+                config_generation,
+                tun_generation,
+            });
+        }
+        let operation = self.tun_recovery.as_ref().expect("operation set above");
+        let response = if let Some(id) = &operation.operation_id {
+            if !id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+            {
+                return Err(invalid());
+            }
+            read_readiness_json(
+                client,
+                controller,
+                &format!("/desktop/recovery/{id}"),
+                deadline,
+            )?
+        } else {
+            read_managed_json_body(
+                client,
+                controller,
+                "/desktop/recovery",
+                deadline,
+                reqwest::Method::POST,
+                Some(
+                    &serde_json::json!({"request_id":operation.request_id,"config_generation":config_generation,"tun_generation":tun_generation}),
+                ),
+            )?
+        };
+        let result = response.get("operation").ok_or_else(invalid)?;
+        if result["core_instance"].as_str() != Some(instance)
+            || result["request_id"].as_str() != Some(operation.request_id.as_str())
+            || result["config_generation"].as_u64() != Some(config_generation)
+            || result["tun_generation"].as_u64() != Some(tun_generation)
+            || !matches!(
+                result["phase"].as_str(),
+                Some("running" | "succeeded" | "failed" | "cancelled")
+            )
+        {
+            return Err(invalid());
+        }
+        let id = result["id"].as_str().ok_or_else(invalid)?;
+        if operation
+            .operation_id
+            .as_deref()
+            .is_some_and(|previous| previous != id)
+        {
+            return Err(invalid());
+        }
+        self.tun_recovery
+            .as_mut()
+            .expect("operation set above")
+            .operation_id = Some(id.into());
+        if result["phase"].as_str() == Some("cancelled") {
+            self.tun_recovery = None;
+            return Err(ReadinessFailure::Temporary(AppError::new(
+                "core_executor_busy",
+                "TUN 恢复已被配置更新取消，等待最新状态",
+            )));
+        }
+        if result["phase"].as_str() == Some("running")
+            && result["status"].as_str() != Some("running")
+            || result["phase"].as_str() == Some("succeeded")
+                && !matches!(result["status"].as_str(), Some("healthy" | "repaired"))
+            || result["phase"].as_str() == Some("failed")
+                && !matches!(
+                    result["status"].as_str(),
+                    Some("needs_restart" | "conflict" | "unavailable")
+                )
+        {
+            return Err(invalid());
+        }
+        Ok(result.clone())
     }
 
     fn observe_health(&mut self, now: Duration) -> Result<()> {
@@ -1178,15 +1593,28 @@ impl CoreSupervisor {
             }
             Ok(HealthCheck::NeedsRestart) => {
                 self.schedule_health_restart(AppError::new(
-                    "tun_restart_required",
+                    "tun_recovery_needs_restart",
                     "内核确认 TUN 需要重启，正在恢复",
                 ))?;
             }
             Err(ReadinessFailure::Temporary(error)) => {
+                if error.code == "core_readiness_unavailable" {
+                    self.control_state = "unreachable".into();
+                } else if matches!(
+                    error.code.as_str(),
+                    "core_executor_busy"
+                        | "core_observation_busy"
+                        | "core_not_ready"
+                        | "tun_recovery_pending"
+                ) {
+                    self.control_state = "busy".into();
+                }
                 let observe_only = matches!(
                     error.code.as_str(),
                     "core_executor_busy"
+                        | "core_observation_busy"
                         | "core_not_ready"
+                        | "tun_recovery_pending"
                         | "tun_health_unavailable"
                         | "tun_recovery_unavailable"
                 );
@@ -1226,6 +1654,13 @@ impl CoreSupervisor {
                 }
             }
             Err(ReadinessFailure::Fatal(error)) => {
+                if error.code == "operation_cancelled" {
+                    return Err(error);
+                }
+                if error.code.starts_with("core_controller_") {
+                    self.control_state = "unreachable".into();
+                    self.controller = None;
+                }
                 crate::diagnostics::record(
                     &self.logs,
                     "core_health_blocked",
@@ -1245,6 +1680,7 @@ impl CoreSupervisor {
         // stop_for confirms this owned process has exited before a later poll
         // may spawn. The intervening user Stop cancels the pending recovery.
         self.stop_for(StopReason::HealthFailure)?;
+        self.check_cancelled()?;
         self.desired_running = true;
         self.error_code = Some(error.code);
         self.error = Some(error.message);
@@ -1253,6 +1689,19 @@ impl CoreSupervisor {
     }
 
     pub fn poll(&mut self) -> Result<CoreStatus> {
+        self.check_cancelled()?;
+        if let Some(validation) = self.validation_child.as_mut() {
+            if validation
+                .try_wait()
+                .map_err(|error| AppError::io("无法确认配置校验进程退出", error))?
+                .is_some()
+            {
+                self.validation_child = None;
+                if self.child.is_none() {
+                    self.termination_unconfirmed = false;
+                }
+            }
+        }
         if let Some(child) = self.child.as_mut() {
             if let Some(exit) = child
                 .try_wait()
@@ -1266,7 +1715,7 @@ impl CoreSupervisor {
                 );
                 self.child = None;
                 self.controller = None;
-                self.termination_unconfirmed = false;
+                self.termination_unconfirmed = self.validation_child.is_some();
                 #[cfg(windows)]
                 {
                     self.job = None;
@@ -1333,6 +1782,7 @@ impl CoreSupervisor {
                 self.observe_health(now)?;
             }
         }
+        self.observed_at = observed_now();
         Ok(self.status())
     }
 
@@ -1341,6 +1791,7 @@ impl CoreSupervisor {
     }
 
     pub fn stop_for(&mut self, reason: StopReason) -> Result<()> {
+        let deadline = Instant::now() + TOTAL_STOP_TIMEOUT;
         crate::diagnostics::record(
             &self.logs,
             "core_stop",
@@ -1352,17 +1803,19 @@ impl CoreSupervisor {
         self.recovery = None;
         self.health_blocked = false;
         self.health_deferred = false;
+        self.tun_recovery = None;
         if self.child.is_some() {
             if let Some(controller) = &self.controller {
                 if let Ok(client) = http_client() {
                     let _ = client
                         .post(format!("{}/desktop/shutdown", controller.url))
                         .bearer_auth(&controller.secret)
+                        .timeout(remaining(deadline)?.min(CONTROL_TIMEOUT))
                         .send();
                 }
             }
-            let stop_started = Instant::now();
-            while stop_started.elapsed() < STOP_TIMEOUT {
+            let graceful_deadline = (Instant::now() + Duration::from_secs(4)).min(deadline);
+            while Instant::now() < graceful_deadline {
                 let exited = self
                     .child
                     .as_mut()
@@ -1376,10 +1829,19 @@ impl CoreSupervisor {
                 }
                 thread::sleep(Duration::from_millis(75));
             }
-            self.terminate_child()?;
+            self.terminate_child_until(deadline)?;
+        }
+        if self.validation_child.is_some() {
+            self.terminate_child_until(deadline)?;
         }
         self.controller = None;
         self.version = None;
+        self.control_state = "unknown".into();
+        self.listeners_ready = Some(false);
+        self.error = None;
+        self.error_code = None;
+        self.tun_health = Some("disabled".into());
+        self.observed_at = observed_now();
         #[cfg(windows)]
         {
             self.job = None;
@@ -1387,30 +1849,46 @@ impl CoreSupervisor {
         Ok(())
     }
 
+    #[cfg(test)]
     fn terminate_child(&mut self) -> Result<()> {
         self.terminate_child_until(Instant::now() + CLEANUP_RESERVE)
     }
 
     fn terminate_child_until(&mut self, deadline: Instant) -> Result<()> {
         let kill_error = self.child.as_mut().and_then(|child| child.kill().err());
+        let validation_kill_error = self
+            .validation_child
+            .as_mut()
+            .and_then(|child| child.kill().err());
         #[cfg(windows)]
         {
             self.job = None;
         }
-        if let Some(child) = self.child.as_mut() {
-            if let Err(error) = confirm_process_exit(child, deadline, kill_error) {
-                // Keep the owned process handle so a later poll/stop can still
-                // confirm its exit. In particular, do not report it as stopped.
-                self.termination_unconfirmed = true;
-                self.desired_running = false;
-                self.restart_at = None;
-                self.controller = None;
-                self.version = None;
-                self.error = Some(error.message.clone());
-                return Err(error);
+        let result = (|| {
+            if let Some(validation) = self.validation_child.as_mut() {
+                confirm_process_exit(validation, deadline, validation_kill_error)?;
+                self.validation_child = None;
             }
+            if let Some(child) = self.child.as_mut() {
+                confirm_process_exit(child, deadline, kill_error)?;
+            }
+            self.child = None;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // Keep every unresolved owned handle. A later observation or Stop
+            // can confirm exit; no validator or main process may replace it.
+            let error: AppError = error;
+            self.termination_unconfirmed = true;
+            self.desired_running = false;
+            self.restart_at = None;
+            self.controller = None;
+            self.version = None;
+            self.error = Some(error.message.clone());
+            self.error_code = Some("core_termination_unconfirmed".into());
+            self.observed_at = observed_now();
+            return Err(error);
         }
-        self.child = None;
         self.termination_unconfirmed = false;
         Ok(())
     }
@@ -1422,6 +1900,9 @@ impl Drop for CoreSupervisor {
             // The operation already used its cleanup allowance. Releasing the
             // owner must not silently start another stop/cleanup deadline.
             if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+            }
+            if let Some(child) = self.validation_child.as_mut() {
                 let _ = child.kill();
             }
             #[cfg(windows)]
@@ -1462,6 +1943,15 @@ mod tests {
         HealthNeedsRestart,
         HealthWrongRecoveryPid,
         HealthDisabledAfterRepair,
+        AsyncHealthy,
+        AsyncPending,
+        AsyncLostReply,
+        AsyncFailed,
+        AsyncWrongTarget,
+        AsyncWrongInstance,
+        LongApply,
+        HealthDisconnect,
+        AsyncLostAlways,
     }
 
     struct ReadinessFixture {
@@ -1470,6 +1960,7 @@ mod tests {
         source: String,
         config_reads: Arc<AtomicUsize>,
         recovery_reads: Arc<AtomicUsize>,
+        recovery_requests: Arc<std::sync::Mutex<Vec<String>>>,
         health_busy: Arc<AtomicBool>,
         health_unavailable: Arc<AtomicBool>,
         finished: Arc<AtomicBool>,
@@ -1527,6 +2018,14 @@ mod tests {
                     | ReadinessScenario::HealthNeedsRestart
                     | ReadinessScenario::HealthWrongRecoveryPid
                     | ReadinessScenario::HealthDisabledAfterRepair
+                    | ReadinessScenario::AsyncHealthy
+                    | ReadinessScenario::AsyncPending
+                    | ReadinessScenario::AsyncLostReply
+                    | ReadinessScenario::AsyncFailed
+                    | ReadinessScenario::AsyncWrongTarget
+                    | ReadinessScenario::AsyncWrongInstance
+                    | ReadinessScenario::HealthDisconnect
+                    | ReadinessScenario::AsyncLostAlways
             );
             core.tun = health_enabled;
             core.desired_running = true;
@@ -1547,6 +2046,18 @@ mod tests {
             let finished = Arc::new(AtomicBool::new(false));
             let config_reads = Arc::new(AtomicUsize::new(0));
             let recovery_reads = Arc::new(AtomicUsize::new(0));
+            let recovery_requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let request_ids = recovery_requests.clone();
+            let async_recovery = matches!(
+                scenario,
+                ReadinessScenario::AsyncHealthy
+                    | ReadinessScenario::AsyncPending
+                    | ReadinessScenario::AsyncLostReply
+                    | ReadinessScenario::AsyncFailed
+                    | ReadinessScenario::AsyncWrongTarget
+                    | ReadinessScenario::AsyncWrongInstance
+                    | ReadinessScenario::AsyncLostAlways
+            );
             let health_busy = Arc::new(AtomicBool::new(matches!(
                 scenario,
                 ReadinessScenario::HealthBusyUntilReleased
@@ -1598,8 +2109,11 @@ mod tests {
                         } else {
                             1
                         };
-                        (200, serde_json::json!({"managed":true,"api_version":api,"state":"running","pid":reported_pid,"capabilities":{"tun_health":health_enabled,"tun_repair":health_enabled}}).to_string())
+                        (200, serde_json::json!({"managed":true,"api_version":api,"state":"running","pid":reported_pid,"core_instance":"fixture-instance","capabilities":{"tun_health":health_enabled,"tun_repair":health_enabled,"tun_recovery_operations":async_recovery}}).to_string())
                     } else if request.starts_with("get /desktop/health ") {
+                        if matches!(scenario, ReadinessScenario::HealthDisconnect) {
+                            continue;
+                        }
                         assert!(
                             health_enabled,
                             "legacy core must not receive a health request"
@@ -1611,15 +2125,62 @@ mod tests {
                                 ReadinessScenario::HealthConflict => "conflict",
                                 ReadinessScenario::HealthDegraded
                                 | ReadinessScenario::HealthNeedsRestart
-                                | ReadinessScenario::HealthDisabledAfterRepair => "degraded",
+                                | ReadinessScenario::HealthDisabledAfterRepair
+                                | ReadinessScenario::AsyncLostReply
+                                | ReadinessScenario::AsyncFailed
+                                | ReadinessScenario::AsyncWrongTarget
+                                | ReadinessScenario::AsyncLostAlways => "degraded",
+                                ReadinessScenario::AsyncPending => "unavailable",
                                 _ => "healthy",
                             }
                         };
                         if busy.load(Ordering::SeqCst) {
                             (503, "{}".into())
                         } else {
-                            (200, serde_json::json!({"managed":true,"api_version":1,"state":"running","pid":pid,"tun":{"enabled":true,"state":state,"repairable":state=="degraded"}}).to_string())
+                            let recovery = if matches!(
+                                scenario,
+                                ReadinessScenario::AsyncPending
+                                    | ReadinessScenario::AsyncFailed
+                                    | ReadinessScenario::AsyncWrongInstance
+                            ) {
+                                let pending = matches!(scenario, ReadinessScenario::AsyncPending);
+                                serde_json::json!({"id":"op1","request_id":"request1","core_instance":if matches!(scenario, ReadinessScenario::AsyncWrongInstance) { "foreign-instance" } else { "fixture-instance" },"config_generation":1,"tun_generation":1,"phase":if pending {"running"} else {"failed"},"status":if pending {"running"} else {"needs_restart"}})
+                            } else {
+                                serde_json::Value::Null
+                            };
+                            (200, serde_json::json!({"managed":true,"api_version":1,"state":"running","pid":pid,"core_instance":"fixture-instance","config_generation":1,"tun_generation":1,"recovery":recovery,"stale":false,"tun":{"enabled":true,"state":state,"repairable":state=="degraded"}}).to_string())
                         }
+                    } else if request.starts_with("post /desktop/recovery ") {
+                        let length = request
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length:")
+                                    .and_then(|length| length.trim().parse::<usize>().ok())
+                            })
+                            .unwrap();
+                        let mut bytes = vec![0; length];
+                        stream.read_exact(&mut bytes).unwrap();
+                        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        let request_id = body["request_id"].as_str().unwrap().to_string();
+                        request_ids.lock().unwrap().push(request_id.clone());
+                        let attempt = recoveries.fetch_add(1, Ordering::SeqCst);
+                        if matches!(scenario, ReadinessScenario::AsyncLostAlways)
+                            || matches!(scenario, ReadinessScenario::AsyncLostReply) && attempt == 0
+                        {
+                            continue;
+                        }
+                        (202, serde_json::json!({"operation":{"id":"op1","request_id":request_id,"core_instance":"fixture-instance","config_generation":if matches!(scenario, ReadinessScenario::AsyncWrongTarget) { 99 } else {1},"tun_generation":1,"phase":"running","status":"running"}}).to_string())
+                    } else if request.starts_with("get /desktop/recovery/op1 ") {
+                        let request_id = request_ids.lock().unwrap().last().unwrap().clone();
+                        (200, serde_json::json!({"operation":{"id":"op1","request_id":request_id,"core_instance":"fixture-instance","config_generation":1,"tun_generation":1,"phase":"succeeded","status":"repaired","tun":{"enabled":true,"state":"healthy","repairable":false}}}).to_string())
+                    } else if request.starts_with("put /configs?")
+                        && matches!(scenario, ReadinessScenario::LongApply)
+                    {
+                        let until = Instant::now() + Duration::from_secs(5);
+                        while !stop.load(Ordering::Acquire) && Instant::now() < until {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        (200, "{}".into())
                     } else if request.starts_with("post /desktop/recover ") {
                         assert!(
                             health_enabled,
@@ -1688,6 +2249,7 @@ mod tests {
                 source: format!("mixed-port: {requested_port}\n"),
                 config_reads,
                 recovery_reads,
+                recovery_requests,
                 health_busy,
                 health_unavailable,
                 finished,
@@ -1776,6 +2338,221 @@ mod tests {
         fixture.wait(Duration::from_secs(2)).unwrap();
         assert_eq!(fixture.config_reads.load(Ordering::SeqCst), 2);
         assert_eq!(fixture.core.child.as_ref().unwrap().id(), original_pid);
+    }
+
+    #[test]
+    fn unconfirmed_validation_ownership_blocks_replacement_until_stop_reaps_it() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthHealthy);
+        let child = fixture.core.child.take().unwrap();
+        let pid = child.id();
+        fixture.core.retain_validation_child(
+            child,
+            &AppError::new(
+                "core_termination_unconfirmed",
+                "fixture confirmation failure",
+            ),
+        );
+        let budget = OperationBudget::new(&fixture.source).unwrap();
+        let error = fixture
+            .core
+            .validate(&fixture.controller, &budget)
+            .unwrap_err();
+        assert_eq!(error.code, "core_termination_unconfirmed");
+        assert_eq!(fixture.core.status().pid, Some(pid));
+        assert_eq!(fixture.core.status().process_state, "unknown");
+        fixture.core.stop().unwrap();
+        assert!(fixture.core.validation_child.is_none());
+        assert!(!fixture.core.termination_unconfirmed);
+        assert!(fixture.core.status().pid.is_none());
+    }
+
+    #[test]
+    fn health_and_recovery_transport_uncertainty_after_identity_stays_observation_only() {
+        for scenario in [
+            ReadinessScenario::HealthDisconnect,
+            ReadinessScenario::AsyncLostAlways,
+        ] {
+            let mut fixture = ReadinessFixture::new(scenario);
+            let pid = fixture.core.child.as_ref().unwrap().id();
+            for now in [1, 2, 3] {
+                fixture
+                    .core
+                    .observe_health(Duration::from_secs(now))
+                    .unwrap();
+            }
+            assert_eq!(fixture.core.status().pid, Some(pid));
+            assert_eq!(
+                fixture.core.error_code.as_deref(),
+                Some("core_observation_busy")
+            );
+            assert!(fixture.core.restart_at.is_none());
+            assert!(fixture.core.restarts.is_empty());
+            let requests = fixture.recovery_requests.lock().unwrap();
+            assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+        }
+    }
+
+    #[test]
+    fn responsive_identity_and_slow_configs_never_spend_restart_budget() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::DisconnectAlways);
+        let pid = fixture.core.child.as_ref().unwrap().id();
+        for now in [1, 2, 3] {
+            fixture
+                .core
+                .observe_health(Duration::from_secs(now))
+                .unwrap();
+        }
+        let status = fixture.core.status();
+        assert_eq!(status.pid, Some(pid));
+        assert_eq!(status.process_state, "alive");
+        assert_eq!(status.error_code.as_deref(), Some("core_observation_busy"));
+        assert!(fixture.core.restart_at.is_none());
+        assert!(fixture.core.restarts.is_empty());
+    }
+
+    #[test]
+    fn persistent_local_identity_transport_failure_schedules_one_bounded_restart() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthHealthy);
+        let unused = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        fixture.core.controller = Some(Controller {
+            url: format!("http://{}", unused.local_addr().unwrap()),
+            secret: "unused".into(),
+        });
+        drop(unused);
+        for now in [1, 2, 3] {
+            fixture
+                .core
+                .observe_health(Duration::from_secs(now))
+                .unwrap();
+        }
+        assert!(fixture.core.child.is_none());
+        assert_eq!(fixture.core.stop_reason, Some(StopReason::HealthFailure));
+        assert!(fixture.core.restart_at.is_some());
+        fixture.core.stop().unwrap();
+        fixture.core.request_reconcile(99).unwrap();
+        assert!(!fixture.core.desired_running);
+        assert!(fixture.core.restart_at.is_none());
+    }
+
+    #[test]
+    fn disproved_controller_identity_withdraws_the_control_capability() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::WrongPid);
+        fixture.core.control_state = "ready".into();
+        fixture.core.observe_health(Duration::ZERO).unwrap();
+        assert_eq!(fixture.core.status().control_state, "unreachable");
+        assert!(fixture.core.status().controller.is_none());
+        assert!(fixture.core.child.is_some());
+    }
+
+    #[test]
+    fn operation_capable_healthy_resume_does_not_mutate_tun() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::AsyncHealthy);
+        let pid = fixture.core.child.as_ref().unwrap().id();
+        fixture.core.request_reconcile(7).unwrap();
+        let status = fixture.core.poll().unwrap();
+        assert!(status.running);
+        assert_eq!(status.pid, Some(pid));
+        assert_eq!(fixture.recovery_reads.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn pending_tun_operation_bypasses_configs_without_spending_restart_budget() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::AsyncPending);
+        let pid = fixture.core.child.as_ref().unwrap().id();
+        for now in [1, 2, 21, 31] {
+            fixture
+                .core
+                .observe_health(Duration::from_secs(now))
+                .unwrap();
+        }
+        let status = fixture.core.status();
+        assert_eq!(status.pid, Some(pid));
+        assert_eq!(status.process_state, "alive");
+        assert_eq!(status.operation.as_deref(), Some("recovering_tun"));
+        assert_eq!(fixture.config_reads.load(Ordering::Acquire), 0);
+        assert!(fixture.core.restarts.is_empty());
+        assert!(fixture.core.restart_at.is_none());
+    }
+
+    #[test]
+    fn lost_recovery_acceptance_reuses_request_and_queries_owned_operation() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::AsyncLostReply);
+        let pid = fixture.core.child.as_ref().unwrap().id();
+        assert!(matches!(
+            fixture.core.check_local_health(false),
+            Err(ReadinessFailure::Temporary(_))
+        ));
+        assert!(matches!(
+            fixture.core.check_local_health(false),
+            Err(ReadinessFailure::Temporary(_))
+        ));
+        assert!(matches!(
+            fixture.core.check_local_health(false),
+            Ok(HealthCheck::Ready)
+        ));
+        let requests = fixture.recovery_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0], requests[1],
+            "an uncertain acceptance must retain its idempotency key"
+        );
+        assert_eq!(fixture.core.child.as_ref().unwrap().id(), pid);
+        assert_eq!(fixture.config_reads.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn durable_failed_repair_is_observed_without_reposting_or_masking_failure() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::AsyncFailed);
+        for _ in 0..2 {
+            assert!(matches!(
+                fixture.core.check_local_health(false),
+                Ok(HealthCheck::NeedsRestart)
+            ));
+        }
+        assert_eq!(fixture.recovery_reads.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.config_reads.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn recovery_results_must_belong_to_the_owned_instance_and_target() {
+        for scenario in [
+            ReadinessScenario::AsyncWrongTarget,
+            ReadinessScenario::AsyncWrongInstance,
+        ] {
+            let mut fixture = ReadinessFixture::new(scenario);
+            assert!(matches!(
+                fixture.core.check_local_health(false),
+                Err(ReadinessFailure::Fatal(_))
+            ));
+            assert!(fixture.core.restarts.is_empty());
+        }
+    }
+
+    #[test]
+    fn cancelled_reload_drops_its_transport_without_waiting_for_resource_timeout() {
+        use std::sync::atomic::AtomicU64;
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::LongApply);
+        let revision = Arc::new(AtomicU64::new(1));
+        fixture
+            .core
+            .set_cancellation(Cancellation::new(revision.clone(), 1));
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            revision.store(2, Ordering::Release);
+        });
+        let started = Instant::now();
+        let error = fixture
+            .core
+            .apply_runtime(
+                &fixture.controller,
+                &fixture.source,
+                started + Duration::from_secs(60),
+                started + Duration::from_secs(60),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "operation_cancelled");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        canceller.join().unwrap();
     }
 
     #[test]

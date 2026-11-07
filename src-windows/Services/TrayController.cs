@@ -32,7 +32,8 @@ internal sealed class TrayController : IDisposable
     private readonly Forms.ToolStripMenuItem restoreItem = new();
     private readonly Forms.ToolStripMenuItem exitItem = new();
     private TrayWindow? flyout;
-    private bool commandBusy;
+    private int activeCommands;
+    private bool commandBusy => activeCommands > 0;
     private bool wasOpenAtMouseDown;
     private DateTime lastHidden;
     private DateTime suppressClicksUntil;
@@ -49,7 +50,7 @@ internal sealed class TrayController : IDisposable
         menu.Items.AddRange([stateItem, new Forms.ToolStripSeparator(), openItem, coreItem, restartItem,
             new Forms.ToolStripSeparator(), proxyItem, tunItem, restoreItem, new Forms.ToolStripSeparator(), exitItem]);
         openItem.Click += (_, _) => main.ShowMain();
-        coreItem.Click += async (_, _) => await Run(IsRunning ? "desktop_stop" : "desktop_start");
+        coreItem.Click += async (_, _) => await Run(session.Runtime.StopRequired ? "desktop_stop" : "desktop_start");
         restartItem.Click += async (_, _) => await Run("desktop_restart");
         proxyItem.Click += async (_, _) => await Run("desktop_set_system_proxy", new { enabled = !session.Status.Bool("systemProxy") });
         tunItem.Click += async (_, _) => await ChangeTun(!session.Status.Bool("tun"));
@@ -75,18 +76,18 @@ internal sealed class TrayController : IDisposable
         menu.Opening += (_, _) => { flyout?.HideFlyout(); Refresh(); };
         L.Changed += Refresh; Refresh();
     }
-    private bool IsRunning => session.Status.Text("phase") is "running" or "recovering";
     private async Task Run(string command, object? args = null, bool reportError = true)
     {
-        if (commandBusy) return;
-        commandBusy = true; Refresh();
+        if (commandBusy && command != "desktop_stop") return;
+        activeCommands++; Refresh();
         try { await session.CommandAsync(command, args); }
+        catch (OperationCanceledException) { }
         catch (Exception error) when (reportError)
         {
             if (NotificationSurface is null) main.ShowMain();
             main.RestoreNotifications(); session.Notify(error.Message, true);
         }
-        finally { commandBusy = false; Refresh(); }
+        finally { activeCommands--; Refresh(); }
     }
     private async Task ChangeTun(bool enabled)
     {
@@ -94,27 +95,28 @@ internal sealed class TrayController : IDisposable
         if (enabled && !session.Status.Get("service").Bool("installed"))
         {
             flyout?.HideFlyout(); main.ShowMain();
-            commandBusy = true; Refresh();
+            activeCommands++; Refresh();
             try
             {
                 await TunConsentDialog.Run(main, async () => { await session.CommandAsync("desktop_set_tun", new { enabled }); }, error => session.Notify(error, true),
                     onSuccess: () => session.NotifySuccess("TUN 模式已开启"));
             }
-            finally { commandBusy = false; Refresh(); }
+            finally { activeCommands--; Refresh(); }
             return;
         }
         await Run("desktop_set_tun", new { enabled });
     }
     public void Refresh()
     {
-        string phase = session.Status.Text("phase");
-        bool idle = session.Ready && !session.IsUpdating && session.BusyCommand is null && !commandBusy && phase is not ("starting" or "stopping" or "connecting" or "recovering");
-        bool canStopRecovery = phase == "recovering" && !session.IsUpdating && session.BusyCommand is null && !commandBusy;
-        stateItem.Text = L.T(phase switch { "running" => "内核运行中", "starting" => "正在启动内核…", "recovering" => "正在恢复内核…", "stopping" => "正在停止内核…", "error" => "内核需要处理", "stopped" => "内核已停止", _ => "正在连接…" });
+        var runtime = session.Runtime;
+        bool idle = session.Ready && !session.IsUpdating && session.BusyCommand is null && !commandBusy && !runtime.IsWorking;
+        stateItem.Text = L.T(runtime.Phase switch { DesktopRuntimePhase.Running => "内核运行中", DesktopRuntimePhase.Stopped => "内核已停止", _ => runtime.Label });
         icon.Text = "Mihomo Optimized · " + stateItem.Text;
-        openItem.Text = L.T("打开主界面"); coreItem.Text = L.T(IsRunning ? "停止内核" : "启动内核"); restartItem.Text = L.T("重启内核");
+        openItem.Text = L.T("打开主界面"); coreItem.Text = L.T(runtime.StopRequired ? "停止内核" : "启动内核"); restartItem.Text = L.T("重启内核");
         proxyItem.Text = L.T("系统代理"); tunItem.Text = L.T("TUN 模式"); restoreItem.Text = L.T("停止代理并恢复网络"); exitItem.Text = L.T("退出");
-        coreItem.Enabled = restoreItem.Enabled = idle || canStopRecovery; restartItem.Enabled = idle && IsRunning;
+        coreItem.Enabled = runtime.StopRequired ? session.CanStopCore : idle && runtime.CanStart;
+        restoreItem.Enabled = session.CanStopCore || idle;
+        restartItem.Enabled = idle && runtime.ProcessAlive;
         proxyItem.Enabled = idle && session.Status.Get("capabilities").Bool("systemProxy"); tunItem.Enabled = idle && session.Status.Get("capabilities").Bool("tun");
         proxyItem.Checked = session.Status.Bool("systemProxy"); tunItem.Checked = session.Status.Bool("tun");
         exitItem.Enabled = !session.IsUpdating;
@@ -202,7 +204,8 @@ internal sealed class TrayWindow : Window
     private string controller = "";
     private bool applying;
     private bool outerBusy;
-    private bool changing;
+    private int activeChanges;
+    private bool changing => activeChanges > 0;
     private bool runtimeReady;
     private bool allowLan;
     private bool hiding;
@@ -212,7 +215,7 @@ internal sealed class TrayWindow : Window
     public Grid ClientArea { get; } = new();
     internal bool IsClosing => closing || closed;
     public string Material => backdrop.Material;
-    private bool Running => session.Status.Text("phase") == "running";
+    private bool Running => session.Runtime.RuntimeAvailable;
     private string Controller => session.Status.Get("controller").Text("url") + "\n" + session.Status.Get("controller").Text("secret");
 
     public TrayWindow(MainWindow main, AppSession session, Func<string, object?, Task> command, Func<bool, Task> changeTun)
@@ -264,7 +267,7 @@ internal sealed class TrayWindow : Window
         var rates = Ui.Column(Rate("arrow-down", down), uploadRate); rates.MinWidth = 92; rates.VerticalAlignment = VerticalAlignment.Center; footerGrid.Children.Add(rates); Grid.SetColumn(sparkline, 1); footerGrid.Children.Add(sparkline);
         var powerContents = new Grid(); powerContents.Children.Add(powerIcon); powerContents.Children.Add(powerProgress);
         power = FluentControls.IconButton("power", "启动内核", "TrayPower", 36); power.Content = powerContents; power.Style = FluentControls.Style("Button"); power.Padding = new Thickness(0); power.VerticalAlignment = VerticalAlignment.Center;
-        power.Click += async (_, _) => await Run(Running || session.Status.Text("phase") == "recovering" ? "desktop_stop" : "desktop_start"); Grid.SetColumn(power, 2); footerGrid.Children.Add(power);
+        power.Click += async (_, _) => await Run(session.Runtime.StopRequired ? "desktop_stop" : "desktop_start"); Grid.SetColumn(power, 2); footerGrid.Children.Add(power);
         var footer = new Border { Child = footerGrid, Padding = new Thickness(16, 12, 12, 12), BorderThickness = new Thickness(0, 1, 0, 0) }; footer.SetResourceReference(Border.BorderBrushProperty, "DividerBrush"); footer.SetResourceReference(Border.BackgroundProperty, "DialogTopBrush"); Grid.SetRow(footer, 2); ClientArea.Children.Add(footer);
         backdrop = new NativeBackdrop(this, ClientArea, session, transient: true);
         IsVisibleChanged += (_, _) =>
@@ -311,10 +314,11 @@ internal sealed class TrayWindow : Window
     private async void TunChanged(object sender, RoutedEventArgs e)
     {
         if (applying || !tun.IsEnabled || changing) return;
-        changing = true; bool enabled = tun.IsChecked == true; Refresh(outerBusy);
+        activeChanges++; bool enabled = tun.IsChecked == true; Refresh(outerBusy);
         try { await changeTun(enabled); }
+        catch (OperationCanceledException) { }
         catch (Exception error) { ReportActionError(error.Message); }
-        finally { changing = false; Refresh(outerBusy); }
+        finally { activeChanges--; Refresh(outerBusy); }
     }
     private void LanguageChanged() => Refresh(outerBusy);
     public void Refresh(bool operationBusy)
@@ -322,40 +326,42 @@ internal sealed class TrayWindow : Window
         outerBusy = operationBusy; applying = true;
         try
         {
-            bool running = Running; string phase = session.Status.Text("phase", fallback: "connecting");
-            bool recovering = phase == "recovering";
-            bool busy = phase is "starting" or "stopping" or "connecting" or "recovering";
-            if (controller != Controller || !running && runtimeReady)
+            var runtime = session.Runtime;
+            bool running = runtime.RuntimeAvailable;
+            bool busy = runtime.IsWorking;
+            if (controller != Controller || !runtime.ProcessAlive && runtimeReady)
             {
                 controller = Controller; runtimeReady = false; allowLan = false; exitSnapshot = ProxyExitSnapshot.Empty;
                 sparkline.Clear(); ByteReading.SetRate(down, 0); ByteReading.SetRate(up, 0);
             }
-            string label = L.T(phase switch { "running" => "运行中", "starting" => "正在启动…", "recovering" => "正在恢复…", "stopping" => "正在停止…", "error" => "需要处理", "stopped" => "已停止", _ => "正在连接…" });
+            string label = L.T(runtime.Phase switch { DesktopRuntimePhase.Starting => "正在启动…", DesktopRuntimePhase.Stopping => "正在停止…", DesktopRuntimePhase.Stopped => "已停止", _ => runtime.Label });
             string modeLabel = L.T(mode.Mode switch { "global" => "全局模式", "direct" => "直连模式", _ => "规则模式" }); state.Text = label + (running ? " · " + modeLabel : "");
-            stateDot.SetResourceReference(Shape.FillProperty, running ? "SuccessBrush" : busy ? "WarningBrush" : phase == "error" ? "DangerBrush" : "TextTertiaryBrush");
+            stateDot.SetResourceReference(Shape.FillProperty, runtime.IsProblem ? "DangerBrush" : busy || runtime.NeedsAttention ? "WarningBrush" : running ? "SuccessBrush" : "TextTertiaryBrush");
             bool interactive = session.Ready && !busy && !outerBusy && !changing && !session.IsUpdating && session.BusyCommand is null;
             proxy.IsChecked = session.Status.Bool("systemProxy"); tun.IsChecked = session.Status.Bool("tun"); lan.IsChecked = allowLan;
-            power.IsEnabled = interactive; proxy.IsEnabled = interactive && session.Status.Get("capabilities").Bool("systemProxy"); tun.IsEnabled = interactive && session.Status.Get("capabilities").Bool("tun"); lan.IsEnabled = mode.IsEnabled = interactive && running && runtimeReady && !session.IsDirty;
-            if (recovering) power.IsEnabled = !session.IsUpdating && session.BusyCommand is null && !outerBusy && !changing;
+            power.IsEnabled = runtime.StopRequired ? session.CanStopCore : interactive && runtime.CanStart;
+            proxy.IsEnabled = interactive && session.Status.Get("capabilities").Bool("systemProxy"); tun.IsEnabled = interactive && session.Status.Get("capabilities").Bool("tun"); lan.IsEnabled = mode.IsEnabled = interactive && running && runtimeReady && !session.IsDirty;
+            tun.ToolTip = L.T(runtime.TunDescription);
             foreach (var item in new[] { proxy, tun, lan }) if (item.Content is FluentIcon glyph) glyph.Filled = item.IsChecked == true;
             exits.Visibility = running ? Visibility.Visible : Visibility.Collapsed; stopped.Visibility = running ? Visibility.Collapsed : Visibility.Visible; exits.Update(exitSnapshot.Summaries.Take(3));
-            stoppedTitle.Text = busy ? label : L.T("内核未运行"); stoppedHint.Text = session.Status.Text("lastError", fallback: busy ? L.T("首次启动可能需要更长时间，请稍候。") : L.T("启动后即可切换模式、出口与快捷开关。"));
+            stoppedTitle.Text = label; stoppedHint.Text = session.Status.Text("lastError", fallback: L.T(runtime.Description));
             stoppedIcon.Visibility = busy ? Visibility.Collapsed : Visibility.Visible; stoppedProgress.IsActive = busy;
-            powerProgress.IsActive = busy || outerBusy || changing; powerIcon.Visibility = powerProgress.IsActive ? Visibility.Collapsed : Visibility.Visible;
+            powerProgress.IsActive = !session.CanStopCore && (busy || outerBusy || changing); powerIcon.Visibility = powerProgress.IsActive ? Visibility.Collapsed : Visibility.Visible;
+            powerIcon.Kind = runtime.StopRequired ? "stop" : "power";
             FluentControlState.SetKind(power, running ? "Primary" : "Button");
             powerProgress.SetResourceReference(FluentProgressRing.ForegroundProperty, running ? "AccentTextBrush" : "AccentBrush");
-            L.Bind(power, AutomationProperties.NameProperty, running || recovering ? "停止内核" : "启动内核"); L.Bind(power, ToolTipProperty, running || recovering ? "停止内核" : "启动内核");
+            L.Bind(power, AutomationProperties.NameProperty, runtime.StopRequired ? "停止内核" : "启动内核"); L.Bind(power, ToolTipProperty, runtime.StopRequired ? "停止内核" : "启动内核");
         }
         finally { applying = false; }
     }
     private async Task Run(string method, object? args = null)
     {
-        if (applying || changing) return;
-        changing = true; Refresh(outerBusy);
+        if (applying || changing && method != "desktop_stop") return;
+        activeChanges++; Refresh(outerBusy);
         try { await command(method, args); if (IsVisible && Running && visible is { } lifetime) await ReadSnapshotAsync(lifetime.Token); }
         catch (OperationCanceledException) { }
         catch (Exception error) { ReportActionError(error.Message); }
-        finally { changing = false; Refresh(outerBusy); }
+        finally { activeChanges--; Refresh(outerBusy); }
     }
     private void ReportActionError(string error)
     {

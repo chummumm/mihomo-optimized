@@ -145,10 +145,10 @@ internal sealed class SearchFlyout : ContentControl
     private bool closed;
     private bool choosing;
 
-    private bool RuntimeReady => session.Ready && !session.IsUpdating && session.Status.Text("phase") == "running";
-    private bool DesktopReady => session.Ready && !session.IsUpdating && session.Status.Text("phase") is not ("connecting" or "starting" or "stopping");
+    private bool RuntimeReady => session.Ready && !session.IsUpdating && session.Runtime.RuntimeAvailable;
+    private bool DesktopReady => session.Ready && !session.IsUpdating && session.BusyCommand is null && !session.Runtime.IsWorking;
     private string ControllerIdentity => session.Status.Get("controller").Text("url") + "\n" + session.Status.Get("controller").Text("secret");
-    private string CommandState => string.Join("|", session.Ready, session.IsUpdating, session.IsDirty, session.Status.Text("phase"), session.Status.Bool("systemProxy"), session.Status.Bool("tun"),
+    private string CommandState => string.Join("|", session.Ready, session.IsUpdating, session.IsDirty, session.Runtime.Phase, session.BusyCommand, session.CanStopCore, session.Status.Bool("systemProxy"), session.Status.Bool("tun"),
         session.Status.Get("capabilities").ToString());
 
     public SearchFlyout(Window owner, Canvas overlayHost, AppSession session, GlobalSearchBox inputBox,
@@ -513,10 +513,11 @@ internal sealed class SearchFlyout : ContentControl
     {
         commandState = CommandState;
         entries.Clear();
-        bool running = session.Status.Text("phase") == "running";
-        AddCommand(running ? "cmd-stop" : "cmd-start", running ? "停止内核" : "启动内核", running ? "stop" : "play",
-            running ? "desktop_stop" : "desktop_start", "core start stop 内核 启动 停止", () => DesktopReady,
-            L.T(running ? "运行中" : "已停止"));
+        var runtime = session.Runtime;
+        bool stop = runtime.StopRequired;
+        AddCommand(stop ? "cmd-stop" : "cmd-start", stop ? "停止内核" : "启动内核", stop ? "stop" : "play",
+            stop ? "desktop_stop" : "desktop_start", "core start stop 内核 启动 停止", () => stop ? session.CanStopCore : DesktopReady && session.Runtime.CanStart,
+            L.T(runtime.Label));
         entries.Add(new Entry("cmd-proxy", "command", "nav-proxies", L.T(session.Status.Bool("systemProxy") ? "关闭系统代理" : "开启系统代理"), "",
             "system proxy 系统代理", async () => await session.CommandAsync("desktop_set_system_proxy", new { enabled = !session.Status.Bool("systemProxy") }),
             () => DesktopReady && session.Status.Get("capabilities").Bool("systemProxy")));
@@ -761,6 +762,7 @@ internal sealed class SearchFlyout : ContentControl
             ClosePalette(clearQuery: true, blur: true);
             await entry.Run();
         }
+        catch (OperationCanceledException) { }
         catch (Exception error) { session.Notify(error.Message, true); }
     }
 

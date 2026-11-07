@@ -1,0 +1,162 @@
+using System.Text.Json;
+
+namespace Mihomo.Desktop.Services;
+
+internal enum DesktopRuntimePhase
+{
+    Connecting,
+    Stopped,
+    Starting,
+    Running,
+    Reloading,
+    Restarting,
+    Recovering,
+    RepairingTun,
+    Uncertain,
+    TunDegraded,
+    TunFailed,
+    Stopping,
+    StopUnconfirmed,
+    Exited,
+    Error
+}
+
+/// <summary>
+/// Presentation and actions use independent process, controller and TUN observations.
+/// An unavailable health observation never proves that the owned process exited.
+/// </summary>
+internal sealed record DesktopRuntimeState
+{
+    public required DesktopRuntimePhase Phase { get; init; }
+    public bool ProcessAlive { get; init; }
+    public bool RuntimeAvailable { get; init; }
+    public bool StopRequired { get; init; }
+    public bool TunRequested { get; init; }
+
+    public bool IsWorking => Phase is DesktopRuntimePhase.Connecting or DesktopRuntimePhase.Starting
+        or DesktopRuntimePhase.Reloading or DesktopRuntimePhase.Restarting or DesktopRuntimePhase.Recovering
+        or DesktopRuntimePhase.RepairingTun or DesktopRuntimePhase.Stopping;
+    public bool IsProblem => Phase is DesktopRuntimePhase.TunFailed or DesktopRuntimePhase.StopUnconfirmed
+        or DesktopRuntimePhase.Exited or DesktopRuntimePhase.Error;
+    public bool NeedsAttention => IsProblem || Phase is DesktopRuntimePhase.Uncertain or DesktopRuntimePhase.TunDegraded;
+    public bool CanStart => !StopRequired && Phase is DesktopRuntimePhase.Stopped or DesktopRuntimePhase.Exited or DesktopRuntimePhase.Error;
+
+    public string Label => Phase switch
+    {
+        DesktopRuntimePhase.Stopped => "未运行",
+        DesktopRuntimePhase.Starting => "正在启动",
+        DesktopRuntimePhase.Running => "运行中",
+        DesktopRuntimePhase.Reloading => "正在应用配置",
+        DesktopRuntimePhase.Restarting => "正在重启内核",
+        DesktopRuntimePhase.Recovering => "正在恢复内核",
+        DesktopRuntimePhase.RepairingTun => "正在恢复 TUN",
+        DesktopRuntimePhase.Uncertain => "状态待确认",
+        DesktopRuntimePhase.TunDegraded => "TUN 需要处理",
+        DesktopRuntimePhase.TunFailed => "TUN 恢复失败",
+        DesktopRuntimePhase.Stopping => "正在停止",
+        DesktopRuntimePhase.StopUnconfirmed => "停止尚未完成",
+        DesktopRuntimePhase.Exited => "内核已退出",
+        DesktopRuntimePhase.Error => "内核需要处理",
+        _ => "正在连接…"
+    };
+
+    public string Description => Phase switch
+    {
+        DesktopRuntimePhase.Starting => "正在校验配置、准备所需资源并等待内核就绪，可随时停止。",
+        DesktopRuntimePhase.Restarting => "正在停止旧内核并准备重新启动，可随时停止。",
+        DesktopRuntimePhase.Reloading => "正在应用已保存的配置，可随时停止内核。",
+        DesktopRuntimePhase.Recovering => "正在核验本地内核与网络设备，可随时停止恢复。",
+        DesktopRuntimePhase.RepairingTun => "内核进程仍在运行，正在恢复本机 TUN 设备。",
+        DesktopRuntimePhase.Uncertain => ProcessAlive
+            ? "内核进程仍在运行，正在等待最新的本机健康状态。"
+            : "暂时无法确认内核状态，正在等待本机服务的最新结果。",
+        DesktopRuntimePhase.TunDegraded => "内核进程仍在运行，TUN 设备需要处理。请查看详细信息或日志。",
+        DesktopRuntimePhase.TunFailed => "TUN 恢复未完成。请查看详细信息或日志；可停止内核后重试。",
+        DesktopRuntimePhase.Stopping => "正在停止代理连接并恢复系统设置，请稍候。",
+        DesktopRuntimePhase.StopUnconfirmed => "尚未确认旧内核退出，暂不启动新内核。请查看详细信息或日志。",
+        DesktopRuntimePhase.Exited => "已确认内核进程退出。请查看错误信息或日志，再重试启动。",
+        DesktopRuntimePhase.Error => "请查看错误信息或日志，再重试启动；需要时可在设置中编辑配置。",
+        DesktopRuntimePhase.Connecting => "正在读取本机内核状态，请稍候。",
+        _ => "已有配置时，可从顶部启动内核；首次使用请在设置中导入完整配置。"
+    };
+
+    public string TunDescription => !TunRequested ? "已关闭" : Phase switch
+    {
+        DesktopRuntimePhase.RepairingTun => "正在恢复 TUN",
+        DesktopRuntimePhase.TunFailed => "TUN 恢复失败",
+        DesktopRuntimePhase.TunDegraded => "TUN 需要处理",
+        DesktopRuntimePhase.Uncertain or DesktopRuntimePhase.StopUnconfirmed => "状态待确认",
+        DesktopRuntimePhase.Stopped or DesktopRuntimePhase.Exited or DesktopRuntimePhase.Error => "内核启动后生效",
+        DesktopRuntimePhase.Starting or DesktopRuntimePhase.Restarting => "等待内核就绪",
+        DesktopRuntimePhase.Stopping => "正在停止",
+        _ => "已开启"
+    };
+
+    public static DesktopRuntimeState Read(JsonElement status, string? command = null)
+    {
+        string phase = Text(status, "phase", "connecting");
+        string process = Text(status, "processState");
+        string control = Text(status, "controlState");
+        string operation = Text(status, "operation");
+        string tunHealth = Text(status, "tunHealth");
+        string error = Text(status, "errorCode");
+        bool tunRequested = Boolean(status, "tun");
+        bool alive = process == "alive" || process.Length == 0 && phase == "running";
+        bool desired = Boolean(status, "desiredRunning");
+        bool ownsProcess = alive || HasPid(status);
+        // A confirmed Stop has no live process whose health can age. Expiring
+        // that observation would disable Start after sitting idle for 30s.
+        bool confirmedStopped = phase == "stopped" && process == "exited" && !ownsProcess && !desired && operation.Length == 0;
+        bool stale = Boolean(status, "statusStale") && !confirmedStopped;
+        bool stopPending = command == "desktop_stop";
+        bool starting = command is "desktop_start" or "desktop_restart";
+        bool stopRequired = ownsProcess || starting || stopPending
+            || phase is "starting" or "recovering" or "stopping"
+            || desired && process != "exited";
+
+        DesktopRuntimePhase state;
+        if (stopPending) state = DesktopRuntimePhase.Stopping;
+        else if (error == "core_termination_unconfirmed") state = DesktopRuntimePhase.StopUnconfirmed;
+        else if (operation == "stopping" || phase == "stopping") state = DesktopRuntimePhase.Stopping;
+        else if (command == "desktop_restart" || operation == "restarting") state = DesktopRuntimePhase.Restarting;
+        else if (command == "desktop_start" || operation == "starting" || phase == "starting") state = DesktopRuntimePhase.Starting;
+        else if (stale) state = DesktopRuntimePhase.Uncertain;
+        else if (operation == "recovering_tun") state = DesktopRuntimePhase.RepairingTun;
+        else if (command == "desktop_reload_config" || operation == "reloading") state = DesktopRuntimePhase.Reloading;
+        else if (alive && tunRequested && (error is "tun_recovery_failed" or "tun_recovery_needs_restart" or "tun_restart_required" || tunHealth == "failed")) state = DesktopRuntimePhase.TunFailed;
+        else if (alive && tunRequested && (tunHealth is "degraded" or "conflict" or "disabled" || error is "tun_not_repairable" or "tun_ownership_conflict")) state = DesktopRuntimePhase.TunDegraded;
+        else if (alive && (tunRequested && tunHealth == "unavailable" || control is "unknown" or "unreachable" or "busy")) state = DesktopRuntimePhase.Uncertain;
+        else if (alive && phase == "error") state = DesktopRuntimePhase.Uncertain;
+        else if (phase == "recovering") state = DesktopRuntimePhase.Recovering;
+        else if (process == "exited" && phase == "error") state = DesktopRuntimePhase.Exited;
+        else if (process == "unknown" && phase != "connecting") state = DesktopRuntimePhase.Uncertain;
+        else state = phase switch
+        {
+            "running" => DesktopRuntimePhase.Running,
+            "stopped" => DesktopRuntimePhase.Stopped,
+            "error" => DesktopRuntimePhase.Error,
+            _ => DesktopRuntimePhase.Connecting
+        };
+
+        bool hasController = status.ValueKind == JsonValueKind.Object && status.TryGetProperty("controller", out var controller)
+            && controller.ValueKind == JsonValueKind.Object && Text(controller, "url").Length > 0;
+        bool runtimeAvailable = hasController && alive && !stale && (control is "ready" or "busy" || control.Length == 0 && phase == "running")
+            && state is not (DesktopRuntimePhase.Starting or DesktopRuntimePhase.Restarting or DesktopRuntimePhase.Stopping or DesktopRuntimePhase.StopUnconfirmed);
+
+        return new DesktopRuntimeState
+        {
+            Phase = state,
+            ProcessAlive = alive,
+            RuntimeAvailable = runtimeAvailable,
+            StopRequired = stopRequired,
+            TunRequested = tunRequested
+        };
+    }
+
+    private static bool HasPid(JsonElement value) => value.ValueKind == JsonValueKind.Object
+        && value.TryGetProperty("pid", out var pid) && pid.ValueKind == JsonValueKind.Number && pid.TryGetUInt32(out uint id) && id > 0;
+    private static bool Boolean(JsonElement value, string key) => value.ValueKind == JsonValueKind.Object
+        && value.TryGetProperty(key, out var item) && item.ValueKind == JsonValueKind.True;
+    private static string Text(JsonElement value, string key, string fallback = "") => value.ValueKind == JsonValueKind.Object
+        && value.TryGetProperty(key, out var item) && item.ValueKind == JsonValueKind.String ? item.GetString() ?? fallback : fallback;
+}
