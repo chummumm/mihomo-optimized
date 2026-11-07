@@ -98,9 +98,12 @@ on Windows. Feature-detect them before use. They describe local ownership and
 resources, not Internet connectivity or a remote proxy.
 
 `GET /desktop/health` returns an authenticated `no-store` snapshot immediately.
-One coalescing observer performs native inspection separately from HTTP readers.
-A cached healthy observation expires after five seconds; `stale: true` is not
-proof of process death. Normal underlay changes retain the core and TUN. A
+After its first activation, one coalescing observer performs native inspection
+every two seconds and also accepts coalesced refresh requests. HTTP readers
+never wait for that worker. A cached healthy observation expires after five
+seconds if inspection cannot refresh it; `stale: true` is not proof of process
+death. A slow native probe retains the sole worker instead of spawning
+overlapping probes. Normal underlay changes retain the core and TUN. A
 representative fresh response is:
 
 ```json

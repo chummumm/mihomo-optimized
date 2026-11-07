@@ -32,28 +32,45 @@ var (
 	desktopHealthRequests = make(chan struct{}, 1)
 )
 
+const desktopHealthInterval = 2 * time.Second
+
 // Only one OS observer exists for the process. Requests coalesce, never spawn
 // per-request goroutines, and never queue on the lifecycle mutex. A native
 // enumeration that stalls therefore cannot also stall controller reads.
 func requestDesktopHealthObservation() {
 	desktopHealthOnce.Do(func() {
 		go func() {
-			var attempted time.Time
-			for range desktopHealthRequests {
-				if ShutdownRequested() {
-					return
-				}
-				if time.Since(attempted) < time.Second {
-					continue
-				}
-				attempted = time.Now()
-				listener.TryObserveTunHealth()
-			}
+			ticker := time.NewTicker(desktopHealthInterval)
+			defer ticker.Stop()
+			runDesktopHealthObserver(desktopHealthRequests, ticker.C, time.Now, listener.TryObserveTunHealth, ShutdownRequested)
 		}()
 	})
 	select {
 	case desktopHealthRequests <- struct{}{}:
 	default:
+	}
+}
+
+// Refresh independently of the desktop's slower health polling cadence. With
+// demand-only refresh, a 10-second client poll would always find the 5-second
+// cache expired and unnecessarily enter recovery on every healthy idle poll.
+// Native calls stay on this one worker; queued ticks and requests coalesce.
+func runDesktopHealthObserver(requests <-chan struct{}, ticks <-chan time.Time, now func() time.Time, observe func() bool, stopping func() bool) {
+	var attempted time.Time
+	for {
+		select {
+		case <-requests:
+		case <-ticks:
+		}
+		if stopping() {
+			return
+		}
+		current := now()
+		if !attempted.IsZero() && current.Sub(attempted) < time.Second {
+			continue
+		}
+		attempted = current
+		observe()
 	}
 }
 
