@@ -207,17 +207,24 @@ func (m *desktopRecoveryCoordinator) start(ctx context.Context, request DesktopR
 		delete(m.records, oldID)
 	}
 	workerOwnsLock = true
-	log.Infoln("[Desktop Recovery] start operation=%s pid=%d config_generation=%d tun_generation=%d identity=%s creation_count=%d", operation.ID, os.Getpid(), request.ConfigGeneration, request.TunGeneration, observation.Tun.Identity, observation.CreationCount)
 	go m.run(operationCtx, work)
 	return operation, nil
 }
 
 func (m *desktopRecoveryCoordinator) run(ctx context.Context, work *desktopRecoveryWork) {
+	operation, observation := work.snapshot, work.result
 	// The deadline publishes a restartable failure even if a Windows native
 	// call ignores cancellation. It does not release mux or active ownership.
 	deadline, _ := ctx.Deadline()
 	timer := time.AfterFunc(time.Until(deadline), func() { m.expire(work) })
-	result, err := m.recover(ctx)
+	// The existing logger can wait on a slow subscriber or output file. Keep
+	// it outside the snapshot mutex and arm the deadline before any such I/O.
+	log.Infoln("[Desktop Recovery] start operation=%s pid=%d config_generation=%d tun_generation=%d identity=%s creation_count=%d", operation.ID, os.Getpid(), operation.ConfigGeneration, operation.TunGeneration, observation.Tun.Identity, observation.CreationCount)
+	result := DesktopRecovery{Status: "unavailable", Tun: m.observe().Tun}
+	err := ctx.Err()
+	if err == nil {
+		result, err = m.recover(ctx)
+	}
 	timer.Stop()
 	work.cancel()
 	m.mu.Lock()
@@ -250,14 +257,16 @@ func (m *desktopRecoveryCoordinator) run(ctx context.Context, work *desktopRecov
 func (m *desktopRecoveryCoordinator) expire(work *desktopRecoveryWork) {
 	work.cancel()
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.active != work || work.snapshot.Phase != "running" {
+		m.mu.Unlock()
 		return
 	}
 	work.snapshot.Phase, work.snapshot.Status = "failed", "needs_restart"
 	work.snapshot.Error = "TUN recovery deadline exceeded; native operation remains owned until cleanup completes"
 	work.snapshot.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	log.Warnln("[Desktop Recovery] deadline operation=%s pid=%d; preserve native ownership until process stop or cleanup", work.snapshot.ID, os.Getpid())
+	id := work.snapshot.ID
+	m.mu.Unlock()
+	log.Warnln("[Desktop Recovery] deadline operation=%s pid=%d; preserve native ownership until process stop or cleanup", id, os.Getpid())
 }
 
 func (m *desktopRecoveryCoordinator) cancel() {

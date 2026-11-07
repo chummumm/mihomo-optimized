@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/listener"
+	"github.com/sirupsen/logrus"
 )
 
 func isolateDesktopRecovery(t *testing.T) (*desktopRecoveryCoordinator, func(listener.TunObservation)) {
@@ -284,5 +285,93 @@ func TestDesktopRecoveryHistoryIsBounded(t *testing.T) {
 	}
 	if _, err := GetDesktopRecovery(first); !errors.Is(err, ErrRecoveryNotFound) {
 		t.Fatalf("old terminal operation was not evicted: %v", err)
+	}
+}
+
+type blockedRecoveryLogWriter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockedRecoveryLogWriter) Write(data []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	return len(data), nil
+}
+
+func TestDesktopRecoveryBlockedLoggingDoesNotBlockAdmissionOrStatus(t *testing.T) {
+	manager, _ := isolateDesktopRecovery(t)
+	manager.limit = 25 * time.Millisecond
+	writer := &blockedRecoveryLogWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	previous := logrus.StandardLogger().Out
+	logrus.SetOutput(writer)
+	var releaseOnce sync.Once
+	var statusFinished <-chan struct{}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(writer.release) })
+		if statusFinished != nil {
+			select {
+			case <-statusFinished:
+			case <-time.After(2 * time.Second):
+				t.Error("status reader did not finish after releasing log output")
+			}
+		}
+		logrus.SetOutput(previous)
+	})
+	var nativeCalls atomic.Int32
+	manager.recover = func(ctx context.Context) (DesktopRecovery, error) {
+		nativeCalls.Add(1)
+		return DesktopRecovery{Status: "unavailable"}, ctx.Err()
+	}
+	type acceptance struct {
+		operation DesktopRecoveryOperation
+		err       error
+	}
+	accepted := make(chan acceptance, 1)
+	go func() {
+		operation, err := manager.start(context.Background(), DesktopRecoveryRequest{RequestID: "blocked-log-output"})
+		accepted <- acceptance{operation, err}
+	}()
+	var operation DesktopRecoveryOperation
+	select {
+	case result := <-accepted:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		operation = result.operation
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery acceptance waited for logging I/O")
+	}
+	select {
+	case <-writer.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery worker did not reach log output")
+	}
+	finished := make(chan struct{})
+	statusFinished = finished
+	var expired DesktopRecoveryOperation
+	go func() {
+		defer close(finished)
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			expired, _ = manager.get(operation.ID)
+			if expired.Phase == "failed" {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery snapshot waited for deadline logging I/O")
+	}
+	if expired.Phase != "failed" || expired.Status != "needs_restart" || nativeCalls.Load() != 0 {
+		t.Fatalf("blocked logger defeated deadline ownership: %+v native_calls=%d", expired, nativeCalls.Load())
+	}
+	releaseOnce.Do(func() { close(writer.release) })
+	if final := waitDesktopRecovery(t, manager, operation.ID); final.Status != "needs_restart" || nativeCalls.Load() != 0 {
+		t.Fatalf("late logging resumed an already expired operation: %+v", final)
 	}
 }
