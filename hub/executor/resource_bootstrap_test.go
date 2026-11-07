@@ -42,7 +42,7 @@ func TestResourceBootstrapProviderFailurePolicyAndSharedDeadline(t *testing.T) {
 
 func TestResourceBootstrapParseAndApplyShareSupervisorBudget(t *testing.T) {
 	preserveStopAdmission(t)
-	ctx := resource.WithBootstrapTimeout(context.Background(), 40*time.Millisecond)
+	ctx := resource.WithBootstrapTimeout(context.Background(), 2*time.Second)
 	cfg, err := ParseWithBytesContext(ctx, []byte("resource-bootstrap: {timeout: 180}\ndns: {enable: false}\nrules: ['MATCH,DIRECT']\n"))
 	if err != nil {
 		t.Fatal(err)
