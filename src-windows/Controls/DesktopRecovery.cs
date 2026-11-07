@@ -25,6 +25,7 @@ public sealed class DesktopRecovery : NativePage
     private readonly FluentProgressRing startProgress = new() { Width = 16, Height = 16, IsButtonSpinner = true, Margin = new Thickness(0, 0, 8, 0) };
     private readonly TextBlock startLabel = Ui.Label("启动内核");
     private string? localCommand;
+    private long localCommandGeneration;
     private string operationError = "";
     private JsonElement lastStatus;
     private bool subscribed;
@@ -69,7 +70,7 @@ public sealed class DesktopRecovery : NativePage
         startProgress.SetResourceReference(FluentProgressRing.ForegroundProperty, "TextSecondaryBrush");
         startContent.Children.Add(startGlyph); startContent.Children.Add(startProgress); startContent.Children.Add(startLabel);
         start.Content = startContent;
-        start.Click += async (_, _) => { if (start.IsEnabled) await RunCommandAsync(Session.Status.Text("phase") == "recovering" ? "desktop_stop" : "desktop_start"); };
+        start.Click += async (_, _) => { if (start.IsEnabled) await RunCommandAsync(Session.Runtime.StopRequired ? "desktop_stop" : "desktop_start"); };
         retry = CreateButton("update", "刷新状态", "RecoveryRefreshStatus");
         retry.Click += async (_, _) => await RunCommandAsync("desktop_status");
         var settings = CreateButton("nav-settings", "打开设置", "RecoverySettings");
@@ -132,59 +133,47 @@ public sealed class DesktopRecovery : NativePage
         // including a same-phase refresh after the configuration was repaired.
         if (!lastStatus.Equals(Session.Status)) { lastStatus = Session.Status; operationError = ""; }
         string phase = Session.Status.Text("phase");
+        var runtime = Session.Runtime;
         string detail = Session.Status.Text("lastError", fallback: operationError);
-        bool recovering = phase == "recovering";
-        bool hasStatus = (Session.Ready || recovering) && phase != "connecting";
+        bool hasStatus = (Session.Ready || Session.IsRecoveringHost) && phase != "connecting";
         bool connectionFailed = !hasStatus && (phase == "error" || detail.Length > 0);
         bool connecting = !hasStatus && !connectionFailed;
-        bool commandBusy = !string.IsNullOrEmpty(Session.BusyCommand) || localCommand == "desktop_start";
-        bool busy = commandBusy || phase is "starting" or "stopping" or "recovering";
-        string title = "本机内核尚未运行";
-        string description = "已有配置时，可从顶部启动内核；首次使用请在设置中导入完整配置。";
+        bool commandBusy = !string.IsNullOrEmpty(Session.BusyCommand) || localCommand is not null;
+        bool busy = commandBusy || runtime.IsWorking;
+        string title = runtime.Phase switch
+        {
+            DesktopRuntimePhase.Stopped => "本机内核尚未运行",
+            DesktopRuntimePhase.Starting => "正在启动本机内核",
+            DesktopRuntimePhase.Stopping => "正在停止本机内核",
+            DesktopRuntimePhase.Recovering => "正在恢复本机内核",
+            _ => runtime.Label
+        };
+        string description = runtime.Description;
         if (!hasStatus)
         {
             title = connectionFailed ? "无法读取本机状态" : "正在连接桌面服务…";
             description = connectionFailed ? ConnectionError : "正在读取本机内核状态，请稍候。";
         }
-        else if (recovering)
-        {
-            title = "正在恢复本机内核";
-            description = "正在核验本地内核与网络设备，可随时停止恢复。";
-        }
-        else if (phase == "starting")
-        {
-            title = "正在启动本机内核";
-            description = "正在校验配置、准备所需资源并等待内核就绪。首次启动可能需要更长时间，请稍候。";
-        }
-        else if (phase == "stopping")
-        {
-            title = "正在停止本机内核";
-            description = "正在停止代理连接并恢复系统设置，请稍候。";
-        }
-        else if (phase == "error")
-        {
-            title = "本机内核运行遇到问题";
-            description = "请查看错误信息或日志，再重试启动；需要时可在设置中编辑配置。";
-        }
         heading.Text = L.T(title); hint.Text = L.T(description); errorText.Text = L.T(detail);
         errorBox.Visibility = detail.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        errorBox.SetResourceReference(Border.BackgroundProperty, runtime.IsProblem || connectionFailed ? "CriticalBackgroundBrush" : "InfoBackgroundBrush");
+        AutomationProperties.SetLiveSetting(errorText, runtime.IsProblem || connectionFailed ? AutomationLiveSetting.Assertive : AutomationLiveSetting.Polite);
         AutomationProperties.SetName(this, heading.Text);
         AutomationProperties.SetItemStatus(this, hasStatus ? phase : connectionFailed ? "error" : "connecting");
-        bool caution = phase == "error" || connectionFailed;
+        bool caution = runtime.NeedsAttention || connectionFailed;
         symbol.SetResourceReference(Border.BackgroundProperty, caution ? "WarningBackgroundBrush" : "ControlAltBrush");
         glyph.SetResourceReference(Control.ForegroundProperty, caution ? "WarningBrush" : "TextSecondaryBrush");
-        glyph.Kind = detail.Length > 0 || phase == "error" ? "warning" : "plug-disconnected";
-        progress.IsActive = busy || connecting;
+        glyph.Kind = caution ? "warning" : "plug-disconnected";
+        progress.IsActive = runtime.IsWorking || connecting;
         glyph.Visibility = progress.IsActive ? Visibility.Collapsed : Visibility.Visible;
-        start.IsEnabled = hasStatus && !busy && phase != "running" && !Session.IsUpdating;
-        if (recovering) start.IsEnabled = !commandBusy && !Session.IsUpdating;
-        startLabel.Text = L.T(recovering ? "停止内核" : "启动内核");
-        startGlyph.Kind = recovering ? "stop" : "play";
+        start.IsEnabled = runtime.StopRequired ? Session.CanStopCore : hasStatus && !busy && runtime.CanStart && !Session.IsUpdating;
+        startLabel.Text = L.T(runtime.StopRequired ? "停止内核" : "启动内核");
+        startGlyph.Kind = runtime.StopRequired ? "stop" : "play";
         AutomationProperties.SetName(start, startLabel.Text);
-        bool starting = localCommand == "desktop_start" || Session.BusyCommand == "desktop_start";
-        startGlyph.Visibility = starting ? Visibility.Collapsed : Visibility.Visible;
-        startProgress.IsActive = starting;
-        if (starting) startLabel.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
+        bool stopping = localCommand == "desktop_stop" || Session.BusyCommand == "desktop_stop";
+        startGlyph.Visibility = stopping ? Visibility.Collapsed : Visibility.Visible;
+        startProgress.IsActive = stopping;
+        if (stopping) startLabel.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
         else startLabel.ClearValue(TextBlock.ForegroundProperty);
         retry.Visibility = connectionFailed ? Visibility.Visible : Visibility.Collapsed;
     }
@@ -193,9 +182,11 @@ public sealed class DesktopRecovery : NativePage
 
     private async Task RunCommandAsync(string command)
     {
-        if (localCommand is not null) return;
+        if (localCommand is not null && command != "desktop_stop") return;
+        long generation = ++localCommandGeneration;
         localCommand = command; operationError = ""; Refresh();
         try { await Session.CommandAsync(command); }
+        catch (OperationCanceledException) { }
         catch (Exception error)
         {
             if (!Session.IsExiting)
@@ -206,7 +197,7 @@ public sealed class DesktopRecovery : NativePage
                 if (command != "desktop_status") Session.Notify(operationError, true);
             }
         }
-        finally { localCommand = null; Refresh(); }
+        finally { if (generation == localCommandGeneration) localCommand = null; Refresh(); }
     }
 
     /// <summary>Flex-wrap with justify-content:center on every line and an exact 8px gap.</summary>

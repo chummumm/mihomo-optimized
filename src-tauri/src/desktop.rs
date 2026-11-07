@@ -3,7 +3,7 @@ use crate::{
     core::{self, Controller, CoreStatus, CoreSupervisor},
     error::{AppError, Result},
     host::HostContext,
-    lifecycle::{self, RecoveryWindow, StopReason},
+    lifecycle::{self, Cancellation, RecoveryWindow, StopReason},
     proxy::SystemProxy,
     service::{self, ServiceStatusView},
     service_ipc::{Client as ServiceClient, Request},
@@ -20,9 +20,10 @@ use std::{
 #[derive(Clone)]
 pub struct HostState(pub Arc<Mutex<DesktopManager>>);
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
+    #[default]
     Stopped,
     Starting,
     Running,
@@ -31,7 +32,7 @@ pub enum Phase {
     Error,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
     system_proxy: bool,
@@ -41,7 +42,7 @@ pub struct Capabilities {
     service_management: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopStatus {
     pub phase: Phase,
@@ -61,10 +62,22 @@ pub struct DesktopStatus {
     pub error_code: Option<String>,
     pub recovery_generation: u64,
     pub tun_health: Option<String>,
+    pub process_state: String,
+    pub control_state: String,
+    pub listeners_ready: Option<bool>,
+    pub pid: Option<u32>,
+    pub operation: Option<String>,
+    pub status_instance: String,
+    pub status_sequence: u64,
+    pub intent_revision: u64,
+    pub observed_at: u64,
+    pub status_stale: bool,
+    pub service_instance: Option<String>,
+    pub service_sequence: u64,
 }
 
 enum RunningCore {
-    Direct(CoreSupervisor),
+    Direct(Box<CoreSupervisor>),
     Service(ServiceClient),
 }
 
@@ -89,6 +102,7 @@ pub struct DesktopManager {
     lease_recovery_pending: Option<u64>,
     lease_restarts: VecDeque<Duration>,
     applied_config: Option<String>,
+    cancellation: Cancellation,
 }
 
 impl DesktopManager {
@@ -109,6 +123,7 @@ impl DesktopManager {
             last_error = Some(error.message);
         }
         let run_intent = preferences.desired_running;
+        let cancellation = app.cancellation();
         Ok(Self {
             app,
             directory,
@@ -130,6 +145,7 @@ impl DesktopManager {
             lease_recovery_pending: None,
             lease_restarts: VecDeque::new(),
             applied_config: None,
+            cancellation,
         })
     }
 
@@ -149,13 +165,35 @@ impl DesktopManager {
         self.publish();
     }
 
+    pub fn operation_cancellation(&self) -> Cancellation {
+        self.cancellation.clone()
+    }
+
+    pub fn begin_operation(&mut self, generation: u64) {
+        if let Ok(status) = self.app.status() {
+            if status.intent_revision == generation {
+                self.run_intent = status.desired_running;
+            }
+        }
+        self.cancellation = Cancellation::new(self.app.runtime_generation.clone(), generation);
+        if let Some(RunningCore::Direct(core)) = &mut self.running {
+            core.set_cancellation(self.cancellation.clone());
+        }
+    }
+
     pub fn status(&self) -> DesktopStatus {
+        self.app.status().unwrap_or_else(|_| self.build_status())
+    }
+
+    fn build_status(&self) -> DesktopStatus {
         DesktopStatus {
             phase: self.phase,
             system_proxy: self.proxy.owned().unwrap_or(false),
             tun: self.preferences.tun,
             autostart: windows::autostart_enabled().unwrap_or(false),
-            controller: if self.phase == Phase::Running {
+            controller: if self.core_status.process_state == "alive"
+                && matches!(self.core_status.control_state.as_str(), "ready" | "busy")
+            {
                 self.core_status.controller.clone()
             } else {
                 None
@@ -181,12 +219,35 @@ impl DesktopManager {
                 .recovery_generation
                 .max(self.resume_pending.unwrap_or(0)),
             tun_health: self.core_status.tun_health.clone(),
+            process_state: if self.core_status.process_state.is_empty() {
+                "exited".into()
+            } else {
+                self.core_status.process_state.clone()
+            },
+            control_state: if self.core_status.control_state.is_empty() {
+                "unknown".into()
+            } else {
+                self.core_status.control_state.clone()
+            },
+            listeners_ready: self.core_status.listeners_ready,
+            pid: self.core_status.pid,
+            operation: match self.phase {
+                Phase::Starting => Some("starting".into()),
+                Phase::Stopping => Some("stopping".into()),
+                _ => self.core_status.operation.clone(),
+            },
+            status_instance: self.app.instance.clone(),
+            status_sequence: 0,
+            intent_revision: self.cancellation.revision(),
+            observed_at: self.core_status.observed_at,
+            status_stale: false,
+            service_instance: self.core_status.service_instance.clone(),
+            service_sequence: self.core_status.status_sequence,
         }
     }
 
     pub fn publish(&self) {
-        let status = self.status();
-        self.app.publish_status(status);
+        self.app.publish_status(self.build_status());
     }
 
     fn active_log_directory(&self) -> PathBuf {
@@ -218,6 +279,7 @@ impl DesktopManager {
 
     pub fn start(&mut self, persist: bool) -> Result<()> {
         self.require_idle_update()?;
+        self.cancellation.check()?;
         if self.phase == Phase::Running {
             return Ok(());
         }
@@ -234,27 +296,39 @@ impl DesktopManager {
                 config::mixed_port(&content)?;
             }
             if let Some(running) = self.running.as_mut() {
-                stop_running(running)?;
+                stop_running(running, &self.cancellation)?;
             }
             self.running = None;
-            let (running, status) = if self.preferences.tun {
+            self.app.pause_service_observation();
+            self.cancellation.check()?;
+            if self.preferences.tun {
                 self.ensure_service()?;
-                let client = ServiceClient::new()?;
-                let status = client.call(&Request::Start {
-                    config: content.clone(),
-                })?;
-                (RunningCore::Service(client), status)
+                self.cancellation.check()?;
+                let client = match self.app.service_client() {
+                    Some(client) => client,
+                    None => ServiceClient::new(self.app.instance.clone())?,
+                };
+                self.app.set_service_client(Some(client.clone()));
+                self.running = Some(RunningCore::Service(client));
             } else {
                 let mut supervisor = CoreSupervisor::new(
                     core::fixed_core_path()?,
                     self.directory.join("runtime"),
                     self.logs.clone(),
                 );
-                let status = supervisor.start(content.clone(), false)?;
-                (RunningCore::Direct(supervisor), status)
+                supervisor.set_cancellation(self.cancellation.clone());
+                self.running = Some(RunningCore::Direct(Box::new(supervisor)));
+            }
+            self.core_status = match self.running.as_mut().expect("runtime set above") {
+                RunningCore::Service(client) => client.call(
+                    Request::Start {
+                        config: content.clone(),
+                    },
+                    &self.cancellation,
+                )?,
+                RunningCore::Direct(supervisor) => supervisor.start(content.clone(), false)?,
             };
-            self.running = Some(running);
-            self.core_status = status;
+            self.cancellation.check()?;
             self.applied_config = Some(content.clone());
             self.applied_proxy_port = config::mixed_port(&content).ok();
             if !self.core_status.running {
@@ -263,6 +337,7 @@ impl DesktopManager {
             if self.preferences.system_proxy {
                 self.proxy.enable(config::mixed_port(&content)?)?;
             }
+            self.cancellation.check()?;
             self.phase = Phase::Running;
             if persist {
                 self.preferences.desired_running = true;
@@ -271,15 +346,22 @@ impl DesktopManager {
             Ok(())
         })();
         if let Err(error) = &result {
-            let _ = self.proxy.restore();
-            if let Some(running) = self.running.as_mut() {
-                let _ = stop_running(running);
+            if error.code != "operation_cancelled" && self.cancellation.check().is_ok() {
+                let _ = self.proxy.restore();
+                if let Some(running) = self.running.as_mut() {
+                    let _ = stop_running(running, &self.cancellation);
+                    self.core_status =
+                        running_status(running).unwrap_or_else(|_| self.core_status.clone());
+                }
+                if self.core_status.pid.is_none() && self.core_status.operation.is_none() {
+                    self.running = None;
+                    self.app.pause_service_observation();
+                }
+                self.applied_proxy_port = None;
+                self.phase = Phase::Error;
+                self.last_error = Some(error.message.clone());
+                self.core_status.error_code = Some(error.code.clone());
             }
-            self.running = None;
-            self.core_status = CoreStatus::default();
-            self.applied_proxy_port = None;
-            self.phase = Phase::Error;
-            self.last_error = Some(error.message.clone());
         }
         self.publish();
         result
@@ -290,39 +372,55 @@ impl DesktopManager {
         self.lease_recovery_pending = None;
         self.communication_recovery = None;
         if persist {
-            // Persist the user's intent even if a later OS cleanup needs retry.
             self.run_intent = false;
             self.preferences.desired_running = false;
-            self.persist()?;
         }
-        self.proxy.restore()?;
         self.phase = Phase::Stopping;
         self.publish();
-        let result = self.running.as_mut().map(stop_running).unwrap_or(Ok(()));
-        if let Err(error) = &result {
-            self.phase = Phase::Error;
+        // Preferences/proxy restoration are independent cleanup steps. Neither
+        // failure is allowed to prevent the owned process from receiving Stop.
+        let persist_error = if persist { self.persist().err() } else { None };
+        let proxy_error = self.proxy.restore().err();
+        let result = self
+            .running
+            .as_mut()
+            .map(|running| stop_running(running, &self.cancellation))
+            .unwrap_or(Ok(()));
+        if let Some(running) = self.running.as_mut() {
+            self.core_status = running_status(running).unwrap_or_else(|_| self.core_status.clone());
+        }
+        if let Err(error) = result {
+            self.phase = Phase::Stopping;
             self.last_error = Some(error.message.clone());
+            self.core_status.error_code = Some(error.code.clone());
+            self.core_status.operation = Some("stopping".into());
+            self.core_status.process_state = "unknown".into();
             self.publish();
-            return result;
+            return Err(error);
         }
         self.running = None;
-        self.core_status = CoreStatus::default();
-        self.core_status.stop_reason = Some(StopReason::UserStop);
+        self.app.pause_service_observation();
+        self.core_status = CoreStatus {
+            process_state: "exited".into(),
+            control_state: "unknown".into(),
+            listeners_ready: Some(false),
+            stop_reason: Some(StopReason::UserStop),
+            observed_at: core::observed_now(),
+            ..CoreStatus::default()
+        };
         self.applied_config = None;
         self.applied_proxy_port = None;
         self.phase = Phase::Stopped;
-        self.last_error = None;
-        if persist {
-            self.preferences.desired_running = false;
-            self.persist()?;
-        }
+        let error = persist_error.or(proxy_error);
+        self.last_error = error.as_ref().map(|error| error.message.clone());
         self.publish();
-        Ok(())
+        error.map_or(Ok(()), Err)
     }
 
     pub fn restart(&mut self) -> Result<()> {
         self.require_idle_update()?;
         self.stop(false)?;
+        self.cancellation.check()?;
         self.start(true)
     }
 
@@ -357,7 +455,7 @@ impl DesktopManager {
             config::runtime_config(&config::read_limited(&self.config_path)?, true, 9090)?;
             self.ensure_service()?;
         }
-        let was_running = self.phase == Phase::Running;
+        let was_running = self.run_intent;
         let previous = self.preferences.tun;
         if was_running {
             self.stop(false)?;
@@ -365,6 +463,9 @@ impl DesktopManager {
         self.preferences.tun = enabled;
         if was_running {
             if let Err(error) = self.start(false) {
+                if error.code == "operation_cancelled" {
+                    return Err(error);
+                }
                 self.preferences.tun = previous;
                 let recovery = self.start(false);
                 self.last_error = Some(if recovery.is_ok() {
@@ -382,17 +483,19 @@ impl DesktopManager {
     }
 
     fn ensure_service(&self) -> Result<()> {
+        windows::wait_for_service_maintenance("install", Some(&self.cancellation))?;
         let state = service::status()?;
         if !state.installed || !state.running {
-            windows::run_elevated_service_action("install")?;
+            windows::run_elevated_service_action_cancellable("install", Some(&self.cancellation))?;
         }
         Ok(())
     }
 
     pub fn install_service(&self) -> Result<()> {
+        windows::wait_for_service_maintenance("install", Some(&self.cancellation))?;
         let state = service::status()?;
         if !state.installed || !state.running {
-            windows::run_elevated_service_action("install")?;
+            windows::run_elevated_service_action_cancellable("install", Some(&self.cancellation))?;
         }
         self.publish();
         Ok(())
@@ -403,7 +506,7 @@ impl DesktopManager {
         if self.preferences.tun {
             self.set_tun(false)?;
         }
-        windows::run_elevated_service_action("uninstall")?;
+        windows::run_elevated_service_action_cancellable("uninstall", Some(&self.cancellation))?;
         self.publish();
         Ok(())
     }
@@ -418,7 +521,7 @@ impl DesktopManager {
         expected_revision: Option<&str>,
     ) -> Result<ConfigDocument> {
         let saved = config::save(&self.config_path, content, expected_revision)?;
-        let _ = self.app.emit(
+        self.app.emit(
             "desktop-config-changed",
             serde_json::json!({"revision":saved.revision}),
         );
@@ -432,7 +535,7 @@ impl DesktopManager {
     ) -> Result<ConfigDocument> {
         self.require_idle_update()?;
         let saved = config::import(&self.config_path, content, expected_revision)?;
-        let _ = self.app.emit(
+        self.app.emit(
             "desktop-config-changed",
             serde_json::json!({"revision":saved.revision}),
         );
@@ -451,9 +554,12 @@ impl DesktopManager {
         }
         let result = match self.running.as_mut() {
             Some(RunningCore::Direct(core)) => core.reload(content.clone()),
-            Some(RunningCore::Service(client)) => client.call(&Request::Reload {
-                config: content.clone(),
-            }),
+            Some(RunningCore::Service(client)) => client.call(
+                Request::Reload {
+                    config: content.clone(),
+                },
+                &self.cancellation,
+            ),
             None => return Ok(()),
         };
         let status = match result {
@@ -462,7 +568,7 @@ impl DesktopManager {
                 self.core_status = match self.running.as_mut() {
                     Some(RunningCore::Direct(core)) => core.status(),
                     Some(RunningCore::Service(client)) => {
-                        client.call(&Request::Status).unwrap_or_default()
+                        client.status().unwrap_or_else(|_| self.core_status.clone())
                     }
                     None => CoreStatus::default(),
                 };
@@ -472,7 +578,9 @@ impl DesktopManager {
                     Phase::Error
                 };
                 self.last_error = Some(error.message.clone());
-                if !self.core_status.running {
+                if self.core_status.process_state == "exited"
+                    || self.core_status.listeners_ready == Some(false)
+                {
                     let _ = self.proxy.restore();
                 }
                 self.publish();
@@ -502,7 +610,7 @@ impl DesktopManager {
             ));
         }
         let saved = config::patch(&self.config_path, patch)?;
-        let _ = self.app.emit(
+        self.app.emit(
             "desktop-config-changed",
             serde_json::json!({"revision":saved.revision}),
         );
@@ -531,6 +639,10 @@ impl DesktopManager {
         Ok(was_running)
     }
 
+    pub fn abort_update(&mut self) {
+        self.updating = false;
+    }
+
     pub fn resume_after_update(&mut self, was_running: bool) -> Result<()> {
         self.updating = false;
         if was_running {
@@ -557,6 +669,7 @@ impl DesktopManager {
             return;
         }
         let generation = self.app.generation();
+        self.begin_operation(generation);
         if let Some(pending) = self.lease_recovery_pending.take() {
             if pending == generation && self.run_intent {
                 self.recover_lease(generation);
@@ -573,9 +686,9 @@ impl DesktopManager {
             }
             Some(RunningCore::Service(client)) => {
                 if let Some(resume) = resume.filter(|_| self.core_status.lifecycle_api >= 1) {
-                    client.call(&Request::Reconcile { generation: resume })
+                    client.reconcile(resume)
                 } else {
-                    client.call(&Request::Status)
+                    client.status()
                 }
             }
             None => {
@@ -596,24 +709,18 @@ impl DesktopManager {
                 // next confirmed Running observation must also restore the user's
                 // preference when that last process status was already running.
                 let recovered = self.phase != Phase::Running && status.running;
-                self.phase = if status.recovering {
-                    Phase::Recovering
-                } else if status.running {
-                    Phase::Running
-                } else if matches!(
-                    status.stop_reason,
-                    Some(StopReason::UserStop | StopReason::Shutdown)
-                ) {
-                    Phase::Stopped
-                } else if status.stop_reason == Some(StopReason::LeaseExpired) && self.run_intent {
-                    self.lease_recovery_pending = Some(generation);
-                    Phase::Recovering
-                } else {
-                    Phase::Error
-                };
+                self.phase =
+                    if status.stop_reason == Some(StopReason::LeaseExpired) && self.run_intent {
+                        self.lease_recovery_pending = Some(generation);
+                        Phase::Recovering
+                    } else {
+                        phase_for_core(&status)
+                    };
                 self.last_error = status.error.clone();
                 self.core_status = status;
-                if !self.core_status.running {
+                if self.core_status.process_state == "exited"
+                    || self.core_status.listeners_ready == Some(false)
+                {
                     if let Err(error) = self.proxy.restore() {
                         self.last_error = Some(error.message);
                     }
@@ -628,7 +735,10 @@ impl DesktopManager {
             Err(error) => {
                 let temporary = matches!(
                     error.code.as_str(),
-                    "service_unavailable" | "service_timeout" | "io_error"
+                    "service_unavailable"
+                        | "service_timeout"
+                        | "service_owner_cleanup"
+                        | "io_error"
                 );
                 let now = lifecycle::awake_now().unwrap_or_default();
                 let exhausted = self
@@ -647,8 +757,13 @@ impl DesktopManager {
                     serde_json::json!({"generation":generation,"code":error.code,"exhausted":exhausted}),
                 );
                 self.last_error = Some(error.message);
-                self.core_status.controller = None;
-                let _ = self.proxy.restore();
+                self.core_status.control_state = "unreachable".into();
+                // Transport uncertainty does not prove proxy listeners stopped.
+                // A disproved service identity/protocol is a separate hard fault.
+                if !temporary {
+                    self.core_status.controller = None;
+                    let _ = self.proxy.restore();
+                }
             }
         }
         self.publish();
@@ -703,7 +818,7 @@ impl DesktopManager {
                 ));
             };
             self.lease_restarts.push_back(now);
-            let status = client.call(&Request::Start { config: source })?;
+            let status = client.call(Request::Start { config: source }, &self.cancellation)?;
             if generation != self.app.generation()
                 || self.app.stop_pending.load(Ordering::Acquire) != 0
             {
@@ -756,9 +871,98 @@ impl DesktopManager {
     }
 }
 
-fn stop_running(running: &mut RunningCore) -> Result<()> {
+fn stop_running(running: &mut RunningCore, cancellation: &Cancellation) -> Result<()> {
     match running {
         RunningCore::Direct(core) => core.stop(),
-        RunningCore::Service(client) => client.call(&Request::Stop).map(|_| ()),
+        RunningCore::Service(client) => client.call(Request::Stop, cancellation).map(|_| ()),
+    }
+}
+
+fn running_status(running: &mut RunningCore) -> Result<CoreStatus> {
+    match running {
+        RunningCore::Direct(core) => Ok(core.status()),
+        RunningCore::Service(client) => client.status(),
+    }
+}
+
+fn phase_for_core(status: &CoreStatus) -> Phase {
+    match status.operation.as_deref() {
+        Some("stopping") => Phase::Stopping,
+        Some("starting" | "restarting") => Phase::Starting,
+        Some(_) => Phase::Recovering,
+        None if status.recovering => Phase::Recovering,
+        None if status.running => Phase::Running,
+        None if status.process_state == "alive" || status.process_state == "unknown" => {
+            Phase::Recovering
+        }
+        None if matches!(
+            status.stop_reason,
+            Some(StopReason::UserStop | StopReason::Shutdown)
+        ) =>
+        {
+            Phase::Stopped
+        }
+        None => Phase::Error,
+    }
+}
+
+impl DesktopStatus {
+    pub fn preserve_core_observation(&mut self, current: &Self) {
+        // A service snapshot orders process facts, not a later host-side trust
+        // failure. Keep the newest PID/observation while preserving a locally
+        // disproved controller or failed authenticated observation.
+        let local_failure = self.control_state == "unreachable"
+            && self
+                .error_code
+                .as_deref()
+                .is_some_and(|code| code.starts_with("service_") || code == "io_error");
+        let failure =
+            local_failure.then(|| (self.phase, self.error_code.clone(), self.last_error.clone()));
+        self.phase = current.phase;
+        self.process_state = current.process_state.clone();
+        self.control_state = current.control_state.clone();
+        self.listeners_ready = current.listeners_ready;
+        self.pid = current.pid;
+        self.operation = current.operation.clone();
+        self.observed_at = current.observed_at;
+        self.stop_reason = current.stop_reason;
+        self.error_code = current.error_code.clone();
+        self.last_error = current.last_error.clone();
+        self.tun_health = current.tun_health.clone();
+        self.core_version = current.core_version.clone();
+        self.recovery_generation = current.recovery_generation;
+        self.service_sequence = current.service_sequence;
+        self.controller = current.controller.clone();
+        if let Some((phase, code, message)) = failure {
+            self.phase = phase;
+            self.control_state = "unreachable".into();
+            self.error_code = code;
+            self.last_error = message;
+            self.controller = None;
+        }
+    }
+    pub fn apply_core_observation(&mut self, core: &CoreStatus) {
+        self.phase = phase_for_core(core);
+        self.process_state = core.process_state.clone();
+        self.control_state = core.control_state.clone();
+        self.listeners_ready = core.listeners_ready;
+        self.pid = core.pid;
+        self.operation = core.operation.clone();
+        self.observed_at = core.observed_at;
+        self.stop_reason = core.stop_reason;
+        self.error_code = core.error_code.clone();
+        self.last_error = core.error.clone();
+        self.tun_health = core.tun_health.clone();
+        self.core_version = core.version.clone();
+        self.recovery_generation = core.recovery_generation;
+        self.service_instance = core.service_instance.clone();
+        self.service_sequence = core.status_sequence;
+        self.controller = if core.process_state == "alive"
+            && matches!(core.control_state.as_str(), "ready" | "busy")
+        {
+            core.controller.clone()
+        } else {
+            None
+        };
     }
 }

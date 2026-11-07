@@ -1,18 +1,20 @@
 use crate::{
     config,
     core::CoreSupervisor,
+    core_runtime::{CoreRuntime, RuntimeRequest},
     error::{AppError, Result},
     lifecycle::{OwnerLease, PowerSignal, StopReason, SystemAwakeClock},
-    service_ipc::{AuthenticatedOwner, Reply, Request, Server},
+    service_ipc::{AuthenticatedOwner, AuthenticatedRequest, Reply, Request, Server},
     windows,
 };
 use serde::Serialize;
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     fs,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -470,122 +472,280 @@ fn run_service() -> Result<()> {
         }
         windows::allow_service_identity_query(owner)?;
         let host_path = directory.join("mihomo-desktop-host.exe");
-        let server = Server::new(owner.into(), host_path.clone())?;
-        let mut core = CoreSupervisor::new(
+        let runtime = CoreRuntime::spawn(CoreSupervisor::new(
             directory.join("mihomo-core.exe"),
             data.join("runtime"),
             data.join("logs"),
-        );
-        let mut lease = OwnerLease::new(SystemAwakeClock)?;
-        let mut active_owner: Option<AuthenticatedOwner> = None;
+        ))?;
+        let session = Arc::new(Mutex::new(ServiceSession {
+            owner: None,
+            id: None,
+            intent_revision: 0,
+            request_sequence: 0,
+            lease: OwnerLease::new(SystemAwakeClock)?,
+            closing: false,
+            retired: VecDeque::new(),
+            shutting_down: false,
+            cleanup_sequence: 0,
+        }));
+        // The work pipe carries bounded config frames. Three separately accepted
+        // control instances retain capacity for Stop/heartbeat when a work peer
+        // is slow; none executes lifecycle work on its connection thread.
+        let mut servers = Vec::new();
+        for (bulk, first) in [(false, true), (false, false), (false, false), (true, true)] {
+            servers.push(Server::new(owner.into(), host_path.clone(), bulk, first)?);
+        }
+        for server in servers {
+            let runtime = runtime.clone();
+            let session = session.clone();
+            let stopping = stopping.clone();
+            thread::Builder::new()
+                .name("service-control".into())
+                .spawn(move || {
+                    while !stopping.load(Ordering::Acquire) {
+                        match server.receive() {
+                            Ok(Some(request)) => {
+                                let _ = server.respond(handle_request(&runtime, &session, request));
+                            }
+                            Ok(None) => thread::sleep(Duration::from_millis(10)),
+                            Err(_) => thread::sleep(Duration::from_millis(25)),
+                        }
+                    }
+                })
+                .map_err(|error| AppError::io("无法启动服务控制通道", error))?;
+        }
         let mut power_generation = power.generation();
         report_status(&handle, ServiceState::Running)?;
-        while !stopping.load(Ordering::SeqCst) {
+        while !stopping.load(Ordering::Acquire) {
             let resumed = power.generation() != power_generation;
             if resumed {
                 power_generation = power.generation();
             }
-            if let Some(authenticated) = active_owner.as_ref() {
-                let valid = if resumed {
-                    authenticated.verify(owner, &host_path).is_ok()
-                } else {
-                    authenticated.alive()
-                };
-                if !valid {
-                    crate::diagnostics::record(
-                        &data.join("logs"),
-                        "service_owner_lost",
-                        serde_json::json!({"ownerPid":authenticated.pid,"generation":power_generation}),
-                    );
-                    core.stop_for(StopReason::OwnerLost)?;
-                    active_owner = None;
-                } else if resumed {
-                    lease.resume_verified()?;
-                    core.request_reconcile(power_generation)?;
-                }
-            }
-            if resumed {
-                crate::diagnostics::record(
-                    &data.join("logs"),
-                    "service_resume",
-                    serde_json::json!({"generation":power_generation,"ownerPid":active_owner.as_ref().map(|owner|owner.pid),"leaseAgeMs":lease.elapsed()?.as_millis()}),
-                );
-            }
-            if let Some(authenticated) = server.receive()? {
-                if active_owner
-                    .as_ref()
-                    .is_some_and(|owner| owner.alive() && owner.pid != authenticated.owner.pid)
-                {
-                    let _ = server.respond(Reply::from_result(Err(AppError::new(
-                        "service_owner_busy",
-                        "现有桌面后台仍拥有服务，请先完全退出旧实例",
-                    ))));
-                    continue;
-                }
-                let is_start = matches!(&authenticated.request, Request::Start { .. });
-                let is_owner = active_owner
-                    .as_ref()
-                    .is_some_and(|owner| owner.pid == authenticated.owner.pid);
-                let reply = match authenticated.request {
-                    Request::Start { config } => {
-                        active_owner = Some(authenticated.owner);
-                        core.start(config, true)
-                    }
-                    Request::Stop => {
-                        let result = core.stop_for(StopReason::UserStop);
-                        if result.is_ok() {
-                            active_owner = None;
+            let mut cleanup_event = None;
+            {
+                let mut session = session.lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(authenticated) = session.owner.as_ref() {
+                    let owner_pid = authenticated.pid;
+                    let valid = if resumed {
+                        authenticated.verify(owner, &host_path).is_ok()
+                    } else {
+                        authenticated.alive()
+                    };
+                    if !session.closing {
+                        if valid && resumed {
+                            session.lease.resume_verified()?;
                         }
-                        result.map(|_| core.status())
+                        let reason = if !valid {
+                            Some(StopReason::OwnerLost)
+                        } else if session.lease.expired()? {
+                            Some(StopReason::LeaseExpired)
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = reason {
+                            begin_owner_cleanup(&runtime, &mut session, reason)?;
+                            cleanup_event = Some(
+                                serde_json::json!({"ownerPid":owner_pid,"reason":reason,"generation":power_generation}),
+                            );
+                        } else if resumed {
+                            runtime.reconcile(power_generation);
+                        }
                     }
-                    Request::Reload { config } if is_owner => core.reload(config),
-                    Request::Reload { .. } => Err(AppError::new(
-                        "service_owner_required",
-                        "只有当前桌面后台可以重载内核",
-                    )),
-                    // Automatic recovery can prepare resources for the full
-                    // configured budget. Run it only inside an authenticated
-                    // heartbeat, whose client already uses that response budget.
-                    Request::Status if is_owner => core.poll(),
-                    Request::Status => Ok(core.status()),
-                    Request::Reconcile { generation } if is_owner => {
-                        core.request_reconcile(generation).and_then(|_| core.poll())
+                    // Never transfer ownership while an old process/operation
+                    // still owns resources, even if the owner PID has vanished.
+                    let status = runtime.status();
+                    if session.closing
+                        && status.pid.is_none()
+                        && status.operation.is_none()
+                        && !status.desired_running
+                    {
+                        if let Some(id) = session.id.take() {
+                            let order = (id, session.intent_revision, session.request_sequence);
+                            session.retired.push_back(order);
+                            while session.retired.len() > 64 {
+                                session.retired.pop_front();
+                            }
+                        }
+                        session.owner = None;
+                        session.closing = false;
+                        session.intent_revision = 0;
+                        session.request_sequence = 0;
                     }
-                    Request::Reconcile { .. } => Err(AppError::new(
-                        "service_owner_required",
-                        "只有当前桌面后台可以恢复内核",
-                    )),
-                };
-                if is_owner || is_start {
-                    lease.renew()?;
                 }
-                let _ = server.respond(Reply::from_result(reply));
             }
-            // A vanished or crashed UI must not leave privileged routing running forever.
-            if active_owner.is_some() && lease.expired()? {
-                crate::diagnostics::record(
-                    &data.join("logs"),
-                    "service_lease_expired",
-                    serde_json::json!({"ownerPid":active_owner.as_ref().map(|owner|owner.pid),"leaseAgeMs":lease.elapsed()?.as_millis(),"generation":power_generation}),
-                );
-                let reason = if core.status().stop_reason == Some(StopReason::UserStop) {
-                    StopReason::UserStop
-                } else {
-                    StopReason::LeaseExpired
-                };
-                core.stop_for(reason)?;
-                active_owner = None;
+            if let Some(event) = cleanup_event {
+                crate::diagnostics::record(&data.join("logs"), "service_owner_cleanup", event);
             }
-            // Do not start recovery outside a request: that would block the next
-            // pipe connection and let the UI lease expire while work is ongoing.
             thread::sleep(Duration::from_millis(25));
         }
+        // Closing admission uses the same mutex as authenticated requests.
+        // A frame already being read cannot overtake the SCM shutdown barrier.
+        session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .shutting_down = true;
         report_status(&handle, ServiceState::StopPending)?;
-        core.stop_for(StopReason::Shutdown)?;
+        runtime.shutdown()?;
         Ok(())
     })();
     let final_status = report_status(&handle, ServiceState::Stopped);
     result.and(final_status)
+}
+
+struct ServiceSession {
+    owner: Option<AuthenticatedOwner>,
+    id: Option<String>,
+    intent_revision: u64,
+    request_sequence: u64,
+    lease: OwnerLease<SystemAwakeClock>,
+    closing: bool,
+    retired: VecDeque<(String, u64, u64)>,
+    shutting_down: bool,
+    cleanup_sequence: u64,
+}
+
+fn begin_owner_cleanup(
+    runtime: &CoreRuntime,
+    session: &mut ServiceSession,
+    reason: StopReason,
+) -> Result<()> {
+    session.cleanup_sequence += 1;
+    runtime.submit(
+        format!(
+            "owner-cleanup-{}-{}",
+            session.id.as_deref().unwrap_or("none"),
+            session.cleanup_sequence
+        ),
+        session.intent_revision,
+        RuntimeRequest::Stop(reason),
+    )?;
+    session.closing = true;
+    Ok(())
+}
+
+fn handle_request(
+    runtime: &CoreRuntime,
+    session: &Mutex<ServiceSession>,
+    authenticated: AuthenticatedRequest,
+) -> Reply {
+    let mut session = session.lock().unwrap_or_else(|error| error.into_inner());
+    if session.shutting_down {
+        return Reply::from_result(Err(AppError::new(
+            "service_stopping",
+            "TUN 服务正在关闭，不能接收新的内核操作",
+        )));
+    }
+    if !authenticated.owner.alive() {
+        return Reply::from_result(Err(AppError::new(
+            "service_owner_lost",
+            "发送请求的桌面后台已经退出",
+        )));
+    }
+    let envelope = authenticated.envelope;
+    let is_owner = session
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner.alive() && owner.pid == authenticated.owner.pid)
+        && session.id.as_deref() == Some(envelope.owner_session.as_str());
+    if session.owner.is_some() && (!is_owner || session.closing) {
+        let cleaning =
+            session.closing || session.owner.as_ref().is_some_and(|owner| !owner.alive());
+        return Reply::from_result(Err(AppError::new(
+            if cleaning {
+                "service_owner_cleanup"
+            } else {
+                "service_owner_busy"
+            },
+            if cleaning {
+                "服务正在清理上一桌面实例的内核"
+            } else {
+                "现有桌面后台仍拥有服务，请先完全退出旧实例"
+            },
+        )));
+    }
+    let key = format!("{}:{}", envelope.owner_session, envelope.request_id);
+    match envelope.request {
+        Request::Status => Reply::from_result(Ok(runtime.status())),
+        Request::Heartbeat if is_owner => {
+            Reply::from_result(session.lease.renew().map(|_| runtime.status()))
+        }
+        Request::Heartbeat => Reply::from_result(Ok(runtime.status())),
+        Request::Operation { id }
+            if is_owner && id.starts_with(&format!("{}:", envelope.owner_session)) =>
+        {
+            Reply::operation(runtime.operation(&id))
+        }
+        Request::Reconcile { generation } if is_owner => {
+            runtime.reconcile(generation);
+            Reply::from_result(Ok(runtime.status()))
+        }
+        request @ (Request::Start { .. } | Request::Stop | Request::Reload { .. }) => {
+            if !is_owner && matches!(request, Request::Reload { .. }) {
+                return Reply::from_result(Err(AppError::new(
+                    "service_owner_required",
+                    "只有当前桌面后台可以重载内核",
+                )));
+            }
+            let operation = match request {
+                Request::Start { config } => RuntimeRequest::Start(config),
+                Request::Reload { config } => RuntimeRequest::Reload(config),
+                Request::Stop => RuntimeRequest::Stop(StopReason::UserStop),
+                _ => unreachable!(),
+            };
+            // Replaying an accepted ID returns its retained outcome; an unseen
+            // stale intent/sequence can never cancel newer work or resurrect it.
+            if runtime.operation(&key).is_ok() {
+                return Reply::operation(runtime.submit(key, envelope.intent_revision, operation));
+            }
+            let (previous_intent, previous_sequence) =
+                if session.id.as_deref() == Some(envelope.owner_session.as_str()) {
+                    (session.intent_revision, session.request_sequence)
+                } else {
+                    session
+                        .retired
+                        .iter()
+                        .rev()
+                        .find(|(id, _, _)| id == &envelope.owner_session)
+                        .map(|(_, intent, sequence)| (*intent, *sequence))
+                        .unwrap_or((0, 0))
+                };
+            if envelope.intent_revision < previous_intent
+                || envelope.intent_revision == previous_intent
+                    && envelope.request_sequence <= previous_sequence
+            {
+                return Reply::from_result(Err(AppError::new(
+                    "operation_cancelled",
+                    "服务已接收更新的用户指令",
+                )));
+            }
+            let start = matches!(operation, RuntimeRequest::Start(_));
+            let result = runtime.submit(key, envelope.intent_revision, operation);
+            if result.is_ok() {
+                session.intent_revision = envelope.intent_revision;
+                session.request_sequence = envelope.request_sequence;
+                if session.owner.is_none() {
+                    // An authenticated Stop on an empty runtime still records a
+                    // session tombstone, so a delayed bulk Start cannot overtake it.
+                    session.owner = Some(authenticated.owner);
+                    session.id = Some(envelope.owner_session);
+                    match OwnerLease::new(SystemAwakeClock) {
+                        Ok(lease) => session.lease = lease,
+                        Err(error) => return Reply::from_result(Err(error)),
+                    }
+                }
+                if start {
+                    if let Err(error) = session.lease.renew() {
+                        return Reply::from_result(Err(error));
+                    }
+                }
+            }
+            Reply::operation(result)
+        }
+        _ => Reply::from_result(Err(AppError::new(
+            "service_owner_required",
+            "只有当前桌面后台可以查询或恢复其内核操作",
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -688,5 +848,276 @@ mod maintenance_tests {
         .unwrap_err();
         assert_eq!(denied.code, "io_error");
         assert!(denied.message.contains("系统错误：5"));
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use crate::service_ipc::{Envelope, PROTOCOL_VERSION};
+
+    fn session() -> Mutex<ServiceSession> {
+        Mutex::new(ServiceSession {
+            owner: None,
+            id: None,
+            intent_revision: 0,
+            request_sequence: 0,
+            lease: OwnerLease::new(SystemAwakeClock).unwrap(),
+            closing: false,
+            retired: VecDeque::new(),
+            shutting_down: false,
+            cleanup_sequence: 0,
+        })
+    }
+
+    fn request(id: &str, intent: u64, sequence: u64, request: Request) -> AuthenticatedRequest {
+        AuthenticatedRequest {
+            owner: AuthenticatedOwner::current_for_test(),
+            envelope: Envelope {
+                protocol_version: PROTOCOL_VERSION,
+                owner_session: "00000000000000000000000000000001".into(),
+                request_id: id.into(),
+                intent_revision: intent,
+                request_sequence: sequence,
+                request,
+            },
+        }
+    }
+
+    #[test]
+    fn empty_runtime_stop_records_ordering_before_a_delayed_bulk_start() {
+        let runtime = CoreRuntime::queued_for_test();
+        let session = session();
+        let stop = handle_request(&runtime, &session, request("stop", 2, 20, Request::Stop));
+        assert!(stop.error.is_none());
+        let stale = handle_request(
+            &runtime,
+            &session,
+            request(
+                "delayed-start",
+                1,
+                19,
+                Request::Start {
+                    config: "mixed-port: 7890".into(),
+                },
+            ),
+        );
+        assert_eq!(stale.error.unwrap().code, "operation_cancelled");
+        assert!(!runtime.status().desired_running);
+        // Highwater survives owner retirement rather than reverting to zero.
+        let mut owner = session.lock().unwrap();
+        let id = owner.id.take().unwrap();
+        let order = (id, owner.intent_revision, owner.request_sequence);
+        owner.retired.push_back(order);
+        owner.owner = None;
+        owner.intent_revision = 0;
+        owner.request_sequence = 0;
+        drop(owner);
+        let stale = handle_request(
+            &runtime,
+            &session,
+            request(
+                "delayed-after-retire",
+                1,
+                19,
+                Request::Start {
+                    config: "mixed-port: 7890".into(),
+                },
+            ),
+        );
+        assert_eq!(stale.error.unwrap().code, "operation_cancelled");
+        assert!(!runtime.status().desired_running);
+    }
+
+    #[test]
+    fn shutdown_gate_rejects_a_frame_that_finished_after_scm_stop() {
+        let runtime = CoreRuntime::queued_for_test();
+        let session = session();
+        let delayed = request(
+            "late",
+            99,
+            99,
+            Request::Start {
+                config: "mixed-port: 7890".into(),
+            },
+        );
+        session.lock().unwrap().shutting_down = true;
+        let reply = handle_request(&runtime, &session, delayed);
+        assert_eq!(reply.error.unwrap().code, "service_stopping");
+        assert!(!runtime.status().desired_running);
+        assert!(runtime.status().operation.is_none());
+    }
+
+    #[test]
+    fn repeated_lease_cleanup_uses_a_new_operation_after_same_session_reacquires() {
+        let runtime = CoreRuntime::queued_for_test();
+        let session = session();
+        handle_request(
+            &runtime,
+            &session,
+            request(
+                "start1",
+                1,
+                1,
+                Request::Start {
+                    config: "mixed-port: 7890".into(),
+                },
+            ),
+        );
+        begin_owner_cleanup(
+            &runtime,
+            &mut session.lock().unwrap(),
+            StopReason::LeaseExpired,
+        )
+        .unwrap();
+        session.lock().unwrap().closing = false;
+        handle_request(
+            &runtime,
+            &session,
+            request(
+                "start2",
+                1,
+                2,
+                Request::Start {
+                    config: "mixed-port: 7890".into(),
+                },
+            ),
+        );
+        assert!(runtime.status().desired_running);
+        begin_owner_cleanup(
+            &runtime,
+            &mut session.lock().unwrap(),
+            StopReason::LeaseExpired,
+        )
+        .unwrap();
+        assert!(!runtime.status().desired_running);
+        assert_eq!(session.lock().unwrap().cleanup_sequence, 2);
+        let id = "00000000000000000000000000000001";
+        assert_eq!(
+            runtime
+                .operation(&format!("owner-cleanup-{id}-1"))
+                .unwrap()
+                .phase,
+            "cancelled"
+        );
+        assert_eq!(
+            runtime
+                .operation(&format!("owner-cleanup-{id}-2"))
+                .unwrap()
+                .phase,
+            "queued"
+        );
+    }
+
+    #[test]
+    fn delayed_start_cannot_override_stop_but_accepted_id_remains_queryable() {
+        let runtime = CoreRuntime::queued_for_test();
+        let session = session();
+        let start = handle_request(
+            &runtime,
+            &session,
+            request(
+                "start",
+                1,
+                10,
+                Request::Start {
+                    config: "mixed-port: 7890".into(),
+                },
+            ),
+        );
+        assert!(start.error.is_none());
+        let stop = handle_request(&runtime, &session, request("stop", 2, 11, Request::Stop));
+        assert!(stop.error.is_none());
+        let stale = handle_request(
+            &runtime,
+            &session,
+            request(
+                "late-start",
+                1,
+                12,
+                Request::Start {
+                    config: "mixed-port: 7890".into(),
+                },
+            ),
+        );
+        assert_eq!(stale.error.unwrap().code, "operation_cancelled");
+        assert!(!runtime.status().desired_running);
+        let replay = handle_request(
+            &runtime,
+            &session,
+            request(
+                "start",
+                1,
+                10,
+                Request::Start {
+                    config: "mixed-port: 7890".into(),
+                },
+            ),
+        );
+        assert_eq!(replay.operation.unwrap().phase, "cancelled");
+        assert!(!runtime.status().desired_running);
+        let older_step = handle_request(
+            &runtime,
+            &session,
+            request(
+                "old-step",
+                2,
+                10,
+                Request::Start {
+                    config: "mixed-port: 7890".into(),
+                },
+            ),
+        );
+        assert_eq!(older_step.error.unwrap().code, "operation_cancelled");
+        let later_start = handle_request(
+            &runtime,
+            &session,
+            request(
+                "new-start",
+                3,
+                13,
+                Request::Start {
+                    config: "mixed-port: 7890".into(),
+                },
+            ),
+        );
+        assert!(later_start.error.is_none());
+        assert!(runtime.status().desired_running);
+    }
+
+    #[test]
+    fn status_is_not_a_heartbeat_and_same_pid_cannot_change_owner_session() {
+        let runtime = CoreRuntime::queued_for_test();
+        let session = session();
+        handle_request(
+            &runtime,
+            &session,
+            request(
+                "start",
+                1,
+                1,
+                Request::Start {
+                    config: "mixed-port: 7890".into(),
+                },
+            ),
+        );
+        thread::sleep(Duration::from_millis(30));
+        let age = session.lock().unwrap().lease.elapsed().unwrap();
+        let before = runtime.status().status_sequence;
+        for number in 0..5 {
+            let reply = handle_request(
+                &runtime,
+                &session,
+                request(&format!("status{number}"), 0, 2 + number, Request::Status),
+            );
+            assert!(reply.error.is_none());
+        }
+        assert!(session.lock().unwrap().lease.elapsed().unwrap() >= age);
+        assert_eq!(runtime.status().status_sequence, before);
+        let mut foreign = request("foreign", 2, 99, Request::Stop);
+        foreign.envelope.owner_session = "00000000000000000000000000000002".into();
+        let reply = handle_request(&runtime, &session, foreign);
+        assert_eq!(reply.error.unwrap().code, "service_owner_busy");
+        assert!(runtime.status().desired_running);
     }
 }

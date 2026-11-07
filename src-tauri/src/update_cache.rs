@@ -510,9 +510,7 @@ fn require_empty_directory(path: &Path) -> CacheResult<()> {
 }
 
 fn delete_on_close(file: File) -> CacheResult<()> {
-    let disposition = FILE_DISPOSITION_INFO {
-        DeleteFile: true.into(),
-    };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     if unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),

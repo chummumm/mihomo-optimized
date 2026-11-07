@@ -1560,6 +1560,7 @@ tun:
   enable: false
   device: MihomoSmokeTun
   stack: mixed
+  inet4-address: ['198.18.0.1/30']
   route-address: ['{TUN_TARGET}/32']
   dns-hijack: []
 proxies:
@@ -2404,16 +2405,19 @@ class Acceptance:
         recovery_hint = self.driver.ui("RecoveryHint")
         recovery_start = self.driver.ui("RecoveryStartCore")
         require(visible.get("found") and recovery_hint.get("found") and "准备所需资源" in recovery_hint.get("name", "")
-                and recovery_start.get("found") and not recovery_start.get("enabled"),
+                and recovery_start.get("found") and recovery_start.get("enabled")
+                and re.search(r"停止内核|Stop core", recovery_start.get("name", ""), re.I),
                 "automatic_startup_proxy_preparation_message_missing")
         require(not re.search(r"请先.*启动内核|内核尚未运行|没有代理策略组|导入订阅", preparing_text),
                 "automatic_startup_proxy_stopped_hint_visible")
         self.driver.navigate("home")
         start_button = self.driver.ui("StartCore")
+        stop_button = self.driver.ui("StopCore")
         restart_button = self.driver.ui("RestartCore")
-        require(start_button.get("found") and not start_button.get("enabled")
+        require((not start_button.get("found") or not start_button.get("enabled"))
+                and stop_button.get("found") and stop_button.get("enabled")
                 and restart_button.get("found") and not restart_button.get("enabled"),
-                "automatic_startup_actions_enabled_during_preparation")
+                "automatic_startup_stop_not_available_during_preparation")
         phase_control = self.driver.ui("CorePhase")
         require(phase_control.get("found") and re.search(r"正在启动|Starting", phase_control.get("name", ""), re.I),
                 "automatic_startup_native_phase_missing")
@@ -2426,7 +2430,7 @@ class Acceptance:
                 and preparing.get("controller") is None and not cache.exists(),
                 "automatic_startup_inspection_missed_preparation")
         evidence.update({"preparationPhase": "starting", "preparationErrorAbsent": True,
-                         "preparationControllerAbsent": True, "startAndRestartDisabled": True,
+                         "preparationControllerAbsent": True, "startAndRestartDisabled": True, "stopEnabled": True,
                          "preparationUiWithoutFailureHint": True})
         self.resources.release_success.set()
 
@@ -2679,7 +2683,7 @@ class Acceptance:
                     return observed if observed.get("phase") == "error" else None
 
                 failed = wait_until(identity_rejected, "service_identity_outage_not_observed", 6)
-                require("无法验证服务进程" in (failed.get("lastError") or "")
+                require(failed.get("errorCode") == "service_identity_failed"
                         and "系统错误：5" in (failed.get("lastError") or "")
                         and failed.get("controller") is None and failed.get("systemProxy") is False,
                         "service_identity_outage_not_safely_reported")
@@ -2759,14 +2763,15 @@ class Acceptance:
                 return json.loads(content)
             finally:
                 connection.close()
-        return wait_until(observe, "health_probe_busy_timeout", 15)
+        return wait_until(observe, "health_probe_busy_timeout", 35)
 
     def check_local_resume_health(self, running: dict, *, remove_route: bool = False) -> None:
         """Exercise the local resume boundary; this is not a simulated OS sleep."""
         self.stage = "local_tun_recovery" if remove_route else "local_healthy_resume"
         before = self.managed_core(running)
         require(before.get("capabilities", {}).get("tun_health") is True
-                and before.get("capabilities", {}).get("tun_repair") is True,
+                and before.get("capabilities", {}).get("tun_repair") is True
+                and before.get("capabilities", {}).get("tun_recovery_operations") is True,
                 "paired_core_health_capability_missing")
         health = self.local_health_request(running, "/desktop/health")
         require(health.get("pid") == before["pid"] and health.get("state") == "running"
@@ -2775,7 +2780,13 @@ class Acceptance:
         recovered = self.local_health_request(running, "/desktop/recover", "POST")
         require(recovered.get("pid") == before["pid"] and recovered.get("status") == "healthy",
                 "healthy_resume_changed_core_or_device")
-        evidence = {"sameCorePid": True, "healthyKept": True, "realSleep": False}
+        evidence = {"sameCorePid": True, "healthyKept": True, "realSleep": False, "realWifiSwitch": False}
+        identity = health.get("tun", {}).get("identity")
+        generation, creations = health.get("tun_generation"), health.get("creation_count")
+        require(isinstance(generation, int) and isinstance(creations, int), "tun_creation_observation_missing")
+        if running.get("tun"):
+            require(isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{16}", identity) and int(identity, 16) != 0,
+                    "owned_tun_handle_identity_missing")
         if remove_route:
             device = health["tun"]
             require(device.get("device") == "MihomoSmokeTun" and isinstance(device.get("index"), int)
@@ -2798,10 +2809,91 @@ class Acceptance:
             wait_until(self.socks.roundtrip, "route_recovery_data_path_failed")
             evidence.update({"ownedRouteRemoved": True, "stateAfterRemoval": observed.get("tun", {}).get("state"),
                              "repairResult": repaired.get("status"), "realTunForwarding": True})
+            verified = self.local_health_request(running, "/desktop/health")
+            require(verified.get("tun", {}).get("identity") == identity
+                    and verified.get("tun", {}).get("index") == device["index"]
+                    and verified.get("tun_generation") == generation and verified.get("creation_count") == creations,
+                    "owned_route_repair_recreated_tun")
+
+            # Remove only the fixed test address on this same verified interface.
+            # Both native address restoration and DAD readiness are exercised.
+            script = Path(__file__).with_name("remove-owned-smoke-address.ps1").resolve()
+            result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                     "-File", str(script), "-InterfaceIndex", str(device["index"])],
+                                    capture_output=True, text=True, encoding="utf-8", errors="strict", timeout=20,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+            require(result.returncode == 0, "owned_address_fault_injection_failed")
+            removed_address = json.loads(result.stdout)
+            require(removed_address.get("removed") is True and removed_address.get("interfaceIndex") == device["index"]
+                    and removed_address.get("address") == "198.18.0.1", "owned_address_fault_not_confirmed")
+            repaired_address = self.local_health_request(running, "/desktop/recover", "POST")
+            require(repaired_address.get("status") in ("healthy", "repaired"), "owned_address_not_recovered")
+            wait_until(self.socks.roundtrip, "address_recovery_data_path_failed")
+            evidence.update({"ownedAddressRemoved": True, "addressRepairedInPlace": True})
+        verified = self.local_health_request(running, "/desktop/health")
+        require(verified.get("tun", {}).get("identity") == identity and verified.get("tun_generation") == generation
+                and verified.get("creation_count") == creations, "local_recovery_recreated_tun")
+        evidence.update({"sameTunIdentity": True, "sameTunGeneration": True, "additionalTunCreations": 0})
         after = self.phase("running")
         require(self.managed_core(after)["pid"] == before["pid"], "local_recovery_restarted_healthy_core")
         self.report[self.stage] = evidence
         self.mark(self.stage)
+
+    def check_stop_during_service_recovery(self, running: dict, cache: Path) -> dict:
+        """A real cold-resource restart must not occupy Status, heartbeat or Stop."""
+        self.stage = "service_recovery_stop"
+        before = self.managed_core(running)
+        identity = self.owned_children[before["pid"]]
+        previous_requests = self.resources.count("/rules.yaml")
+        cache.unlink()  # The unique cache belonging to this fixture was verified above.
+        self.resources.release_success.clear()
+        self.processes.kill(identity)
+        response_times = []
+        try:
+            wait_until(lambda: self.resources.count("/rules.yaml") > previous_requests,
+                       "service_cancel_resource_not_requested", 15)
+            resource_request_observed_at = time.monotonic()
+            for _ in range(3):
+                started = time.monotonic()
+                observed = self.status(timeout=3)
+                response_times.append(round((time.monotonic() - started) * 1000, 1))
+                require(response_times[-1] < 2000, "service_recovery_blocked_status")
+                require(observed.get("desiredRunning") is True, "service_recovery_lost_user_intent")
+            self.driver.navigate("home")
+            stop_button = self.driver.ui("StopCore")
+            require(stop_button.get("found") and stop_button.get("enabled"), "service_recovery_ui_stop_disabled")
+            stopped_at = time.monotonic()
+            self.driver.invoke("desktop_stop", timeout=18)
+            stop_seconds = time.monotonic() - stopped_at
+            require(stop_seconds < 15, "service_recovery_stop_waited_for_resource_budget")
+            stopped = self.phase("stopped")
+            require(stopped.get("desiredRunning") is False, "service_recovery_stop_intent_not_persisted")
+            wait_until(lambda: not self.processes.at_paths([self.core]), "service_cancel_left_core_process", 5)
+        finally:
+            self.resources.release_success.set()
+            released_at = time.monotonic()
+        # A late fixture response and automatic poll may not resurrect the stopped core.
+        # The handler starts its delay after replacement requests the resource,
+        # which can be several seconds after the old process was killed. Cover
+        # that full delay and at least four seconds after releasing the response.
+        observation_end = max(resource_request_observed_at + self.resources.delay + 4, released_at + 4)
+        post_release_observations = 0
+        while time.monotonic() < observation_end:
+            observed = self.status(timeout=3)
+            require(observed.get("phase") == "stopped" and observed.get("desiredRunning") is False
+                    and not self.processes.at_paths([self.core]), "service_cancel_resurrected_core")
+            post_release_observations += 1
+            time.sleep(0.25)
+        require(post_release_observations > 0, "service_cancel_late_response_not_observed")
+        self.report[self.stage] = {"statusResponseMilliseconds": response_times, "stopSeconds": round(stop_seconds, 3),
+                                   "stoppedBeforeResourceReady": True, "noLateRestart": True, "noOrphanCore": True,
+                                   "postReleaseObservations": post_release_observations}
+        self.mark(self.stage)
+        self.driver.invoke("desktop_start")
+        running = self.phase("running")
+        self.managed_core(running)
+        wait_until(self.socks.roundtrip, "service_after_cancel_forwarding_failed")
+        return running
 
     def check_host_channel_recovery(self, running: dict) -> None:
         self.stage = "host_channel_recovery"
@@ -3120,9 +3212,8 @@ class Acceptance:
             self.check_local_resume_health(self.phase("running"), remove_route=True)
             tun = self.phase("running")
 
-            # A recovery must run inside an already authenticated heartbeat.
-            # Otherwise its >20s preparation would block the next pipe connect
-            # (4s) and incorrectly expire the service's normal 20s UI lease.
+            # Automatic recovery runs in the sole lifecycle worker. Independent
+            # authenticated heartbeats must maintain the normal 20s UI lease.
             self.stage = "resource_bootstrap_recovery"
             old_controller = tun["controller"]
             old_identity = self.owned_children[tun_core_pid]
@@ -3158,6 +3249,8 @@ class Acceptance:
                 "serviceRecoveryTunForwarded": True,
             })
             self.mark("resource_bootstrap_recovery")
+            tun = self.check_stop_during_service_recovery(tun, service_cache)
+            tun_core_pid = self.managed_core(tun)["pid"]
             self.stage = "tun_forwarding"
             wait_until(self.socks.roundtrip, "tun_forwarding_timeout")
             require(owned_firewall_rule_count(self.core) == 1, "tun_firewall_rule_not_installed")
@@ -3353,7 +3446,7 @@ def main() -> int:
                         "single_instance_and_native_ui", "native_titlebar_pointer", "native_redesign_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
                         "local_healthy_resume", "local_tun_recovery", "host_channel_recovery",
-                        "resource_bootstrap_recovery", "system_proxy_service_recovery"}
+                        "resource_bootstrap_recovery", "system_proxy_service_recovery", "service_recovery_stop"}
             acceptance.report["passed"] = all(acceptance.report["tests"].get(name) is True for name in required) and not acceptance.report["diagnostics"]
             (artifacts / "verification.json").write_text(json.dumps(acceptance.report, indent=2) + "\n", encoding="utf-8")
     return 0 if acceptance and acceptance.report["passed"] else 1

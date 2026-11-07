@@ -8,6 +8,8 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Child,
+    sync::{Arc, Mutex, TryLockError},
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::{GetLastError, LocalFree, HANDLE},
@@ -43,6 +45,9 @@ pub fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
 
+/// # Safety
+/// `value` must be null or point to aligned, readable UTF-16 memory that remains
+/// valid until its NUL terminator or 32,768 code units have been read.
 pub unsafe fn read_wide(value: *const u16) -> String {
     if value.is_null() {
         return String::new();
@@ -614,18 +619,157 @@ pub fn shell_open(target: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn run_elevated_service_action(action: &str) -> Result<()> {
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServiceAction {
+    Install,
+    Uninstall,
+}
+
+impl ServiceAction {
+    fn parse(action: &str) -> Result<Self> {
+        match action {
+            "install" => Ok(Self::Install),
+            "uninstall" => Ok(Self::Uninstall),
+            _ => Err(AppError::new("invalid_service_action", "不支持的服务操作")),
+        }
+    }
+}
+
+struct ServiceHelper {
+    // A successful ShellExecute without a process handle cannot prove cleanup.
+    // Keep that exceptional reservation instead of launching competing work.
+    process: Option<OwnedHandle>,
+}
+
+struct ServiceMaintenance<P> {
+    action: ServiceAction,
+    process: P,
+    deadline: Instant,
+}
+
+type MaintenanceSlot<P> = Mutex<Option<Arc<ServiceMaintenance<P>>>>;
+static SERVICE_MAINTENANCE: MaintenanceSlot<ServiceHelper> = Mutex::new(None);
+const SERVICE_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(60);
+const SERVICE_MAINTENANCE_SLICE: Duration = Duration::from_millis(75);
+
+fn maintenance_busy() -> AppError {
+    AppError::new(
+        "service_maintenance_busy",
+        "先前的服务设置仍在进行，请等待完成后再更改服务",
+    )
+}
+
+fn retire_maintenance<P>(slot: &MaintenanceSlot<P>, completed: &Arc<ServiceMaintenance<P>>) {
+    // A concurrent caller may already have observed this exit and launched the
+    // opposite operation. Never clear its reservation or wait behind its UAC.
+    let mut current = match slot.try_lock() {
+        Ok(current) => current,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(TryLockError::WouldBlock) => return,
+    };
+    if current
+        .as_ref()
+        .is_some_and(|active| Arc::ptr_eq(active, completed))
+    {
+        *current = None;
+    }
+}
+
+/// Own one launched helper across cancellation and timeouts. Only the native
+/// launch and wait are injected; the same ownership policy is exercised in tests.
+fn service_maintenance_with<P>(
+    slot: &MaintenanceSlot<P>,
+    action: ServiceAction,
+    cancellation: Option<&crate::lifecycle::Cancellation>,
+    launch_if_idle: bool,
+    launch: impl FnOnce() -> Result<P>,
+    mut wait: impl FnMut(&P, Duration) -> Result<Option<u32>>,
+) -> Result<()> {
+    let check = || cancellation.map_or(Ok(()), crate::lifecycle::Cancellation::check);
+    check()?;
+    let active = {
+        // ShellExecute can wait for UAC. Another caller must remain cancellable
+        // and must not launch a second helper while that launch is unresolved.
+        let mut current = match slot.try_lock() {
+            Ok(current) => current,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(maintenance_busy()),
+        };
+        if let Some(previous) = current.as_ref() {
+            if previous.action != action {
+                if wait(&previous.process, Duration::ZERO)?.is_none() {
+                    return Err(maintenance_busy());
+                }
+                *current = None;
+            }
+        }
+        if let Some(previous) = current.as_ref() {
+            previous.clone()
+        } else {
+            if !launch_if_idle {
+                return Ok(());
+            }
+            check()?;
+            let process = match launch() {
+                Ok(process) => process,
+                Err(error) => {
+                    check()?;
+                    return Err(error);
+                }
+            };
+            let active = Arc::new(ServiceMaintenance {
+                action,
+                process,
+                deadline: Instant::now() + SERVICE_MAINTENANCE_TIMEOUT,
+            });
+            // Store ownership before checking cancellation after ShellExecute.
+            *current = Some(active.clone());
+            active
+        }
+    };
+    loop {
+        check()?;
+        // An expired waiter can still observe a completed process. Rejoining
+        // never grants a still-running helper a new 60-second deadline.
+        let mut exited = wait(&active.process, Duration::ZERO)?;
+        if exited.is_none() {
+            let Some(remaining) = active.deadline.checked_duration_since(Instant::now()) else {
+                return Err(AppError::new(
+                    "service_install_timeout",
+                    "服务设置仍未完成，请稍后检查服务状态",
+                ));
+            };
+            exited = wait(&active.process, remaining.min(SERVICE_MAINTENANCE_SLICE))?;
+        }
+        if let Some(code) = exited {
+            retire_maintenance(slot, &active);
+            check()?;
+            return if code == 0 {
+                Ok(())
+            } else {
+                Err(AppError::new(
+                    "service_install_failed",
+                    "服务操作失败，请检查安装目录权限后重试",
+                ))
+            };
+        }
+    }
+}
+
+fn launch_service_helper(
+    action: ServiceAction,
+    cancellation: Option<&crate::lifecycle::Cancellation>,
+) -> Result<ServiceHelper> {
     let directory = protected_install_dir()?;
     let service = wide(directory.join("mihomo-desktop-service.exe"));
     let sid = current_sid()?;
     let parameters = match action {
-        "install" => format!("--install --owner-sid {sid}"),
-        "uninstall" => "--uninstall".into(),
-        _ => return Err(AppError::new("invalid_service_action", "不支持的服务操作")),
+        ServiceAction::Install => format!("--install --owner-sid {sid}"),
+        ServiceAction::Uninstall => "--uninstall".into(),
     };
     let parameters = wide(parameters);
     let verb = wide("runas");
+    cancellation.map_or(Ok(()), crate::lifecycle::Cancellation::check)?;
     unsafe {
         let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
         info.cbSize = std::mem::size_of_val(&info) as u32;
@@ -644,28 +788,71 @@ pub fn run_elevated_service_action(action: &str) -> Result<()> {
                 "管理员授权未完成，服务设置没有更改",
             ));
         }
-        if info.hProcess.is_null() {
-            return Err(AppError::new(
-                "service_elevation_failed",
-                "无法等待服务安装结果",
-            ));
-        }
-        let process = OwnedHandle::from_raw_handle(info.hProcess);
-        if WaitForSingleObject(process.as_raw_handle(), 60_000) != 0 {
-            return Err(AppError::new(
-                "service_install_timeout",
-                "服务安装仍未完成，请稍后检查服务状态",
-            ));
-        }
-        let mut code = 1;
-        if GetExitCodeProcess(process.as_raw_handle(), &mut code) == 0 || code != 0 {
-            return Err(AppError::new(
-                "service_install_failed",
-                "服务操作失败，请检查安装目录权限后重试",
-            ));
-        }
+        Ok(ServiceHelper {
+            process: (!info.hProcess.is_null())
+                .then(|| OwnedHandle::from_raw_handle(info.hProcess)),
+        })
     }
-    Ok(())
+}
+
+fn wait_service_helper(helper: &ServiceHelper, timeout: Duration) -> Result<Option<u32>> {
+    use windows_sys::Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{GetExitCodeProcess, WaitForSingleObject},
+    };
+    let process = helper.process.as_ref().ok_or_else(|| {
+        AppError::new(
+            "service_elevation_failed",
+            "无法确认先前服务设置的完成状态，请检查服务后重新启动桌面程序",
+        )
+    })?;
+    match unsafe { WaitForSingleObject(process.as_raw_handle(), timeout.as_millis() as u32) } {
+        WAIT_OBJECT_0 => {
+            let mut code = 1;
+            if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
+                code = 1;
+            }
+            Ok(Some(code))
+        }
+        WAIT_TIMEOUT => Ok(None),
+        _ => Err(last_error("无法核验服务设置进程是否退出")),
+    }
+}
+
+pub fn run_elevated_service_action(action: &str) -> Result<()> {
+    run_elevated_service_action_cancellable(action, None)
+}
+
+pub fn run_elevated_service_action_cancellable(
+    action: &str,
+    cancellation: Option<&crate::lifecycle::Cancellation>,
+) -> Result<()> {
+    let action = ServiceAction::parse(action)?;
+    service_maintenance_with(
+        &SERVICE_MAINTENANCE,
+        action,
+        cancellation,
+        true,
+        || launch_service_helper(action, cancellation),
+        wait_service_helper,
+    )
+}
+
+/// Check retained maintenance before relying on SCM state: an opposite helper
+/// may still change a service that currently looks installed and running.
+pub fn wait_for_service_maintenance(
+    action: &str,
+    cancellation: Option<&crate::lifecycle::Cancellation>,
+) -> Result<()> {
+    let action = ServiceAction::parse(action)?;
+    service_maintenance_with(
+        &SERVICE_MAINTENANCE,
+        action,
+        cancellation,
+        false,
+        || launch_service_helper(action, cancellation),
+        wait_service_helper,
+    )
 }
 
 pub fn autostart_enabled() -> Result<bool> {
@@ -701,6 +888,197 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+
+    struct HelperFixture {
+        exit: Arc<AtomicI32>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for HelperFixture {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn observe_helper(process: &HelperFixture, timeout: Duration) -> Result<Option<u32>> {
+        assert!(timeout <= SERVICE_MAINTENANCE_SLICE);
+        let code = process.exit.load(Ordering::Acquire);
+        Ok((code >= 0).then_some(code as u32))
+    }
+
+    #[test]
+    fn service_maintenance_cancellation_retains_helper_and_blocks_opposite_action() {
+        let slot = Mutex::new(None);
+        let revision = Arc::new(AtomicU64::new(1));
+        let cancellation = crate::lifecycle::Cancellation::new(revision.clone(), 1);
+        let exit = Arc::new(AtomicI32::new(-1));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let result = service_maintenance_with(
+            &slot,
+            ServiceAction::Install,
+            Some(&cancellation),
+            true,
+            || {
+                Ok(HelperFixture {
+                    exit: exit.clone(),
+                    drops: drops.clone(),
+                })
+            },
+            |process, timeout| {
+                if !timeout.is_zero() {
+                    revision.store(2, Ordering::Release);
+                }
+                observe_helper(process, timeout)
+            },
+        );
+        assert_eq!(result.unwrap_err().code, "operation_cancelled");
+        assert_eq!(
+            drops.load(Ordering::Acquire),
+            0,
+            "Stop must retain the launched helper"
+        );
+        let result = service_maintenance_with(
+            &slot,
+            ServiceAction::Uninstall,
+            None,
+            true,
+            || panic!("opposite helper must not launch while install is alive"),
+            observe_helper,
+        );
+        assert_eq!(result.unwrap_err().code, "service_maintenance_busy");
+        let result = service_maintenance_with(
+            &slot,
+            ServiceAction::Install,
+            None,
+            true,
+            || panic!("same action must rejoin the retained helper"),
+            |process, timeout| {
+                if !timeout.is_zero() {
+                    exit.store(0, Ordering::Release);
+                }
+                observe_helper(process, timeout)
+            },
+        );
+        result.unwrap();
+        assert!(slot.lock().unwrap().is_none());
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn service_maintenance_registers_launch_before_honoring_late_cancellation() {
+        let slot = Mutex::new(None);
+        let revision = Arc::new(AtomicU64::new(1));
+        let cancellation = crate::lifecycle::Cancellation::new(revision.clone(), 1);
+        let exit = Arc::new(AtomicI32::new(-1));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let result = service_maintenance_with(
+            &slot,
+            ServiceAction::Install,
+            Some(&cancellation),
+            true,
+            || {
+                revision.store(2, Ordering::Release); // Stop while ShellExecute waits for UAC.
+                Ok(HelperFixture {
+                    exit: exit.clone(),
+                    drops: drops.clone(),
+                })
+            },
+            observe_helper,
+        );
+        assert_eq!(result.unwrap_err().code, "operation_cancelled");
+        assert!(slot.lock().unwrap().is_some());
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        let result = service_maintenance_with(
+            &slot,
+            ServiceAction::Install,
+            Some(&cancellation),
+            false,
+            || panic!("already cancelled caller must not launch"),
+            |_, _| panic!("already cancelled caller must not wait"),
+        );
+        assert_eq!(result.unwrap_err().code, "operation_cancelled");
+        exit.store(0, Ordering::Release);
+        service_maintenance_with(
+            &slot,
+            ServiceAction::Install,
+            None,
+            false,
+            || panic!("observation must not launch a helper"),
+            observe_helper,
+        )
+        .unwrap();
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn service_maintenance_timeout_retains_original_deadline_and_ownership() {
+        let exit = Arc::new(AtomicI32::new(-1));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let slot = Mutex::new(Some(Arc::new(ServiceMaintenance {
+            action: ServiceAction::Install,
+            process: HelperFixture {
+                exit: exit.clone(),
+                drops: drops.clone(),
+            },
+            deadline: Instant::now() - Duration::from_secs(1),
+        })));
+        for _ in 0..2 {
+            let result = service_maintenance_with(
+                &slot,
+                ServiceAction::Install,
+                None,
+                true,
+                || panic!("a timed out helper must not be replaced"),
+                |process, timeout| {
+                    assert!(timeout.is_zero(), "joining must not extend the deadline");
+                    observe_helper(process, timeout)
+                },
+            );
+            assert_eq!(result.unwrap_err().code, "service_install_timeout");
+        }
+        let result = service_maintenance_with(
+            &slot,
+            ServiceAction::Uninstall,
+            None,
+            false,
+            || panic!("preflight cannot launch"),
+            observe_helper,
+        );
+        assert_eq!(result.unwrap_err().code, "service_maintenance_busy");
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        exit.store(1, Ordering::Release);
+        service_maintenance_with(
+            &slot,
+            ServiceAction::Uninstall,
+            None,
+            false,
+            || panic!("completed opposite preflight cannot launch"),
+            observe_helper,
+        )
+        .unwrap();
+        assert!(slot.lock().unwrap().is_none());
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn late_service_maintenance_waiter_cannot_clear_new_helper() {
+        let helper = |action| {
+            Arc::new(ServiceMaintenance {
+                action,
+                process: (),
+                deadline: Instant::now() + SERVICE_MAINTENANCE_TIMEOUT,
+            })
+        };
+        let completed = helper(ServiceAction::Install);
+        let current = helper(ServiceAction::Uninstall);
+        let slot = Mutex::new(Some(current.clone()));
+        retire_maintenance(&slot, &completed);
+        assert!(Arc::ptr_eq(
+            slot.lock().unwrap().as_ref().unwrap(),
+            &current
+        ));
+    }
 
     fn temporary_directory() -> PathBuf {
         let mut nonce = [0_u8; 12];

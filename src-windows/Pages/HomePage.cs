@@ -54,6 +54,7 @@ public sealed class HomePage : NativePage
     private ProxyExitSnapshot exitSnapshot = ProxyExitSnapshot.Empty;
     private string controller = "";
     private string pending = "";
+    private long pendingGeneration;
     private string runtimeMode = "rule";
     private bool refreshing;
     private bool runtimeReady;
@@ -199,10 +200,11 @@ public sealed class HomePage : NativePage
     }
     private async Task ChangeAsync(string key, string method, object? args = null)
     {
-        if (pending.Length > 0) { UpdateStatus(); return; }
+        if (pending.Length > 0 && method != "desktop_stop") { UpdateStatus(); return; }
+        long generation = ++pendingGeneration;
         pending = key; UpdateStatus();
         try { await Command(method, args); if (IsActive) await RefreshAsync(); }
-        finally { pending = ""; UpdateStatus(); }
+        finally { if (generation == pendingGeneration) pending = ""; UpdateStatus(); }
     }
     private async Task ChangeTunAsync(bool enabled)
     {
@@ -221,19 +223,18 @@ public sealed class HomePage : NativePage
     }
     private void UpdateStatus()
     {
-        var status = Session.Status; string state = status.Text("phase", fallback: "connecting"); bool running = state == "running";
-        if (controller != ControllerIdentity || !running && runtimeReady)
+        var status = Session.Status; var runtime = Session.Runtime; bool running = runtime.RuntimeAvailable;
+        if (controller != ControllerIdentity || !runtime.ProcessAlive && runtimeReady)
         {
             controller = ControllerIdentity; runtimeReady = false; exitSnapshot = ProxyExitSnapshot.Empty; chart.Clear(); ByteReading.SetRate(up, 0); ByteReading.SetRate(down, 0);
             processes = connections = 0; downloaded = uploaded = 0; port = 0; allowLan = false;
         }
-        bool recovering = state == "recovering";
-        bool busy = state is "starting" or "stopping" or "connecting" or "recovering";
+        bool busy = runtime.IsWorking;
         bool interactive = Session.Ready && !busy && !Session.IsUpdating && Session.BusyCommand is null && pending.Length == 0;
         modes.SetMode(runtimeMode);
-        phase.Text = L.T(state switch { "running" => "已连接", "starting" => "正在启动", "recovering" => "正在恢复", "stopping" => "正在停止", "error" => "运行异常", "stopped" => "未运行", _ => "正在连接…" });
-        phase.SetResourceReference(TextBlock.ForegroundProperty, state == "error" ? "DangerBrush" : "TextPrimaryBrush");
-        bool failed = state == "error";
+        phase.Text = L.T(runtime.Phase == DesktopRuntimePhase.Running ? "已连接" : runtime.Label);
+        phase.SetResourceReference(TextBlock.ForegroundProperty, runtime.IsProblem ? "DangerBrush" : "TextPrimaryBrush");
+        bool failed = runtime.IsProblem;
         heroImage.SetResourceReference(Image.SourceProperty, failed ? "ColorIcon.warning.48" : "ColorIcon.globe-shield.48");
         heroImage.Visibility = running || failed ? Visibility.Visible : Visibility.Collapsed;
         heroGlyph.Visibility = running || failed ? Visibility.Collapsed : Visibility.Visible;
@@ -242,35 +243,33 @@ public sealed class HomePage : NativePage
         Fade(heroGlow, running ? 1 : 0); Fade(heroWash, running ? 1 : 0); heroProgress.IsActive = busy;
         string mode = L.T(modes.Mode switch { "global" => "全局模式", "direct" => "直连模式", _ => "规则模式" });
         string? selected = exitSnapshot.Main?.Exit;
-        description.Text = state switch
-        {
-            "starting" => L.T("首次启动可能需要更长时间，请稍候。"),
-            "recovering" => L.T("正在核验本地内核与网络设备，可随时停止恢复。"),
-            "stopping" => L.T("正在关闭连接并恢复系统代理设置。"),
-            "running" => mode + (selected is null ? "" : " · " + exitSnapshot.Main!.Group + " → " + selected + (exitSnapshot.Main.Delay > 0 ? $" · {exitSnapshot.Main.Delay:0} ms" : "")),
-            "connecting" => L.T("读取本地内核状态…"),
-            _ => L.T("已保存的配置") + (Path.GetFileName(status.Text("configPath")) is { Length: > 0 } name ? " · " + name : "")
-        };
+        description.Text = runtime.Phase == DesktopRuntimePhase.Running
+            ? mode + (selected is null ? "" : " · " + exitSnapshot.Main!.Group + " → " + selected + (exitSnapshot.Main.Delay > 0 ? $" · {exitSnapshot.Main.Delay:0} ms" : ""))
+            : runtime.Phase == DesktopRuntimePhase.Stopped
+                ? L.T("已保存的配置") + (Path.GetFileName(status.Text("configPath")) is { Length: > 0 } name ? " · " + name : "")
+                : L.T(runtime.Description);
         description.ToolTip = description.Text;
         string version = status.Text("coreVersion", fallback: "—");
         coreVersion.Text = ShortVersion(version); coreVersion.ToolTip = version;
         coreVersion.TextTrimming = TextTrimming.CharacterEllipsis; coreVersion.MaxWidth = 180; coreVersion.TextWrapping = TextWrapping.NoWrap;
         proxyAddress.Text = port > 0 ? "127.0.0.1:" + port : "—";
         coreError.Text = status.Text("lastError"); coreError.Visibility = coreError.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
-        start.Visibility = running || recovering || state == "stopping" ? Visibility.Collapsed : Visibility.Visible;
-        stop.Visibility = running || recovering || state == "stopping" ? Visibility.Visible : Visibility.Collapsed;
+        coreError.SetResourceReference(TextBlock.ForegroundProperty, runtime.IsProblem ? "DangerBrush" : "TextSecondaryBrush");
+        start.Visibility = runtime.StopRequired ? Visibility.Collapsed : Visibility.Visible;
+        stop.Visibility = runtime.StopRequired ? Visibility.Visible : Visibility.Collapsed;
         // Keep the disabled restart action exposed during preparation so keyboard,
         // screen-reader and automation clients can observe that it is unavailable.
-        restart.Visibility = running || state is "starting" or "stopping" ? Visibility.Visible : Visibility.Collapsed;
-        start.IsEnabled = interactive && !running; stop.IsEnabled = restart.IsEnabled = interactive && running;
-        if (recovering) stop.IsEnabled = !Session.IsUpdating && Session.BusyCommand is null && pending.Length == 0;
+        restart.Visibility = runtime.ProcessAlive || runtime.Phase is DesktopRuntimePhase.Starting or DesktopRuntimePhase.Stopping or DesktopRuntimePhase.Restarting ? Visibility.Visible : Visibility.Collapsed;
+        start.IsEnabled = interactive && runtime.CanStart;
+        stop.IsEnabled = Session.CanStopCore;
+        restart.IsEnabled = interactive && runtime.ProcessAlive;
         modes.IsEnabled = interactive && running && runtimeReady;
         proxy.SetState(status.Bool("systemProxy"), !running && status.Bool("systemProxy") ? L.T("内核启动后生效") : status.Bool("systemProxy") ? L.F("端口 {0}", port > 0 ? port.ToString(CultureInfo.CurrentCulture) : "—") : L.T("已关闭"), interactive && status.Get("capabilities").Bool("systemProxy"), pending == "proxy");
-        tun.SetState(status.Bool("tun"), status.Bool("tun") ? L.T(running ? "已开启" : "内核启动后生效") : !status.Get("service").Bool("installed") ? L.T("需要安装系统服务") : L.T("已关闭"), interactive && status.Get("capabilities").Bool("tun"), pending == "tun");
+        tun.SetState(status.Bool("tun"), status.Bool("tun") ? L.T(runtime.TunDescription) : !status.Get("service").Bool("installed") ? L.T("需要安装系统服务") : L.T("已关闭"), interactive && status.Get("capabilities").Bool("tun"), pending == "tun");
         lan.SetState(allowLan, allowLan ? L.F("局域网可用 :{0}", port > 0 ? port.ToString(CultureInfo.CurrentCulture) : "—") : L.T("仅本机"), interactive && running && runtimeReady, pending == "lan");
         autostart.SetState(status.Bool("autostart"), L.T(status.Bool("autostart") ? "登录时启动" : "已关闭"), interactive && status.Get("capabilities").Bool("autostart"), pending == "autostart");
-        throughputHint.Text = L.T(running ? "最近 60 秒 · 每秒采样" : "内核未运行");
-        exits.SetEmptyText(running ? "配置中没有策略组。" : state is "starting" or "stopping" ? description.Text : "启动内核后，这里会显示实时数据。");
+        throughputHint.Text = L.T(running ? "最近 60 秒 · 每秒采样" : runtime.StopRequired ? "等待本机状态更新" : "内核未运行");
+        exits.SetEmptyText(running ? "配置中没有策略组。" : runtime.StopRequired ? description.Text : "启动内核后，这里会显示实时数据。");
         UpdateStatistics(); exits.Update(running ? exitSnapshot.Summaries.Take(4) : Array.Empty<ProxyExit>());
     }
     private static string ShortVersion(string value)
@@ -282,7 +281,7 @@ public sealed class HomePage : NativePage
     private void UpdateStatistics()
     {
         connectionCount.Text = IsRunning ? connections.ToString("N0", CultureInfo.CurrentCulture) : "—";
-        processCount.Text = IsRunning ? L.F("来自 {0} 个进程", processes) : L.T("内核未运行");
+        processCount.Text = IsRunning ? L.F("来自 {0} 个进程", processes) : L.T(Session.Runtime.StopRequired ? "等待本机状态更新" : "内核未运行");
         downloadTotal.Text = FormatTraffic(downloaded); uploadTotal.Text = L.F("上传 {0}", FormatTraffic(uploaded));
     }
     private static string FormatTraffic(double bytes)

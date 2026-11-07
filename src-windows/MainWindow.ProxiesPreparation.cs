@@ -18,7 +18,7 @@ public partial class MainWindow
 
     private bool CanPrepareProxies => IsLoaded && IsVisible && WindowState != WindowState.Minimized &&
         !allowClose && !preparingExit && !navigating && !EditorOpen && !session.IsUpdating &&
-        session.BusyCommand is null && session.Status.Text("phase") == "running" &&
+        session.BusyCommand is null && session.Runtime.RuntimeAvailable &&
         currentPage == "home" && activePage is HomePage && !overlayOpen && !overlayClosing &&
         !overlayPreparing && searchWindow is not { IsVisible: true } &&
         PageContent.ActualWidth > 0 && PageContent.ActualHeight > 0;

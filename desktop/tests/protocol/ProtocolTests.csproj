@@ -13,5 +13,7 @@
     <Compile Include="../../../src-windows/Services/DnsPageIndex.cs" Link="DnsPageIndex.cs" />
     <Compile Include="../../../src-windows/Services/WindowPlacementGeometry.cs" Link="WindowPlacementGeometry.cs" />
     <Compile Include="../../../src-windows/Services/ConfigApplicationState.cs" Link="ConfigApplicationState.cs" />
+    <Compile Include="../../../src-windows/Services/DesktopRuntimeState.cs" Link="DesktopRuntimeState.cs" />
+    <Compile Include="../../../src-windows/Services/DesktopStatusOrder.cs" Link="DesktopStatusOrder.cs" />
   </ItemGroup>
 </Project>

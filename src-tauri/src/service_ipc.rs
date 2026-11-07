@@ -1,14 +1,19 @@
 use crate::{
     config,
     core::CoreStatus,
+    core_runtime::RuntimeOperation,
     error::{AppError, Result},
+    lifecycle::Cancellation,
     windows,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::Cell,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -40,18 +45,18 @@ use windows_sys::Win32::{
 
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 const RESPONSE_RESERVE: Duration = Duration::from_secs(60);
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+pub const PROTOCOL_VERSION: u32 = 2;
 
-fn operation_timeout(request: &Request, current: Duration) -> Result<Duration> {
+fn operation_timeout(request: &Request) -> Result<Duration> {
     match request {
         Request::Start { config } | Request::Reload { config } => {
             config::resource_bootstrap_timeout(config)?
                 .checked_add(RESPONSE_RESERVE)
                 .ok_or_else(|| AppError::new("config_invalid", "服务操作时限超出系统支持范围"))
         }
-        // Status can observe a bounded automatic core recovery, so it must use
-        // the active configuration's budget rather than the old fixed 90s wait.
-        Request::Status | Request::Reconcile { .. } => Ok(current),
-        Request::Stop => Ok(Duration::from_secs(30)),
+        Request::Stop => Ok(Duration::from_secs(18)),
+        _ => Ok(CONTROL_TIMEOUT),
     }
 }
 
@@ -76,6 +81,25 @@ pub enum Request {
     Reload { config: String },
     Status,
     Reconcile { generation: u64 },
+    Heartbeat,
+    Operation { id: String },
+}
+
+impl Request {
+    fn bulk(&self) -> bool {
+        matches!(self, Self::Start { .. } | Self::Reload { .. })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Envelope {
+    pub protocol_version: u32,
+    pub owner_session: String,
+    pub request_id: String,
+    pub intent_revision: u64,
+    pub request_sequence: u64,
+    pub request: Request,
 }
 
 pub struct AuthenticatedOwner {
@@ -84,6 +108,22 @@ pub struct AuthenticatedOwner {
 }
 
 impl AuthenticatedOwner {
+    #[cfg(test)]
+    pub(crate) fn current_for_test() -> Self {
+        let pid = std::process::id();
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        assert!(!raw.is_null());
+        Self {
+            pid,
+            handle: unsafe { OwnedHandle::from_raw_handle(raw) },
+        }
+    }
     pub fn alive(&self) -> bool {
         unsafe {
             WaitForSingleObject(self.handle.as_raw_handle(), 0)
@@ -110,13 +150,15 @@ impl AuthenticatedOwner {
 }
 
 pub struct AuthenticatedRequest {
-    pub request: Request,
+    pub envelope: Envelope,
     pub owner: AuthenticatedOwner,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
+    pub protocol_version: u32,
     pub status: Option<CoreStatus>,
+    pub operation: Option<RuntimeOperation>,
     pub error: Option<AppError>,
 }
 
@@ -124,41 +166,198 @@ impl Reply {
     pub fn from_result(result: Result<CoreStatus>) -> Self {
         match result {
             Ok(status) => Self {
+                protocol_version: PROTOCOL_VERSION,
                 status: Some(status),
+                operation: None,
                 error: None,
             },
             Err(error) => Self {
+                protocol_version: PROTOCOL_VERSION,
                 status: None,
+                operation: None,
                 error: Some(error),
             },
         }
     }
+    pub fn operation(result: Result<RuntimeOperation>) -> Self {
+        match result {
+            Ok(operation) => Self {
+                protocol_version: PROTOCOL_VERSION,
+                status: Some(operation.status.clone()),
+                operation: Some(operation),
+                error: None,
+            },
+            Err(error) => Self::from_result(Err(error)),
+        }
+    }
 }
 
-fn pipe_name(sid: &str) -> String {
-    format!(r"\\.\pipe\MihomoOptimized.{sid}")
+fn pipe_name(sid: &str, bulk: bool) -> String {
+    format!(
+        r"\\.\pipe\MihomoOptimized.{sid}.v2.{}",
+        if bulk { "work" } else { "control" }
+    )
 }
 
+fn request_id() -> Result<String> {
+    let mut random = [0u8; 16];
+    getrandom::getrandom(&mut random)
+        .map_err(|_| AppError::new("random_failed", "无法建立服务请求编号"))?;
+    Ok(hex::encode(random))
+}
+
+#[derive(Clone)]
 pub struct Client {
     sid: String,
     expected_service: PathBuf,
-    response_timeout: Cell<Duration>,
+    owner_session: String,
+    sequence: Arc<AtomicU64>,
 }
 
 impl Client {
-    pub fn new() -> Result<Self> {
+    pub fn new(owner_session: String) -> Result<Self> {
         Ok(Self {
             sid: windows::current_sid()?,
             expected_service: windows::protected_install_dir()?.join("mihomo-desktop-service.exe"),
-            response_timeout: Cell::new(config::DEFAULT_RESOURCE_TIMEOUT + RESPONSE_RESERVE),
+            owner_session,
+            sequence: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    pub fn call(&self, request: &Request) -> Result<CoreStatus> {
-        let timeout = operation_timeout(request, self.response_timeout.get())?;
-        let deadline = deadline_after(timeout)?;
-        let pipe = windows::wide(pipe_name(&self.sid));
-        let start = Instant::now();
+    pub fn call(&self, request: Request, cancellation: &Cancellation) -> Result<CoreStatus> {
+        cancellation.check()?;
+        let deadline = deadline_after(operation_timeout(&request)?)?;
+        let envelope = self.envelope(request, cancellation.revision())?;
+        // A lost accepted response is retried with the same request ID. The
+        // service records it before dispatch, so retries cannot spawn twice.
+        let mut attempts = 0;
+        let reply = loop {
+            cancellation.check()?;
+            time_left(deadline)?;
+            match self.exchange(&envelope, deadline) {
+                Ok(reply)
+                    if reply
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.code == "service_owner_cleanup") =>
+                {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                Ok(reply) => break reply,
+                Err(error)
+                    if attempts < 2
+                        && matches!(
+                            error.code.as_str(),
+                            "service_timeout" | "service_unavailable" | "io_error"
+                        ) =>
+                {
+                    attempts += 1;
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if let Some(error) = reply.error {
+            return Err(error);
+        }
+        let Some(mut operation) = reply.operation else {
+            return reply
+                .status
+                .ok_or_else(|| AppError::new("service_protocol", "服务响应缺少状态"));
+        };
+        loop {
+            cancellation.check()?;
+            if !matches!(operation.phase.as_str(), "queued" | "running") {
+                return operation.error.map_or(Ok(operation.status), Err);
+            }
+            time_left(deadline)?;
+            thread::sleep(Duration::from_millis(100));
+            cancellation.check()?;
+            let probe = self.envelope(
+                Request::Operation {
+                    id: operation.id.clone(),
+                },
+                cancellation.revision(),
+            )?;
+            let reply = match self.exchange(&probe, deadline) {
+                Ok(reply) => reply,
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "service_timeout" | "service_unavailable" | "io_error"
+                    ) =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(error) = reply.error {
+                return Err(error);
+            }
+            operation = reply
+                .operation
+                .ok_or_else(|| AppError::new("service_protocol", "服务响应缺少操作进度"))?;
+        }
+    }
+
+    pub fn status(&self) -> Result<CoreStatus> {
+        self.observe(Request::Status)
+    }
+    pub fn heartbeat(&self) -> Result<CoreStatus> {
+        self.observe(Request::Heartbeat)
+    }
+    pub fn reconcile(&self, generation: u64) -> Result<CoreStatus> {
+        self.observe(Request::Reconcile { generation })
+    }
+
+    fn observe(&self, request: Request) -> Result<CoreStatus> {
+        let reply = self.exchange(
+            &self.envelope(request, 0)?,
+            deadline_after(CONTROL_TIMEOUT)?,
+        )?;
+        if let Some(error) = reply.error {
+            return Err(error);
+        }
+        reply
+            .status
+            .ok_or_else(|| AppError::new("service_protocol", "服务响应缺少状态"))
+    }
+
+    /// The reserved host control path only waits for admission, never cleanup.
+    /// Its operation ID is deterministic for this intent, including retries.
+    pub fn accept_stop(&self, intent_revision: u64) -> Result<CoreStatus> {
+        let envelope = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            owner_session: self.owner_session.clone(),
+            request_id: format!("stop-{intent_revision}"),
+            intent_revision,
+            request_sequence: self.sequence.fetch_add(1, Ordering::AcqRel) + 1,
+            request: Request::Stop,
+        };
+        let reply = self.exchange(&envelope, deadline_after(CONTROL_TIMEOUT)?)?;
+        if let Some(error) = reply.error {
+            return Err(error);
+        }
+        reply
+            .status
+            .ok_or_else(|| AppError::new("service_protocol", "服务响应缺少状态"))
+    }
+
+    fn envelope(&self, request: Request, intent_revision: u64) -> Result<Envelope> {
+        Ok(Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            owner_session: self.owner_session.clone(),
+            request_id: request_id()?,
+            intent_revision,
+            request_sequence: self.sequence.fetch_add(1, Ordering::AcqRel) + 1,
+            request,
+        })
+    }
+
+    fn exchange(&self, envelope: &Envelope, operation_deadline: Instant) -> Result<Reply> {
+        let deadline = deadline_after(CONTROL_TIMEOUT)?.min(operation_deadline);
+        let pipe = windows::wide(pipe_name(&self.sid, envelope.request.bulk()));
         let handle = loop {
             let raw = unsafe {
                 CreateFileW(
@@ -175,31 +374,47 @@ impl Client {
                 break unsafe { OwnedHandle::from_raw_handle(raw) };
             }
             let code = unsafe { GetLastError() };
-            if start.elapsed() >= Duration::from_secs(4) || ![ERROR_PIPE_BUSY, 2].contains(&code) {
+            if time_left(deadline).is_err() || ![ERROR_PIPE_BUSY, 2].contains(&code) {
                 return Err(AppError::new(
                     "service_unavailable",
-                    "无法连接本用户的 TUN 服务，请重新安装或启动服务",
+                    "无法连接配套 TUN 服务，请安装完整新版桌面程序或修复服务",
                 ));
             }
-            thread::sleep(Duration::from_millis(40));
+            thread::sleep(Duration::from_millis(20));
         };
-        unsafe {
+        let _service_process = unsafe {
             let mut pid = 0;
             if GetNamedPipeServerProcessId(handle.as_raw_handle(), &mut pid) == 0 {
                 return Err(windows::last_error("无法验证 TUN 服务"));
             }
-            let actual = windows::process_path(pid)
-                .map_err(|mut error| {
+            let raw = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            );
+            if raw.is_null() {
+                let mut error = windows::last_error("无法保留 TUN 服务身份");
+                error.code = "service_identity_failed".into();
+                return Err(error);
+            }
+            let service_process = OwnedHandle::from_raw_handle(raw);
+            let (actual, sid) =
+                windows::process_handle_identity(&service_process).map_err(|mut error| {
                     error.code = "service_identity_failed".into();
                     error
-                })?
+                })?;
+            let actual = actual
                 .canonicalize()
                 .map_err(|e| AppError::io("无法验证 TUN 服务路径", e))?;
             let expected = self
                 .expected_service
                 .canonicalize()
                 .map_err(|e| AppError::io("无法验证服务安装目录", e))?;
-            if actual != expected {
+            if actual != expected
+                || sid != "S-1-5-18"
+                || WaitForSingleObject(service_process.as_raw_handle(), 0)
+                    != windows_sys::Win32::Foundation::WAIT_TIMEOUT
+            {
                 return Err(AppError::new(
                     "service_identity_failed",
                     "本地服务身份不匹配，已拒绝发送配置",
@@ -215,36 +430,32 @@ impl Client {
             {
                 return Err(windows::last_error("无法初始化服务连接"));
             }
-        }
-        let bytes = serde_json::to_vec(request)
+            service_process
+        };
+        let bytes = serde_json::to_vec(envelope)
             .map_err(|_| AppError::new("service_protocol", "无法编码服务请求"))?;
-        write_message(
-            handle.as_raw_handle(),
-            &bytes,
-            time_left(deadline)?.min(Duration::from_secs(10)),
-        )?;
-        // Validation, application, rollback and pipe framing share this one
-        // outer deadline. A header does not restart the response timer.
+        write_message(handle.as_raw_handle(), &bytes, time_left(deadline)?)?;
         let response = read_message(handle.as_raw_handle(), time_left(deadline)?)?;
-        let reply: Reply = serde_json::from_slice(&response)
-            .map_err(|_| AppError::new("service_protocol", "服务返回了不兼容的响应"))?;
+        let reply: Reply = serde_json::from_slice(&response).map_err(|_| {
+            AppError::new(
+                "service_version_required",
+                "服务协议不兼容，请安装完整新版桌面程序",
+            )
+        })?;
+        if reply.protocol_version != PROTOCOL_VERSION {
+            return Err(AppError::new(
+                "service_version_required",
+                "桌面与 TUN 服务版本不匹配，请修复安装",
+            ));
+        }
         if let Ok(remaining) = time_left(deadline) {
             let _ = write_bytes(
                 handle.as_raw_handle(),
                 &[1],
-                remaining.min(Duration::from_secs(1)),
+                remaining.min(Duration::from_millis(200)),
             );
         }
-        if let Some(error) = reply.error {
-            return Err(error);
-        }
-        let status = reply
-            .status
-            .ok_or_else(|| AppError::new("service_protocol", "服务响应缺少状态"))?;
-        if matches!(request, Request::Start { .. } | Request::Reload { .. }) {
-            self.response_timeout.set(timeout);
-        }
-        Ok(status)
+        Ok(reply)
     }
 }
 
@@ -252,12 +463,13 @@ pub struct Server {
     handle: OwnedHandle,
     owner_sid: String,
     expected_gui: PathBuf,
+    bulk: bool,
 }
 
 impl Server {
-    pub fn new(owner_sid: String, expected_gui: PathBuf) -> Result<Self> {
+    pub fn new(owner_sid: String, expected_gui: PathBuf, bulk: bool, first: bool) -> Result<Self> {
         let sddl = windows::wide(format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{owner_sid})"));
-        let name = windows::wide(pipe_name(&owner_sid));
+        let name = windows::wide(pipe_name(&owner_sid, bulk));
         unsafe {
             let mut descriptor = std::ptr::null_mut();
             if ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -276,9 +488,14 @@ impl Server {
             };
             let raw = CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_ACCESS_DUPLEX
+                    | if first {
+                        FILE_FLAG_FIRST_PIPE_INSTANCE
+                    } else {
+                        0
+                    },
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
+                if bulk { 1 } else { 3 },
                 65536,
                 65536,
                 5000,
@@ -297,6 +514,7 @@ impl Server {
                 handle: OwnedHandle::from_raw_handle(raw),
                 owner_sid,
                 expected_gui,
+                bulk,
             })
         }
     }
@@ -335,10 +553,37 @@ impl Server {
                 handle: unsafe { OwnedHandle::from_raw_handle(raw) },
             };
             owner.verify(&self.owner_sid, &self.expected_gui)?;
-            let bytes = read_message(self.handle.as_raw_handle(), Duration::from_secs(6))?;
-            let request = serde_json::from_slice::<Request>(&bytes)
-                .map_err(|_| AppError::new("service_protocol", "无效的服务操作"))?;
-            Ok(AuthenticatedRequest { request, owner })
+            let bytes = read_message(
+                self.handle.as_raw_handle(),
+                if self.bulk {
+                    Duration::from_secs(3)
+                } else {
+                    Duration::from_secs(1)
+                },
+            )?;
+            let envelope = serde_json::from_slice::<Envelope>(&bytes).map_err(|_| {
+                AppError::new("service_version_required", "服务要求配套新版桌面控制协议")
+            })?;
+            if envelope.protocol_version != PROTOCOL_VERSION
+                || envelope.request.bulk() != self.bulk
+                || envelope.owner_session.len() != 32
+                || !envelope
+                    .owner_session
+                    .bytes()
+                    .all(|c| c.is_ascii_hexdigit())
+                || envelope.request_id.is_empty()
+                || envelope.request_id.len() > 80
+                || !envelope
+                    .request_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+            {
+                return Err(AppError::new(
+                    "service_protocol",
+                    "服务请求版本、会话或编号无效",
+                ));
+            }
+            Ok(AuthenticatedRequest { envelope, owner })
         })();
         match validated {
             Ok(request) => Ok(Some(request)),
@@ -358,7 +603,7 @@ impl Server {
             read_bytes(
                 self.handle.as_raw_handle(),
                 &mut acknowledgement,
-                Duration::from_secs(2),
+                Duration::from_millis(200),
             )?;
             Ok(())
         })();
@@ -496,51 +741,34 @@ mod timeout_tests {
     use super::*;
 
     #[test]
-    fn service_wait_tracks_the_configuration_including_automatic_recovery() {
-        let current = Duration::from_secs(240);
+    fn status_and_heartbeat_never_borrow_a_resource_budget() {
         assert_eq!(
-            operation_timeout(
-                &Request::Start {
-                    config: "mode: rule".into()
-                },
-                current
-            )
+            operation_timeout(&Request::Status).unwrap(),
+            CONTROL_TIMEOUT
+        );
+        assert_eq!(
+            operation_timeout(&Request::Heartbeat).unwrap(),
+            CONTROL_TIMEOUT
+        );
+        assert_eq!(
+            operation_timeout(&Request::Reconcile { generation: 99 }).unwrap(),
+            CONTROL_TIMEOUT
+        );
+        assert_eq!(
+            operation_timeout(&Request::Stop).unwrap(),
+            Duration::from_secs(18)
+        );
+        assert_eq!(
+            operation_timeout(&Request::Start {
+                config: "resource-bootstrap:\n  timeout: 300\n".into()
+            })
             .unwrap(),
-            current
+            Duration::from_secs(360)
         );
-        let enlarged = operation_timeout(
-            &Request::Reload {
-                config: "resource-bootstrap:\n  timeout: 300\n".into(),
-            },
-            current,
-        )
-        .unwrap();
-        assert_eq!(enlarged, Duration::from_secs(360));
-        assert_eq!(
-            operation_timeout(
-                &Request::Start {
-                    config: "resource-bootstrap:\n  timeout: 1\n".into()
-                },
-                current
-            )
-            .unwrap(),
-            Duration::from_secs(61)
+        assert_ne!(
+            pipe_name("S-1-5-21-test", true),
+            pipe_name("S-1-5-21-test", false)
         );
-        assert_eq!(
-            operation_timeout(&Request::Status, enlarged).unwrap(),
-            enlarged
-        );
-        assert_eq!(
-            operation_timeout(&Request::Stop, enlarged).unwrap(),
-            Duration::from_secs(30)
-        );
-        assert!(operation_timeout(
-            &Request::Start {
-                config: "resource-bootstrap:\n  timeout: 0\n".into()
-            },
-            current
-        )
-        .is_err());
     }
 
     #[test]

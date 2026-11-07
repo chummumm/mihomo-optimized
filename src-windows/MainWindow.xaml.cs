@@ -57,6 +57,7 @@ public partial class MainWindow : Window
     private bool navigationInitialBackdropFromCache;
     private bool? navigationBackdropVerificationSucceeded;
     private bool shellCommandBusy;
+    private long shellCommandGeneration;
     private double pillTop = double.NaN;
     private string lastCoreError = "";
     private sealed class NavigationTiming
@@ -236,25 +237,26 @@ public partial class MainWindow : Window
 
     private void UpdateStatus()
     {
-        string phase = session.Status.Text("phase", fallback: "connecting");
-        string label = phase switch { "running" => "运行中", "starting" => "正在启动…", "recovering" => "正在恢复…", "stopping" => "正在停止…", "stopped" => "已停止", "error" => "需要处理", _ => "正在连接…" };
+        var runtime = session.Runtime;
+        bool running = runtime.Phase == DesktopRuntimePhase.Running;
+        string label = runtime.Phase switch { DesktopRuntimePhase.Starting => "正在启动…", DesktopRuntimePhase.Stopping => "正在停止…", DesktopRuntimePhase.Stopped => "已停止", _ => runtime.Label };
         PhaseText.Text = L.T(label);
         PhaseText.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush");
-        CoreStatusDot.SetResourceReference(ShellVisuals.BackgroundProperty, phase == "running" ? "SuccessBrush" : phase == "error" ? "DangerBrush" : phase is "starting" or "stopping" ? "WarningBrush" : "TextTertiaryBrush");
+        CoreStatusDot.SetResourceReference(ShellVisuals.BackgroundProperty, runtime.IsProblem ? "DangerBrush" : runtime.IsWorking || runtime.NeedsAttention ? "WarningBrush" : running ? "SuccessBrush" : "TextTertiaryBrush");
         // Running shows the full-colour emblem on a quiet accent tint; other phases keep the neutral power glyph.
-        CoreAvatarBackground.SetResourceReference(ShellVisuals.BackgroundProperty, phase == "running" ? "AccentSubtleBrush" : "ControlAltBrush");
-        CoreImage.Visibility = phase == "running" ? Visibility.Visible : Visibility.Collapsed;
-        CoreGlyph.Visibility = phase == "running" ? Visibility.Collapsed : Visibility.Visible;
-        CoreGlyph.Kind = phase == "error" ? "warning" : "power";
-        CoreGlyph.SetResourceReference(Control.ForegroundProperty, phase == "error" ? "DangerBrush" : "TextSecondaryBrush");
-        CoreProgress.IsActive = phase is "starting" or "stopping" or "recovering";
+        CoreAvatarBackground.SetResourceReference(ShellVisuals.BackgroundProperty, running ? "AccentSubtleBrush" : "ControlAltBrush");
+        CoreImage.Visibility = running ? Visibility.Visible : Visibility.Collapsed;
+        CoreGlyph.Visibility = running ? Visibility.Collapsed : Visibility.Visible;
+        CoreGlyph.Kind = runtime.NeedsAttention ? "warning" : "power";
+        CoreGlyph.SetResourceReference(Control.ForegroundProperty, runtime.IsProblem ? "DangerBrush" : "TextSecondaryBrush");
+        CoreProgress.IsActive = runtime.IsWorking;
         string version = ShortVersion(session.Status.Text("coreVersion")); VersionText.Text = version.Length > 0 ? L.F("内核 {0}", version) : "—";
         AutomationProperties.SetName(CoreCardButton, L.T("本地内核") + " · " + PhaseText.Text);
         CoreCardButton.ToolTip = PhaseText.Text + " · " + VersionText.Text;
         UpdateUpdateNotice();
         UpdateTitleSubtitle();
         string error = session.Status.Text("lastError");
-        if (error.Length > 0 && error != lastCoreError) ShowNotice(error, true);
+        if (runtime.IsProblem && error.Length > 0 && error != lastCoreError) ShowNotice(error, true);
         lastCoreError = error;
         recovery.Refresh();
         UpdatePageActivity();
@@ -276,7 +278,7 @@ public partial class MainWindow : Window
     {
         string mode = session.RuntimeMode switch { "rule" => "规则模式", "global" => "全局模式", "direct" => "直连模式", "script" => "脚本模式", _ => "" };
         TitleSubtitle.Text = mode.Length > 0 ? "· " + L.T(mode) : "";
-        TitleSubtitle.Visibility = ActualWidth > 640 && session.Status.Text("phase") == "running" && mode.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        TitleSubtitle.Visibility = ActualWidth > 640 && session.Runtime.RuntimeAvailable && mode.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
     }
     private void ShowNotice(string text, bool error)
     {
@@ -329,7 +331,7 @@ public partial class MainWindow : Window
         if (resumed && activePage is { } page) _ = ResumePageTargetAsync(page, location);
         UpdateProxiesPreparation();
     }
-    private bool RecoveryRequired => currentPage is not ("home" or "settings" or "profiles") && session.Status.Text("phase") != "running";
+    private bool RecoveryRequired => currentPage is not ("home" or "settings" or "profiles") && !session.Runtime.RuntimeAvailable;
     private async Task ResumePageTargetAsync(NativePage page, NavigationTarget target)
     {
         try { if (ReferenceEquals(page, activePage)) await page.NavigateToAsync(target); }
@@ -572,18 +574,26 @@ public partial class MainWindow : Window
         if (EditorOpen) return;
         var menu = new ContextMenu { PlacementTarget = CoreCardButton, Placement = navigationMode == "expanded" || overlayOpen ? PlacementMode.Bottom : PlacementMode.Right };
         menu.Items.Add(new MenuItem { Header = PhaseText.Text + " · " + VersionText.Text, IsEnabled = false }); menu.Items.Add(new Separator());
-        bool running = session.Status.Text("phase") == "running";
-        bool idle = session.Ready && !session.IsUpdating && session.BusyCommand is null && !shellCommandBusy && session.Status.Text("phase") is not ("starting" or "stopping");
+        var runtime = session.Runtime;
+        bool stop = runtime.StopRequired;
+        bool idle = session.Ready && !session.IsUpdating && session.BusyCommand is null && !shellCommandBusy && !runtime.IsWorking;
         void Add(string text, string icon, bool enabled, Func<Task> operation)
         {
             var item = new MenuItem { Header = L.T(text), Icon = new FluentIcon(icon), IsEnabled = enabled };
-            item.Click += async (_, _) => { try { shellCommandBusy = true; await operation(); } catch (Exception error) { ShowNotice(error.Message, true); } finally { shellCommandBusy = false; UpdateStatus(); } }; menu.Items.Add(item);
+            item.Click += async (_, _) =>
+            {
+                long generation = ++shellCommandGeneration;
+                try { shellCommandBusy = true; await operation(); }
+                catch (OperationCanceledException) { }
+                catch (Exception error) { ShowNotice(error.Message, true); }
+                finally { if (generation == shellCommandGeneration) shellCommandBusy = false; UpdateStatus(); }
+            }; menu.Items.Add(item);
         }
-        Add(running ? "停止内核" : "启动内核", running ? "stop" : "power", idle, async () => { await session.CommandAsync(running ? "desktop_stop" : "desktop_start"); });
-        Add("重启内核", "arrow-sync", idle && running, async () => { await session.CommandAsync("desktop_restart"); });
+        Add(stop ? "停止内核" : "启动内核", stop ? "stop" : "power", stop ? session.CanStopCore : idle && runtime.CanStart, async () => { await session.CommandAsync(stop ? "desktop_stop" : "desktop_start"); });
+        Add("重启内核", "arrow-sync", idle && runtime.ProcessAlive, async () => { await session.CommandAsync("desktop_restart"); });
         menu.Items.Add(new Separator());
         Add("打开配置", "nav-profiles", true, async () => { await NavigateAsync("profiles"); });
-        Add("查看日志", "nav-logs", running, async () => { await NavigateAsync("logs"); });
+        Add("查看日志", "nav-logs", runtime.RuntimeAvailable, async () => { await NavigateAsync("logs"); });
         CoreCardButton.ContextMenu = menu; menu.IsOpen = true;
     }
 
