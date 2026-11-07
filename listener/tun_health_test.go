@@ -1,6 +1,7 @@
 package listener
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/netip"
@@ -12,13 +13,26 @@ import (
 
 type healthTestTun struct {
 	*fakeTunListener
-	owned    bool
-	routes   bool
-	probeErr error
+	owned     bool
+	routes    bool
+	probeErr  error
+	repairs   int
+	repairErr error
 }
 
 func (l *healthTestTun) CheckDeviceIdentity() (bool, error) { return l.owned, nil }
 func (l *healthTestTun) CheckRoutes() (bool, error)         { return l.routes, l.probeErr }
+func (l *healthTestTun) RepairResources(ctx context.Context) error {
+	l.repairs++
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if l.repairErr != nil {
+		return l.repairErr
+	}
+	l.routes = true
+	return nil
+}
 
 func setupTunHealth(t *testing.T) *healthTestTun {
 	t.Helper()
@@ -68,7 +82,7 @@ func TestDesktopTunHealthRequiresEveryAddress(t *testing.T) {
 	live := setupTunHealth(t)
 	live.config.Inet4Address = append(live.config.Inet4Address, netip.MustParsePrefix("172.20.0.1/30"))
 	state := InspectTunHealth()
-	if state.State != "degraded" || !state.Repairable || state.Reason != "owned TUN address is missing" {
+	if state.State != "degraded" || !state.Repairable || state.Reason != tunAddressNotReadyReason {
 		t.Fatalf("one present address hid a missing configured address: %+v", state)
 	}
 }
@@ -91,7 +105,7 @@ func TestDesktopTunHealthRepairsMissingRoute(t *testing.T) {
 		return &healthTestTun{fakeTunListener: &fakeTunListener{config: cfg, device: "test-tun", index: 42}, owned: true, routes: true}, nil
 	}
 	state, repaired, err := RecoverTun(nil)
-	if err != nil || !repaired || state.State != "healthy" || created != 1 || live.closed != 1 {
+	if err != nil || !repaired || state.State != "healthy" || created != 0 || live.closed != 0 || live.repairs != 1 || tunLister != live {
 		t.Fatalf("missing route recovery failed: %+v repaired=%v err=%v created=%d closed=%d", state, repaired, err, created, live.closed)
 	}
 }
@@ -125,7 +139,6 @@ func TestDesktopTunHealthDoesNotCreateDisabledDevice(t *testing.T) {
 
 func TestDesktopTunHealthChecksIdentityAgainBeforeClose(t *testing.T) {
 	live := setupTunHealth(t)
-	live.routes = false
 	queries := 0
 	tunInterfaceByName = func(name string) (*net.Interface, error) {
 		queries++
@@ -133,7 +146,8 @@ func TestDesktopTunHealthChecksIdentityAgainBeforeClose(t *testing.T) {
 		if queries >= 2 {
 			index = 43
 		}
-		return &net.Interface{Name: name, Index: index, Flags: net.FlagUp}, nil
+		// A down device needs replacement; missing routes use in-place repair.
+		return &net.Interface{Name: name, Index: index}, nil
 	}
 	_, _, err := RecoverTun(nil)
 	if err == nil || live.closed != 0 {

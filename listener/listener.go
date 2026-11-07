@@ -69,22 +69,13 @@ type Ports struct {
 }
 
 func GetTunConf() LC.Tun {
-	transparentListenersMu.Lock()
-	defer transparentListenersMu.Unlock()
-	if tunLister == nil {
-		cfg := LastTunConf.Clone()
-		cfg.Enable = false
-		return cfg
-	}
-	return tunLister.Config()
+	return currentTunSnapshot().applied.Clone()
 }
 
 // GetLastTunConf returns the effective request before listener-specific
 // defaults. PATCH uses this stable snapshot so an unrelated edit reuses TUN.
 func GetLastTunConf() LC.Tun {
-	transparentListenersMu.Lock()
-	defer transparentListenersMu.Unlock()
-	return LastTunConf.Clone()
+	return currentTunSnapshot().requested.Clone()
 }
 
 func GetTuicConf() LC.TuicServer {

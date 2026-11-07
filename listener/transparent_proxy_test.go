@@ -54,6 +54,9 @@ func (l *fakeTProxyListener) TransparentFamilies() (bool, bool) { return l.ipv4,
 func isolateTransparentListeners(t *testing.T) {
 	t.Helper()
 	oldTun, oldConf := tunLister, LastTunConf
+	oldSnapshot := publishedTun.Load()
+	oldConfigGeneration, oldGeneration, oldCreations := tunConfigGeneration, tunGeneration, tunCreationCount
+	oldTransition, oldFailure := tunTransition, tunFailure
 	oldTCP, oldUDP, oldPort := tproxyListener, tproxyUDPListener, lastTProxyPort
 	oldRedir, oldRedirUDP, oldRedirPort := redirListener, redirUDPListener, lastRedirPort
 	oldNewRedir, oldNewRedirUDP, oldBeforeRedir := newRedirListener, newRedirUDPListener, beforeRedirClose
@@ -64,6 +67,9 @@ func isolateTransparentListeners(t *testing.T) {
 	oldAllowLAN, oldBind := allowLan, bindAddress
 	t.Cleanup(func() {
 		tunLister, LastTunConf = oldTun, oldConf
+		publishedTun.Store(oldSnapshot)
+		tunConfigGeneration, tunGeneration, tunCreationCount = oldConfigGeneration, oldGeneration, oldCreations
+		tunTransition, tunFailure = oldTransition, oldFailure
 		tproxyListener, tproxyUDPListener, lastTProxyPort = oldTCP, oldUDP, oldPort
 		redirListener, redirUDPListener, lastRedirPort = oldRedir, oldRedirUDP, oldRedirPort
 		newRedirListener, newRedirUDPListener, beforeRedirClose = oldNewRedir, oldNewRedirUDP, oldBeforeRedir
@@ -74,6 +80,9 @@ func isolateTransparentListeners(t *testing.T) {
 		allowLan, bindAddress = oldAllowLAN, oldBind
 	})
 	tunLister, LastTunConf = nil, LC.Tun{}
+	publishedTun.Store(nil)
+	tunConfigGeneration, tunGeneration, tunCreationCount = 0, 0, 0
+	tunTransition, tunFailure = "", nil
 	tproxyListener, tproxyUDPListener, lastTProxyPort = nil, nil, 0
 	redirListener, redirUDPListener, lastRedirPort = nil, nil, 0
 	allowLan, bindAddress = false, "*"

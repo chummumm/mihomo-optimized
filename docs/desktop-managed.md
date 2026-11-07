@@ -92,12 +92,16 @@ start a configuration and the endpoint is unavailable.
 
 ### Local health and resume recovery
 
-Core 1.0.23 adds `tun_health` and `tun_repair`, advertised only on Windows.
-These are optional API 1 capabilities; a supervisor must feature-detect them
-before using the new endpoints with an older core. They report local ownership
-and resources, not Internet connectivity or remote proxy availability.
+Core 1.0.23 adds `tun_health` and `tun_repair`; 1.0.26 adds
+`tun_recovery_operations`. These optional API 1 capabilities are advertised only
+on Windows. Feature-detect them before use. They describe local ownership and
+resources, not Internet connectivity or a remote proxy.
 
-`GET /desktop/health` returns a fresh authenticated, `no-store` snapshot:
+`GET /desktop/health` returns an authenticated `no-store` snapshot immediately.
+One coalescing observer performs native inspection separately from HTTP readers.
+A cached healthy observation expires after five seconds; `stale: true` is not
+proof of process death. Normal underlay changes retain the core and TUN. A
+representative fresh response is:
 
 ```json
 {
@@ -105,39 +109,77 @@ and resources, not Internet connectivity or remote proxy availability.
   "api_version": 1,
   "state": "running",
   "pid": 1234,
+  "core_instance": "4dc7146e4f1042fcbbab7d99c94c6421",
+  "config_generation": 1,
+  "tun_generation": 1,
+  "creation_count": 1,
+  "observed_at": "2026-11-07T12:00:00Z",
+  "stale": false,
+  "recovery": null,
   "tun": {
     "enabled": true,
     "state": "healthy",
     "device": "Mihomo",
     "index": 42,
+    "identity": "0006008000000000",
     "repairable": false
   }
 }
 ```
 
-TUN states are `disabled`, `healthy`, `degraded`, `unavailable`, or `conflict`;
-an optional `reason` describes the local failure. The check compares the owned
-device's name, index and Windows LUID, every configured address, and expected
-automatic route prefixes with their gateway. An inspection error is not proof
-that the interface is missing. The supervisor still checks its child process
-identity and the actual configured proxy listeners.
+The existing TUN states remain `disabled`, `healthy`, `degraded`, `unavailable`
+and `conflict`; `reason` explains an observed failure. `enabled` is the requested
+TUN intent; `/configs.tun` reports the applied configuration and withdraws the
+enabled flag before a native close. Name/index and the actual handle LUID must
+agree. Address checks include exact prefixes, lifetimes and DAD readiness;
+automatic routes include their expected next hops. Failed enumeration never
+proves absence. The supervisor independently checks the child process and proxy
+listeners. `config_generation` tracks effective requested TUN configuration changes, not
+unrelated DNS/rule reloads. `creation_count` counts listener factory invocations
+(including failures); `tun_generation` counts
+successfully installed listeners. In-place address/route repair changes neither.
 
-`POST /desktop/recover` accepts an empty body and no query parameters. It
-serializes with configuration changes, retains a healthy TUN, and recreates a
-verified degraded TUN using the current applied configuration. It does not
-download resources, reset the configuration, probe Internet reachability or
-change the user's running intent. The result includes `pid`, `tun`, `status`
-and an optional `error`; status is `healthy`, `repaired`, `unavailable`,
-`conflict`, or `needs_restart`. The last result permits the supervisor to use
-its bounded owned-process restart policy after confirmed shutdown. Foreign
-device identities and unknown inspection failures do not authorize that path.
+For new supervisors, `POST /desktop/recovery` accepts only:
 
-Both endpoints return HTTP 503 with `Retry-After: 1` when configuration or
-recovery already owns the lifecycle lock. This is a retryable busy state, not
-process death. A recover request before readiness or during shutdown returns
-HTTP 409. Stop intent takes precedence over subsequent resume work. Successful
-recovery also invalidates old LAN preparation results so current LAN intents
-can prepare in the background.
+```json
+{"request_id":"client-unique-request-1","config_generation":1,"tun_generation":1}
+```
+
+A running operation returns HTTP 202 with `{"operation": {...}}`. Repeating the
+same request ID and target returns the same operation, including when the first
+response was lost. Reusing an ID for a different target or supplying superseded
+generations returns HTTP 409. Malformed/unknown fields are rejected. Another
+active operation or configuration mutation returns HTTP 503 and `Retry-After: 1`.
+The request cannot supply a device name, replacement configuration or force flag.
+
+`GET /desktop/recovery/{id}` returns the operation. Its fields are `id`,
+`request_id`, `core_instance`, `config_generation`, `tun_generation`, `phase`,
+`status`, `tun`, `started_at`, `deadline_at`, optional `finished_at` and `error`.
+Phases are `running`, `succeeded`, `failed` and `cancelled`. Terminal status is
+`healthy`, `repaired`, `unavailable`, `conflict` or `needs_restart` (the in-progress
+status is `running`). The latest relevant operation is also in health.recovery.
+The last 64 operations remain queryable for this process lifetime; records do not
+survive a core replacement. Unknown/expired IDs return HTTP 404. Supervisors must
+bind IDs and generation numbers to `core_instance`.
+
+The worker serializes with configuration and close. Missing owned Windows
+addresses/routes are added in place, then verified; foreign entries are never
+flushed. A verified failed device can be rebuilt. A closed-old/failed-new result
+remains an explicit failure, even with no listener pointer. Recovery does not
+reload configuration, download providers or change the user's running intent.
+The operation has one 30-second deadline. A blocked native call can outlive that
+deadline; the published failure does not release its ownership or permit a second
+constructor. Process shutdown is the supervisor's escalation boundary, and exit
+must be confirmed before another core starts.
+
+Legacy `POST /desktop/recover` retains the empty body/query contract and the old
+result schema (`pid`, `tun`, `status`, optional `error`). It starts/coalesces the
+same background work and returns HTTP 503 while pending. A lost terminal reply
+can be read again; `needs_restart` survives until a later valid observation or
+configuration supersedes it. A later resource failure on the same device can
+start a new recovery. HTTP 409 before readiness/during shutdown and HTTP 503 busy
+are observations, not evidence of process death. Unknown ownership never grants
+permission to remove an adapter. Successful recovery refreshes LAN preparation.
 
 ### Shutdown
 

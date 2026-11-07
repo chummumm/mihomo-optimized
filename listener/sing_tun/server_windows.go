@@ -1,29 +1,49 @@
 package sing_tun
 
 import (
+	"errors"
 	"time"
 
 	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/log"
 
 	tun "github.com/metacubex/sing-tun"
+	"golang.org/x/sys/windows"
 )
 
 func tunNew(options tun.Options) (tunIf tun.Tun, err error) {
-	maxRetry := 3
-	for i := 0; i < maxRetry; i++ {
-		timeBegin := time.Now()
-		tunIf, err = tun.New(options)
+	return createWindowsTun(options, func(options tun.Options) (tun.Tun, error) {
+		return tun.NewExclusive(options)
+	}, time.Now, time.Sleep)
+}
+
+func retryableWindowsTunError(err error) bool {
+	// Name conflicts and access/parameter errors cannot be repaired by reopening
+	// an adapter. Only retry explicit transient driver errors, after cleanup.
+	return errors.Is(err, windows.ERROR_BUSY) || errors.Is(err, windows.ERROR_RETRY) ||
+		errors.Is(err, windows.ERROR_NOT_READY) || errors.Is(err, windows.ERROR_SHARING_VIOLATION) ||
+		errors.Is(err, windows.ERROR_LOCK_VIOLATION)
+}
+
+func createWindowsTun(options tun.Options, create func(tun.Options) (tun.Tun, error), now func() time.Time, wait func(time.Duration)) (tun.Tun, error) {
+	// Native driver calls cannot be forcibly cancelled in-process. This deadline
+	// bounds further retries; it never launches a replacement over an in-flight call.
+	deadline := now().Add(3 * time.Second)
+	for attempt := 1; ; attempt++ {
+		device, err := create(options)
 		if err == nil {
-			return
+			return device, nil
 		}
-		timeEnd := time.Now()
-		if timeEnd.Sub(timeBegin) < 1*time.Second { // retrying for "Cannot create a file when that file already exists."
-			return
+		if attempt == 3 || !retryableWindowsTunError(err) {
+			return nil, err
 		}
-		log.Warnln("Start Tun interface timeout: %s [retrying %d/%d]", err, i+1, maxRetry)
+		delay := time.Duration(attempt) * 200 * time.Millisecond
+		if !now().Add(delay).Before(deadline) {
+			return nil, err
+		}
+		log.Warnln("[TUN] transient adapter creation error: %v [retry %d/2]", err, attempt)
+		wait(delay)
 	}
-	return
 }
 
 func init() {

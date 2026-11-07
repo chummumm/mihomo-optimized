@@ -149,3 +149,6 @@ require (
 
 // for https://github.com/golang/protobuf/issues/1704
 replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686
+
+// Pinned v0.4.28 with exclusive Windows adapter creation and failure cleanup.
+replace github.com/metacubex/sing-tun => ./third_party/sing-tun
