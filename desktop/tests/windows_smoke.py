@@ -3181,8 +3181,14 @@ class Acceptance:
         tun_core_pid = 0
         try:
             self.service_action("install")
-            installed = self.status()
-            require(installed.get("service", {}).get("installed") and service_installed(), "tun_service_not_installed")
+            # The elevated fixture changes SCM outside the host command path.
+            # Status is a cached read; wait for the independent observer to see
+            # the installation, while still checking the actual SCM state.
+            def installed_status():
+                observed = self.status(timeout=3)
+                return observed if observed.get("service", {}).get("installed") and service_installed() else None
+
+            wait_until(installed_status, "tun_service_not_installed", 8)
             self.stage = "tun_service_identity"
             self.report["serviceProcessAccess"] = self.service_process_access()
             self.report["tunGuiToken"] = self.desktop.check_gui(self.gui, self.processes)

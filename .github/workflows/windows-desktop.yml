@@ -131,7 +131,9 @@ jobs:
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./listener ./listener/sing_tun ./hub/executor ./hub/route ./component/lanpreconnect -run 'Desktop|LAN'
       - name: Verify exclusive Windows adapter creation and deterministic cleanup
         working-directory: core-src
-        run: go test -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun -run Desktop
+        env:
+          MIHOMO_TUN_INTEGRATION: '1'
+        run: go test -v -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun -run Desktop
       - name: Verify proxy IP destinations and DNS address-family output
         working-directory: core-src
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./adapter ./adapter/provider ./dns ./config ./tunnel -run 'ProxyTarget|ProxyForceIP|TargetIPFamily|AnswerIPFamily|ProviderTargetFamily'
