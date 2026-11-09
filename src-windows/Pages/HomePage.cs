@@ -17,6 +17,8 @@ public sealed class HomePage : NativePage
     private readonly TextBlock coreVersion = Ui.Text("—", 13);
     private readonly TextBlock proxyAddress = Ui.Text("—", 13);
     private readonly TextBlock coreError = Ui.Text("");
+    private readonly TextBlock tunDeviceRecoveryHint = Ui.Muted("");
+    private readonly StackPanel tunDeviceRecovery = new() { Margin = new Thickness(0, 12, 0, 0), Visibility = Visibility.Collapsed };
     private readonly TextBlock up = Ui.Text("—", 18, true);
     private readonly TextBlock down = Ui.Text("—", 18, true);
     private readonly TextBlock connectionCount = Ui.Text("—", 28, true);
@@ -33,6 +35,7 @@ public sealed class HomePage : NativePage
     private readonly Button start;
     private readonly Button stop;
     private readonly Button restart;
+    private readonly Button useManagedTunDevice;
     // Emblem: the colour globe-shield floats on a soft accent glow while running; other phases use a
     // neutral disc with a monochrome glyph, and errors show the colour warning sign.
     private readonly Border heroGlyph = new() { Width = 56, Height = 56, CornerRadius = new CornerRadius(28), BorderThickness = new Thickness(1) };
@@ -72,6 +75,12 @@ public sealed class HomePage : NativePage
         start = Action("启动内核", "StartCore", () => RunUserActionAsync(() => ChangeAsync("core", "desktop_start")), true);
         stop = Action("停止内核", "StopCore", () => RunUserActionAsync(() => ChangeAsync("core", "desktop_stop")));
         restart = Action("重启内核", "RestartCore", () => RunUserActionAsync(() => ChangeAsync("core", "desktop_restart")));
+        useManagedTunDevice = Action("改用桌面专属网卡并重试", "HomeUseManagedTunDevice", () => RunUserActionAsync(UseManagedTunDeviceAsync));
+        useManagedTunDevice.Content = FluentControls.ButtonContent("arrow-swap", "改用桌面专属网卡并重试");
+        useManagedTunDevice.HorizontalAlignment = HorizontalAlignment.Left;
+        useManagedTunDevice.MinHeight = 32; useManagedTunDevice.Margin = new Thickness(0, 8, 0, 0);
+        tunDeviceRecoveryHint.Id("HomeTunDeviceRecoveryHint");
+        tunDeviceRecovery.Children.Add(tunDeviceRecoveryHint); tunDeviceRecovery.Children.Add(useManagedTunDevice);
         FluentControls.Primary(start); stop.Style = restart.Style = FluentControls.Style("Button");
         start.Content = FluentControls.ButtonContent("play", "启动内核"); stop.Content = FluentControls.ButtonContent("stop", "停止内核"); restart.Content = new FluentIcon("update", 16);
         restart.Width = restart.Height = 32; restart.Padding = new Thickness(0); L.Bind(restart, ToolTipProperty, "重启内核");
@@ -100,7 +109,7 @@ public sealed class HomePage : NativePage
         ((FrameworkElement)facts.Children[0]).Margin = new Thickness(0, 0, 24, 0);
         var footContent = new HomeFlowRow(24, 12); footContent.Children.Add(modeRow); footContent.Children.Add(facts);
         var foot = new Border { Child = footContent, Margin = new Thickness(0, 16, 0, 0), Padding = new Thickness(0, 16, 0, 0), BorderThickness = new Thickness(0, 1, 0, 0) }; foot.SetResourceReference(Border.BorderBrushProperty, "DividerBrush");
-        heroContent.Children.Add(heroMain); heroContent.Children.Add(coreError); heroContent.Children.Add(foot);
+        heroContent.Children.Add(heroMain); heroContent.Children.Add(coreError); heroContent.Children.Add(tunDeviceRecovery); heroContent.Children.Add(foot);
         var heroLayers = new Grid(); heroLayers.Children.Add(heroWash); heroLayers.Children.Add(heroContent);
         hero = Ui.Card(heroLayers, 0); hero.Margin = new Thickness(0);
         proxy = new QuickSettingTile("nav-proxies", "系统代理", "systemProxy", () => Session.Navigate(new NavigationTarget("settings", "set-system-proxy")));
@@ -217,6 +226,12 @@ public sealed class HomePage : NativePage
         }
         await ChangeAsync("tun", "desktop_set_tun", new { enabled });
     }
+    private Task UseManagedTunDeviceAsync()
+    {
+        var device = Session.TunDevice;
+        if (!device.CanUseManaged) { UpdateStatus(); return Task.CompletedTask; }
+        return ChangeAsync("tunDevice", "desktop_use_managed_tun_device", new { expectedRevision = device.ConfigRevision });
+    }
     public override async Task NavigateToAsync(NavigationTarget target)
     {
         if (target.Action is "toggle-tun" or "toggleTun") await RunUserActionAsync(() => ChangeTunAsync(!Session.Status.Bool("tun")));
@@ -255,6 +270,10 @@ public sealed class HomePage : NativePage
         proxyAddress.Text = port > 0 ? "127.0.0.1:" + port : "—";
         coreError.Text = status.Text("lastError"); coreError.Visibility = coreError.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
         coreError.SetResourceReference(TextBlock.ForegroundProperty, runtime.IsProblem ? "DangerBrush" : "TextSecondaryBrush");
+        var device = Session.TunDevice;
+        tunDeviceRecovery.Visibility = device.OfferManaged ? Visibility.Visible : Visibility.Collapsed;
+        tunDeviceRecoveryHint.Text = L.F("已有同名网卡，暂时无法确认其归属。可改用“{0}”重试，原配置文件保持不变。", device.ManagedName);
+        useManagedTunDevice.IsEnabled = interactive && device.CanUseManaged;
         start.Visibility = runtime.StopRequired ? Visibility.Collapsed : Visibility.Visible;
         stop.Visibility = runtime.StopRequired ? Visibility.Visible : Visibility.Collapsed;
         // Keep the disabled restart action exposed during preparation so keyboard,

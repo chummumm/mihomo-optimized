@@ -10,6 +10,7 @@ use std::{
 };
 
 pub const MAX_CONFIG_SIZE: usize = 4 * 1024 * 1024;
+pub const MANAGED_TUN_DEVICE: &str = "MihomoDesktop";
 pub const DEFAULT_RESOURCE_TIMEOUT: Duration = Duration::from_secs(180);
 // Go's time.Duration is a signed count of nanoseconds, including on 32-bit builds.
 const MAX_RESOURCE_TIMEOUT_SECONDS: u64 = 9_223_372_036;
@@ -30,6 +31,31 @@ pub struct Preferences {
     pub desired_running: bool,
     pub system_proxy: bool,
     pub tun: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tun_device_override: Option<TunDeviceOverride>,
+}
+
+/// An explicit desktop choice, bound to the source's requested name. The
+/// original YAML stays untouched and a later source-name change retires it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TunDeviceOverride {
+    pub configured_name: Option<String>,
+    pub effective_name: String,
+}
+
+impl TunDeviceOverride {
+    pub fn managed(configured_name: Option<String>) -> Self {
+        Self {
+            configured_name,
+            effective_name: MANAGED_TUN_DEVICE.into(),
+        }
+    }
+
+    pub fn applies_to(&self, configured_name: Option<&str>) -> bool {
+        self.effective_name == MANAGED_TUN_DEVICE
+            && self.configured_name.as_deref() == configured_name
+    }
 }
 
 pub fn revision(content: &[u8]) -> String {
@@ -58,6 +84,82 @@ pub fn parse(content: &str) -> Result<Mapping> {
             "配置根节点必须是 YAML 对象",
         )),
     }
+}
+
+pub fn configured_tun_device(content: &str) -> Result<Option<String>> {
+    let document = parse(content)?;
+    match document.get("tun").and_then(|tun| tun.get("device")) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) if name.is_empty() => Ok(None),
+        Some(Value::String(name)) => Ok(Some(name.clone())),
+        Some(_) => Err(AppError::new(
+            "config_invalid",
+            "tun.device 必须是接口名称字符串",
+        )),
+    }
+}
+
+pub fn diagnostic_tun_device(name: Option<&str>) -> Option<String> {
+    name.map(|name| {
+        if !name.is_empty()
+            && name.chars().count() <= 80
+            && name
+                .chars()
+                .all(|c| c.is_alphanumeric() || " ._-()".contains(c))
+            && !(name.len() >= 32
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'))
+        {
+            name.into()
+        } else {
+            "[configured device]".into()
+        }
+    })
+}
+
+pub fn require_revision(content: &str, expected: &str) -> Result<()> {
+    if revision(content.as_bytes()) != expected {
+        return Err(AppError::new(
+            "config_conflict",
+            "配置已被修改，请重新读取配置后再选择 TUN 接口",
+        ));
+    }
+    Ok(())
+}
+
+pub fn reconcile_tun_device_override(preferences: &mut Preferences, content: &str) -> Result<bool> {
+    let configured_name = configured_tun_device(content)?;
+    if preferences
+        .tun_device_override
+        .as_ref()
+        .is_some_and(|choice| !choice.applies_to(configured_name.as_deref()))
+    {
+        preferences.tun_device_override = None;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// This is an ephemeral source for the existing runtime/validation pipeline,
+/// never a write to the user's source document.
+pub fn source_with_tun_device(content: &str, choice: Option<&TunDeviceOverride>) -> Result<String> {
+    let configured_name = configured_tun_device(content)?;
+    let Some(choice) = choice.filter(|choice| choice.applies_to(configured_name.as_deref())) else {
+        return Ok(content.into());
+    };
+    let mut document = parse(content)?;
+    let tun = document
+        .entry(key("tun"))
+        .or_insert(Value::Mapping(Mapping::new()));
+    if !tun.is_mapping() {
+        *tun = Value::Mapping(Mapping::new());
+    }
+    tun.as_mapping_mut()
+        .expect("mapping created above")
+        .insert(key("device"), key(&choice.effective_name));
+    serde_yaml::to_string(&document)
+        .map_err(|_| AppError::new("config_invalid", "无法生成专用 TUN 运行配置"))
 }
 
 pub fn resource_bootstrap_timeout(content: &str) -> Result<Duration> {
@@ -348,6 +450,95 @@ pub fn data_paths(directory: &Path) -> (PathBuf, PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn managed_tun_choice_survives_reload_without_rewriting_source() {
+        let source = "# Keep this exact source\ndns:\n  enable: true\ntun:\n  device: utun\n  stack: mixed\n";
+        let mut random = [0u8; 12];
+        getrandom::getrandom(&mut random).unwrap();
+        let directory = std::env::temp_dir().join(format!("tun-choice-{}", hex::encode(random)));
+        let path = directory.join("config.yaml");
+        atomic_write(&path, source.as_bytes()).unwrap();
+        let original = read(&path).unwrap();
+        assert_eq!(source_with_tun_device(source, None).unwrap(), source);
+        let preferences = Preferences {
+            tun: true,
+            tun_device_override: Some(TunDeviceOverride::managed(Some("utun".into()))),
+            ..Preferences::default()
+        };
+        save_preferences(&directory, &preferences).unwrap();
+        let mut restored = load_preferences(&directory).unwrap();
+        assert!(!reconcile_tun_device_override(&mut restored, source).unwrap());
+        let selected =
+            source_with_tun_device(source, restored.tun_device_override.as_ref()).unwrap();
+        for port in [9090, 45123] {
+            let runtime = runtime_config(&selected, true, port).unwrap();
+            assert_eq!(
+                configured_tun_device(&runtime).unwrap().as_deref(),
+                Some(MANAGED_TUN_DEVICE)
+            );
+        }
+        assert_eq!(read(&path).unwrap().revision, original.revision);
+        assert_eq!(fs::read(&path).unwrap(), source.as_bytes());
+        let changed = source.replace("stack: mixed", "stack: gvisor");
+        assert!(!reconcile_tun_device_override(&mut restored, &changed).unwrap());
+        assert_eq!(
+            require_revision(&changed, &original.revision)
+                .unwrap_err()
+                .code,
+            "config_conflict"
+        );
+        let renamed = changed.replace("device: utun", "device: custom-tun");
+        assert_eq!(
+            source_with_tun_device(&renamed, restored.tun_device_override.as_ref()).unwrap(),
+            renamed
+        );
+        assert!(reconcile_tun_device_override(&mut restored, &renamed).unwrap());
+        save_preferences(&directory, &restored).unwrap();
+        assert!(load_preferences(&directory)
+            .unwrap()
+            .tun_device_override
+            .is_none());
+        assert_eq!(
+            source_with_tun_device(source, restored.tun_device_override.as_ref()).unwrap(),
+            source
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn configured_names_and_automatic_name_are_never_implicitly_migrated() {
+        for source in [
+            "mode: rule\n",
+            "tun:\n  device: ''\n",
+            "tun:\n  device: custom\n",
+            "tun:\n  device: MihomoDesktop\n",
+        ] {
+            assert_eq!(source_with_tun_device(source, None).unwrap(), source);
+        }
+        let automatic = TunDeviceOverride::managed(None);
+        assert_eq!(
+            configured_tun_device(
+                &source_with_tun_device("mode: rule\n", Some(&automatic)).unwrap()
+            )
+            .unwrap()
+            .as_deref(),
+            Some(MANAGED_TUN_DEVICE)
+        );
+        assert_eq!(
+            source_with_tun_device("tun:\n  device: custom\n", Some(&automatic)).unwrap(),
+            "tun:\n  device: custom\n"
+        );
+        let untrusted = TunDeviceOverride {
+            configured_name: Some("utun".into()),
+            effective_name: "other-owner".into(),
+        };
+        let source = "tun:\n  device: utun\n";
+        assert_eq!(
+            source_with_tun_device(source, Some(&untrusted)).unwrap(),
+            source
+        );
+    }
+
     #[test]
     fn resource_budget_uses_positive_integer_seconds_without_overflow() {
         for content in [

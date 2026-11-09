@@ -155,7 +155,8 @@ fn finish_diagnostics(reader: thread::JoinHandle<String>, deadline: Instant) -> 
 }
 
 // Core failures can include complete subscription URLs or YAML source lines.
-// Only the bootstrap diagnostic protocol is copied into host errors/logs.
+// Only recognized bootstrap fields and the exact native TUN ownership guard
+// are copied into host errors/logs.
 fn safe_resource_diagnostic(line: &str) -> Option<String> {
     let (_, record) = line.split_once("[resource-bootstrap]")?;
     let field = |name: &str| -> Option<&str> {
@@ -206,6 +207,65 @@ fn safe_resource_diagnostic(line: &str) -> Option<String> {
     Some(safe)
 }
 
+const TUN_DEVICE_CONFLICT_SUFFIX: &str = " already exists with active, foreign or unverified ownership; stop its owner or choose an unused tun.device: file already exists";
+
+fn safe_tun_device_conflict(line: &str) -> Option<String> {
+    let line = line.trim();
+    let decoded;
+    let message = if (line.starts_with("time=") || line.starts_with("level="))
+        && (line.contains("level=fatal msg=") || line.contains("level=error msg="))
+    {
+        let (_, value) = line.split_once("msg=")?;
+        decoded = serde_json::Deserializer::from_str(value)
+            .into_iter::<String>()
+            .next()?
+            .ok()?;
+        decoded.as_str()
+    } else {
+        line
+    };
+    let message = message
+        .strip_prefix("parse config error: ")
+        .unwrap_or(message);
+    let value = message.strip_prefix("configure tun interface: adapter ")?;
+    let mut quoted = serde_json::Deserializer::from_str(value).into_iter::<String>();
+    let name = quoted.next()?.ok()?;
+    if value.get(quoted.byte_offset()..)? != TUN_DEVICE_CONFLICT_SUFFIX {
+        return None;
+    }
+    // Preserve the native cause, without echoing an accidental URL, credential,
+    // control character or unbounded source string used as an interface name.
+    let name = config::diagnostic_tun_device(Some(&name))?;
+    Some(format!(
+        "configure tun interface: adapter {}{TUN_DEVICE_CONFLICT_SUFFIX}",
+        serde_json::to_string(&name).ok()?
+    ))
+}
+
+fn safe_core_diagnostic(line: &str) -> Option<String> {
+    safe_tun_device_conflict(line).or_else(|| safe_resource_diagnostic(line))
+}
+
+fn tun_device_conflict_error(diagnostic: &str) -> Option<AppError> {
+    diagnostic
+        .lines()
+        .find_map(safe_tun_device_conflict)
+        .map(|cause| AppError::new("tun_device_conflict", format!("TUN 网卡名称冲突：{cause}")))
+}
+
+pub(crate) fn startup_cleanup_error(cause: &AppError, cleanup: &AppError) -> AppError {
+    if cleanup.code == "operation_cancelled" {
+        return cleanup.clone();
+    }
+    AppError::new(
+        "core_termination_unconfirmed",
+        format!(
+            "{}；无法确认启动清理完成：{}",
+            cause.message, cleanup.message
+        ),
+    )
+}
+
 fn collect_diagnostics(mut reader: impl Read) -> String {
     let mut output = VecDeque::new();
     let mut size = 0;
@@ -220,7 +280,7 @@ fn collect_diagnostics(mut reader: impl Read) -> String {
         for byte in &chunk[..count] {
             if *byte == b'\n' {
                 if !overflow {
-                    if let Some(safe) = safe_resource_diagnostic(&String::from_utf8_lossy(&line)) {
+                    if let Some(safe) = safe_core_diagnostic(&String::from_utf8_lossy(&line)) {
                         size += safe.len() + 1;
                         output.push_back(safe);
                         while size > MAX_DIAGNOSTIC_BYTES {
@@ -240,7 +300,7 @@ fn collect_diagnostics(mut reader: impl Read) -> String {
         }
     }
     if !overflow {
-        if let Some(safe) = safe_resource_diagnostic(&String::from_utf8_lossy(&line)) {
+        if let Some(safe) = safe_core_diagnostic(&String::from_utf8_lossy(&line)) {
             size += safe.len() + 1;
             output.push_back(safe);
             while size > MAX_DIAGNOSTIC_BYTES {
@@ -686,7 +746,7 @@ impl CoreSupervisor {
 
     fn spawn_with_budget(&mut self, budget: &OperationBudget) -> Result<()> {
         let result = self.launch(budget);
-        if result.is_err() {
+        if let Err(cause) = &result {
             if self.validation_child.is_some() && self.termination_unconfirmed {
                 // Validation already consumed its cleanup allowance and retained
                 // the unresolved handle. Do not silently grant another budget.
@@ -694,7 +754,9 @@ impl CoreSupervisor {
             }
             let cleanup = self.terminate_child_until(self.operation_cleanup_deadline(budget));
             self.controller = None;
-            cleanup?;
+            if let Err(cleanup) = cleanup {
+                return Err(startup_cleanup_error(cause, &cleanup));
+            }
         }
         result
     }
@@ -787,7 +849,9 @@ impl CoreSupervisor {
         crate::diagnostics::record(
             &self.logs,
             "core_ready",
-            serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"tun":self.tun}),
+            serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"tun":self.tun,
+                "tunDevice":config::diagnostic_tun_device(config::configured_tun_device(&source).ok().flatten().as_deref()),
+                "desktopVersion":env!("CARGO_PKG_VERSION"),"coreVersion":self.version}),
         );
         Ok(())
     }
@@ -855,6 +919,9 @@ impl CoreSupervisor {
                 .map_err(|e| AppError::io("无法读取内核状态", e))?
             {
                 let diagnostic = self.recent_diagnostic();
+                if let Some(error) = tun_device_conflict_error(&diagnostic) {
+                    return Err(error);
+                }
                 return Err(AppError::new(
                     "core_start_failed",
                     format!(
@@ -1012,6 +1079,11 @@ impl CoreSupervisor {
         let summary = collect_diagnostics(output.as_bytes());
         self.log_diagnostic(&summary);
         result.map_err(|mut error| {
+            if error.code == "reload_invalid" {
+                if let Some(conflict) = tun_device_conflict_error(&summary) {
+                    return conflict;
+                }
+            }
             if let Some(last) = summary.lines().last() {
                 error.message.push('：');
                 error.message.push_str(last);
@@ -1142,8 +1214,12 @@ impl CoreSupervisor {
                 .and_then(|body| {
                     body.get("message")
                         .and_then(|message| message.as_str())
-                        .and_then(safe_resource_diagnostic)
+                        .and_then(safe_core_diagnostic)
                 });
+            if let Some(conflict) = diagnostic.as_deref().and_then(tun_device_conflict_error) {
+                self.log_diagnostic(diagnostic.as_deref().unwrap_or_default());
+                return Err(conflict);
+            }
             let message = match diagnostic {
                 Some(diagnostic) => {
                     self.log_diagnostic(&diagnostic);
@@ -1183,6 +1259,7 @@ impl CoreSupervisor {
             let old = config::runtime_config(&previous, self.tun, port)?;
             config::atomic_write(&self.home.join("config.yaml"), old.as_bytes())?;
             self.error = Some(error.message.clone());
+            self.error_code = Some(error.code.clone());
             return Err(error);
         }
         if let Err(error) = self.apply_runtime(
@@ -1208,13 +1285,18 @@ impl CoreSupervisor {
             })();
             if rollback.is_ok() {
                 let restored = AppError::new(
-                    "reload_failed",
+                    if error.code == "tun_device_conflict" {
+                        "tun_device_conflict"
+                    } else {
+                        "reload_failed"
+                    },
                     format!(
                         "配置已保存，但未能应用：{}。已恢复上次运行配置，请修正后重载",
                         error.message
                     ),
                 );
                 self.error = Some(restored.message.clone());
+                self.error_code = Some(restored.code.clone());
                 return Err(restored);
             }
             // A timed-out ApplyConfig may still be running. Only confirmed process
@@ -1224,19 +1306,31 @@ impl CoreSupervisor {
             let cleanup = self.terminate_child_until(budget.cleanup_deadline());
             self.controller = None;
             self.version = None;
+            let code = if self.termination_unconfirmed {
+                "core_termination_unconfirmed"
+            } else if error.code == "tun_device_conflict" {
+                "tun_device_conflict"
+            } else {
+                "reload_restore_failed"
+            };
             self.error = Some(match cleanup {
                 Ok(()) => {
-                    "配置已保存，重载和运行回滚均失败，内核已停止；请修正配置后重新启动".into()
+                    format!(
+                        "配置已保存，重载和运行回滚均失败，内核已停止；{}",
+                        error.message
+                    )
                 }
-                Err(cleanup) => format!("配置已保存，重载和运行回滚均失败；{}", cleanup.message),
+                Err(cleanup) => format!(
+                    "配置已保存，重载和运行回滚均失败；{}；{}",
+                    error.message, cleanup.message
+                ),
             });
-            return Err(AppError::new(
-                "reload_restore_failed",
-                self.error.clone().unwrap_or_default(),
-            ));
+            self.error_code = Some(code.into());
+            return Err(AppError::new(code, self.error.clone().unwrap_or_default()));
         }
         self.source = Some(source);
         self.error = None;
+        self.error_code = None;
         self.observed_at = observed_now();
         Ok(self.status())
     }
@@ -2879,6 +2973,61 @@ mod tests {
             "137.250001000s"
         );
         assert!(OperationBudget::from_timeout(Duration::MAX, started).is_err());
+    }
+
+    #[test]
+    fn unconfirmed_start_cleanup_takes_priority_and_keeps_the_original_cause() {
+        let original = AppError::new(
+            "tun_device_conflict",
+            "native ownership guard for the configured device",
+        );
+        let cleanup = AppError::new("service_timeout", "Stop completion is not confirmed");
+        let error = startup_cleanup_error(&original, &cleanup);
+        assert_eq!(error.code, "core_termination_unconfirmed");
+        assert!(error.message.contains(&original.message));
+        assert!(error.message.contains(&cleanup.message));
+        assert_eq!(
+            startup_cleanup_error(
+                &original,
+                &AppError::new("operation_cancelled", "newer Stop")
+            )
+            .code,
+            "operation_cancelled"
+        );
+    }
+
+    #[test]
+    fn exact_native_tun_guard_becomes_typed_without_exposing_other_core_output() {
+        let cause =
+            format!("configure tun interface: adapter \"utun\"{TUN_DEVICE_CONFLICT_SUFFIX}");
+        let line = format!(
+            "time=\"2000-01-01T00:00:00Z\" level=fatal msg={}",
+            serde_json::to_string(&format!("parse config error: {cause}")).unwrap()
+        );
+        let captured = collect_diagnostics(format!("secret: never-echo\n{line}\n").as_bytes());
+        assert_eq!(captured, cause);
+        let error = tun_device_conflict_error(&captured).unwrap();
+        assert_eq!(error.code, "tun_device_conflict");
+        assert!(error.message.contains(&cause));
+        assert!(!error.message.contains("never-echo"));
+        for unrelated in [
+            "configure tun interface: adapter \"utun\" already exists",
+            "parse config error: access is denied",
+            "adapter utun: file already exists",
+            "[resource-bootstrap] code=timeout kind=provider",
+        ] {
+            assert!(
+                tun_device_conflict_error(unrelated).is_none(),
+                "{unrelated}"
+            );
+        }
+        let sensitive = format!("configure tun interface: adapter \"https://user:password@example.invalid/secret\"{TUN_DEVICE_CONFLICT_SUFFIX}");
+        let error = tun_device_conflict_error(&sensitive).unwrap();
+        assert_eq!(error.code, "tun_device_conflict");
+        assert!(!error.message.contains("password"));
+        assert!(error
+            .message
+            .contains("active, foreign or unverified ownership"));
     }
 
     #[test]

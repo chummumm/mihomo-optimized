@@ -7,6 +7,7 @@ internal static class DesktopStatusTests
     {
         RejectDelayedObservations();
         SeparateProcessAndTunHealth();
+        SeparateTunDeviceConflicts();
         Console.WriteLine("Desktop status: ordered host observations, Stop intent, TUN uncertainty/failure, live controller access, and confirmed exit passed.");
     }
 
@@ -117,6 +118,39 @@ internal static class DesktopStatusTests
             pid, operation, errorCode, statusStale = stale,
             controller = controller ? new { url = "http://127.0.0.1:1234", secret = "fixture" } : null
         });
+
+    private static void SeparateTunDeviceConflicts()
+    {
+        var exited = DesktopRuntimeState.Read(Status(phase: "error", process: "exited", control: "unknown",
+            pid: null, controller: false, errorCode: "tun_device_conflict"));
+        Equal(DesktopRuntimePhase.TunDeviceConflict, exited.Phase);
+        Check(exited.IsProblem && exited.CanStart && !exited.ProcessAlive && exited.TunRequested,
+            "A confirmed stopped adapter conflict lost the error or TUN intent");
+
+        var alive = DesktopRuntimeState.Read(Status(phase: "error", errorCode: "tun_device_conflict"));
+        Equal(DesktopRuntimePhase.TunDeviceConflict, alive.Phase);
+        Check(alive.ProcessAlive && alive.StopRequired && !alive.CanStart,
+            "An adapter conflict was treated as proof that a live core exited");
+
+        var unknown = DesktopRuntimeState.Read(Status(phase: "error", process: "unknown", control: "unknown",
+            desired: false, pid: null, controller: false, errorCode: "tun_device_conflict"));
+        Equal(DesktopRuntimePhase.Uncertain, unknown.Phase);
+        Check(!unknown.CanStart, "A conflict with unknown process state allowed another core to start");
+        Equal(DesktopRuntimePhase.Uncertain, DesktopRuntimeState.Read(Status(stale: true, errorCode: "tun_device_conflict")).Phase);
+
+        foreach (string command in new[] { "desktop_use_managed_tun_device", "desktop_use_configured_tun_device" })
+        {
+            var pending = DesktopRuntimeState.Read(Status(phase: "stopped", process: "exited", control: "unknown",
+                desired: false, pid: null, controller: false), command);
+            Equal(DesktopRuntimePhase.ApplyingTunDevice, pending.Phase);
+            Check(pending.IsWorking && pending.StopRequired && !pending.CanStart && !pending.RuntimeAvailable,
+                "A name change lost its Stop action before the next host snapshot");
+            var withController = DesktopRuntimeState.Read(Status(), command);
+            Check(withController.ProcessAlive && !withController.RuntimeAvailable && withController.StopRequired,
+                "A name change reused a controller that is about to stop");
+        }
+        Equal(DesktopRuntimePhase.Stopping, DesktopRuntimeState.Read(Status(errorCode: "tun_device_conflict"), "desktop_stop").Phase);
+    }
 
     private static void Check(bool condition, string message) { if (!condition) throw new Exception(message); }
     private static void Equal<T>(T expected, T actual) where T : notnull =>

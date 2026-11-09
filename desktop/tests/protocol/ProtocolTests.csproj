@@ -15,5 +15,6 @@
     <Compile Include="../../../src-windows/Services/ConfigApplicationState.cs" Link="ConfigApplicationState.cs" />
     <Compile Include="../../../src-windows/Services/DesktopRuntimeState.cs" Link="DesktopRuntimeState.cs" />
     <Compile Include="../../../src-windows/Services/DesktopStatusOrder.cs" Link="DesktopStatusOrder.cs" />
+    <Compile Include="../../../src-windows/Services/TunDeviceState.cs" Link="TunDeviceState.cs" />
   </ItemGroup>
 </Project>

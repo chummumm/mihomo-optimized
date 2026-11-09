@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise published 0.1.1 recovery, 0.1.7 migration and 0.2.5 service upgrade.
+"""Exercise published 0.1.1 recovery, 0.1.7 migration and active 0.2.5 TUN upgrade.
 
 Only disposable GitHub Actions Windows runners may run this elevated fixture.
 A read handle without FILE_SHARE_DELETE reproduces a leftover old helper after
@@ -361,7 +361,7 @@ class UpgradeAcceptance:
         require(owned_firewall_rule_count(self.core) == 1, "installed_firewall_rule_missing")
         return identity
 
-    def assert_candidate_files(self) -> None:
+    def assert_candidate_files(self, *, configuration_hash: str | None = None) -> None:
         evidence = {"stage": self.stage, "files": {}}
         for name, expected in self.expected_hashes.items():
             path = self.install_dir / name
@@ -390,7 +390,8 @@ class UpgradeAcceptance:
         require(actual_files == set(self.expected_hashes) | {"resources/build-info.json", "uninstall.exe"},
                 "installed_unexpected_legacy_runtime_file")
         self.assert_registration(self.info["desktopVersion"])
-        self.assert_marker()
+        require(self.config.is_file() and digest(self.config) == (configuration_hash or self.marker_hash),
+                "user_configuration_not_preserved")
 
     def run(self) -> None:
         import win32api
@@ -589,6 +590,14 @@ class UpgradeAcceptance:
                 "native_paired_service_remove_failed")
         self.assert_no_service()
 
+        # The idle service gate above cannot expose an abandoned legacy TUN.
+        # Exercise the real published GUI/service/core before overwriting it,
+        # then independently reproduce the exact forced-exit and live-owner
+        # conflicts. Each case uses actual native identity and raw forwarding.
+        from upgrade_tun_smoke import TunUpgradeAcceptance
+
+        TunUpgradeAcceptance(self, native, NATIVE_VERSION, NATIVE_SOURCE).run()
+
         self.stage = "candidate_reinstall_for_gui"
         require(self.command("candidate_reinstall", self.candidate, ["/S"], 180)["exitCode"] == 0,
                 "candidate_reinstall_failed")
@@ -694,7 +703,10 @@ def main() -> int:
         code = failure_code(error)
         print("FAIL: upgrade_" + code, file=sys.stderr, flush=True)
         if acceptance:
-            acceptance.report["diagnostics"].append({"stage": acceptance.stage, "code": code})
+            diagnostic = {"stage": acceptance.stage, "code": code}
+            if isinstance(error, SmokeFailure) and error.uia:
+                diagnostic["uia"] = error.uia
+            acceptance.report["diagnostics"].append(diagnostic)
         elif allowed:
             (artifacts / "upgrade.json").write_text(json.dumps({"passed": False, "tests": {},
                 "diagnostics": [{"stage": "preflight", "code": code}]}, indent=2) + "\n", encoding="utf-8")
@@ -708,6 +720,8 @@ def main() -> int:
                         "published_old_helper_failure_reproduced", "candidate_repairs_uninstall_residue",
                         "overwrite_restarts_existing_service", "candidate_application_fully_uninstalled",
                         "published_0_1_7_direct_upgrade", "published_0_2_5_paired_upgrade",
+                        "published_0_2_5_live_tun_upgrade", "legacy_tun_phantom_ui_recovery",
+                        "live_foreign_tun_preserved", "managed_tun_choice_persists_without_yaml_rewrite",
                         "candidate_reinstalled_for_gui", "final_cleanup"}
             acceptance.report["passed"] = (all(acceptance.report["tests"].get(name) is True for name in required)
                                            and not acceptance.report["diagnostics"])

@@ -12,9 +12,11 @@ internal enum DesktopRuntimePhase
     Restarting,
     Recovering,
     RepairingTun,
+    ApplyingTunDevice,
     Uncertain,
     TunDegraded,
     TunFailed,
+    TunDeviceConflict,
     Stopping,
     StopUnconfirmed,
     Exited,
@@ -35,11 +37,12 @@ internal sealed record DesktopRuntimeState
 
     public bool IsWorking => Phase is DesktopRuntimePhase.Connecting or DesktopRuntimePhase.Starting
         or DesktopRuntimePhase.Reloading or DesktopRuntimePhase.Restarting or DesktopRuntimePhase.Recovering
-        or DesktopRuntimePhase.RepairingTun or DesktopRuntimePhase.Stopping;
+        or DesktopRuntimePhase.RepairingTun or DesktopRuntimePhase.ApplyingTunDevice or DesktopRuntimePhase.Stopping;
     public bool IsProblem => Phase is DesktopRuntimePhase.TunFailed or DesktopRuntimePhase.StopUnconfirmed
-        or DesktopRuntimePhase.Exited or DesktopRuntimePhase.Error;
+        or DesktopRuntimePhase.TunDeviceConflict or DesktopRuntimePhase.Exited or DesktopRuntimePhase.Error;
     public bool NeedsAttention => IsProblem || Phase is DesktopRuntimePhase.Uncertain or DesktopRuntimePhase.TunDegraded;
-    public bool CanStart => !StopRequired && Phase is DesktopRuntimePhase.Stopped or DesktopRuntimePhase.Exited or DesktopRuntimePhase.Error;
+    public bool CanStart => !StopRequired && Phase is DesktopRuntimePhase.Stopped or DesktopRuntimePhase.Exited
+        or DesktopRuntimePhase.TunDeviceConflict or DesktopRuntimePhase.Error;
 
     public string Label => Phase switch
     {
@@ -50,9 +53,11 @@ internal sealed record DesktopRuntimeState
         DesktopRuntimePhase.Restarting => "正在重启内核",
         DesktopRuntimePhase.Recovering => "正在恢复内核",
         DesktopRuntimePhase.RepairingTun => "正在恢复 TUN",
+        DesktopRuntimePhase.ApplyingTunDevice => "正在应用网卡名称",
         DesktopRuntimePhase.Uncertain => "状态待确认",
         DesktopRuntimePhase.TunDegraded => "TUN 需要处理",
         DesktopRuntimePhase.TunFailed => "TUN 恢复失败",
+        DesktopRuntimePhase.TunDeviceConflict => "TUN 网卡名称冲突",
         DesktopRuntimePhase.Stopping => "正在停止",
         DesktopRuntimePhase.StopUnconfirmed => "停止尚未完成",
         DesktopRuntimePhase.Exited => "内核已退出",
@@ -67,11 +72,13 @@ internal sealed record DesktopRuntimeState
         DesktopRuntimePhase.Reloading => "正在应用已保存的配置，可随时停止内核。",
         DesktopRuntimePhase.Recovering => "正在核验本地内核与网络设备，可随时停止恢复。",
         DesktopRuntimePhase.RepairingTun => "内核进程仍在运行，正在恢复本机 TUN 设备。",
+        DesktopRuntimePhase.ApplyingTunDevice => "正在应用 TUN 网卡名称，可随时停止。原配置文件保持不变。",
         DesktopRuntimePhase.Uncertain => ProcessAlive
             ? "内核进程仍在运行，正在等待最新的本机健康状态。"
             : "暂时无法确认内核状态，正在等待本机服务的最新结果。",
         DesktopRuntimePhase.TunDegraded => "内核进程仍在运行，TUN 设备需要处理。请查看详细信息或日志。",
         DesktopRuntimePhase.TunFailed => "TUN 恢复未完成。请查看详细信息或日志；可停止内核后重试。",
+        DesktopRuntimePhase.TunDeviceConflict => "已有同名网卡，暂时无法确认其归属。请查看详细信息或选择其他网卡名称。",
         DesktopRuntimePhase.Stopping => "正在停止代理连接并恢复系统设置，请稍候。",
         DesktopRuntimePhase.StopUnconfirmed => "尚未确认旧内核退出，暂不启动新内核。请查看详细信息或日志。",
         DesktopRuntimePhase.Exited => "已确认内核进程退出。请查看错误信息或日志，再重试启动。",
@@ -83,7 +90,9 @@ internal sealed record DesktopRuntimeState
     public string TunDescription => !TunRequested ? "已关闭" : Phase switch
     {
         DesktopRuntimePhase.RepairingTun => "正在恢复 TUN",
+        DesktopRuntimePhase.ApplyingTunDevice => "正在应用网卡名称",
         DesktopRuntimePhase.TunFailed => "TUN 恢复失败",
+        DesktopRuntimePhase.TunDeviceConflict => "网卡名称冲突",
         DesktopRuntimePhase.TunDegraded => "TUN 需要处理",
         DesktopRuntimePhase.Uncertain or DesktopRuntimePhase.StopUnconfirmed => "状态待确认",
         DesktopRuntimePhase.Stopped or DesktopRuntimePhase.Exited or DesktopRuntimePhase.Error => "内核启动后生效",
@@ -110,7 +119,8 @@ internal sealed record DesktopRuntimeState
         bool stale = Boolean(status, "statusStale") && !confirmedStopped;
         bool stopPending = command == "desktop_stop";
         bool starting = command is "desktop_start" or "desktop_restart";
-        bool stopRequired = ownsProcess || starting || stopPending
+        bool changingTunDevice = command is "desktop_use_managed_tun_device" or "desktop_use_configured_tun_device";
+        bool stopRequired = ownsProcess || starting || stopPending || changingTunDevice
             || phase is "starting" or "recovering" or "stopping"
             || desired && process != "exited";
 
@@ -118,11 +128,13 @@ internal sealed record DesktopRuntimeState
         if (stopPending) state = DesktopRuntimePhase.Stopping;
         else if (error == "core_termination_unconfirmed") state = DesktopRuntimePhase.StopUnconfirmed;
         else if (operation == "stopping" || phase == "stopping") state = DesktopRuntimePhase.Stopping;
+        else if (changingTunDevice) state = DesktopRuntimePhase.ApplyingTunDevice;
         else if (command == "desktop_restart" || operation == "restarting") state = DesktopRuntimePhase.Restarting;
         else if (command == "desktop_start" || operation == "starting" || phase == "starting") state = DesktopRuntimePhase.Starting;
         else if (stale) state = DesktopRuntimePhase.Uncertain;
         else if (operation == "recovering_tun") state = DesktopRuntimePhase.RepairingTun;
         else if (command == "desktop_reload_config" || operation == "reloading") state = DesktopRuntimePhase.Reloading;
+        else if (error == "tun_device_conflict" && phase != "recovering" && (alive || process == "exited")) state = DesktopRuntimePhase.TunDeviceConflict;
         else if (alive && tunRequested && (error is "tun_recovery_failed" or "tun_recovery_needs_restart" or "tun_restart_required" || tunHealth == "failed")) state = DesktopRuntimePhase.TunFailed;
         else if (alive && tunRequested && (tunHealth is "degraded" or "conflict" or "disabled" || error is "tun_not_repairable" or "tun_ownership_conflict")) state = DesktopRuntimePhase.TunDegraded;
         else if (alive && (tunRequested && tunHealth == "unavailable" || control is "unknown" or "unreachable" or "busy")) state = DesktopRuntimePhase.Uncertain;
@@ -141,7 +153,8 @@ internal sealed record DesktopRuntimeState
         bool hasController = status.ValueKind == JsonValueKind.Object && status.TryGetProperty("controller", out var controller)
             && controller.ValueKind == JsonValueKind.Object && Text(controller, "url").Length > 0;
         bool runtimeAvailable = hasController && alive && !stale && (control is "ready" or "busy" || control.Length == 0 && phase == "running")
-            && state is not (DesktopRuntimePhase.Starting or DesktopRuntimePhase.Restarting or DesktopRuntimePhase.Stopping or DesktopRuntimePhase.StopUnconfirmed);
+            && state is not (DesktopRuntimePhase.Starting or DesktopRuntimePhase.Restarting or DesktopRuntimePhase.ApplyingTunDevice
+                or DesktopRuntimePhase.Stopping or DesktopRuntimePhase.StopUnconfirmed);
 
         return new DesktopRuntimeState
         {

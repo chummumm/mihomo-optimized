@@ -178,21 +178,31 @@ async function main() {
         await assertSourceCounts('connection snapshot')
     }
     async function position(label) {
-        const result = await page.evaluate(label => {
+        const snapshot = await page.waitForFunction(label => {
             const scroll = document.querySelector('.connections-scroll')
+            const table = document.querySelector('[role="table"]')
+            const header = document.querySelector('.connections-header')
+            if (!scroll || !table || !header) return false
             const rect = scroll.getBoundingClientRect()
             const rows = [...document.querySelectorAll('.connections-row')]
-            const headerBottom = document.querySelector('.connections-header').getBoundingClientRect().bottom
+            const headerBottom = header.getBoundingClientRect().bottom
             const visible = rows.filter(row => row.getBoundingClientRect().bottom > headerBottom && row.getBoundingClientRect().top < rect.top + scroll.clientHeight)
             const first = visible[0]
             const last = visible[visible.length - 1]
+            // Assigning scrollTop changes layout before react-window handles
+            // the scroll event and commits the new virtual range. Wait for
+            // rows covering this viewport, not for an expected connection ID:
+            // a wrongly restored anchor must still fail the assertion below.
+            if (!first?.dataset.connectionId || !last?.dataset.connectionId
+                || first.getBoundingClientRect().top > headerBottom
+                || last.getBoundingClientRect().bottom < Math.min(rect.top + scroll.clientHeight, table.getBoundingClientRect().bottom)) return false
             return {
                 label,
                 top: scroll.scrollTop, left: scroll.scrollLeft,
                 maximum: Math.max(0, scroll.scrollHeight - scroll.clientHeight),
                 first: first?.dataset.connectionId, last: last?.dataset.connectionId,
                 rendered: rows.length,
-                tableRows: Number(document.querySelector('[role="table"]').getAttribute('aria-rowcount')) - 1,
+                tableRows: Number(table.getAttribute('aria-rowcount')) - 1,
                 devices: [...document.querySelectorAll('.connections-devices-item:not([aria-hidden="true"])')].map(item => item.textContent.trim()),
                 stickyLeft: first?.querySelector('.fixed')?.getBoundingClientRect().left,
                 scrollLeft: rect.left,
@@ -204,13 +214,15 @@ async function main() {
                 historyNoteHeight: document.querySelector('.connections-history-note')?.clientHeight ?? 0,
             }
         }, label)
+        const result = await snapshot.jsonValue()
+        await snapshot.dispose()
         observations.push(result)
+        assert.ok(result.first && result.last, label + ': reading anchors are rendered')
         assert.ok(result.rendered < 70, 'virtual rows must remain bounded')
         return result
     }
     async function bottom(label) {
         await page.locator('.connections-scroll').evaluate(element => { element.scrollTop = element.scrollHeight; element.scrollLeft = 320 })
-        await page.waitForTimeout(80)
         const result = await position(label)
         expectedHorizontal = result.left
         assert.ok(Math.abs(result.maximum - result.top) <= 2, label + ': bottom position')
@@ -252,8 +264,8 @@ async function main() {
     await clickHeader('Speed')
     await send(connections, item => Number(item.id.slice(11)) + 1)
     await page.locator('.connections-scroll').evaluate(element => { element.scrollTop = 4500 })
-    await page.waitForTimeout(80)
     const reading = await position('reading_before_rate_change')
+    assert.equal(reading.top, 4500, 'reading anchor is sampled at the requested middle position')
     await send(connections, item => 330 - Number(item.id.slice(11)))
     const readingAfter = await position('reading_after_rate_change')
     assert.equal(readingAfter.first, reading.first, 'dynamic sort preserves the reading anchor')
