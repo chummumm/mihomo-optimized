@@ -90,7 +90,6 @@ public sealed class SettingsPage : NativePage
     private readonly Button openRelease;
     private readonly Button installService;
     private readonly Button uninstallService;
-    private readonly Button useConfiguredTunDevice;
     private readonly SettingCard tunDeviceCard;
     private readonly Button saveProbe;
     private readonly Button resetProbe;
@@ -176,7 +175,6 @@ public sealed class SettingsPage : NativePage
             if (Session.Status.Bool("tun")) throw new InvalidOperationException(L.T("请先关闭 TUN 模式，再卸载服务。"));
             await ChangeDesktop("desktop_uninstall_service");
         });
-        useConfiguredTunDevice = Action("恢复使用配置名称", "SettingsUseConfiguredTunDevice", UseConfiguredTunDeviceAsync);
         check = Action("检查应用更新", "CheckAppUpdate", CheckUpdate);
         install = Action("安装并重新启动", "InstallAppUpdate", InstallUpdate, true);
         openRelease = Action("下载完整安装包", "OpenAppRelease", OpenReleasePage, true);
@@ -190,12 +188,11 @@ public sealed class SettingsPage : NativePage
         AutomationProperties.SetLiveSetting(progress, AutomationLiveSetting.Polite);
         AutomationProperties.SetLiveSetting(serviceStatus, AutomationLiveSetting.Polite);
         AutomationProperties.SetLiveSetting(runtimeStatus, AutomationLiveSetting.Polite);
-        foreach (var button in new[] { saveProbe, resetProbe, installService, uninstallService, useConfiguredTunDevice, check, install, openRelease, openConfig, openLogs, openProject })
+        foreach (var button in new[] { saveProbe, resetProbe, installService, uninstallService, check, install, openRelease, openConfig, openLogs, openProject })
         { button.MinHeight = 32; button.Margin = new Thickness(0); button.Padding = new Thickness(11, 0, 11, 0); }
         installService.Content = TunConsentDialog.InstallButtonContent("安装服务");
         installService.Padding = new Thickness(12, 0, 12, 0);
         uninstallService.Content = FluentControls.ButtonContent("trash", "卸载服务");
-        useConfiguredTunDevice.Content = FluentControls.ButtonContent("arrow-swap", "恢复使用配置名称");
         check.Content = FluentControls.ButtonContent("update", "检查应用更新");
         install.Content = FluentControls.ButtonContent("arrow-down", "安装并重新启动");
         openRelease.Content = FluentControls.ButtonContent("arrow-down", "下载完整安装包");
@@ -216,8 +213,8 @@ public sealed class SettingsPage : NativePage
         L.Bind((TextBlock)proxy.Children[0], TextBlock.TextProperty, "代理", "settings-section");
         runtimeStatus.Margin = new Thickness(2, 8, 2, 0); proxy.Children.Add(runtimeStatus);
         tunDeviceEffectiveName.Margin = new Thickness(0, 4, 0, 0);
-        tunDeviceCard = Row("set-tun-device", "router", "TUN 网卡名称", "", useConfiguredTunDevice,
-            Ui.Column(tunDeviceConfiguredName, tunDeviceEffectiveName), useConfiguredTunDevice, tunDeviceHint);
+        tunDeviceCard = Row("set-tun-device", "router", "TUN 网卡名称", "", null,
+            Ui.Column(tunDeviceConfiguredName, tunDeviceEffectiveName), descriptionBlock: tunDeviceHint);
         var tunSection = Section("TUN 与系统服务",
             Row("set-tun", "shield-lock", "TUN 模式", "TUN 通过系统服务运行。首次启用会请求管理员授权；服务模式需要安装版。", SettingToggle(tun), focus: tun),
             tunDeviceCard,
@@ -487,10 +484,9 @@ public sealed class SettingsPage : NativePage
         var device = Session.TunDevice;
         tunDeviceCard.Visibility = device.Available ? Visibility.Visible : Visibility.Collapsed;
         tunDeviceConfiguredName.Text = L.F("配置名称：{0}", string.IsNullOrWhiteSpace(device.ConfiguredName) ? L.T("内核默认名称") : device.ConfiguredName);
-        tunDeviceEffectiveName.Text = L.F("使用名称：{0}", string.IsNullOrWhiteSpace(device.EffectiveName) ? L.T("尚未确定") : device.EffectiveName);
-        tunDeviceHint.Text = L.T(device.Managed ? "已选用桌面专属网卡，原配置文件保持不变。" : "使用配置中的网卡名称。");
-        useConfiguredTunDevice.Visibility = device.Managed ? Visibility.Visible : Visibility.Collapsed;
-        useConfiguredTunDevice.IsEnabled = !DesktopBusy && device.CanUseConfigured;
+        bool preparingDevice = Session.Runtime.Phase == DesktopRuntimePhase.RecoveringTunDevice && device.Managed;
+        tunDeviceEffectiveName.Text = L.F(preparingDevice ? "准备使用名称：{0}" : "使用名称：{0}", string.IsNullOrWhiteSpace(device.EffectiveName) ? L.T("尚未确定") : device.EffectiveName);
+        tunDeviceHint.Text = L.T("发生网卡名称冲突时，软件会自动尝试恢复。原配置文件保持不变。");
         configPath.Text = status.Text("configPath", fallback: L.T("主配置、备份和资源缓存"));
         logsPath.Text = L.T("内核与桌面程序的日志，按天轮转");
         applying = true;
@@ -603,12 +599,6 @@ public sealed class SettingsPage : NativePage
             success = true;
         }
         finally { EndChange(success); }
-    }
-    private Task UseConfiguredTunDeviceAsync()
-    {
-        var device = Session.TunDevice;
-        if (!device.CanUseConfigured || DesktopBusy) { ApplyStatus(); return Task.CompletedTask; }
-        return ChangeDesktop("desktop_use_configured_tun_device", new { expectedRevision = device.ConfigRevision });
     }
     private async Task ChangeRuntime(Dictionary<string, object> patch)
     {

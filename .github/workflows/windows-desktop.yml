@@ -190,7 +190,7 @@ jobs:
         run: python desktop/tests/core_smoke.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe
       - name: Test real Windows bootstrap groups, offline cache and cancellation
         run: python core-src/scripts/test-resource-bootstrap.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe --report artifacts/verification/resource-bootstrap-core.json
-      - name: Test legacy installer recovery and active 0.2.5 TUN upgrade
+      - name: Test legacy installer upgrade and automatic TUN recovery
         run: ./desktop/tests/setup-windows.ps1
       - name: Test installed native UI, system proxy, TUN forwarding and cleanup
         run: python desktop/tests/windows_smoke.py
