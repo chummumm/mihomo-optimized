@@ -52,12 +52,15 @@ class TunUpgradeAcceptance:
         self.child_output = None
         self.child_controller = None
         self.child_identity = None
+        self.child_record = None
         self.children = []
         self.child_handles = {}
         self.adapters = []
         self.secrets = set()
         self.temp = tempfile.TemporaryDirectory(prefix="mihomo-upgrade-tun-")
-        self.directory = Path(self.temp.name)
+        # Windows TEMP may contain an 8.3 component such as RUNNER~1. Use the
+        # actual private directory spelling before copying or launching files.
+        self.directory = Path(self.temp.name).resolve(strict=True)
         self.evidence = {"oldDesktopVersion": version, "oldDesktopSource": source,
                          "oldCoreSource": OLD_CORE_SOURCE, "candidateCoreSource": CURRENT_CORE_SOURCE,
                          "scenarios": {}, "cleanup": []}
@@ -285,6 +288,8 @@ class TunUpgradeAcceptance:
                 except subprocess.TimeoutExpired:
                     self.child.kill()  # Popen retains the exact CreateProcess handle.
                     self.child.wait(timeout=10)
+            if self.child_record is not None:
+                self.child_record["exitCode"] = self.child.poll()
             self.child = None
         if self.child_output is not None:
             try:
@@ -405,14 +410,38 @@ class TunUpgradeAcceptance:
         self.secrets.add(self.child_controller["secret"])
         environment = child_environment()
         environment["CLASH_OVERRIDE_SECRET"] = self.child_controller["secret"]
+        self.child_identity = None
+        self.child_record = None
         self.child_output = tempfile.TemporaryFile()
         self.child = subprocess.Popen([str(self.old_core), "-desktop-managed", "-d", str(home),
             "-f", str(home / "config.yaml"), "-ext-ctl", self.child_controller["url"].removeprefix("http://")],
             cwd=home, env=environment, stdin=subprocess.DEVNULL,
             stdout=self.child_output, stderr=self.child_output, close_fds=True,
             creationflags=subprocess.CREATE_NO_WINDOW)
-        self.child_identity = self.owner.processes.identity(self.child.pid)
-        require(self.child_identity and self.child_identity.path == os.path.normcase(str(self.old_core.resolve())),
+        # Query the exact process returned by CreateProcess, not a fresh PID
+        # lookup. Preserve its raw ProcessIdentity for the later kill guard;
+        # only the comparison to the verified file needs path normalization.
+        self.child_identity = self.owner.processes.from_handle(int(self.child._handle), self.child.pid)
+        expected = os.path.normcase(str(self.old_core.resolve(strict=True)))
+        self.child_record = {"pid": self.child.pid, "expectedPath": expected,
+            "actualPath": self.child_identity.path if self.child_identity else None,
+            "canonicalPath": None, "sameFile": False,
+            "creationTime": str(self.child_identity.created) if self.child_identity else None,
+            "exitCodeAtInspection": self.child.poll(), "exitCode": None}
+        self.evidence.setdefault("isolatedProcesses", []).append(self.child_record)
+        if self.child_identity:
+            try:
+                self.child_record["canonicalPath"] = os.path.normcase(str(
+                    Path(self.child_identity.path).resolve(strict=True)))
+                # samefile checks the volume/file ID on Windows. Different
+                # textual paths never authorize a different executable.
+                self.child_record["sameFile"] = os.path.samefile(self.child_identity.path, self.old_core)
+            except OSError as error:
+                self.child_record["pathQueryError"] = {"type": type(error).__name__,
+                    "winerror": getattr(error, "winerror", None)}
+        self.checkpoint()
+        require(self.child_identity and self.child_record["canonicalPath"] == expected
+                and self.child_record["sameFile"] is True,
                 "upgrade_isolated_old_core_identity_mismatch")
         self.retain_process(self.child_identity)
 
