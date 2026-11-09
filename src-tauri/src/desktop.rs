@@ -2145,7 +2145,7 @@ mod cleanup_observation_tests {
             }
         }));
         let error = fixture.manager.start(true).unwrap_err();
-        assert_eq!(error.code, "io_error");
+        assert_eq!(error.code, "config_missing");
         assert!(error.message.contains("utun"));
         assert_eq!(
             fixture.runtime.lock().unwrap().actions,
@@ -2165,7 +2165,7 @@ mod cleanup_observation_tests {
         assert!(fixture.manager.status().phase == Phase::Error);
         assert_eq!(
             fixture.manager.status().error_code.as_deref(),
-            Some("io_error")
+            Some("config_missing")
         );
     }
 
