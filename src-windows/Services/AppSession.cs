@@ -65,6 +65,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public bool IsRecoveringHost => hostRecovery is { IsCompleted: false };
     public bool IsUpdating { get; private set; }
     internal DesktopRuntimeState Runtime => DesktopRuntimeState.Read(Status, BusyCommand);
+    internal TunDeviceState TunDevice => TunDeviceState.Read(Status, Ready && !IsRecoveringHost && !exiting, IsDirty, IsUpdating, BusyCommand);
     internal bool CanStopCore => !exiting && !IsUpdating && BusyCommand != "desktop_stop"
         && (Ready || IsRecoveringHost) && Runtime.StopRequired;
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -85,6 +86,7 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             dirty = value;
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsDirty)));
             dirtySync = SyncDirtyAsync(dirtySync, value);
+            StatusChanged?.Invoke(this, EventArgs.Empty);
         }
     }
 
@@ -166,8 +168,18 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             launchCheckConsumed = true;
             return await CheckUpdateAsync(cancellationToken);
         }
+        if (method is "desktop_use_managed_tun_device" or "desktop_use_configured_tun_device")
+        {
+            var device = TunDevice;
+            var parameters = JsonSerializer.SerializeToElement(args, HostChannel.JsonOptions);
+            if (!device.MatchesRevision(HostChannel.Text(parameters, "expectedRevision")))
+                throw new DesktopException("config_conflict", "配置已变化，请刷新状态后重试。");
+            if (!(method == "desktop_use_managed_tun_device" ? device.CanUseManaged : device.CanUseConfigured))
+                throw new DesktopException("tun_device_action_unavailable", "当前无法切换网卡名称，请先保存配置修改并等待当前操作完成。");
+        }
         bool runtimeAction = method is "desktop_start" or "desktop_stop" or "desktop_restart" or "desktop_reload_config"
-            or "desktop_set_tun" or "desktop_set_system_proxy" or "desktop_install_service" or "desktop_uninstall_service";
+            or "desktop_set_tun" or "desktop_set_system_proxy" or "desktop_install_service" or "desktop_uninstall_service"
+            or "desktop_use_managed_tun_device" or "desktop_use_configured_tun_device";
         long operationGeneration = 0;
         if (runtimeAction)
         {

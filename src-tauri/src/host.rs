@@ -645,6 +645,8 @@ impl WorkQueue {
                     | "desktop_restart"
                     | "desktop_set_tun"
                     | "desktop_set_system_proxy"
+                    | "desktop_use_managed_tun_device"
+                    | "desktop_use_configured_tun_device"
                     | "desktop_reload_config"
                     | "desktop_patch_config"
                     | "desktop_install_update"
@@ -873,6 +875,51 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn tun_device_choices_are_cancelled_by_a_newer_stop_and_invalid_revisions_do_not_cancel() {
+        for method in [
+            "desktop_use_managed_tun_device",
+            "desktop_use_configured_tun_device",
+        ] {
+            let (context, _messages, _stops) = context();
+            let queue = WorkQueue::default();
+            queue
+                .enqueue(
+                    &context,
+                    request(
+                        1,
+                        method,
+                        serde_json::json!({"expectedRevision":"a".repeat(64)}),
+                    ),
+                )
+                .unwrap();
+            let accepted = context.generation();
+            let token = Cancellation::new(context.runtime_generation.clone(), accepted);
+            assert_eq!(
+                queue
+                    .enqueue(
+                        &context,
+                        request(
+                            2,
+                            method,
+                            serde_json::json!({"expectedRevision":"stale-or-missing"})
+                        )
+                    )
+                    .unwrap_err()
+                    .code,
+                "invalid_arguments"
+            );
+            assert_eq!(context.generation(), accepted);
+            queue
+                .enqueue(&context, request(3, "desktop_stop", serde_json::json!({})))
+                .unwrap();
+            assert_eq!(token.check().unwrap_err().code, "operation_cancelled");
+            assert!(queue.next().unwrap().stops);
+            let cancelled = queue.next().unwrap();
+            assert!(cancelled.invalidates && cancelled.generation < context.generation());
+        }
+    }
+
+    #[test]
     fn full_normal_queue_cannot_reject_stop_or_run_an_older_implicit_start() {
         let (context, _messages, _stops) = context();
         let queue = WorkQueue::default();
@@ -990,6 +1037,113 @@ mod lifecycle_tests {
         assert_eq!(context.generation(), 0);
         assert_eq!(context.stop_pending.load(Ordering::Acquire), 0);
         assert!(!queue.next().unwrap().stops);
+    }
+
+    #[test]
+    fn confirmed_cleanup_does_not_erase_actionable_tun_conflict_or_age_it_out() {
+        let (context, _messages, _stops) = context();
+        let mut stopped = context.status().unwrap();
+        stopped.service_instance = Some("service".into());
+        stopped.service_sequence = 3;
+        stopped.observed_at = 1;
+        context.publish_status(stopped.clone());
+        let mut failed = stopped;
+        failed.phase = Phase::Error;
+        failed.service_sequence = 2;
+        failed.error_code = Some("tun_device_conflict".into());
+        failed.last_error = Some("original native ownership guard".into());
+        failed.tun_device.configured_name = Some("utun".into());
+        failed.tun_device.effective_name = Some("utun".into());
+        failed.tun_device.config_revision = "a".repeat(64);
+        failed.tun_device.can_use_managed = true;
+        context.publish_status(failed);
+        let observed = context.status().unwrap();
+        assert!(observed.phase == Phase::Error);
+        assert_eq!(observed.process_state, "exited");
+        assert_eq!(observed.service_sequence, 3);
+        assert_eq!(observed.error_code.as_deref(), Some("tun_device_conflict"));
+        assert_eq!(
+            observed.last_error.as_deref(),
+            Some("original native ownership guard")
+        );
+        assert!(observed.tun_device.can_use_managed);
+        assert!(!observed.status_stale);
+    }
+
+    #[test]
+    fn newer_heartbeats_do_not_release_unconfirmed_cleanup() {
+        let (context, _messages, _stops) = context();
+        context.service_active.store(true, Ordering::Release);
+        let healthy = CoreStatus {
+            running: true,
+            process_state: "alive".into(),
+            control_state: "ready".into(),
+            listeners_ready: Some(true),
+            pid: Some(111),
+            controller: Some(crate::core::Controller {
+                url: "http://127.0.0.1:9090".into(),
+                secret: "fixture".into(),
+            }),
+            service_instance: Some("service".into()),
+            status_sequence: 2,
+            observed_at: core::observed_now(),
+            ..CoreStatus::default()
+        };
+        context.publish_service_observation(healthy.clone(), 0);
+        let mut failure = context.status().unwrap();
+        failure.service_sequence = 1;
+        failure.phase = Phase::Stopping;
+        failure.operation = Some("stopping".into());
+        failure.process_state = "unknown".into();
+        failure.control_state = "unknown".into();
+        failure.controller = None;
+        failure.error_code = Some("core_termination_unconfirmed".into());
+        failure.last_error = Some("original native conflict; cleanup exit unconfirmed".into());
+        failure.tun_device.can_use_managed = false;
+        context.publish_status(failure);
+        for sequence in [2, 3] {
+            if sequence == 3 {
+                context.publish_service_observation(
+                    CoreStatus {
+                        status_sequence: sequence,
+                        ..healthy.clone()
+                    },
+                    0,
+                );
+            }
+            let status = context.status().unwrap();
+            assert_eq!(status.service_sequence, sequence);
+            assert_eq!(status.pid, Some(111));
+            assert_eq!(status.process_state, "alive");
+            assert!(status.phase == Phase::Stopping);
+            assert_eq!(status.operation.as_deref(), Some("stopping"));
+            assert_eq!(status.control_state, "unknown");
+            assert_eq!(
+                status.error_code.as_deref(),
+                Some("core_termination_unconfirmed")
+            );
+            assert_eq!(
+                status.last_error.as_deref(),
+                Some("original native conflict; cleanup exit unconfirmed")
+            );
+            assert!(status.controller.is_none());
+            assert!(!status.tun_device.can_use_managed);
+        }
+
+        // An explicit owner publication after confirming exit clears the
+        // barrier; the heartbeat overlay must not latch the error forever.
+        let mut confirmed = context.status().unwrap();
+        confirmed.phase = Phase::Stopped;
+        confirmed.process_state = "exited".into();
+        confirmed.pid = None;
+        confirmed.operation = None;
+        confirmed.error_code = None;
+        confirmed.last_error = None;
+        context.publish_status(confirmed);
+        let status = context.status().unwrap();
+        assert!(status.phase == Phase::Stopped);
+        assert!(status.operation.is_none());
+        assert!(status.error_code.is_none());
     }
 
     #[test]

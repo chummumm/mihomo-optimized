@@ -21,6 +21,7 @@ public sealed class DesktopRecovery : NativePage
     private readonly Border errorBox;
     private readonly Button start;
     private readonly Button retry;
+    private readonly Button useManagedTunDevice;
     private readonly FluentIcon startGlyph = new("play", 16) { Margin = new Thickness(0, 0, 8, 0) };
     private readonly FluentProgressRing startProgress = new() { Width = 16, Height = 16, IsButtonSpinner = true, Margin = new Thickness(0, 0, 8, 0) };
     private readonly TextBlock startLabel = Ui.Label("启动内核");
@@ -73,10 +74,17 @@ public sealed class DesktopRecovery : NativePage
         start.Click += async (_, _) => { if (start.IsEnabled) await RunCommandAsync(Session.Runtime.StopRequired ? "desktop_stop" : "desktop_start"); };
         retry = CreateButton("update", "刷新状态", "RecoveryRefreshStatus");
         retry.Click += async (_, _) => await RunCommandAsync("desktop_status");
+        useManagedTunDevice = CreateButton("arrow-swap", "改用桌面专属网卡并重试", "RecoveryUseManagedTunDevice");
+        useManagedTunDevice.Click += async (_, _) =>
+        {
+            var device = Session.TunDevice;
+            if (device.CanUseManaged && localCommand is null)
+                await RunCommandAsync("desktop_use_managed_tun_device", new { expectedRevision = device.ConfigRevision });
+        };
         var settings = CreateButton("nav-settings", "打开设置", "RecoverySettings");
         settings.Click += (_, _) => Session.Navigate("settings");
         var actions = new CenteredActions { Margin = new Thickness(0, 24, 0, 0) };
-        actions.Children.Add(start); actions.Children.Add(retry); actions.Children.Add(settings);
+        actions.Children.Add(useManagedTunDevice); actions.Children.Add(start); actions.Children.Add(retry); actions.Children.Add(settings);
 
         var recovery = new Border
         {
@@ -149,6 +157,9 @@ public sealed class DesktopRecovery : NativePage
             _ => runtime.Label
         };
         string description = runtime.Description;
+        var device = Session.TunDevice;
+        if (runtime.Phase == DesktopRuntimePhase.TunDeviceConflict && device.OfferManaged)
+            description = L.F("已有同名网卡，暂时无法确认其归属。可改用“{0}”重试，原配置文件保持不变。", device.ManagedName);
         if (!hasStatus)
         {
             title = connectionFailed ? "无法读取本机状态" : "正在连接桌面服务…";
@@ -176,16 +187,18 @@ public sealed class DesktopRecovery : NativePage
         if (stopping) startLabel.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
         else startLabel.ClearValue(TextBlock.ForegroundProperty);
         retry.Visibility = connectionFailed ? Visibility.Visible : Visibility.Collapsed;
+        useManagedTunDevice.Visibility = device.OfferManaged ? Visibility.Visible : Visibility.Collapsed;
+        useManagedTunDevice.IsEnabled = device.CanUseManaged && !commandBusy;
     }
 
     public override Task RefreshAsync() { Refresh(); return Task.CompletedTask; }
 
-    private async Task RunCommandAsync(string command)
+    private async Task RunCommandAsync(string command, object? arguments = null)
     {
         if (localCommand is not null && command != "desktop_stop") return;
         long generation = ++localCommandGeneration;
         localCommand = command; operationError = ""; Refresh();
-        try { await Session.CommandAsync(command); }
+        try { await Session.CommandAsync(command, arguments); }
         catch (OperationCanceledException) { }
         catch (Exception error)
         {
