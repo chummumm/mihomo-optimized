@@ -8,7 +8,8 @@ internal static class DesktopStatusTests
         RejectDelayedObservations();
         SeparateProcessAndTunHealth();
         SeparateTunDeviceConflicts();
-        Console.WriteLine("Desktop status: ordered host observations, Stop intent, TUN uncertainty/failure, live controller access, and confirmed exit passed.");
+        ObserveAutomaticTunDeviceRecovery();
+        Console.WriteLine("Desktop status: ordered host observations, automatic TUN recovery, Stop intent, TUN uncertainty/failure, live controller access, and confirmed exit passed.");
     }
 
     private static void RejectDelayedObservations()
@@ -138,18 +139,71 @@ internal static class DesktopStatusTests
         Check(!unknown.CanStart, "A conflict with unknown process state allowed another core to start");
         Equal(DesktopRuntimePhase.Uncertain, DesktopRuntimeState.Read(Status(stale: true, errorCode: "tun_device_conflict")).Phase);
 
-        foreach (string command in new[] { "desktop_use_managed_tun_device", "desktop_use_configured_tun_device" })
-        {
-            var pending = DesktopRuntimeState.Read(Status(phase: "stopped", process: "exited", control: "unknown",
-                desired: false, pid: null, controller: false), command);
-            Equal(DesktopRuntimePhase.ApplyingTunDevice, pending.Phase);
-            Check(pending.IsWorking && pending.StopRequired && !pending.CanStart && !pending.RuntimeAvailable,
-                "A name change lost its Stop action before the next host snapshot");
-            var withController = DesktopRuntimeState.Read(Status(), command);
-            Check(withController.ProcessAlive && !withController.RuntimeAvailable && withController.StopRequired,
-                "A name change reused a controller that is about to stop");
-        }
         Equal(DesktopRuntimePhase.Stopping, DesktopRuntimeState.Read(Status(errorCode: "tun_device_conflict"), "desktop_stop").Phase);
+    }
+
+    private static void ObserveAutomaticTunDeviceRecovery()
+    {
+        foreach (string process in new[] { "alive", "exited" })
+        {
+            var status = Status(phase: "recovering", process: process, pid: process == "alive" ? 123U : null,
+                operation: "recovering_tun_device", errorCode: "tun_device_conflict");
+            foreach (string? command in new[] { null, "desktop_start", "desktop_restart", "desktop_set_tun" })
+            {
+                var recovering = DesktopRuntimeState.Read(status, command);
+                Equal(DesktopRuntimePhase.RecoveringTunDevice, recovering.Phase);
+                Check(recovering.IsWorking && recovering.TunDeviceRecoveryPending && recovering.StopRequired
+                    && !recovering.CanStart && !recovering.RuntimeAvailable && recovering.TunRequested,
+                    "Automatic recovery lost Stop or exposed a controller before the replacement was ready");
+                Check(recovering.ProcessAlive == (process == "alive"), "Automatic recovery invented process liveness");
+                Equal("正在自动恢复 TUN", recovering.TunDescription);
+                Check(!recovering.Description.Contains("进程仍在运行", StringComparison.Ordinal),
+                    "Automatic device recovery claimed the stopped process was alive");
+            }
+            Equal(DesktopRuntimePhase.Stopping, DesktopRuntimeState.Read(status, "desktop_stop").Phase);
+        }
+
+        foreach (var status in new[]
+        {
+            Status(phase: "recovering", process: "unknown", pid: null, operation: "recovering_tun_device"),
+            Status(phase: "recovering", operation: "recovering_tun_device", stale: true),
+            JsonSerializer.SerializeToElement(new
+            {
+                phase = "running", controlState = "ready", operation = "recovering_tun_device",
+                controller = new { url = "http://127.0.0.1:1234" }
+            })
+        })
+        {
+            var uncertain = DesktopRuntimeState.Read(status);
+            Equal(DesktopRuntimePhase.Uncertain, uncertain.Phase);
+            Check(uncertain.IsWorking && uncertain.StopRequired && !uncertain.CanStart && !uncertain.RuntimeAvailable,
+                "An uncertain automatic recovery enabled another action or lost Stop");
+        }
+
+        foreach (string? operation in new[] { null, "stopping", "recovering_tun_device" })
+        {
+            var unconfirmed = DesktopRuntimeState.Read(Status(phase: "error", process: "unknown", pid: null,
+                desired: false, operation: operation, errorCode: "core_termination_unconfirmed"));
+            Equal(DesktopRuntimePhase.StopUnconfirmed, unconfirmed.Phase);
+            Check(unconfirmed.StopRequired && !unconfirmed.CanStart && !unconfirmed.IsWorking && !unconfirmed.RuntimeAvailable,
+                "Unconfirmed cleanup was hidden behind automatic recovery or lost its Stop action");
+        }
+        var stopping = DesktopRuntimeState.Read(Status(phase: "error", process: "exited", pid: null,
+            desired: false, operation: "stopping"));
+        Check(stopping.Phase == DesktopRuntimePhase.Stopping && stopping.StopRequired && !stopping.CanStart,
+            "An admitted Stop without a PID exposed Start before completion");
+
+        var ready = DesktopRuntimeState.Read(Status());
+        Check(ready.Phase == DesktopRuntimePhase.Running && !ready.IsWorking && !ready.TunDeviceRecoveryPending
+            && ready.RuntimeAvailable, "Successful recovery retained its pending transition");
+        var failed = DesktopRuntimeState.Read(Status(phase: "error", process: "exited", pid: null,
+            controller: false, errorCode: "tun_device_conflict"));
+        Check(failed.Phase == DesktopRuntimePhase.TunDeviceConflict && failed.IsProblem && !failed.IsWorking
+            && !failed.TunDeviceRecoveryPending && failed.CanStart, "Terminal recovery failure was presented as ongoing recovery");
+        var stopped = DesktopRuntimeState.Read(Status(phase: "stopped", process: "exited", pid: null,
+            desired: false, controller: false));
+        Check(stopped.Phase == DesktopRuntimePhase.Stopped && !stopped.IsWorking && !stopped.StopRequired
+            && stopped.CanStart, "Completed Stop retained the automatic recovery intent");
     }
 
     private static void Check(bool condition, string message) { if (!condition) throw new Exception(message); }

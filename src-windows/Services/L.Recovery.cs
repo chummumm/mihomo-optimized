@@ -45,22 +45,18 @@ public static partial class L
         catalog["启动内核"] = "Start core";
         catalog["刷新状态"] = "Refresh status";
         catalog["打开设置"] = "Open settings";
-        catalog["正在应用网卡名称"] = "Applying adapter name";
-        catalog["正在应用 TUN 网卡名称，可随时停止。原配置文件保持不变。"] = "Applying the TUN adapter name. You can stop at any time. The configuration file is unchanged.";
+        catalog["正在自动恢复 TUN 接口"] = "Automatically recovering the TUN interface";
+        catalog["正在自动恢复 TUN"] = "Automatically recovering TUN";
+        catalog["正在自动恢复 TUN 接口，可随时停止。原配置文件保持不变。"] = "Automatically recovering the TUN interface. You can stop at any time. The configuration file is unchanged.";
         catalog["TUN 网卡名称冲突"] = "TUN adapter name conflict";
         catalog["网卡名称冲突"] = "Adapter name conflict";
-        catalog["已有同名网卡，暂时无法确认其归属。请查看详细信息或选择其他网卡名称。"] = "An adapter with this name already exists, and its ownership could not be verified. Review the details or choose another adapter name.";
-        catalog["已有同名网卡，暂时无法确认其归属。可改用“{0}”重试，原配置文件保持不变。"] = "An adapter with this name already exists, and its ownership could not be verified. You can retry using “{0}”. The configuration file is unchanged.";
-        catalog["改用桌面专属网卡并重试"] = "Use the desktop adapter and retry";
-        catalog["恢复使用配置名称"] = "Use the configured name";
+        catalog["TUN 接口未能启动。已有同名网卡，暂时无法确认其归属；可查看详细信息或日志。"] = "The TUN interface could not start. An adapter with this name already exists, and its ownership could not be verified. Review the details or logs.";
         catalog["TUN 网卡名称"] = "TUN adapter name";
         catalog["配置名称：{0}"] = "Configured name: {0}";
         catalog["使用名称：{0}"] = "Effective name: {0}";
+        catalog["准备使用名称：{0}"] = "Preparing to use: {0}";
         catalog["内核默认名称"] = "Core default";
         catalog["尚未确定"] = "Not yet known";
-        catalog["已选用桌面专属网卡，原配置文件保持不变。"] = "The desktop adapter is selected. The configuration file is unchanged.";
-        catalog["使用配置中的网卡名称。"] = "Uses the adapter name from the configuration.";
-        catalog["配置已变化，请刷新状态后重试。"] = "The configuration has changed. Refresh the status and try again.";
-        catalog["当前无法切换网卡名称，请先保存配置修改并等待当前操作完成。"] = "The adapter name cannot be changed now. Save configuration changes and wait for the current operation to finish.";
+        catalog["发生网卡名称冲突时，软件会自动尝试恢复。原配置文件保持不变。"] = "The app automatically attempts recovery if an adapter name conflicts. The configuration file is unchanged.";
     }
 }

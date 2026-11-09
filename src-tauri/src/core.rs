@@ -1853,9 +1853,16 @@ impl CoreSupervisor {
                     Err(error) => {
                         self.failed_recoveries += 1;
                         self.controller = None;
+                        let device_conflict = error.code == "tun_device_conflict";
                         self.error = Some(error.message);
                         self.error_code = Some(error.code);
-                        if !self.termination_unconfirmed {
+                        if device_conflict {
+                            // Repeating the same rejected alias cannot repair
+                            // native ownership. Preserve the exact failure for
+                            // the desktop's bounded source-bound recovery.
+                            self.desired_running = false;
+                            self.restart_at = None;
+                        } else if !self.termination_unconfirmed {
                             self.restart_at = Some(
                                 Instant::now() + Duration::from_secs(1 << self.restarts.len()),
                             );
@@ -3061,6 +3068,49 @@ mod tests {
                 "[resource-bootstrap] code=deadline kind=config resource=\"configuration\"".into()
             )
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_name_conflict_after_restart_preserves_cause_without_retrying_original_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut random = [0u8; 12];
+        getrandom::getrandom(&mut random).unwrap();
+        let directory = std::env::temp_dir().join(format!("tun-conflict-{}", hex::encode(random)));
+        fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("fixture-core");
+        let cause =
+            format!("configure tun interface: adapter \"utun\"{TUN_DEVICE_CONFLICT_SUFFIX}");
+        fs::write(&executable, format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = '-t' ]; then exit 0; fi\ndone\nprintf '%s\\n' '{cause}'\nexit 1\n"
+        )).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = format!("{}tun:\n  device: utun\n", config::INITIAL_CONFIG);
+        let mut supervisor = CoreSupervisor::new(
+            executable,
+            directory.join("runtime"),
+            directory.join("logs"),
+        );
+        supervisor.source = Some(source.clone());
+        supervisor.tun = true;
+        supervisor.desired_running = true;
+        supervisor.restart_at = Some(Instant::now());
+        let failed = supervisor.poll().unwrap();
+        assert_eq!(failed.error_code.as_deref(), Some("tun_device_conflict"));
+        assert!(failed.error.as_deref().unwrap().contains(&cause));
+        assert_eq!(failed.process_state, "exited");
+        assert!(!failed.recovering && !failed.desired_running);
+        assert_eq!(failed.restart_count, 1);
+        for _ in 0..4 {
+            let observed = supervisor.poll().unwrap();
+            assert_eq!(observed.error_code, failed.error_code);
+            assert_eq!(observed.restart_count, 1);
+            assert!(supervisor.restart_at.is_none());
+            assert!(supervisor.child.is_none() && supervisor.validation_child.is_none());
+        }
+        assert_eq!(supervisor.source.as_deref(), Some(source.as_str()));
+        drop(supervisor);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

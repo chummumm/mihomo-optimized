@@ -48,27 +48,6 @@ struct Save {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct TunDeviceChoice {
-    expected_revision: String,
-}
-
-fn tun_device_choice(params: Map<String, Value>) -> Result<TunDeviceChoice> {
-    let choice: TunDeviceChoice = decode(params)?;
-    if choice.expected_revision.len() != 64
-        || !choice
-            .expected_revision
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(AppError::new(
-            "invalid_arguments",
-            "TUN 接口选择需要当前配置版本",
-        ));
-    }
-    Ok(choice)
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Import {
     content: String,
     expected_revision: Option<String>,
@@ -107,9 +86,6 @@ pub fn validate_admission(method: &str, params: &Map<String, Value>) -> Result<(
         }
         "desktop_set_tun" | "desktop_set_system_proxy" => {
             decode::<Enabled>(params.clone())?;
-        }
-        "desktop_use_managed_tun_device" | "desktop_use_configured_tun_device" => {
-            tun_device_choice(params.clone())?;
         }
         "desktop_reload_config" | "desktop_exit" => {
             decode::<Force>(params.clone())?;
@@ -187,17 +163,6 @@ pub fn dispatch(
         "desktop_start" => core_action(state, params, |manager| manager.start(true)),
         "desktop_stop" => core_action(state, params, |manager| manager.stop(true)),
         "desktop_restart" => core_action(state, params, DesktopManager::restart),
-        "desktop_use_managed_tun_device" | "desktop_use_configured_tun_device" => {
-            let choice = tun_device_choice(params)?;
-            with_manager(state, |manager| {
-                if method == "desktop_use_managed_tun_device" {
-                    manager.use_managed_tun_device(&choice.expected_revision)?;
-                } else {
-                    manager.use_configured_tun_device(&choice.expected_revision)?;
-                }
-                encode(manager.status())
-            })
-        }
         "desktop_install_service" => {
             core_action(state, params, |manager| manager.install_service())
         }

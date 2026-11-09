@@ -170,6 +170,8 @@ impl HostContext {
         if let Ok(mut status) = self.status() {
             status.intent_revision = revision;
             status.desired_running = false;
+            status.auto_tun_recovery_eligible = false;
+            status.tun_device_recovery = crate::desktop::TunDeviceRecoveryStatus::Idle;
             status.phase = crate::desktop::Phase::Stopping;
             status.operation = Some("stopping".into());
             status.stop_reason = Some(crate::lifecycle::StopReason::UserStop);
@@ -645,8 +647,6 @@ impl WorkQueue {
                     | "desktop_restart"
                     | "desktop_set_tun"
                     | "desktop_set_system_proxy"
-                    | "desktop_use_managed_tun_device"
-                    | "desktop_use_configured_tun_device"
                     | "desktop_reload_config"
                     | "desktop_patch_config"
                     | "desktop_install_update"
@@ -701,6 +701,8 @@ impl WorkQueue {
         } else if invalidates {
             if let Ok(mut status) = context.status() {
                 status.intent_revision = generation;
+                status.tun_device_recovery = crate::desktop::TunDeviceRecoveryStatus::Idle;
+                status.auto_tun_recovery_eligible = false;
                 if matches!(action.as_str(), "desktop_start" | "desktop_restart") || implicit_start
                 {
                     status.desired_running = true;
@@ -825,11 +827,16 @@ fn operations(
 }
 
 #[cfg(test)]
+pub(crate) fn test_context() -> HostContext {
+    lifecycle_tests::context().0
+}
+
+#[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use crate::desktop::Phase;
+    use crate::desktop::{Phase, TunDeviceRecoveryStatus};
 
-    fn context() -> (HostContext, Receiver<Message>, Receiver<u64>) {
+    pub(super) fn context() -> (HostContext, Receiver<Message>, Receiver<u64>) {
         let raw = unsafe {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
@@ -871,51 +878,6 @@ mod lifecycle_tests {
             id,
             method: method.into(),
             params: params.as_object().unwrap().clone(),
-        }
-    }
-
-    #[test]
-    fn tun_device_choices_are_cancelled_by_a_newer_stop_and_invalid_revisions_do_not_cancel() {
-        for method in [
-            "desktop_use_managed_tun_device",
-            "desktop_use_configured_tun_device",
-        ] {
-            let (context, _messages, _stops) = context();
-            let queue = WorkQueue::default();
-            queue
-                .enqueue(
-                    &context,
-                    request(
-                        1,
-                        method,
-                        serde_json::json!({"expectedRevision":"a".repeat(64)}),
-                    ),
-                )
-                .unwrap();
-            let accepted = context.generation();
-            let token = Cancellation::new(context.runtime_generation.clone(), accepted);
-            assert_eq!(
-                queue
-                    .enqueue(
-                        &context,
-                        request(
-                            2,
-                            method,
-                            serde_json::json!({"expectedRevision":"stale-or-missing"})
-                        )
-                    )
-                    .unwrap_err()
-                    .code,
-                "invalid_arguments"
-            );
-            assert_eq!(context.generation(), accepted);
-            queue
-                .enqueue(&context, request(3, "desktop_stop", serde_json::json!({})))
-                .unwrap();
-            assert_eq!(token.check().unwrap_err().code, "operation_cancelled");
-            assert!(queue.next().unwrap().stops);
-            let cancelled = queue.next().unwrap();
-            assert!(cancelled.invalidates && cancelled.generation < context.generation());
         }
     }
 
@@ -1040,6 +1002,190 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn raw_conflict_and_metadata_publish_keep_recovery_until_the_owner_finishes() {
+        let (context, _messages, _stops) = context();
+        context.service_active.store(true, Ordering::Release);
+        let mut metadata = context.status().unwrap();
+        metadata.desired_running = true;
+        metadata.tun = true;
+        metadata.auto_tun_recovery_eligible = true;
+        metadata.service_instance = Some("service".into());
+        metadata.service_sequence = 1;
+        metadata.phase = Phase::Running;
+        context.publish_status(metadata.clone());
+        context.publish_service_observation(
+            CoreStatus {
+                process_state: "exited".into(),
+                error_code: Some("tun_device_conflict".into()),
+                error: Some("native conflict".into()),
+                service_instance: Some("service".into()),
+                status_sequence: 2,
+                observed_at: core::observed_now(),
+                ..CoreStatus::default()
+            },
+            0,
+        );
+        let pending = context.status().unwrap();
+        assert!(pending.phase == Phase::Recovering);
+        assert_eq!(pending.operation.as_deref(), Some("recovering_tun_device"));
+        assert!(pending.pid.is_none());
+        // read_config/metadata has not observed or completed this recovery.
+        context.publish_status(metadata);
+        let pending = context.status().unwrap();
+        assert!(pending.phase == Phase::Recovering);
+        assert_eq!(pending.service_sequence, 2);
+
+        let ready = CoreStatus {
+            running: true,
+            process_state: "alive".into(),
+            control_state: "ready".into(),
+            pid: Some(222),
+            service_instance: Some("service".into()),
+            status_sequence: 3,
+            observed_at: core::observed_now(),
+            ..CoreStatus::default()
+        };
+        context.publish_service_observation(ready.clone(), 0);
+        assert!(context.status().unwrap().phase == Phase::Recovering);
+        let mut completed = pending;
+        completed.phase = Phase::Running;
+        completed.operation = None;
+        completed.error_code = None;
+        completed.last_error = None;
+        completed.auto_tun_recovery_eligible = false;
+        completed.tun_device_recovery = TunDeviceRecoveryStatus::Succeeded;
+        context.publish_status(completed);
+        let completed = context.status().unwrap();
+        assert!(completed.phase == Phase::Running);
+        assert!(completed.operation.is_none());
+        assert_eq!(completed.pid, Some(222));
+        assert_eq!(completed.service_sequence, 3);
+        context.publish_service_observation(
+            CoreStatus {
+                status_sequence: 4,
+                ..ready
+            },
+            0,
+        );
+        assert!(context.status().unwrap().operation.is_none());
+    }
+
+    #[test]
+    fn late_recovery_success_cannot_overwrite_a_newer_native_failure() {
+        let (context, _messages, _stops) = context();
+        context.service_active.store(true, Ordering::Release);
+        let mut recovering = context.status().unwrap();
+        recovering.desired_running = true;
+        recovering.tun = true;
+        recovering.service_instance = Some("service".into());
+        recovering.service_sequence = 1;
+        recovering.phase = Phase::Recovering;
+        recovering.operation = Some("recovering_tun_device".into());
+        recovering.tun_device_recovery = TunDeviceRecoveryStatus::Pending;
+        context.publish_status(recovering.clone());
+        context.publish_service_observation(
+            CoreStatus {
+                process_state: "exited".into(),
+                error_code: Some("core_unexpected_exit".into()),
+                error: Some("newer native exit".into()),
+                service_instance: Some("service".into()),
+                status_sequence: 2,
+                observed_at: core::observed_now(),
+                ..CoreStatus::default()
+            },
+            0,
+        );
+        recovering.phase = Phase::Running;
+        recovering.operation = None;
+        recovering.tun_device_recovery = TunDeviceRecoveryStatus::Succeeded;
+        context.publish_status(recovering);
+        let final_status = context.status().unwrap();
+        assert!(final_status.phase == Phase::Error);
+        assert_eq!(
+            final_status.error_code.as_deref(),
+            Some("core_unexpected_exit")
+        );
+        assert_eq!(
+            final_status.last_error.as_deref(),
+            Some("newer native exit")
+        );
+        assert_eq!(final_status.process_state, "exited");
+        assert!(final_status.operation.is_none());
+    }
+
+    #[test]
+    fn recovery_failure_survives_later_healthy_heartbeats_and_stop_cancels_its_overlay() {
+        let (context, _messages, _stops) = context();
+        context.service_active.store(true, Ordering::Release);
+        let mut recovering = context.status().unwrap();
+        recovering.desired_running = true;
+        recovering.tun = true;
+        recovering.service_instance = Some("service".into());
+        recovering.service_sequence = 1;
+        recovering.phase = Phase::Recovering;
+        recovering.operation = Some("recovering_tun_device".into());
+        recovering.tun_device_recovery = TunDeviceRecoveryStatus::Pending;
+        context.publish_status(recovering.clone());
+        let ready = CoreStatus {
+            running: true,
+            process_state: "alive".into(),
+            control_state: "ready".into(),
+            pid: Some(222),
+            service_instance: Some("service".into()),
+            status_sequence: 2,
+            observed_at: core::observed_now(),
+            ..CoreStatus::default()
+        };
+        context.publish_service_observation(ready.clone(), 0);
+        recovering.phase = Phase::Error;
+        recovering.operation = None;
+        recovering.error_code = Some("config_conflict".into());
+        recovering.last_error = Some("source changed during recovery".into());
+        recovering.tun_device_recovery = TunDeviceRecoveryStatus::Failed(AppError::new(
+            "config_conflict",
+            "source changed during recovery",
+        ));
+        context.publish_status(recovering);
+        for sequence in [3, 4] {
+            context.publish_service_observation(
+                CoreStatus {
+                    status_sequence: sequence,
+                    ..ready.clone()
+                },
+                0,
+            );
+            let failed = context.status().unwrap();
+            assert!(failed.phase == Phase::Error);
+            assert!(failed.operation.is_none());
+            assert_eq!(failed.error_code.as_deref(), Some("config_conflict"));
+            assert_eq!(
+                failed.last_error.as_deref(),
+                Some("source changed during recovery")
+            );
+            assert_eq!(failed.pid, Some(222));
+        }
+        let queue = WorkQueue::default();
+        queue
+            .enqueue(&context, request(1, "desktop_stop", serde_json::json!({})))
+            .unwrap();
+        context.publish_service_observation(
+            CoreStatus {
+                status_sequence: 5,
+                ..ready
+            },
+            0,
+        );
+        let stopping = context.status().unwrap();
+        assert!(!stopping.desired_running);
+        assert!(stopping.phase == Phase::Stopping);
+        assert_eq!(stopping.operation.as_deref(), Some("stopping"));
+        assert!(matches!(
+            stopping.tun_device_recovery,
+            TunDeviceRecoveryStatus::Idle
+        ));
+    }
+
+    #[test]
     fn confirmed_cleanup_does_not_erase_actionable_tun_conflict_or_age_it_out() {
         let (context, _messages, _stops) = context();
         let mut stopped = context.status().unwrap();
@@ -1055,7 +1201,6 @@ mod lifecycle_tests {
         failed.tun_device.configured_name = Some("utun".into());
         failed.tun_device.effective_name = Some("utun".into());
         failed.tun_device.config_revision = "a".repeat(64);
-        failed.tun_device.can_use_managed = true;
         context.publish_status(failed);
         let observed = context.status().unwrap();
         assert!(observed.phase == Phase::Error);
@@ -1066,7 +1211,6 @@ mod lifecycle_tests {
             observed.last_error.as_deref(),
             Some("original native ownership guard")
         );
-        assert!(observed.tun_device.can_use_managed);
         assert!(!observed.status_stale);
     }
 
@@ -1099,7 +1243,6 @@ mod lifecycle_tests {
         failure.controller = None;
         failure.error_code = Some("core_termination_unconfirmed".into());
         failure.last_error = Some("original native conflict; cleanup exit unconfirmed".into());
-        failure.tun_device.can_use_managed = false;
         context.publish_status(failure);
         for sequence in [2, 3] {
             if sequence == 3 {
@@ -1127,7 +1270,6 @@ mod lifecycle_tests {
                 Some("original native conflict; cleanup exit unconfirmed")
             );
             assert!(status.controller.is_none());
-            assert!(!status.tun_device.can_use_managed);
         }
 
         // An explicit owner publication after confirming exit clears the

@@ -35,7 +35,7 @@ pub struct Preferences {
     pub tun_device_override: Option<TunDeviceOverride>,
 }
 
-/// An explicit desktop choice, bound to the source's requested name. The
+/// A desktop recovery mapping, bound to the source's requested name. The
 /// original YAML stays untouched and a later source-name change retires it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

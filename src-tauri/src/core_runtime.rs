@@ -544,6 +544,13 @@ mod tests {
         thread::sleep(Duration::from_millis(150));
         assert!(runtime.status().pid.is_none());
         runtime.shutdown().unwrap();
+        // Shutdown confirms the child first. Wait for the worker's supervisor
+        // destructor (including its final diagnostic write) before removing logs.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Arc::strong_count(&runtime.shared) > 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(Arc::strong_count(&runtime.shared), 1);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
