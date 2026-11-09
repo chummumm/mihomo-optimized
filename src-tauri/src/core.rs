@@ -11,7 +11,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -122,10 +122,10 @@ fn confirm_process_exit(
     child: &mut Child,
     deadline: Instant,
     kill_error: Option<std::io::Error>,
-) -> Result<()> {
+) -> Result<ExitStatus> {
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
+            Ok(Some(status)) => return Ok(status),
             Ok(None) => {}
             Err(error) => return Err(AppError::io("无法确认自有内核进程退出", error)),
         }
@@ -361,6 +361,79 @@ struct TunRecovery {
     tun_generation: u64,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessObservation {
+    state: &'static str,
+    exit_code: Option<i32>,
+    exit_success: Option<bool>,
+    os_error: Option<i32>,
+}
+
+fn observe_process(child: Option<&mut Child>) -> ProcessObservation {
+    let mut observation = ProcessObservation {
+        state: "not_running",
+        exit_code: None,
+        exit_success: None,
+        os_error: None,
+    };
+    if let Some(child) = child {
+        match child.try_wait() {
+            Ok(Some(exit)) => {
+                observation.state = "exited";
+                observation.exit_code = exit.code();
+                observation.exit_success = Some(exit.success());
+            }
+            Ok(None) => observation.state = "alive",
+            Err(error) => {
+                observation.state = "unknown";
+                observation.os_error = error.raw_os_error();
+            }
+        }
+    }
+    observation
+}
+
+#[derive(Default)]
+struct CleanupEvidence {
+    main_exit: Option<ExitStatus>,
+    force_requested: bool,
+}
+
+fn diagnostic_identity(value: &serde_json::Value) -> Option<&str> {
+    value.as_str().filter(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_:.{}".contains(&byte))
+    })
+}
+
+fn tun_reason_code(reason: Option<&str>) -> &'static str {
+    match reason.unwrap_or_default() {
+        "" => "none",
+        "owned TUN device is missing" => "device_missing",
+        "owned TUN device is down" => "device_down",
+        "owned TUN address is missing or not ready" => "address_not_ready",
+        "owned TUN route is missing" => "route_missing",
+        "TUN device identity changed" => "identity_changed",
+        "original TUN identity is unavailable" => "identity_unavailable",
+        "owned TUN listener is unavailable" => "listener_unavailable",
+        "TUN route inspection is unavailable" => "route_inspection_unavailable",
+        "TUN health observation is pending" => "observation_pending",
+        "TUN health observation is stale" => "observation_stale",
+        value if value.starts_with("inspect TUN device:") => "device_inspection_failed",
+        value if value.starts_with("inspect TUN identity:") => "identity_inspection_failed",
+        value if value.starts_with("inspect TUN addresses:") => "address_inspection_failed",
+        value if value.starts_with("inspect TUN routes:") => "route_inspection_failed",
+        value if value.starts_with("owned TUN replacement failed:") => "replacement_failed",
+        value if value.starts_with("owned TUN recovery failed:") => "recovery_failed",
+        value if value.starts_with("TUN operation is in progress:") => "operation_pending",
+        _ => "unclassified",
+    }
+}
+
 pub struct CoreSupervisor {
     executable: PathBuf,
     home: PathBuf,
@@ -394,6 +467,8 @@ pub struct CoreSupervisor {
     observed_at: u64,
     cancellation: Option<Cancellation>,
     tun_recovery: Option<TunRecovery>,
+    diagnostic_health: Option<serde_json::Value>,
+    diagnostic_health_at: Option<u64>,
 }
 
 pub fn http_client() -> Result<Client> {
@@ -641,11 +716,17 @@ impl CoreSupervisor {
             observed_at: observed_now(),
             cancellation: None,
             tun_recovery: None,
+            diagnostic_health: None,
+            diagnostic_health_at: None,
         }
     }
 
     pub fn set_cancellation(&mut self, cancellation: Cancellation) {
         self.cancellation = Some(cancellation);
+    }
+
+    pub(crate) fn record_lifecycle(&self, event: &str, fields: serde_json::Value) {
+        crate::diagnostics::record(&self.logs, event, fields);
     }
 
     fn check_cancelled(&self) -> Result<()> {
@@ -707,7 +788,7 @@ impl CoreSupervisor {
     pub fn start(&mut self, source: String, tun: bool) -> Result<CoreStatus> {
         self.check_cancelled()?;
         let budget = OperationBudget::new(&source)?;
-        self.stop()?;
+        self.stop_for_cause(StopReason::UserStop, "start_replace")?;
         self.check_cancelled()?;
         self.source = Some(source);
         self.tun = tun;
@@ -745,8 +826,14 @@ impl CoreSupervisor {
     }
 
     fn spawn_with_budget(&mut self, budget: &OperationBudget) -> Result<()> {
+        let started = Instant::now();
+        self.record_lifecycle("core_start", serde_json::json!({"tun":self.tun,"generation":self.recovery_generation,"cancellationRevision":self.cancellation.as_ref().map(Cancellation::revision)}));
         let result = self.launch(budget);
+        self.record_lifecycle("core_start_result", serde_json::json!({"tun":self.tun,"corePid":self.child.as_ref().map(Child::id),"durationMs":started.elapsed().as_millis(),"success":result.is_ok(),"errorCode":result.as_ref().err().map(|error|&error.code)}));
         if let Err(cause) = &result {
+            let _scope = crate::diagnostics::scope(
+                serde_json::json!({"cleanupCause":"startup_failure","startupErrorCode":cause.code}),
+            );
             if self.validation_child.is_some() && self.termination_unconfirmed {
                 // Validation already consumed its cleanup allowance and retained
                 // the unresolved handle. Do not silently grant another budget.
@@ -811,6 +898,9 @@ impl CoreSupervisor {
             .spawn()
             .map_err(|e| AppError::io("无法启动配套内核", e))?;
         self.child = Some(child);
+        self.diagnostic_health = None;
+        self.diagnostic_health_at = None;
+        self.record_lifecycle("core_spawned", serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"tun":self.tun,"generation":self.recovery_generation}));
         self.termination_unconfirmed = false;
         #[cfg(windows)]
         {
@@ -1235,6 +1325,17 @@ impl CoreSupervisor {
     }
 
     pub fn reload(&mut self, source: String) -> Result<CoreStatus> {
+        let started = Instant::now();
+        self.record_lifecycle(
+            "core_reload",
+            serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"tun":self.tun}),
+        );
+        let result = self.reload_inner(source);
+        self.record_lifecycle("core_reload_result", serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"durationMs":started.elapsed().as_millis(),"success":result.is_ok(),"errorCode":result.as_ref().err().map(|error|&error.code)}));
+        result
+    }
+
+    fn reload_inner(&mut self, source: String) -> Result<CoreStatus> {
         self.check_cancelled()?;
         let budget = OperationBudget::new(&source)?;
         self.log_start = fs::metadata(self.logs.join("core.log")).map_or(0, |file| file.len());
@@ -1386,6 +1487,7 @@ impl CoreSupervisor {
         let health = read_readiness_json(&client, &controller, "/desktop/health", deadline)
             .map_err(observation_failure)?;
         verify_managed_identity(&health, pid)?;
+        self.record_health_observation(&health);
         self.check_cancelled().map_err(ReadinessFailure::Fatal)?;
         let recovery = &health["recovery"];
         let recovery_current = recovery.is_object()
@@ -1534,6 +1636,38 @@ impl CoreSupervisor {
                 "core_controller_incompatible",
                 "本地内核返回无效恢复结果",
             )),
+        }
+    }
+
+    fn record_health_observation(&mut self, health: &serde_json::Value) {
+        // Take only typed lifecycle fields from the existing read-only API.
+        // In particular, raw reason/error strings may contain configuration.
+        let observation = serde_json::json!({
+            "corePid": self.child.as_ref().map(Child::id),
+            "coreInstance": diagnostic_identity(&health["core_instance"]),
+            "configGeneration": health["config_generation"].as_u64(),
+            "tunGeneration": health["tun_generation"].as_u64(),
+            "creationCount": health["creation_count"].as_u64(),
+            "stale": health["stale"].as_bool(),
+            "tun": {
+                "enabled": health["tun"]["enabled"].as_bool(),
+                "state": health["tun"]["state"].as_str()
+                    .filter(|state| matches!(*state, "healthy" | "disabled" | "unavailable" | "degraded" | "conflict"))
+                    .unwrap_or("invalid"),
+                "device": config::diagnostic_tun_device(health["tun"]["device"].as_str()),
+                "index": health["tun"]["index"].as_u64(),
+                "identity": diagnostic_identity(&health["tun"]["identity"]),
+                "reasonCode": tun_reason_code(health["tun"]["reason"].as_str()),
+                "repairable": health["tun"]["repairable"].as_bool(),
+            },
+            "recoveryId": diagnostic_identity(&health["recovery"]["id"]),
+            "recoveryPhase": diagnostic_identity(&health["recovery"]["phase"]),
+            "recoveryStatus": diagnostic_identity(&health["recovery"]["status"]),
+        });
+        self.diagnostic_health_at = Some(observed_now());
+        if self.diagnostic_health.as_ref() != Some(&observation) {
+            self.record_lifecycle("core_health_observation", observation.clone());
+            self.diagnostic_health = Some(observation);
         }
     }
 
@@ -1773,12 +1907,16 @@ impl CoreSupervisor {
     fn schedule_health_restart(&mut self, error: AppError) -> Result<()> {
         // stop_for confirms this owned process has exited before a later poll
         // may spawn. The intervening user Stop cancels the pending recovery.
+        let _scope = crate::diagnostics::scope(
+            serde_json::json!({"trigger":"health_restart","triggerCode":error.code}),
+        );
         self.stop_for(StopReason::HealthFailure)?;
         self.check_cancelled()?;
         self.desired_running = true;
         self.error_code = Some(error.code);
         self.error = Some(error.message);
         self.restart_at = Some(Instant::now() + Duration::from_secs(1));
+        self.record_lifecycle("core_restart_scheduled", serde_json::json!({"cause":"health_failure","errorCode":self.error_code,"delayMs":1000,"generation":self.recovery_generation}));
         Ok(())
     }
 
@@ -1805,7 +1943,8 @@ impl CoreSupervisor {
                 crate::diagnostics::record(
                     &self.logs,
                     "core_exit",
-                    serde_json::json!({"corePid":child.id(),"exitCode":exit.code(),"desiredRunning":self.desired_running}),
+                    serde_json::json!({"corePid":child.id(),"exitCode":exit.code(),"exitSuccess":exit.success(),"desiredRunning":self.desired_running,
+                        "cancellationRevision":self.cancellation.as_ref().map(Cancellation::revision),"lastHealth":self.diagnostic_health,"lastHealthObservedAtMs":self.diagnostic_health_at}),
                 );
                 self.child = None;
                 self.controller = None;
@@ -1819,6 +1958,7 @@ impl CoreSupervisor {
                     self.error_code = Some("core_unexpected_exit".into());
                     self.error = Some("内核意外退出，正在准备恢复".into());
                     self.restart_at = Some(Instant::now() + Duration::from_secs(1));
+                    self.record_lifecycle("core_restart_scheduled", serde_json::json!({"cause":"unexpected_exit","exitCode":exit.code(),"delayMs":1000,"generation":self.recovery_generation}));
                 }
                 self.recovery = None;
             }
@@ -1892,62 +2032,150 @@ impl CoreSupervisor {
     }
 
     pub fn stop_for(&mut self, reason: StopReason) -> Result<()> {
-        let deadline = Instant::now() + TOTAL_STOP_TIMEOUT;
-        crate::diagnostics::record(
-            &self.logs,
-            "core_stop",
-            serde_json::json!({"reason":reason,"corePid":self.child.as_ref().map(Child::id),"generation":self.recovery_generation}),
-        );
-        self.stop_reason = Some(reason);
-        self.desired_running = false;
-        self.restart_at = None;
-        self.recovery = None;
-        self.health_blocked = false;
-        self.health_deferred = false;
-        self.tun_recovery = None;
-        if self.child.is_some() {
-            if let Some(controller) = &self.controller {
-                if let Ok(client) = http_client() {
-                    let _ = client
-                        .post(format!("{}/desktop/shutdown", controller.url))
-                        .bearer_auth(&controller.secret)
-                        .timeout(remaining(deadline)?.min(CONTROL_TIMEOUT))
-                        .send();
+        let cause = match reason {
+            StopReason::UserStop => "requested_stop",
+            StopReason::OwnerLost => "owner_lost",
+            StopReason::LeaseExpired => "lease_expired",
+            StopReason::UnexpectedExit => "unexpected_exit",
+            StopReason::RecoveryExhausted => "recovery_exhausted",
+            StopReason::HealthFailure => "health_failure",
+            StopReason::Shutdown => "shutdown",
+        };
+        self.stop_for_cause(reason, cause)
+    }
+
+    fn stop_for_cause(&mut self, reason: StopReason, cause: &'static str) -> Result<()> {
+        let started = Instant::now();
+        let deadline = started + TOTAL_STOP_TIMEOUT;
+        let pid = self.child.as_ref().map(Child::id);
+        let validation_pid = self.validation_child.as_ref().map(Child::id);
+        let before = observe_process(self.child.as_mut());
+        let mut exit_code = before.exit_code;
+        let mut exit_success = before.exit_success;
+        let mut shutdown_outcome = "not_attempted";
+        let mut shutdown_status = None;
+        let mut force_requested = false;
+        let mut outcome = if pid.is_none() {
+            "no_process"
+        } else if before.state == "exited" {
+            "already_exited"
+        } else {
+            "exit_unconfirmed"
+        };
+        // A destructor with no process performs no lifecycle action worth a
+        // second event. This also avoids recreating removed fixture directories.
+        let record = cause != "drop_cleanup" || pid.is_some() || self.validation_child.is_some();
+        if record {
+            self.record_lifecycle("core_stop", serde_json::json!({
+                "reason":reason,"cause":cause,"corePid":pid,"generation":self.recovery_generation,
+                "cancellationRevision":self.cancellation.as_ref().map(Cancellation::revision),
+                "processBefore":before.state,"processObservation":before,
+                "validationPid":self.validation_child.as_ref().map(Child::id),
+                "lastHealth":self.diagnostic_health,"lastHealthObservedAtMs":self.diagnostic_health_at,
+            }));
+        }
+        let result: Result<()> = (|| {
+            self.stop_reason = Some(reason);
+            self.desired_running = false;
+            self.restart_at = None;
+            self.recovery = None;
+            self.health_blocked = false;
+            self.health_deferred = false;
+            self.tun_recovery = None;
+            if self.child.is_some() {
+                if let Some(controller) = &self.controller {
+                    if let Ok(client) = http_client() {
+                        let sent = client
+                            .post(format!("{}/desktop/shutdown", controller.url))
+                            .bearer_auth(&controller.secret)
+                            .timeout(remaining(deadline)?.min(CONTROL_TIMEOUT))
+                            .send();
+                        match sent {
+                            Ok(response) => {
+                                shutdown_status = Some(response.status().as_u16());
+                                shutdown_outcome = if response.status().is_success() {
+                                    "accepted"
+                                } else {
+                                    "rejected"
+                                };
+                            }
+                            Err(_) => shutdown_outcome = "transport_error",
+                        }
+                    } else {
+                        shutdown_outcome = "client_unavailable";
+                    }
+                } else {
+                    shutdown_outcome = "controller_unavailable";
+                }
+                self.record_lifecycle("core_shutdown_request", serde_json::json!({"corePid":pid,"cause":cause,"outcome":shutdown_outcome,"httpStatus":shutdown_status,"durationMs":started.elapsed().as_millis()}));
+                let graceful_deadline = (Instant::now() + Duration::from_secs(4)).min(deadline);
+                while Instant::now() < graceful_deadline {
+                    let exit = self
+                        .child
+                        .as_mut()
+                        .expect("child exists until cleanup")
+                        .try_wait()
+                        .map_err(|e| AppError::io("无法等待内核退出", e))?;
+                    if let Some(exit) = exit {
+                        exit_code = exit.code();
+                        exit_success = Some(exit.success());
+                        if before.state != "exited" {
+                            outcome = "exited_during_grace";
+                        }
+                        self.child = None;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(75));
+                }
+                force_requested = self.child.is_some() || self.validation_child.is_some();
+                let cleanup = self.terminate_child_with_evidence(deadline)?;
+                force_requested |= cleanup.force_requested;
+                if let Some(exit) = cleanup.main_exit {
+                    exit_code = exit.code();
+                    exit_success = Some(exit.success());
+                    outcome = "exit_confirmed_after_force";
                 }
             }
-            let graceful_deadline = (Instant::now() + Duration::from_secs(4)).min(deadline);
-            while Instant::now() < graceful_deadline {
-                let exited = self
-                    .child
-                    .as_mut()
-                    .expect("child exists until cleanup")
-                    .try_wait()
-                    .map_err(|e| AppError::io("无法等待内核退出", e))?
-                    .is_some();
-                if exited {
-                    self.child = None;
-                    break;
+            if self.validation_child.is_some() {
+                force_requested = true;
+                self.terminate_child_with_evidence(deadline)?;
+                if pid.is_none() {
+                    outcome = "validation_exit_confirmed_after_force";
                 }
-                thread::sleep(Duration::from_millis(75));
             }
-            self.terminate_child_until(deadline)?;
+            self.controller = None;
+            self.version = None;
+            self.control_state = "unknown".into();
+            self.listeners_ready = Some(false);
+            self.error = None;
+            self.error_code = None;
+            self.tun_health = Some("disabled".into());
+            self.observed_at = observed_now();
+            #[cfg(windows)]
+            {
+                self.job = None;
+            }
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            outcome = if error.code == "core_termination_unconfirmed" {
+                "exit_unconfirmed"
+            } else {
+                "error"
+            };
         }
-        if self.validation_child.is_some() {
-            self.terminate_child_until(deadline)?;
+        if record {
+            self.record_lifecycle("core_stop_result", serde_json::json!({
+                "reason":reason,"cause":cause,"corePid":pid,"generation":self.recovery_generation,
+                "validationPid":validation_pid,
+                "processBefore":before.state,"outcome":outcome,
+                "exitConfirmed":self.child.is_none() && self.validation_child.is_none(),
+                "forceRequested":force_requested,"exitCode":exit_code,"exitSuccess":exit_success,
+                "shutdownOutcome":shutdown_outcome,"shutdownHttpStatus":shutdown_status,
+                "durationMs":started.elapsed().as_millis(),"errorCode":result.as_ref().err().map(|error| &error.code),
+            }));
         }
-        self.controller = None;
-        self.version = None;
-        self.control_state = "unknown".into();
-        self.listeners_ready = Some(false);
-        self.error = None;
-        self.error_code = None;
-        self.tun_health = Some("disabled".into());
-        self.observed_at = observed_now();
-        #[cfg(windows)]
-        {
-            self.job = None;
-        }
-        Ok(())
+        result
     }
 
     #[cfg(test)]
@@ -1956,30 +2184,65 @@ impl CoreSupervisor {
     }
 
     fn terminate_child_until(&mut self, deadline: Instant) -> Result<()> {
+        self.terminate_child_with_evidence(deadline).map(|_| ())
+    }
+
+    fn terminate_child_with_evidence(&mut self, deadline: Instant) -> Result<CleanupEvidence> {
+        let started = Instant::now();
+        let main_pid = self.child.as_ref().map(Child::id);
+        let validation_pid = self.validation_child.as_ref().map(Child::id);
+        let main_before = observe_process(self.child.as_mut());
+        let validation_before = observe_process(self.validation_child.as_mut());
         let kill_error = self.child.as_mut().and_then(|child| child.kill().err());
         let validation_kill_error = self
             .validation_child
             .as_mut()
             .and_then(|child| child.kill().err());
+        for (role, pid, before, error) in [
+            ("main", main_pid, &main_before, &kill_error),
+            (
+                "validation",
+                validation_pid,
+                &validation_before,
+                &validation_kill_error,
+            ),
+        ] {
+            if let Some(pid) = pid {
+                self.record_lifecycle("core_force_stop",serde_json::json!({"corePid":pid,"role":role,"processBefore":before.state,"killRequested":true,"killAccepted":error.is_none(),"osError":error.as_ref().and_then(std::io::Error::raw_os_error)}));
+            }
+        }
         #[cfg(windows)]
         {
             self.job = None;
         }
-        let result = (|| {
+        let mut evidence = CleanupEvidence {
+            main_exit: None,
+            force_requested: main_pid.is_some() || validation_pid.is_some(),
+        };
+        let result: Result<()> = (|| {
             if let Some(validation) = self.validation_child.as_mut() {
-                confirm_process_exit(validation, deadline, validation_kill_error)?;
+                let exit = confirm_process_exit(validation, deadline, validation_kill_error)?;
+                self.record_lifecycle("core_force_stop_result", serde_json::json!({"corePid":validation_pid,"role":"validation","exitConfirmed":true,"exitCode":exit.code(),"exitSuccess":exit.success(),"durationMs":started.elapsed().as_millis()}));
                 self.validation_child = None;
             }
             if let Some(child) = self.child.as_mut() {
-                confirm_process_exit(child, deadline, kill_error)?;
+                let exit = confirm_process_exit(child, deadline, kill_error)?;
+                self.record_lifecycle("core_force_stop_result", serde_json::json!({"corePid":main_pid,"role":"main","exitConfirmed":true,"exitCode":exit.code(),"exitSuccess":exit.success(),"durationMs":started.elapsed().as_millis()}));
+                evidence.main_exit = Some(exit);
             }
             self.child = None;
             Ok(())
         })();
         if let Err(error) = result {
-            // Keep every unresolved owned handle. A later observation or Stop
-            // can confirm exit; no validator or main process may replace it.
-            let error: AppError = error;
+            // Retain unresolved handles and the original cleanup deadline.
+            for (role, pid) in [
+                ("main", self.child.as_ref().map(Child::id)),
+                ("validation", self.validation_child.as_ref().map(Child::id)),
+            ] {
+                if let Some(pid) = pid {
+                    self.record_lifecycle("core_force_stop_result", serde_json::json!({"corePid":pid,"role":role,"exitConfirmed":false,"durationMs":started.elapsed().as_millis(),"errorCode":error.code}));
+                }
+            }
             self.termination_unconfirmed = true;
             self.desired_running = false;
             self.restart_at = None;
@@ -1991,13 +2254,14 @@ impl CoreSupervisor {
             return Err(error);
         }
         self.termination_unconfirmed = false;
-        Ok(())
+        Ok(evidence)
     }
 }
 
 impl Drop for CoreSupervisor {
     fn drop(&mut self) {
         if self.termination_unconfirmed {
+            self.record_lifecycle("core_drop_unconfirmed", serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"validationPid":self.validation_child.as_ref().map(Child::id),"cause":"drop_cleanup","exitConfirmed":false}));
             // The operation already used its cleanup allowance. Releasing the
             // owner must not silently start another stop/cleanup deadline.
             if let Some(child) = self.child.as_mut() {
@@ -2011,7 +2275,7 @@ impl Drop for CoreSupervisor {
                 self.job = None;
             }
         } else {
-            let _ = self.stop();
+            let _ = self.stop_for_cause(StopReason::UserStop, "drop_cleanup");
         }
     }
 }
@@ -2381,6 +2645,161 @@ mod tests {
         if std::env::var_os("MIHOMO_READINESS_TEST_CHILD").is_some() {
             let _ = std::io::stdin().read_to_end(&mut Vec::new());
         }
+    }
+
+    fn diagnostic_test_directory(label: &str) -> PathBuf {
+        let mut random = [0u8; 8];
+        getrandom::getrandom(&mut random).unwrap();
+        std::env::temp_dir().join(format!(
+            "mihomo-core-diagnostics-{label}-{}",
+            hex::encode(random)
+        ))
+    }
+
+    fn diagnostic_test_child() -> Child {
+        quiet_command(&std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "core::tests::readiness_owned_process",
+            ])
+            .env("MIHOMO_READINESS_TEST_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn diagnostic_events(directory: &Path) -> Vec<serde_json::Value> {
+        assert!(crate::diagnostics::flush(Duration::from_secs(2)));
+        fs::read_to_string(directory.join("recovery.log"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn stop_diagnostics_distinguish_observed_exit_grace_and_confirmed_force() {
+        for mode in [
+            "already_exited",
+            "exited_during_grace",
+            "exit_confirmed_after_force",
+        ] {
+            let directory = diagnostic_test_directory(mode);
+            let mut core = CoreSupervisor::new(PathBuf::new(), PathBuf::new(), directory.clone());
+            let mut child = diagnostic_test_child();
+            let pid = child.id();
+            let closing = match mode {
+                "already_exited" => {
+                    drop(child.stdin.take());
+                    child.wait().unwrap();
+                    None
+                }
+                "exited_during_grace" => {
+                    let input = child.stdin.take();
+                    Some(thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(150));
+                        drop(input);
+                    }))
+                }
+                _ => None,
+            };
+            core.child = Some(child);
+            let _scope = crate::diagnostics::scope(
+                serde_json::json!({"operationId":"fixture-stop","cause":"automatic_host_recovery"}),
+            );
+            core.stop_for_cause(StopReason::UserStop, "start_replace")
+                .unwrap();
+            if let Some(closing) = closing {
+                closing.join().unwrap();
+            }
+            assert!(core.child.is_none());
+            drop(core);
+            let events = diagnostic_events(&directory);
+            let began = events
+                .iter()
+                .find(|event| event["event"] == "core_stop")
+                .unwrap();
+            let ended = events
+                .iter()
+                .find(|event| event["event"] == "core_stop_result")
+                .unwrap();
+            assert_eq!(began["data"]["corePid"], pid);
+            assert_eq!(
+                began["data"]["processBefore"],
+                if mode == "already_exited" {
+                    "exited"
+                } else {
+                    "alive"
+                }
+            );
+            assert_eq!(ended["data"]["cause"], "start_replace");
+            assert_eq!(ended["context"]["cause"], "automatic_host_recovery");
+            assert_eq!(ended["context"]["operationId"], "fixture-stop");
+            assert_eq!(ended["data"]["outcome"], mode);
+            assert_eq!(ended["data"]["exitConfirmed"], true);
+            assert_eq!(
+                ended["data"]["forceRequested"],
+                mode == "exit_confirmed_after_force"
+            );
+            assert!(ended["data"]["errorCode"].is_null());
+            if mode != "exit_confirmed_after_force" {
+                assert_eq!(ended["data"]["exitCode"], 0);
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn unavailable_diagnostic_destination_cannot_fail_an_explicit_stop() {
+        let directory = diagnostic_test_directory("unwritable");
+        fs::write(&directory, b"not a directory").unwrap();
+        let mut core = CoreSupervisor::new(PathBuf::new(), PathBuf::new(), directory.clone());
+        core.desired_running = true;
+        core.restart_at = Some(Instant::now());
+        core.stop().unwrap();
+        assert!(!core.desired_running && core.restart_at.is_none());
+        drop(core);
+        assert!(crate::diagnostics::flush(Duration::from_secs(2)));
+        fs::remove_file(directory).unwrap();
+    }
+
+    #[test]
+    fn health_diagnostics_keep_identity_and_fixed_reason_without_raw_errors_or_duplicate_polls() {
+        let directory = diagnostic_test_directory("health");
+        let mut core = CoreSupervisor::new(PathBuf::new(), PathBuf::new(), directory.clone());
+        let mut health = serde_json::json!({
+            "core_instance":"instance-1","config_generation":2,"tun_generation":3,"creation_count":1,
+            "stale":false,"tun":{"enabled":true,"state":"unavailable","device":"MihomoDesktop","index":42,
+                "identity":"windows-luid:1234","reason":"inspect TUN routes: https://private.example/token-secret","repairable":false},
+            "secret":"must-never-appear","config":"subscription-secret",
+        });
+        core.record_health_observation(&health);
+        core.record_health_observation(&health);
+        health["tun"]["state"] = "healthy".into();
+        health["tun"]["reason"] = "".into();
+        core.record_health_observation(&health);
+        drop(core);
+        let events = diagnostic_events(&directory);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]["data"]["tun"]["reasonCode"],
+            "route_inspection_failed"
+        );
+        assert_eq!(events[0]["data"]["tun"]["identity"], "windows-luid:1234");
+        assert_eq!(events[0]["data"]["creationCount"], 1);
+        let text = serde_json::to_string(&events).unwrap();
+        for secret in [
+            "private.example",
+            "token-secret",
+            "must-never-appear",
+            "subscription-secret",
+        ] {
+            assert!(!text.contains(secret));
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -3110,6 +3529,7 @@ mod tests {
         }
         assert_eq!(supervisor.source.as_deref(), Some(source.as_str()));
         drop(supervisor);
+        assert!(crate::diagnostics::flush(Duration::from_secs(2)));
         fs::remove_dir_all(directory).unwrap();
     }
 
