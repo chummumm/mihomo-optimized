@@ -20,6 +20,8 @@ internal static class ProcessFixtures
             try
             {
                 using var request = JsonDocument.Parse(line);
+                if (request.RootElement.EnumerateObject().Count() != 3 || !request.RootElement.TryGetProperty("params", out _))
+                    throw new InvalidDataException("Diagnostics changed the IPC schema");
                 long id = request.RootElement.GetProperty("id").GetInt64();
                 string method = request.RootElement.GetProperty("method").GetString()!;
                 if (method == "desktop_eof") return;
@@ -35,9 +37,61 @@ internal static class ProcessFixtures
                     Console.WriteLine(JsonSerializer.Serialize(new { id, result = new { exiting = true } }));
                     return;
                 }
-                Console.WriteLine(JsonSerializer.Serialize(new { id, result = new { count = ++count, pid = Environment.ProcessId, noAutostart = Environment.GetCommandLineArgs().Contains("--no-autostart") } }));
+                Console.WriteLine(JsonSerializer.Serialize(new { id, result = new { count = ++count, pid = Environment.ProcessId, noAutostart = Environment.GetCommandLineArgs().Contains("--no-autostart"), statusInstance = "fixture-host-" + Environment.ProcessId } }));
             }
             catch (JsonException) { Console.WriteLine("invalid-json"); }
+        }
+    }
+
+    public static async Task TestHostDiagnosticsAsync()
+    {
+        string executable = CopyAppHost(AppContext.BaseDirectory, "mihomo-desktop-host.exe");
+        string directory = Path.Combine(Path.GetTempPath(), "mihomo-host-evidence-" + Guid.NewGuid().ToString("N"));
+        string? previous = Environment.GetEnvironmentVariable("MIHOMO_PROTOCOL_FIXTURE");
+        try
+        {
+            Environment.SetEnvironmentVariable("MIHOMO_PROTOCOL_FIXTURE", "normal");
+            await using var diagnostics = new LifecycleDiagnostics(directory);
+            string channelId;
+            int hostPid;
+            await using (var host = new HostChannel(diagnostics))
+            {
+                host.Start(allowAutostart: false, origin: "host_recovery");
+                channelId = host.ChannelId;
+                using var deadline = new CancellationTokenSource(5000);
+                var status = await host.CallAsync("desktop_status", null, deadline.Token, new HostCallContext("host_recovery_handshake", 11));
+                hostPid = status.GetProperty("pid").GetInt32();
+                await host.CallAsync("desktop_start", new { content = "private-fixture-configuration", secret = "private-fixture-secret" }, deadline.Token,
+                    new HostCallContext("host_recovery_restore_intent", 11, 4));
+                await ExpectFailure(host.CallAsync("desktop_bad_frame", null, deadline.Token), "host_protocol_error");
+            }
+            if (!await diagnostics.FlushAsync(TimeSpan.FromSeconds(3))) throw new Exception("Host evidence did not flush");
+            string text = File.ReadAllText(Path.Combine(directory, LifecycleDiagnostics.FileName));
+            if (text.Contains("private-fixture-", StringComparison.Ordinal)) throw new Exception("Request payload leaked into lifecycle evidence");
+            var records = text.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(line => JsonDocument.Parse(line).RootElement.Clone()).ToArray();
+            JsonElement Data(string name) => records.Single(record => record.GetProperty("event").GetString() == name).GetProperty("data");
+            var sent = Data("host_request_sent");
+            if (sent.GetProperty("channelId").GetString() != channelId || sent.GetProperty("hostPid").GetInt32() != hostPid
+                || sent.GetProperty("hostInstance").GetString() != "fixture-host-" + hostPid
+                || sent.GetProperty("requestId").GetInt64() != 2
+                || sent.GetProperty("origin").GetString() != "host_recovery_restore_intent"
+                || sent.GetProperty("uiIntentRevision").GetInt64() != 11)
+                throw new Exception("Automatic host recovery lost its actual IPC request identity or source");
+            var result = records.Single(record => record.GetProperty("event").GetString() == "host_request_result"
+                && record.GetProperty("data").GetProperty("command").GetString() == "desktop_start").GetProperty("data");
+            if (result.GetProperty("requestId").GetInt64() != 2 || result.GetProperty("outcome").GetString() != "succeeded")
+                throw new Exception("Host request result could not be joined to the sent request");
+            if (Data("host_channel_fault").GetProperty("reason").GetString() != "protocol_read"
+                || Data("host_process_exit").GetProperty("exitCode").GetInt32() != 0
+                || Data("host_dispose_finished").GetProperty("outcome").GetString() != "exited")
+                throw new Exception("Host communication fault or confirmed exit was not recorded");
+            Console.WriteLine("Native host diagnostics: exact IPC IDs, automatic recovery origin, real exit, unchanged wire and payload omission passed.");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("MIHOMO_PROTOCOL_FIXTURE", previous);
+            File.Delete(executable);
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
         }
     }
 

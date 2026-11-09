@@ -13,6 +13,7 @@ WindowPlacementGeometryTests.Run();
 HostRecoveryIntentTests.Run();
 DesktopStatusTests.Run();
 TunDeviceStateTests.Run();
+await LifecycleDiagnosticsTests.RunAsync();
 
 static StreamReader Reader(string text) => new(new MemoryStream(Encoding.UTF8.GetBytes(text)), Encoding.UTF8);
 static void Equal<T>(T expected, T actual)
@@ -53,6 +54,7 @@ using (var reader = Reader("complete\nincomplete"))
 }
 Console.WriteLine("Native client protocol: Unicode/escaped YAML, combined and split frames, exact limits, oversized and incomplete EOF passed.");
 await ProcessFixtures.TestHostAsync();
+await ProcessFixtures.TestHostDiagnosticsAsync();
 if (OperatingSystem.IsWindows()) await ProcessFixtures.TestBrokerAsync();
 
 // Filtered DNS histories use atomic cursor boundaries, never guessed sequential IDs.

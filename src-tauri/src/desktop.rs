@@ -14,7 +14,7 @@ use std::{
     collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::{atomic::Ordering, Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone)]
@@ -584,13 +584,35 @@ impl DesktopManager {
     }
 
     pub fn start(&mut self, persist: bool) -> Result<()> {
-        let result = self.start_once(persist, None);
+        self.record_lifecycle(
+            "desktop_start_requested",
+            serde_json::json!({"persistIntent":persist}),
+        );
+        let mut result = self.start_once(persist, None);
         if result.is_err() {
             if let Some(recovery) = self.recover_tun_device(persist) {
-                return recovery;
+                result = recovery;
             }
         }
+        self.record_lifecycle(
+            "desktop_start_finished",
+            serde_json::json!({"code":result.as_ref().err().map(|error| &error.code)}),
+        );
         result
+    }
+
+    fn record_lifecycle(&self, event: &str, mut data: serde_json::Value) {
+        if let Some(fields) = data.as_object_mut() {
+            fields.insert("corePid".into(), serde_json::json!(self.core_status.pid));
+            fields.insert("phase".into(), serde_json::json!(self.phase));
+            fields.insert("desiredRunning".into(), serde_json::json!(self.run_intent));
+            fields.insert("tun".into(), serde_json::json!(self.preferences.tun));
+            fields.insert(
+                "intentRevision".into(),
+                serde_json::json!(self.cancellation.revision()),
+            );
+        }
+        crate::diagnostics::record(&self.logs, event, data);
     }
 
     fn start_once(&mut self, persist: bool, expected_revision: Option<&str>) -> Result<()> {
@@ -615,6 +637,9 @@ impl DesktopManager {
                 config::mixed_port(&content)?;
             }
             if let Some(running) = self.running.as_mut() {
+                let _scope = crate::diagnostics::scope(
+                    serde_json::json!({"step":"replace_previous_runtime"}),
+                );
                 stop_running(running, &self.cancellation)?;
             }
             self.running = None;
@@ -655,6 +680,10 @@ impl DesktopManager {
         })();
         if let Some(mut error) = result.as_ref().err().cloned() {
             if error.code != "operation_cancelled" && self.cancellation.check().is_ok() {
+                let _scope = crate::diagnostics::scope(
+                    serde_json::json!({"step":"startup_failure_cleanup","triggerCode":error.code}),
+                );
+                self.record_lifecycle("desktop_start_cleanup_requested", serde_json::json!({}));
                 let _ = self.proxy.restore();
                 let mut cleanup_unconfirmed = false;
                 if let Some(running) = self.running.as_mut() {
@@ -691,6 +720,11 @@ impl DesktopManager {
     }
 
     pub fn stop(&mut self, persist: bool) -> Result<()> {
+        let started = Instant::now();
+        self.record_lifecycle(
+            "desktop_stop_requested",
+            serde_json::json!({"persistIntent":persist}),
+        );
         if !self.tun_device_recovery.active {
             self.tun_device_recovery.outcome = None;
         }
@@ -722,6 +756,7 @@ impl DesktopManager {
             self.core_status.operation = Some("stopping".into());
             self.core_status.process_state = "unknown".into();
             self.publish();
+            self.record_lifecycle("desktop_stop_finished", serde_json::json!({"code":error.code,"elapsedMs":started.elapsed().as_millis(),"exitConfirmed":false}));
             return Err(error);
         }
         self.running = None;
@@ -741,10 +776,12 @@ impl DesktopManager {
         let error = persist_error.or(proxy_error);
         self.last_error = error.as_ref().map(|error| error.message.clone());
         self.publish();
+        self.record_lifecycle("desktop_stop_finished", serde_json::json!({"code":error.as_ref().map(|error| &error.code),"elapsedMs":started.elapsed().as_millis(),"exitConfirmed":true}));
         error.map_or(Ok(()), Err)
     }
 
     pub fn restart(&mut self) -> Result<()> {
+        let _scope = crate::diagnostics::scope(serde_json::json!({"cause":"restart"}));
         self.require_idle_update()?;
         self.stop(false)?;
         self.cancellation.check()?;
@@ -752,9 +789,14 @@ impl DesktopManager {
     }
 
     pub fn set_system_proxy(&mut self, enabled: bool) -> Result<()> {
+        let _scope = crate::diagnostics::scope(serde_json::json!({"cause":"system_proxy_change"}));
         self.require_idle_update()?;
         if enabled {
             if self.phase != Phase::Running {
+                self.record_lifecycle(
+                    "desktop_implicit_start",
+                    serde_json::json!({"trigger":"enable_system_proxy"}),
+                );
                 self.start(true)?;
             }
             let port = self.applied_proxy_port.ok_or_else(|| {
@@ -774,6 +816,9 @@ impl DesktopManager {
     }
 
     pub fn set_tun(&mut self, enabled: bool) -> Result<()> {
+        let _scope = crate::diagnostics::scope(
+            serde_json::json!({"cause":"tun_mode_change","requestedTun":enabled}),
+        );
         self.require_idle_update()?;
         if self.preferences.tun == enabled {
             return Ok(());
@@ -807,6 +852,10 @@ impl DesktopManager {
                     return Err(error);
                 }
                 self.preferences.tun = previous;
+                let _rollback_scope = crate::diagnostics::scope(
+                    serde_json::json!({"cause":"tun_mode_rollback","triggerCode":error.code}),
+                );
+                self.record_lifecycle("desktop_mode_rollback_requested", serde_json::json!({}));
                 let recovery = self.start(false);
                 self.last_error = Some(if recovery.is_ok() {
                     format!("{}；已恢复先前模式", error.message)
@@ -833,6 +882,10 @@ impl DesktopManager {
         if !self.tun_device_recovery.claim(generation, &revision) {
             return None;
         }
+        let _scope = crate::diagnostics::scope(
+            serde_json::json!({"cause":"automatic_tun_device_recovery","triggerCode":"tun_device_conflict"}),
+        );
+        self.record_lifecycle("desktop_tun_recovery_started", serde_json::json!({}));
         let original = AppError::new(
             "tun_device_conflict",
             self.last_error
@@ -940,6 +993,10 @@ impl DesktopManager {
             );
         }
         self.tun_device_recovery.active = false;
+        self.record_lifecycle(
+            "desktop_tun_recovery_finished",
+            serde_json::json!({"code":result.as_ref().err().map(|error| &error.code)}),
+        );
         self.tun_device_recovery.outcome = Some(result.clone());
         self.publish();
         Some(result)
@@ -992,7 +1049,7 @@ impl DesktopManager {
             self.cancellation.check()?;
             let client = match self.app.service_client() {
                 Some(client) => client,
-                None => ServiceClient::new(self.app.instance.clone())?,
+                None => ServiceClient::new(self.app.instance.clone(), self.logs.clone())?,
             };
             self.app.set_service_client(Some(client.clone()));
             Ok(RunningCore::Service(client))
@@ -1025,6 +1082,7 @@ impl DesktopManager {
     }
 
     pub fn uninstall_service(&mut self) -> Result<()> {
+        let _scope = crate::diagnostics::scope(serde_json::json!({"cause":"service_uninstall"}));
         self.require_idle_update()?;
         if self.preferences.tun {
             self.set_tun(false)?;
@@ -1073,6 +1131,7 @@ impl DesktopManager {
     }
 
     pub fn reload_config(&mut self, _force: bool) -> Result<()> {
+        let _scope = crate::diagnostics::scope(serde_json::json!({"cause":"config_reload"}));
         self.require_idle_update()?;
         let (content, revision) = self.read_runtime_source(None)?;
         if self.phase != Phase::Running {
@@ -1161,6 +1220,7 @@ impl DesktopManager {
     }
 
     pub fn prepare_update(&mut self) -> Result<bool> {
+        let _scope = crate::diagnostics::scope(serde_json::json!({"cause":"update_prepare"}));
         self.require_idle_update()?;
         if self.dirty {
             return Err(AppError::new(
@@ -1179,6 +1239,7 @@ impl DesktopManager {
     }
 
     pub fn resume_after_update(&mut self, was_running: bool) -> Result<()> {
+        let _scope = crate::diagnostics::scope(serde_json::json!({"cause":"update_rollback"}));
         self.updating = false;
         if was_running {
             self.start(false)?;
@@ -1380,6 +1441,10 @@ impl DesktopManager {
     }
 
     fn recover_lease(&mut self, generation: u64) {
+        let _scope = crate::diagnostics::scope(
+            serde_json::json!({"cause":"automatic_lease_recovery","intentRevision":generation}),
+        );
+        self.record_lifecycle("lease_recovery_started", serde_json::json!({}));
         let result = (|| {
             let now = lifecycle::awake_now()?;
             while self
@@ -1439,6 +1504,10 @@ impl DesktopManager {
             }
             Ok(())
         })();
+        self.record_lifecycle("lease_recovery_finished", serde_json::json!({
+            "code":result.as_ref().err().map(|error| &error.code),
+            "superseded":generation != self.app.generation() || self.app.stop_pending.load(Ordering::Acquire) != 0,
+        }));
         if generation != self.app.generation() || self.app.stop_pending.load(Ordering::Acquire) != 0
         {
             return;
@@ -1460,6 +1529,7 @@ impl DesktopManager {
     }
 
     pub fn request_exit(&mut self, force: bool) -> Result<bool> {
+        let _scope = crate::diagnostics::scope(serde_json::json!({"step":"application_exit"}));
         if self.dirty && !force {
             self.app.emit(
                 "desktop-exit-requested",
@@ -1774,6 +1844,7 @@ mod cleanup_observation_tests {
         }
 
         fn events(&self) -> Vec<serde_json::Value> {
+            assert!(crate::diagnostics::flush(Duration::from_secs(2)));
             std::fs::read_to_string(self.manager.logs.join("recovery.log"))
                 .unwrap_or_default()
                 .lines()
@@ -1799,6 +1870,26 @@ mod cleanup_observation_tests {
                 Some(config::TunDeviceOverride::managed(Some("utun".into())))
             );
             let events = self.events();
+            let recovery = events
+                .iter()
+                .position(|event| event["event"] == "desktop_tun_recovery_started")
+                .unwrap();
+            let stop = events
+                .iter()
+                .position(|event| {
+                    event["event"] == "desktop_stop_requested"
+                        && event["context"]["cause"] == "automatic_tun_device_recovery"
+                })
+                .unwrap();
+            assert!(
+                recovery < stop,
+                "the automatic recovery cause must precede its Stop"
+            );
+            assert_eq!(
+                events[stop]["context"]["triggerCode"],
+                "tun_device_conflict"
+            );
+            assert_eq!(events[stop]["data"]["persistIntent"], false);
             let attempts: Vec<_> = events
                 .iter()
                 .filter(|event| event["event"] == "tun_device_auto_recovery")
@@ -1824,6 +1915,7 @@ mod cleanup_observation_tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
+            let _ = crate::diagnostics::flush(Duration::from_secs(2));
             let _ = std::fs::remove_dir_all(&self.directory);
         }
     }
@@ -2289,7 +2381,10 @@ mod cleanup_observation_tests {
             .push_back(Ok(ready(111)));
         ordinary.manager.start(true).unwrap();
         assert!(!ordinary.manager.tun_device.managed);
-        assert!(ordinary.events().is_empty());
+        assert!(!ordinary
+            .events()
+            .iter()
+            .any(|event| event["event"] == "tun_device_auto_recovery"));
         assert_eq!(
             std::fs::read_to_string(&ordinary.manager.config_path).unwrap(),
             SOURCE
@@ -2329,7 +2424,10 @@ mod cleanup_observation_tests {
                 .count(),
             1
         );
-        assert!(failed.events().is_empty());
+        assert!(!failed
+            .events()
+            .iter()
+            .any(|event| event["event"] == "tun_device_auto_recovery"));
     }
 
     #[test]

@@ -83,6 +83,25 @@ pub enum Request {
 }
 
 impl Request {
+    pub(crate) fn diagnostic_name(&self) -> &'static str {
+        match self {
+            Self::Start { .. } => "start",
+            Self::Stop => "stop",
+            Self::Reload { .. } => "reload",
+            Self::Status => "status",
+            Self::Reconcile { .. } => "reconcile",
+            Self::Heartbeat => "heartbeat",
+            Self::Operation { .. } => "operation",
+        }
+    }
+
+    pub(crate) fn lifecycle_request(&self) -> bool {
+        matches!(
+            self,
+            Self::Start { .. } | Self::Stop | Self::Reload { .. } | Self::Reconcile { .. }
+        )
+    }
+
     fn bulk(&self) -> bool {
         matches!(self, Self::Start { .. } | Self::Reload { .. })
     }
@@ -97,6 +116,29 @@ pub struct Envelope {
     pub intent_revision: u64,
     pub request_sequence: u64,
     pub request: Request,
+}
+
+impl Envelope {
+    /// Only protocol identities and a fixed command category cross into logs.
+    /// Configurations and authenticated payloads are deliberately not serialized.
+    pub(crate) fn diagnostic_fields(&self) -> serde_json::Value {
+        let mut fields = serde_json::json!({
+            "ownerSession":self.owner_session,"serviceRequestId":self.request_id,
+            "requestSequence":self.request_sequence,"intentRevision":self.intent_revision,
+            "serviceCommand":self.request.diagnostic_name(),
+        });
+        if matches!(
+            self.request,
+            Request::Start { .. } | Request::Stop | Request::Reload { .. }
+        ) {
+            fields["operationId"] =
+                serde_json::json!(format!("{}:{}", self.owner_session, self.request_id));
+        }
+        if let Request::Reconcile { generation } = self.request {
+            fields["powerGeneration"] = serde_json::json!(generation);
+        }
+        fields
+    }
 }
 
 pub struct AuthenticatedOwner {
@@ -203,15 +245,17 @@ pub struct Client {
     expected_service: PathBuf,
     owner_session: String,
     sequence: Arc<AtomicU64>,
+    diagnostic_directory: PathBuf,
 }
 
 impl Client {
-    pub fn new(owner_session: String) -> Result<Self> {
+    pub fn new(owner_session: String, diagnostic_directory: PathBuf) -> Result<Self> {
         Ok(Self {
             sid: windows::current_sid()?,
             expected_service: windows::protected_install_dir()?.join("mihomo-desktop-service.exe"),
             owner_session,
             sequence: Arc::new(AtomicU64::new(0)),
+            diagnostic_directory,
         })
     }
 
@@ -219,13 +263,39 @@ impl Client {
         cancellation.check()?;
         let deadline = deadline_after(operation_timeout(&request)?)?;
         let envelope = self.envelope(request, cancellation.revision())?;
+        let _scope = crate::diagnostics::scope(envelope.diagnostic_fields());
+        let started = Instant::now();
+        crate::diagnostics::record(
+            &self.diagnostic_directory,
+            "service_call_started",
+            envelope.diagnostic_fields(),
+        );
+        let result = self.call_envelope(&envelope, cancellation, deadline);
+        crate::diagnostics::record(
+            &self.diagnostic_directory,
+            "service_call_finished",
+            serde_json::json!({
+                "code":result.as_ref().err().map(|error| &error.code),
+                "corePid":result.as_ref().ok().and_then(|status| status.pid),
+                "elapsedMs":started.elapsed().as_millis(),
+            }),
+        );
+        result
+    }
+
+    fn call_envelope(
+        &self,
+        envelope: &Envelope,
+        cancellation: &Cancellation,
+        deadline: Instant,
+    ) -> Result<CoreStatus> {
         // A lost accepted response is retried with the same request ID. The
         // service records it before dispatch, so retries cannot spawn twice.
         let mut attempts = 0;
         let reply = loop {
             cancellation.check()?;
             time_left(deadline)?;
-            match self.exchange(&envelope, deadline) {
+            match self.exchange(envelope, deadline) {
                 Ok(reply)
                     if reply
                         .error
@@ -244,6 +314,11 @@ impl Client {
                         ) =>
                 {
                     attempts += 1;
+                    crate::diagnostics::record(
+                        &self.diagnostic_directory,
+                        "service_call_retry",
+                        serde_json::json!({"code":error.code,"attempt":attempts}),
+                    );
                     thread::sleep(Duration::from_millis(100));
                 }
                 Err(error) => return Err(error),
@@ -303,16 +378,25 @@ impl Client {
     }
 
     fn observe(&self, request: Request) -> Result<CoreStatus> {
-        let reply = self.exchange(
-            &self.envelope(request, 0)?,
-            deadline_after(CONTROL_TIMEOUT)?,
-        )?;
-        if let Some(error) = reply.error {
-            return Err(error);
+        let diagnostic = request.lifecycle_request();
+        let envelope = self.envelope(request, 0)?;
+        let _scope = crate::diagnostics::scope(envelope.diagnostic_fields());
+        if diagnostic {
+            crate::diagnostics::record(
+                &self.diagnostic_directory,
+                "service_observation_requested",
+                envelope.diagnostic_fields(),
+            );
         }
-        reply
-            .status
-            .ok_or_else(|| AppError::new("service_protocol", "服务响应缺少状态"))
+        let result = self.exchange_status(&envelope);
+        if diagnostic {
+            crate::diagnostics::record(
+                &self.diagnostic_directory,
+                "service_observation_finished",
+                serde_json::json!({"code":result.as_ref().err().map(|error| &error.code)}),
+            );
+        }
+        result
     }
 
     /// The reserved host control path only waits for admission, never cleanup.
@@ -326,7 +410,23 @@ impl Client {
             request_sequence: self.sequence.fetch_add(1, Ordering::AcqRel) + 1,
             request: Request::Stop,
         };
-        let reply = self.exchange(&envelope, deadline_after(CONTROL_TIMEOUT)?)?;
+        let _scope = crate::diagnostics::scope(envelope.diagnostic_fields());
+        crate::diagnostics::record(
+            &self.diagnostic_directory,
+            "service_priority_stop_requested",
+            envelope.diagnostic_fields(),
+        );
+        let result = self.exchange_status(&envelope);
+        crate::diagnostics::record(
+            &self.diagnostic_directory,
+            "service_priority_stop_finished",
+            serde_json::json!({"code":result.as_ref().err().map(|error| &error.code)}),
+        );
+        result
+    }
+
+    fn exchange_status(&self, envelope: &Envelope) -> Result<CoreStatus> {
+        let reply = self.exchange(envelope, deadline_after(CONTROL_TIMEOUT)?)?;
         if let Some(error) = reply.error {
             return Err(error);
         }
@@ -451,10 +551,17 @@ pub struct Server {
     owner_sid: String,
     expected_gui: PathBuf,
     bulk: bool,
+    diagnostic_directory: PathBuf,
 }
 
 impl Server {
-    pub fn new(owner_sid: String, expected_gui: PathBuf, bulk: bool, first: bool) -> Result<Self> {
+    pub fn new(
+        owner_sid: String,
+        expected_gui: PathBuf,
+        bulk: bool,
+        first: bool,
+        diagnostic_directory: PathBuf,
+    ) -> Result<Self> {
         let sddl = windows::wide(format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{owner_sid})"));
         let name = windows::wide(pipe_name(&owner_sid, bulk));
         unsafe {
@@ -502,6 +609,7 @@ impl Server {
                 owner_sid,
                 expected_gui,
                 bulk,
+                diagnostic_directory,
             })
         }
     }
@@ -569,6 +677,11 @@ impl Server {
         match validated {
             Ok(request) => Ok(Some(request)),
             Err(error) => {
+                crate::diagnostics::record(
+                    &self.diagnostic_directory,
+                    "service_frame_rejected",
+                    serde_json::json!({"code":error.code}),
+                );
                 let _ = self.respond(Reply::from_result(Err(error)));
                 Ok(None)
             }
@@ -720,6 +833,42 @@ fn write_bytes(handle: HANDLE, buffer: &[u8], timeout: Duration) -> Result<()> {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_map_lifecycle_ids_without_serializing_request_payloads() {
+        let mut envelope = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            owner_session: "00000000000000000000000000000001".into(),
+            request_id: "request-17".into(),
+            intent_revision: 4,
+            request_sequence: 17,
+            request: Request::Start {
+                config: "secret: must-not-be-logged".into(),
+            },
+        };
+        let fields = envelope.diagnostic_fields();
+        assert_eq!(fields["serviceCommand"], "start");
+        assert_eq!(fields["serviceRequestId"], "request-17");
+        assert_eq!(
+            fields["operationId"],
+            "00000000000000000000000000000001:request-17"
+        );
+        assert_eq!(fields["requestSequence"], 17);
+        assert_eq!(fields["intentRevision"], 4);
+        assert!(!fields.to_string().contains("must-not-be-logged"));
+        envelope.request = Request::Operation {
+            id: "unvalidated-target-must-not-be-logged".into(),
+        };
+        let fields = envelope.diagnostic_fields();
+        assert!(fields.get("operationId").is_none());
+        assert!(!fields
+            .to_string()
+            .contains("unvalidated-target-must-not-be-logged"));
+        envelope.request = Request::Reconcile { generation: 7 };
+        let fields = envelope.diagnostic_fields();
+        assert_eq!(fields["powerGeneration"], 7);
+        assert!(fields.get("operationId").is_none());
+    }
 
     #[test]
     fn status_and_heartbeat_never_borrow_a_resource_budget() {

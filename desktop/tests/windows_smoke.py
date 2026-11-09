@@ -1616,6 +1616,11 @@ class Acceptance:
         self.mutations_started = False
         self.service_owned = False
         self.animation_before: bool | None = None
+        self.lifecycle_started_ms = int(time.time() * 1000)
+        self.lifecycle_host_recovery: dict | None = None
+        self.lifecycle_service_stop_pid: int | None = None
+        self.lifecycle_core_exits: set[int] = set()
+        self.lifecycle_frame_errors: dict[Path, int] = {}
         self.stage = "preflight"
         self.report = {"passed": False, "platform": "windows", "tests": {}, "diagnostics": []}
 
@@ -2916,6 +2921,7 @@ class Acceptance:
         cache.unlink()  # The unique cache belonging to this fixture was verified above.
         self.resources.release_success.clear()
         self.processes.kill(identity)
+        self.lifecycle_core_exits.add(identity.pid)
         response_times = []
         try:
             wait_until(lambda: self.resources.count("/rules.yaml") > previous_requests,
@@ -2986,7 +2992,128 @@ class Acceptance:
         require(self.processes.identity(previous.pid) != previous, "old_host_survived_replacement")
         require(self.managed_core(recovered)["pid"] != before["pid"], "dead_host_core_was_not_reconciled")
         require(self.processes.identity(self.gui.pid) == self.gui, "host_recovery_restarted_gui")
+        self.lifecycle_host_recovery = {"oldHostPid": previous.pid,
+                                        "newHostPid": self.processes.at_paths([self.host])[0].pid,
+                                        "uiPid": self.gui.pid}
         self.report[self.stage] = {"oldHostExitConfirmed": True, "newChannelReady": True, "sameGui": True}
+        self.mark(self.stage)
+
+    def lifecycle_records(self, directory: Path, stem: str) -> list[dict]:
+        """Read only bounded complete frames; the asynchronous writer may append."""
+        records = []
+        paths = [directory / (stem + ".previous.log"), directory / (stem + ".log")]
+        for path in paths:
+            self.lifecycle_frame_errors[path] = 0
+            try:
+                with path.open("rb") as source:
+                    payload = source.read(2 * 1024 * 1024 + 1)
+            except FileNotFoundError:
+                continue
+            require(len(payload) <= 2 * 1024 * 1024, "lifecycle_log_size_unbounded")
+            for secret in self.secrets:
+                require(secret.encode() not in payload, "lifecycle_log_exposed_controller_secret")
+            complete = payload.rsplit(b"\n", 1)[0] if b"\n" in payload else b""
+            for line in complete.splitlines():
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # A deliberately terminated process can leave an interrupted
+                    # write before the next writer appends. Keep that loss visible;
+                    # every required current-run causal event must still exist.
+                    self.lifecycle_frame_errors[path] += 1
+                    continue
+                require(isinstance(event, dict), "lifecycle_log_frame_invalid")
+                if event.get("timeMs", 0) >= self.lifecycle_started_ms:
+                    records.append(event)
+        return records
+
+    def check_lifecycle_diagnostics(self) -> None:
+        """Correlate the real unattended host replacement and owned core exit."""
+        self.stage = "lifecycle_diagnostics"
+        require(self.lifecycle_host_recovery is not None and self.lifecycle_service_stop_pid,
+                "lifecycle_fixture_incomplete")
+        expected = self.lifecycle_host_recovery
+        service_logs = Path(os.environ["PROGRAMDATA"]) / "Mihomo Optimized" / "service" / "logs"
+
+        def evidence():
+            ui = self.lifecycle_records(self.directory / "logs", "ui-recovery")
+            host = self.lifecycle_records(self.directory / "logs", "recovery")
+            service = self.lifecycle_records(service_logs, "recovery")
+            started = next((row for row in ui if row.get("event") == "host_recovery_started"
+                            and row.get("processId") == expected["uiPid"]
+                            and row.get("data", {}).get("oldHostPid") == expected["oldHostPid"]), None)
+            replacement = next((row for row in ui if row.get("event") == "host_recovery_replacement"
+                                and row.get("data", {}).get("oldHostPid") == expected["oldHostPid"]
+                                and row.get("data", {}).get("newHostPid") == expected["newHostPid"]), None)
+            finished = next((row for row in ui if row.get("event") == "host_recovery_finished"
+                             and row.get("data", {}).get("oldHostPid") == expected["oldHostPid"]
+                             and row.get("data", {}).get("outcome") == "succeeded"), None)
+            automatic = [row for row in ui if row.get("event") == "host_request_sent"
+                         and row.get("data", {}).get("hostPid") == expected["newHostPid"]
+                         and row.get("data", {}).get("command") == "desktop_start"
+                         and row.get("data", {}).get("origin") == "host_recovery_restore_intent"]
+            accepted = next((row for row in host if row.get("event") == "host_request_accepted"
+                             and row.get("processId") == expected["newHostPid"]
+                             and row.get("context", {}).get("command") == "desktop_start"
+                             and any(request["data"]["requestId"] == row.get("context", {}).get("uiRequestId")
+                                     for request in automatic)), None)
+            bridge = None
+            for call in host:
+                data = call.get("data", {})
+                context = call.get("context", {})
+                if (call.get("event") != "service_call_started" or data.get("serviceCommand") != "start"
+                        or not context.get("uiRequestId") or not data.get("operationId")):
+                    continue
+                requested = next((row for row in ui if row.get("event") == "host_request_sent"
+                                  and row.get("data", {}).get("hostPid") == call.get("processId")
+                                  and row.get("data", {}).get("requestId") == context["uiRequestId"]), None)
+                received = next((row for row in service if row.get("event") == "service_request_received"
+                                 and row.get("data", {}).get("operationId") == data["operationId"]), None)
+                executed = next((row for row in service if row.get("event") == "runtime_operation_begin"
+                                 and row.get("context", {}).get("operationId") == data["operationId"]), None)
+                if requested and received and executed:
+                    bridge = (requested, call, received, executed)
+                    break
+            exits = [row for row in service if row.get("event") == "core_exit"
+                     and row.get("data", {}).get("corePid") in self.lifecycle_core_exits]
+            stopped = next((row for row in service if row.get("event") == "core_stop_result"
+                            and row.get("data", {}).get("corePid") == self.lifecycle_service_stop_pid
+                            and row.get("data", {}).get("exitConfirmed") is True), None)
+            network = next((row for row in ui if row.get("event") == "network_snapshot_changed"
+                            and row.get("processId") == expected["uiPid"]), None)
+            self.report[self.stage] = {"ignoredInterruptedFrames": sum(self.lifecycle_frame_errors.values()), "observed": {
+                "hostRecoveryStarted": bool(started), "hostReplacement": bool(replacement),
+                "hostRecoveryFinished": bool(finished), "automaticRequest": bool(automatic),
+                "hostAcceptedRequest": bool(accepted), "serviceExecutionChain": bool(bridge),
+                "ownedCoreExit": bool(exits), "confirmedStop": bool(stopped),
+                "networkSnapshot": bool(network),
+            }}
+            if not all((started, replacement, finished, automatic, accepted, bridge, exits, stopped, network)):
+                return None
+            require(isinstance(started["data"].get("reason"), str) and started["data"]["reason"],
+                    "lifecycle_host_recovery_reason_missing")
+            require(replacement["data"].get("newHostInstance") == accepted["context"].get("hostInstance")
+                    and replacement["data"].get("newHostInstance"), "lifecycle_host_instance_mismatch")
+            require(stopped["data"].get("outcome") in
+                    {"already_exited", "exited_during_grace", "exit_confirmed_after_force"},
+                    "lifecycle_stop_outcome_missing")
+            require(isinstance(stopped["data"].get("durationMs"), (int, float))
+                    and isinstance(stopped["data"].get("forceRequested"), bool)
+                    and stopped["data"].get("cause"), "lifecycle_stop_result_incomplete")
+            for row in (started, replacement, finished, accepted, *bridge, *exits, stopped, network):
+                require(row.get("desktopVersion", row.get("appVersion")) ==
+                        json.loads((self.app.parent / "resources" / "build-info.json").read_text())["desktopVersion"],
+                        "lifecycle_event_version_missing")
+                require(isinstance(row.get("sequence"), int) and row["sequence"] > 0,
+                        "lifecycle_event_sequence_missing")
+            return {"unattendedHostRecoveryAttributed": True, "uiRequestCorrelated": True,
+                    "serviceRequestCorrelated": True, "ownedProcessExitRecorded": True,
+                    "stopOutcome": stopped["data"]["outcome"],
+                    "stopExitConfirmed": True, "networkSnapshotRecorded": True,
+                    "controllerSecretsAbsent": True, "physicalWifiSwitch": False,
+                    "ignoredInterruptedFrames": sum(self.lifecycle_frame_errors.values())}
+
+        self.report[self.stage] = wait_until(evidence, "lifecycle_causal_evidence_missing", 8)
         self.mark(self.stage)
 
     def capture_children(self) -> None:
@@ -3298,6 +3425,7 @@ class Acceptance:
             recovery_requests = self.resources.count("/rules.yaml")
             recovery_started = time.monotonic()
             self.processes.kill(old_identity)
+            self.lifecycle_core_exits.add(old_identity.pid)
 
             def recovered_status():
                 observed = self.status()
@@ -3339,6 +3467,7 @@ class Acceptance:
         self.mark("tun_forwarding")
 
         self.stage = "stop_cleanup"
+        self.lifecycle_service_stop_pid = tun_core_pid
         self.driver.invoke("desktop_stop")
         self.driver.invoke("desktop_set_tun", {"enabled": False})
         self.service_action("uninstall")
@@ -3362,6 +3491,7 @@ class Acceptance:
         wait_until(lambda: not self.processes.at_paths([self.helper]), "watchdog_process_survived_gui_crash")
         require(not service_installed(), "service_reappeared_after_crash")
         self.mark("crash_cleanup")
+        self.check_lifecycle_diagnostics()
 
     def cleanup(self) -> None:
         if not self.mutations_started:
@@ -3520,7 +3650,8 @@ def main() -> int:
                         "single_instance_and_native_ui", "native_titlebar_pointer", "native_redesign_ui", "tun_forwarding", "stop_cleanup", "crash_cleanup", "final_cleanup",
                         "non_elevated_gui", "tun_service_identity", "resource_bootstrap", "resource_bootstrap_service",
                         "local_healthy_resume", "local_tun_recovery", "host_channel_recovery",
-                        "resource_bootstrap_recovery", "system_proxy_service_recovery", "service_recovery_stop"}
+                        "resource_bootstrap_recovery", "system_proxy_service_recovery", "service_recovery_stop",
+                        "lifecycle_diagnostics"}
             acceptance.report["passed"] = all(acceptance.report["tests"].get(name) is True for name in required) and not acceptance.report["diagnostics"]
             (artifacts / "verification.json").write_text(json.dumps(acceptance.report, indent=2) + "\n", encoding="utf-8")
     return 0 if acceptance and acceptance.report["passed"] else 1

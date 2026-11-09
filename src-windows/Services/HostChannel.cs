@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -25,6 +26,10 @@ internal sealed class HostChannel : IAsyncDisposable
     private readonly SemaphoreSlim writes = new(1, 1);
     private readonly CancellationTokenSource lifetime = new();
     private readonly CancellationToken lifetimeToken;
+    private readonly LifecycleDiagnostics? diagnostics;
+    private string? hostInstance;
+    private int? hostPid;
+    private int exitRecorded;
     private Process? process;
     private Task? reader;
     private Exception? failure;
@@ -34,10 +39,17 @@ internal sealed class HostChannel : IAsyncDisposable
     private volatile bool closing;
     public event Action<string, JsonElement>? Event;
     public event Action<Exception>? Disconnected;
+    internal string ChannelId { get; } = Guid.NewGuid().ToString("N");
+    internal string? HostInstance => Volatile.Read(ref hostInstance);
+    internal int? HostPid => hostPid;
 
-    public HostChannel() => lifetimeToken = lifetime.Token;
+    public HostChannel(LifecycleDiagnostics? diagnostics = null)
+    {
+        this.diagnostics = diagnostics;
+        lifetimeToken = lifetime.Token;
+    }
 
-    public void Start(bool allowAutostart = true)
+    public void Start(bool allowAutostart = true, string origin = "initial_start")
     {
         if (process is not null) throw new InvalidOperationException("后台已经启动");
         string executable = Path.Combine(AppContext.BaseDirectory, "mihomo-desktop-host.exe");
@@ -59,22 +71,39 @@ internal sealed class HostChannel : IAsyncDisposable
         start.ArgumentList.Add(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         if (!allowAutostart) start.ArgumentList.Add("--no-autostart");
         process = Process.Start(start) ?? throw new DesktopException("host_start_failed", "无法启动桌面后台");
+        hostPid = process.Id;
+        Process ownedProcess = process;
+        try
+        {
+            process.Exited += (_, _) => RecordExit(ownedProcess);
+            process.EnableRaisingEvents = true;
+        }
+        catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            Record("host_exit_observer_unavailable", ("errorType", error.GetType().Name));
+        }
+        Record("host_process_started", ("allowAutostart", allowAutostart), ("origin", LifecycleDiagnostics.Code(origin)));
         reader = ReadAsync(process, lifetimeToken);
         // Diagnostics can contain paths; drain stderr without forwarding potentially sensitive text into the UI.
         _ = DrainAsync(process.StandardError, lifetimeToken);
     }
 
-    public async Task<JsonElement> CallAsync(string method, object? arguments, CancellationToken cancellationToken)
+    public async Task<JsonElement> CallAsync(string method, object? arguments, CancellationToken cancellationToken, HostCallContext? context = null)
     {
-        var child = process ?? throw new DesktopException("host_unavailable", "桌面后台尚未连接");
-        if (Volatile.Read(ref failure) is Exception disconnected) throw disconnected;
-        if (closing || child.HasExited) throw new DesktopException("host_unavailable", "桌面后台已退出，请重新打开应用");
-        if (!requests.Wait(0)) throw new DesktopException("desktop_busy", "待处理操作过多，请稍后再试");
-        long id = Interlocked.Increment(ref sequence);
+        long began = Stopwatch.GetTimestamp();
+        long? id = null;
+        bool acquired = false;
+        bool sent = false;
         var completion = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
-            if (!pending.TryAdd(id, new PendingCall(method, completion))) throw new InvalidOperationException();
+            var child = process ?? throw new DesktopException("host_unavailable", "桌面后台尚未连接");
+            if (Volatile.Read(ref failure) is Exception disconnected) throw disconnected;
+            if (closing || child.HasExited) throw new DesktopException("host_unavailable", "桌面后台已退出，请重新打开应用");
+            if (!requests.Wait(0)) throw new DesktopException("desktop_busy", "待处理操作过多，请稍后再试");
+            acquired = true;
+            id = Interlocked.Increment(ref sequence);
+            if (!pending.TryAdd(id.Value, new PendingCall(method, completion))) throw new InvalidOperationException();
             var request = JsonSerializer.Serialize(new { id, method, @params = arguments ?? new { } }, JsonOptions);
             // Match Rust's bound, including the Windows CRLF frame terminator.
             if (Encoding.UTF8.GetByteCount(request) + 2 > MaximumRequestBytes)
@@ -91,27 +120,38 @@ internal sealed class HostChannel : IAsyncDisposable
                     // partial JSON line for the next request to append to.
                     await child.StandardInput.WriteLineAsync(request.AsMemory(), lifetimeToken).ConfigureAwait(false);
                     await child.StandardInput.FlushAsync(lifetimeToken).ConfigureAwait(false);
+                    sent = true;
+                    if (IsLifecycleCommand(method)) RecordRequest("host_request_sent", id, method, context, "sent", null, true, began);
                 }
                 catch (Exception error) when (error is IOException or ObjectDisposedException or OperationCanceledException or InvalidOperationException)
                 {
                     var broken = new DesktopException("host_disconnected", "桌面后台通信中断；请退出后重新打开应用。");
-                    Fault(broken);
+                    Fault(broken, "request_write", error.GetType().Name);
                     throw broken;
                 }
             }
             finally { writes.Release(); }
-            return await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var result = await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (IsLifecycleCommand(method)) RecordRequest("host_request_result", id, method, context, "succeeded", null, sent, began);
+            return result;
+        }
+        catch (Exception error)
+        {
+            RecordRequest("host_request_result", id, method, context, error is OperationCanceledException ? "cancelled" : "failed", LifecycleDiagnostics.ErrorCode(error), sent, began);
+            throw;
         }
         finally
         {
-            pending.TryRemove(id, out _);
-            requests.Release();
+            if (id is long requestId) pending.TryRemove(requestId, out _);
+            if (acquired) requests.Release();
         }
     }
 
     private async Task ReadAsync(Process child, CancellationToken cancellationToken)
     {
         Exception errorResult = new DesktopException("host_disconnected", "桌面后台已断开；请退出后重新打开应用。");
+        string reason = "pipe_eof";
+        string? errorType = null;
         try
         {
             var frames = new BoundedLineReader(child.StandardOutput, 32 * 1024 * 1024);
@@ -122,6 +162,7 @@ internal sealed class HostChannel : IAsyncDisposable
                 if (message.TryGetProperty("event", out var name))
                 {
                     var data = message.TryGetProperty("data", out var value) ? value.Clone() : JsonSerializer.SerializeToElement(new { });
+                    if (name.GetString() == "desktop-status") ObserveHostInstance(data);
                     Event?.Invoke(name.GetString() ?? "", data);
                     continue;
                 }
@@ -131,30 +172,33 @@ internal sealed class HostChannel : IAsyncDisposable
                 else
                 {
                     var result = message.TryGetProperty("result", out var value) ? value.Clone() : JsonSerializer.SerializeToElement<object?>(null);
+                    ObserveHostInstance(result);
                     if (call.Method is "desktop_exit" or "desktop_install_update" && result.ValueKind == JsonValueKind.Object && result.TryGetProperty("exiting", out var leaving) && leaving.ValueKind == JsonValueKind.True)
                         ExpectExit();
                     call.Completion.TrySetResult(result);
                 }
             }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
-        catch (Exception error) { errorResult = new DesktopException("host_protocol_error", "桌面后台通信中断：" + error.GetType().Name); }
-        finally { Fault(errorResult); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { reason = "reader_cancelled"; }
+        catch (Exception error) { reason = "protocol_read"; errorType = error.GetType().Name; errorResult = new DesktopException("host_protocol_error", "桌面后台通信中断：" + error.GetType().Name); }
+        finally { RecordExit(child); Fault(errorResult, reason, errorType); }
     }
 
-    private void CloseInput()
+    private void CloseInput(string reason)
     {
         // Dispose the pipe itself, not StreamWriter: Dispose/Close would flush
         // buffered data and can race an in-flight WriteLineAsync or block here.
+        Record("host_input_closed", ("reason", reason), ("expectedExit", closing));
         try { process?.StandardInput.BaseStream.Dispose(); }
         catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException) { }
     }
 
-    private void Fault(Exception error)
+    private void Fault(Exception error, string reason, string? errorType)
     {
         if (Interlocked.CompareExchange(ref failure, error, null) is not null) return;
+        Record("host_channel_fault", ("reason", reason), ("code", LifecycleDiagnostics.ErrorCode(error)), ("errorType", errorType), ("expectedExit", closing), ("processState", ProcessState()));
         lifetime.Cancel();
-        CloseInput();
+        CloseInput("channel_fault");
         foreach (var request in pending.Values) request.Completion.TrySetException(error);
         if (!closing) Disconnected?.Invoke(error);
     }
@@ -168,7 +212,11 @@ internal sealed class HostChannel : IAsyncDisposable
     internal static string Text(JsonElement element, string key, string fallback = "") =>
         element.ValueKind == JsonValueKind.Object && element.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? fallback : fallback;
 
-    public void ExpectExit() => closing = true;
+    public void ExpectExit()
+    {
+        closing = true;
+        Record("host_exit_expected", ("processState", ProcessState()));
+    }
 
     public ValueTask DisposeAsync()
     {
@@ -177,34 +225,106 @@ internal sealed class HostChannel : IAsyncDisposable
 
     private async Task DisposeCoreAsync()
     {
+        long began = Stopwatch.GetTimestamp();
+        string outcome = "not_started";
+        string? errorCode = null;
+        bool killIssued = false;
+        Record("host_dispose_started", ("processState", ProcessState()), ("expectedExit", closing));
         closing = true;
         lifetime.Cancel();
-        CloseInput();
-        if (process is not null)
+        CloseInput("dispose");
+        try
         {
-            try
+            if (process is not null)
             {
-                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
-                await process.WaitForExitAsync(deadline.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                // The independent proxy watchdog and update monitor must survive host failure.
-                try { process.Kill(entireProcessTree: false); }
-                catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception) { }
-                using var confirmation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                try { await process.WaitForExitAsync(confirmation.Token).ConfigureAwait(false); }
+                try
+                {
+                    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+                    await process.WaitForExitAsync(deadline.Token).ConfigureAwait(false);
+                    outcome = "exited";
+                }
                 catch (OperationCanceledException)
                 {
-                    // Keep the owned handle and the fault latch. A caller must
-                    // not start a replacement while the old host may be alive.
-                    throw new DesktopException("host_termination_unconfirmed", "无法确认旧桌面后台已退出，已停止自动恢复。");
+                    // The independent proxy watchdog and update monitor must survive host failure.
+                    Record("host_termination_requested", ("reason", "dispose_deadline"), ("processState", ProcessState()));
+                    try { process.Kill(entireProcessTree: false); killIssued = true; }
+                    catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception)
+                    {
+                        Record("host_termination_failed", ("errorType", error.GetType().Name), ("processState", ProcessState()));
+                    }
+                    using var confirmation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    try { await process.WaitForExitAsync(confirmation.Token).ConfigureAwait(false); outcome = killIssued ? "exit_confirmed_after_force" : "exit_confirmed"; }
+                    catch (OperationCanceledException)
+                    {
+                        outcome = "exit_unconfirmed";
+                        // Keep the owned handle and the fault latch. A caller must
+                        // not start a replacement while the old host may be alive.
+                        throw new DesktopException("host_termination_unconfirmed", "无法确认旧桌面后台已退出，已停止自动恢复。");
+                    }
                 }
+                RecordExit(process);
+                if (reader is not null) try { await reader.ConfigureAwait(false); } catch (OperationCanceledException) { }
+                process.Dispose();
             }
-            if (reader is not null) try { await reader.ConfigureAwait(false); } catch (OperationCanceledException) { }
-            process.Dispose();
+            lifetime.Dispose();
         }
-        lifetime.Dispose();
+        catch (Exception error)
+        {
+            if (outcome != "exit_unconfirmed") outcome = "failed";
+            errorCode = LifecycleDiagnostics.ErrorCode(error);
+            throw;
+        }
+        finally
+        {
+            Record("host_dispose_finished", ("outcome", outcome), ("code", errorCode), ("killIssued", killIssued), ("elapsedMs", (long)Stopwatch.GetElapsedTime(began).TotalMilliseconds));
+        }
+    }
+
+    private void ObserveHostInstance(JsonElement value)
+    {
+        string identity = Text(value, "statusInstance");
+        if (identity.Length is 0 or > 96 || !System.Linq.Enumerable.All(identity, character => char.IsAsciiLetterOrDigit(character) || character is '-' or '_')) return;
+        string? previous = Interlocked.CompareExchange(ref hostInstance, identity, null);
+        if (previous is null) Record("host_instance_identified");
+        else if (previous != identity) Record("host_instance_changed", ("observedInstance", identity));
+    }
+
+    internal string ProcessState()
+    {
+        try { return process is null ? "not_started" : process.HasExited ? "exited" : "alive"; }
+        catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception) { return "unknown"; }
+    }
+
+    private void RecordExit(Process child)
+    {
+        try
+        {
+            if (!child.HasExited) return;
+            int exitCode = child.ExitCode;
+            if (Interlocked.Exchange(ref exitRecorded, 1) == 0)
+                Record("host_process_exit", ("exitCode", exitCode), ("expectedExit", closing));
+        }
+        catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception) { }
+    }
+
+    private void RecordRequest(string name, long? id, string method, HostCallContext? context, string outcome, string? code, bool sent, long began)
+    {
+        Record(name, ("requestId", id), ("command", KnownCommand(method)), ("origin", LifecycleDiagnostics.Code(context?.Origin ?? "unspecified")),
+            ("uiIntentRevision", context?.IntentRevision), ("commandGeneration", context?.CommandGeneration),
+            ("outcome", outcome), ("code", code), ("sent", sent), ("elapsedMs", (long)Stopwatch.GetElapsedTime(began).TotalMilliseconds));
+    }
+
+    private static bool IsLifecycleCommand(string method) => method is "desktop_start" or "desktop_stop" or "desktop_restart" or "desktop_reload_config"
+        or "desktop_set_tun" or "desktop_set_system_proxy" or "desktop_install_service" or "desktop_uninstall_service" or "desktop_exit"
+        or "desktop_install_update" or "desktop_patch_config" or "desktop_save_config" or "desktop_import_config" or "desktop_import_config_url";
+    private static string KnownCommand(string method) => IsLifecycleCommand(method) || method is "desktop_status" or "desktop_set_dirty" or "desktop_check_update" ? method : "other_command";
+
+    private void Record(string name, params (string Key, object? Value)[] fields)
+    {
+        if (diagnostics is null) return;
+        var data = new Dictionary<string, object?> { ["channelId"] = ChannelId, ["hostInstance"] = HostInstance, ["hostPid"] = hostPid };
+        foreach (var field in fields) data[field.Key] = field.Value;
+        diagnostics.Record(name, data);
     }
 }
 

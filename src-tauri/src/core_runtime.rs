@@ -282,9 +282,13 @@ fn stamp(shared: &Shared, state: &mut State) {
 }
 
 fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
+    let _worker_scope = crate::diagnostics::scope(
+        serde_json::json!({"component":"core_runtime","serviceInstance":shared.instance}),
+    );
+    core.record_lifecycle("core_runtime_started", serde_json::json!({}));
     let mut last_poll = Instant::now() - Duration::from_secs(2);
     while !shared.shutdown.load(Ordering::Acquire) {
-        let (work, reconcile, revision) = {
+        let (work, reconcile, revision, intent_revision) = {
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.pending.is_none()
                 && state.reconcile.is_none()
@@ -310,9 +314,19 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
                 work,
                 state.reconcile.take(),
                 shared.revision.load(Ordering::Acquire),
+                state.status.intent_revision,
             )
         };
         if let Some(work) = work {
+            let started = Instant::now();
+            let _operation_scope = crate::diagnostics::scope(serde_json::json!({
+                "source":"runtime_request","operationId":work.id,"intentRevision":work.intent_revision,
+                "workerRevision":work.revision,"action":work.request.name(),
+            }));
+            core.record_lifecycle(
+                "runtime_operation_begin",
+                serde_json::json!({"corePid":core.status().pid}),
+            );
             core.set_cancellation(Cancellation::new(shared.revision.clone(), work.revision));
             let result = if work.revision != shared.revision.load(Ordering::Acquire) {
                 Err(cancelled())
@@ -325,7 +339,13 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
             };
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             let current = work.revision == shared.revision.load(Ordering::Acquire);
+            let execution_error = result.as_ref().err().map(|error| error.code.clone());
             let result = if current { result } else { Err(cancelled()) };
+            core.record_lifecycle("runtime_operation_result", serde_json::json!({
+                "success":result.is_ok(),"superseded":!current,"durationMs":started.elapsed().as_millis(),
+                "executionErrorCode":execution_error,"errorCode":result.as_ref().err().map(|error|&error.code),
+                "corePid":core.status().pid,"processState":core.status().process_state,
+            }));
             if current {
                 state.status = core.status();
                 state.status.intent_revision = work.intent_revision;
@@ -348,6 +368,10 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
             }
             last_poll = Instant::now();
         } else if last_poll.elapsed() >= Duration::from_secs(2) || reconcile.is_some() {
+            let _poll_scope = crate::diagnostics::scope(serde_json::json!({
+                "source":if reconcile.is_some() { "resume_reconcile" } else { "background_health_poll" },
+                "intentRevision":intent_revision,"workerRevision":revision,
+            }));
             core.set_cancellation(Cancellation::new(shared.revision.clone(), revision));
             if let Some(generation) = reconcile {
                 let _ = core.request_reconcile(generation);
@@ -369,6 +393,10 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
             last_poll = Instant::now();
         }
     }
+    core.record_lifecycle(
+        "core_runtime_finished",
+        serde_json::json!({"corePid":core.status().pid}),
+    );
 }
 
 #[cfg(test)]
@@ -494,7 +522,7 @@ mod tests {
         runtime
             .submit(
                 "session:start".into(),
-                1,
+                41,
                 RuntimeRequest::Start(crate::config::INITIAL_CONFIG.into()),
             )
             .unwrap();
@@ -516,7 +544,7 @@ mod tests {
         runtime
             .submit(
                 "session:stop".into(),
-                2,
+                42,
                 RuntimeRequest::Stop(StopReason::UserStop),
             )
             .unwrap();
@@ -551,6 +579,61 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(Arc::strong_count(&runtime.shared), 1);
+        assert!(crate::diagnostics::flush(Duration::from_secs(2)));
+        let events: Vec<serde_json::Value> =
+            std::fs::read_to_string(directory.join("logs/recovery.log"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        for (operation, intent_revision, worker_revision, success) in [
+            ("session:start", 41, 1, false),
+            ("session:stop", 42, 2, true),
+        ] {
+            let begin = events
+                .iter()
+                .find(|event| {
+                    event["event"] == "runtime_operation_begin"
+                        && event["context"]["operationId"] == operation
+                })
+                .unwrap();
+            let result = events
+                .iter()
+                .find(|event| {
+                    event["event"] == "runtime_operation_result"
+                        && event["context"]["operationId"] == operation
+                })
+                .unwrap();
+            assert_eq!(begin["context"]["intentRevision"], intent_revision);
+            assert_eq!(begin["context"]["workerRevision"], worker_revision);
+            assert_eq!(result["context"], begin["context"]);
+            assert_eq!(result["data"]["success"], success);
+            assert_eq!(result["data"]["superseded"], !success);
+            let stop_begin = events
+                .iter()
+                .find(|event| {
+                    event["event"] == "core_stop" && event["context"]["operationId"] == operation
+                })
+                .unwrap();
+            assert_eq!(stop_begin["context"]["intentRevision"], intent_revision);
+            assert_eq!(stop_begin["data"]["cancellationRevision"], worker_revision);
+            assert!(stop_begin["data"].get("intentRevision").is_none());
+        }
+        let stop = events
+            .iter()
+            .find(|event| {
+                event["event"] == "core_stop_result"
+                    && event["context"]["operationId"] == "session:stop"
+            })
+            .unwrap();
+        assert_eq!(stop["data"]["cause"], "requested_stop");
+        assert_eq!(stop["data"]["exitConfirmed"], true);
+        let finished = events
+            .iter()
+            .find(|event| event["event"] == "core_runtime_finished")
+            .unwrap();
+        assert_eq!(finished["context"]["component"], "core_runtime");
+        assert!(finished["context"].get("operationId").is_none());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

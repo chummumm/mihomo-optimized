@@ -42,12 +42,29 @@ use windows_sys::Win32::{
 const WORK_QUEUE_CAPACITY: usize = 4;
 const OWNER_EXIT_GRACE: Duration = Duration::from_secs(12);
 
+fn lifecycle_command(method: &str) -> Option<&'static str> {
+    const COMMANDS: &[&str] = &[
+        "desktop_start",
+        "desktop_stop",
+        "desktop_restart",
+        "desktop_set_tun",
+        "desktop_set_system_proxy",
+        "desktop_reload_config",
+        "desktop_patch_config",
+        "desktop_install_update",
+        "desktop_uninstall_service",
+        "desktop_install_service",
+        "desktop_exit",
+    ];
+    COMMANDS.iter().copied().find(|command| *command == method)
+}
+
 enum Message {
     Request(Request),
     Invalid(Option<i64>, AppError),
     Reply(i64, Result<Value>),
     Event(Value),
-    InputClosed,
+    InputClosed(&'static str),
     Exit,
 }
 
@@ -77,9 +94,46 @@ pub struct HostContext {
     service_epoch: Arc<AtomicU64>,
     service_stop: SyncSender<u64>,
     stop_intent_revision: Arc<AtomicU64>,
+    diagnostic_directory: PathBuf,
+    shutdown_cause: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl HostContext {
+    fn diagnostic_scope(&self, cause: &'static str) -> crate::diagnostics::DiagnosticScope {
+        crate::diagnostics::scope(serde_json::json!({
+            "hostInstance":self.instance,"uiPid":self.owner.pid,"cause":cause,
+            "intentRevision":self.generation(),
+        }))
+    }
+
+    fn record(&self, event: &str, data: Value) {
+        crate::diagnostics::record(&self.diagnostic_directory, event, data);
+    }
+
+    fn record_shutdown(&self, cause: &'static str) {
+        let mut first = self
+            .shutdown_cause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if first.is_some() {
+            return;
+        }
+        *first = Some(cause);
+        drop(first);
+        let _scope = self.diagnostic_scope(cause);
+        self.record(
+            "host_shutdown_requested",
+            serde_json::json!({"uiExited":self.owner.exited()}),
+        );
+    }
+
+    fn first_shutdown_cause(&self) -> &'static str {
+        self.shutdown_cause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or("shutdown_requested")
+    }
+
     pub fn generation(&self) -> u64 {
         self.runtime_generation.load(Ordering::Acquire)
     }
@@ -374,11 +428,22 @@ pub fn run() -> Result<()> {
         service_epoch: Arc::new(AtomicU64::new(0)),
         service_stop,
         stop_intent_revision: Arc::new(AtomicU64::new(0)),
+        diagnostic_directory: windows::user_data_dir()
+            .map(|data| data.join("logs"))
+            .unwrap_or_default(),
+        shutdown_cause: Arc::new(Mutex::new(None)),
     };
     let power = Arc::new(PowerSignal::default());
     let _power_registration = crate::power::Registration::new(power.clone())?;
     let mut manager = DesktopManager::new(context.clone())?;
     let start = manager.prepare_startup(!no_autostart);
+    {
+        let _scope = context.diagnostic_scope("host_startup");
+        context.record(
+            "host_started",
+            serde_json::json!({"allowAutostart":!no_autostart,"savedStartAccepted":start}),
+        );
+    }
     let state = HostState(Arc::new(Mutex::new(manager)));
     let work = Arc::new(WorkQueue::default());
     let requests = work.clone();
@@ -389,6 +454,7 @@ pub fn run() -> Result<()> {
     let poll_state = state.clone();
     let poll_stopping = stopping.clone();
     let poll_context = context.clone();
+    let observation_context = context.clone();
     let heartbeat_stopping = stopping.clone();
     let heartbeat_power = power.clone();
     thread::Builder::new()
@@ -411,6 +477,7 @@ pub fn run() -> Result<()> {
             while !control_stopping.load(Ordering::Acquire) {
                 match service_stops.recv_timeout(Duration::from_millis(100)) {
                     Ok(_) => {
+                        let _scope = control_context.diagnostic_scope("priority_stop");
                         let revision = control_context.stop_intent_revision.load(Ordering::Acquire);
                         if revision == control_context.generation()
                             && control_context.stop_pending.load(Ordering::Acquire) != 0
@@ -434,6 +501,7 @@ pub fn run() -> Result<()> {
         .name("desktop-heartbeat".into())
         .spawn(move || {
             let mut generation = heartbeat_power.generation();
+            let mut last_failure = None;
             while !heartbeat_stopping.load(Ordering::Acquire) {
                 for _ in 0..20 {
                     if heartbeat_power.generation() != generation {
@@ -450,8 +518,26 @@ pub fn run() -> Result<()> {
                 }
                 if !heartbeat_power.suspended() {
                     if let Some((client, epoch)) = poll_context.service_observer() {
-                        if let Ok(status) = client.heartbeat() {
-                            poll_context.publish_service_observation(status, epoch);
+                        let _scope = poll_context.diagnostic_scope("service_heartbeat");
+                        match client.heartbeat() {
+                            Ok(status) => {
+                                if last_failure.take().is_some() {
+                                    poll_context.record(
+                                        "service_heartbeat_recovered",
+                                        serde_json::json!({"corePid":status.pid}),
+                                    );
+                                }
+                                poll_context.publish_service_observation(status, epoch);
+                            }
+                            Err(error) => {
+                                if last_failure.as_deref() != Some(error.code.as_str()) {
+                                    poll_context.record(
+                                        "service_heartbeat_failed",
+                                        serde_json::json!({"code":error.code}),
+                                    );
+                                }
+                                last_failure = Some(error.code);
+                            }
                         }
                         if resumed {
                             let _ = client.reconcile(generation);
@@ -477,6 +563,7 @@ pub fn run() -> Result<()> {
                 }
                 if !power.suspended() {
                     if let Ok(mut manager) = poll_state.0.try_lock() {
+                        let _scope = observation_context.diagnostic_scope("background_observation");
                         if power.generation() != generation {
                             generation = power.generation();
                             manager.request_reconcile(generation);
@@ -492,28 +579,35 @@ pub fn run() -> Result<()> {
         .spawn(move || read_requests(output))
         .map_err(|e| AppError::io("无法启动桌面请求通道", e))?;
     crate::update_cache::start_cleanup_worker();
-    protocol_loop(state, context, messages, work, stopping)
+    let _scope = context.diagnostic_scope("host_protocol");
+    let result = protocol_loop(state, context.clone(), messages, work, stopping);
+    let _exit_scope = context.diagnostic_scope(context.first_shutdown_cause());
+    context.record("host_finished", serde_json::json!({
+        "cause":context.first_shutdown_cause(),"code":result.as_ref().err().map(|error| &error.code),
+    }));
+    let _ = crate::diagnostics::flush(Duration::from_millis(200));
+    result
 }
 
 fn read_requests(output: SyncSender<Message>) {
     let mut input = BufReader::new(std::io::stdin());
-    loop {
+    let close_cause = loop {
         let message = match protocol::read_frame(&mut input) {
             Ok(Some(bytes)) => match protocol::parse_request(&bytes) {
                 Ok(request) => Message::Request(request),
                 Err(error) => Message::Invalid(protocol::request_id(&bytes), error),
             },
-            Ok(None) => break,
+            Ok(None) => break "input_closed",
             Err(error) => {
                 let _ = output.send(Message::Invalid(None, error));
-                break;
+                break "protocol_read_failure";
             }
         };
         if output.send(message).is_err() {
             return;
         }
-    }
-    let _ = output.send(Message::InputClosed);
+    };
+    let _ = output.send(Message::InputClosed(close_cause));
 }
 
 fn reply(id: Option<i64>, result: Result<Value>) -> Value {
@@ -536,6 +630,7 @@ fn protocol_loop(
     let mut output_open = true;
     loop {
         if context.owner.exited() && owner_lost_at.is_none() {
+            context.record_shutdown("ui_process_exit");
             owner_lost_at = Some(Instant::now());
             context.runtime_generation.fetch_add(1, Ordering::AcqRel);
             stopping.store(true, Ordering::Release);
@@ -544,11 +639,17 @@ fn protocol_loop(
             // Kill only this host, never its descendants: the recovery helper
             // must outlive us to restore WinINet, and an update monitor may own
             // an installer. The existing core job closes with this process.
+            context.record(
+                "host_exit_deadline",
+                serde_json::json!({"cause":context.first_shutdown_cause()}),
+            );
+            let _ = crate::diagnostics::flush(Duration::from_millis(100));
             std::process::exit(1);
         }
         let frame = match messages.recv_timeout(Duration::from_millis(100)) {
             Ok(Message::Request(request)) if owner_lost_at.is_none() => {
                 if pending.contains(&request.id) {
+                    context.record_shutdown("protocol_duplicate_id");
                     owner_lost_at = Some(Instant::now());
                     context.runtime_generation.fetch_add(1, Ordering::AcqRel);
                     stopping.store(true, Ordering::Release);
@@ -563,10 +664,17 @@ fn protocol_loop(
                     ))
                 } else {
                     let id = request.id;
+                    let action = lifecycle_command(&request.method);
+                    let _request_context = context.diagnostic_scope("ui_request");
+                    let _scope = crate::diagnostics::scope(serde_json::json!({
+                        "uiRequestId":id,"command":action,"hostInstance":context.instance,
+                        "uiPid":context.owner.pid,
+                    }));
                     match work.enqueue(&context, request) {
                         Ok(replaced) => {
                             pending.insert(id);
                             if let Some(replaced) = replaced {
+                                context.record("host_request_superseded", serde_json::json!({"replacedUiRequestId":replaced,"replacementUiRequestId":id}));
                                 pending.remove(&replaced);
                                 Some(reply(
                                     Some(replaced),
@@ -579,21 +687,49 @@ fn protocol_loop(
                                 None
                             }
                         }
-                        Err(error) => Some(reply(Some(id), Err(error))),
+                        Err(error) => {
+                            if action.is_some() {
+                                context.record(
+                                    "host_request_rejected",
+                                    serde_json::json!({"code":error.code}),
+                                );
+                            }
+                            Some(reply(Some(id), Err(error)))
+                        }
                     }
                 }
             }
-            Ok(Message::Request(request)) => Some(reply(
-                Some(request.id),
-                Err(AppError::new("desktop_exiting", "桌面后台正在退出")),
-            )),
-            Ok(Message::Invalid(id, error)) => Some(reply(id, Err(error))),
+            Ok(Message::Request(request)) => {
+                if let Some(command) = lifecycle_command(&request.method) {
+                    let _scope = context.diagnostic_scope(context.first_shutdown_cause());
+                    context.record(
+                        "host_request_rejected",
+                        serde_json::json!({
+                            "uiRequestId":request.id,"command":command,"code":"desktop_exiting",
+                            "cause":context.first_shutdown_cause(),
+                        }),
+                    );
+                }
+                Some(reply(
+                    Some(request.id),
+                    Err(AppError::new("desktop_exiting", "桌面后台正在退出")),
+                ))
+            }
+            Ok(Message::Invalid(id, error)) => {
+                let _scope = context.diagnostic_scope("protocol_rejection");
+                context.record(
+                    "host_protocol_rejected",
+                    serde_json::json!({"uiRequestId":id,"code":error.code}),
+                );
+                Some(reply(id, Err(error)))
+            }
             Ok(Message::Reply(id, result)) => {
                 pending.remove(&id);
                 Some(reply(Some(id), result))
             }
             Ok(Message::Event(frame)) => Some(frame),
-            Ok(Message::InputClosed) => {
+            Ok(Message::InputClosed(cause)) => {
+                context.record_shutdown(cause);
                 owner_lost_at.get_or_insert_with(Instant::now);
                 context.runtime_generation.fetch_add(1, Ordering::AcqRel);
                 stopping.store(true, Ordering::Release);
@@ -605,6 +741,7 @@ fn protocol_loop(
         };
         if let Some(frame) = frame {
             if output_open && protocol::write_frame(&mut stdout, &frame).is_err() {
+                context.record_shutdown("output_closed");
                 output_open = false;
                 owner_lost_at.get_or_insert_with(Instant::now);
                 context.runtime_generation.fetch_add(1, Ordering::AcqRel);
@@ -677,6 +814,15 @@ impl WorkQueue {
         } else {
             context.generation()
         };
+        if let Some(command) = lifecycle_command(&action) {
+            let _scope = context.diagnostic_scope("accepted_command");
+            context.record(
+                "host_request_accepted",
+                serde_json::json!({
+                    "uiRequestId":request.id,"command":command,"intentRevision":generation,
+                }),
+            );
+        }
         let work = WorkRequest {
             request,
             generation,
@@ -746,8 +892,14 @@ fn operations(
     start: bool,
 ) {
     if start && !stopping.load(Ordering::Acquire) {
+        let _scope = context.diagnostic_scope("saved_startup");
+        context.record("desktop_autostart_requested", serde_json::json!({}));
         if let Ok(mut manager) = state.0.lock() {
-            let _ = manager.start(false);
+            let result = manager.start(false);
+            context.record(
+                "desktop_autostart_finished",
+                serde_json::json!({"code":result.as_ref().err().map(|error| &error.code)}),
+            );
         }
     }
     if let Some(message) = crate::update::take_install_result() {
@@ -762,6 +914,15 @@ fn operations(
             }
             let request = work.request;
             let stops = work.stops;
+            let action = lifecycle_command(&request.method);
+            let _scope = context.diagnostic_scope("accepted_command");
+            let _request_scope = crate::diagnostics::scope(serde_json::json!({
+                "uiRequestId":request.id,"command":action,"intentRevision":work.generation,
+            }));
+            let started = Instant::now();
+            if action.is_some() {
+                context.record("host_request_started", serde_json::json!({}));
+            }
             let result = if work.stops && work.generation != context.generation() {
                 // A later Start may replace the desired state, but it cannot
                 // bypass an already accepted Stop's ownership cleanup barrier.
@@ -805,8 +966,22 @@ fn operations(
                 .and_then(Value::as_bool)
                 == Some(true);
             let update_exit = exit && request.method == "desktop_install_update";
+            if action.is_some() {
+                context.record(
+                    "host_request_finished",
+                    serde_json::json!({
+                        "code":result.as_ref().err().map(|error| &error.code),
+                        "elapsedMs":started.elapsed().as_millis(),"exiting":exit,
+                    }),
+                );
+            }
             let _ = context.output.send(Message::Reply(request.id, result));
             if exit {
+                context.record_shutdown(if update_exit {
+                    "update_exit"
+                } else {
+                    "command_exit"
+                });
                 if update_exit {
                     context.emit(
                         "desktop-exit-requested",
@@ -819,9 +994,15 @@ fn operations(
         }
     }
     context.runtime_generation.fetch_add(1, Ordering::AcqRel);
+    let _scope = context.diagnostic_scope(context.first_shutdown_cause());
+    context.record("host_owner_cleanup_started", serde_json::json!({}));
     if let Ok(mut manager) = state.0.lock() {
         manager.begin_operation(context.generation());
-        let _ = manager.request_exit(true);
+        let result = manager.request_exit(true);
+        context.record(
+            "host_owner_cleanup_finished",
+            serde_json::json!({"code":result.as_ref().err().map(|error| &error.code)}),
+        );
     }
     let _ = context.output.send(Message::Exit);
 }
@@ -864,6 +1045,8 @@ mod lifecycle_tests {
             service_epoch: Arc::new(AtomicU64::new(0)),
             service_stop,
             stop_intent_revision: Arc::new(AtomicU64::new(0)),
+            diagnostic_directory: PathBuf::new(),
+            shutdown_cause: Arc::new(Mutex::new(None)),
         };
         context.publish_status(DesktopStatus {
             process_state: "exited".into(),
@@ -879,6 +1062,30 @@ mod lifecycle_tests {
             method: method.into(),
             params: params.as_object().unwrap().clone(),
         }
+    }
+
+    #[test]
+    fn shutdown_evidence_keeps_first_source_and_real_parent_state() {
+        let (mut context, _messages, _stops) = context();
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let logs = std::env::temp_dir().join(format!("host-origin-{}", hex::encode(nonce)));
+        context.diagnostic_directory = logs.clone();
+        context.record_shutdown("input_closed");
+        context.record_shutdown("ui_process_exit");
+        assert_eq!(context.first_shutdown_cause(), "input_closed");
+        assert!(crate::diagnostics::flush(Duration::from_secs(2)));
+        let events: Vec<Value> = std::fs::read_to_string(logs.join("recovery.log"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "host_shutdown_requested");
+        assert_eq!(events[0]["context"]["cause"], "input_closed");
+        assert_eq!(events[0]["context"]["hostInstance"], context.instance);
+        assert_eq!(events[0]["data"]["uiExited"], false);
+        std::fs::remove_dir_all(logs).unwrap();
     }
 
     #[test]

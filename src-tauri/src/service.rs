@@ -12,8 +12,9 @@ use std::{
     collections::VecDeque,
     ffi::OsString,
     fs,
+    path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -429,10 +430,23 @@ fn report_status(
 fn run_service() -> Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     let stop_handler = stopping.clone();
+    let stop_signal = Arc::new(AtomicU8::new(0));
+    let stop_signal_handler = stop_signal.clone();
     let power = Arc::new(PowerSignal::default());
     let power_handler = power.clone();
     let handle = service_control_handler::register(SERVICE_NAME, move |control| match control {
-        ServiceControl::Stop | ServiceControl::Shutdown => {
+        control @ (ServiceControl::Stop | ServiceControl::Shutdown) => {
+            let signal = if matches!(control, ServiceControl::Shutdown) {
+                2
+            } else {
+                1
+            };
+            let _ = stop_signal_handler.compare_exchange(
+                0,
+                signal,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             stop_handler.store(true, Ordering::SeqCst);
             ServiceControlHandlerResult::NoError
         }
@@ -487,28 +501,63 @@ fn run_service() -> Result<()> {
             retired: VecDeque::new(),
             shutting_down: false,
             cleanup_sequence: 0,
+            diagnostic_directory: data.join("logs"),
         }));
+        crate::diagnostics::record(
+            &data.join("logs"),
+            "service_started",
+            serde_json::json!({"serviceInstance":runtime.status().service_instance}),
+        );
         // The work pipe carries bounded config frames. Three separately accepted
         // control instances retain capacity for Stop/heartbeat when a work peer
         // is slow; none executes lifecycle work on its connection thread.
         let mut servers = Vec::new();
         for (bulk, first) in [(false, true), (false, false), (false, false), (true, true)] {
-            servers.push(Server::new(owner.into(), host_path.clone(), bulk, first)?);
+            servers.push(Server::new(
+                owner.into(),
+                host_path.clone(),
+                bulk,
+                first,
+                data.join("logs"),
+            )?);
         }
         for server in servers {
             let runtime = runtime.clone();
             let session = session.clone();
             let stopping = stopping.clone();
+            let logs = data.join("logs");
             thread::Builder::new()
                 .name("service-control".into())
                 .spawn(move || {
+                    let mut receive_failure = None;
                     while !stopping.load(Ordering::Acquire) {
                         match server.receive() {
                             Ok(Some(request)) => {
-                                let _ = server.respond(handle_request(&runtime, &session, request));
+                                receive_failure = None;
+                                let _scope =
+                                    crate::diagnostics::scope(request.envelope.diagnostic_fields());
+                                if let Err(error) =
+                                    server.respond(handle_request(&runtime, &session, request))
+                                {
+                                    crate::diagnostics::record(
+                                        &logs,
+                                        "service_response_failed",
+                                        serde_json::json!({"code":error.code}),
+                                    );
+                                }
                             }
                             Ok(None) => thread::sleep(Duration::from_millis(10)),
-                            Err(_) => thread::sleep(Duration::from_millis(25)),
+                            Err(error) => {
+                                if receive_failure.as_deref() != Some(error.code.as_str()) {
+                                    crate::diagnostics::record(
+                                        &logs,
+                                        "service_receive_failed",
+                                        serde_json::json!({"code":error.code}),
+                                    );
+                                }
+                                receive_failure = Some(error.code);
+                                thread::sleep(Duration::from_millis(25));
+                            }
                         }
                     }
                 })
@@ -526,10 +575,16 @@ fn run_service() -> Result<()> {
                 let mut session = session.lock().unwrap_or_else(|error| error.into_inner());
                 if let Some(authenticated) = session.owner.as_ref() {
                     let owner_pid = authenticated.pid;
-                    let valid = if resumed {
-                        authenticated.verify(owner, &host_path).is_ok()
+                    let owner_alive = authenticated.alive();
+                    let identity_error = if resumed {
+                        authenticated.verify(owner, &host_path).err()
                     } else {
-                        authenticated.alive()
+                        None
+                    };
+                    let valid = if resumed {
+                        identity_error.is_none()
+                    } else {
+                        owner_alive
                     };
                     if !session.closing {
                         if valid && resumed {
@@ -543,9 +598,12 @@ fn run_service() -> Result<()> {
                             None
                         };
                         if let Some(reason) = reason {
+                            let owner_session = session.id.clone();
+                            let intent_revision = session.intent_revision;
+                            let lease_age = session.lease.elapsed().ok().map(|age| age.as_millis());
                             begin_owner_cleanup(&runtime, &mut session, reason)?;
                             cleanup_event = Some(
-                                serde_json::json!({"ownerPid":owner_pid,"reason":reason,"generation":power_generation}),
+                                serde_json::json!({"ownerPid":owner_pid,"reason":reason,"generation":power_generation,"ownerAlive":owner_alive,"identityRechecked":resumed,"identityErrorCode":identity_error.as_ref().map(|error|&error.code),"ownerValid":valid,"ownerSession":owner_session,"intentRevision":intent_revision,"leaseAgeMs":lease_age,"cleanupSequence":session.cleanup_sequence}),
                             );
                         } else if resumed {
                             runtime.reconcile(power_generation);
@@ -559,6 +617,14 @@ fn run_service() -> Result<()> {
                         && status.operation.is_none()
                         && !status.desired_running
                     {
+                        crate::diagnostics::record(
+                            &data.join("logs"),
+                            "service_owner_released",
+                            serde_json::json!({
+                                "ownerSession":session.id,"ownerPid":owner_pid,
+                                "intentRevision":session.intent_revision,"exitConfirmed":true,
+                            }),
+                        );
                         if let Some(id) = session.id.take() {
                             let order = (id, session.intent_revision, session.request_sequence);
                             session.retired.push_back(order);
@@ -585,10 +651,27 @@ fn run_service() -> Result<()> {
             .unwrap_or_else(|error| error.into_inner())
             .shutting_down = true;
         report_status(&handle, ServiceState::StopPending)?;
-        runtime.shutdown()?;
+        let _scope = crate::diagnostics::scope(
+            serde_json::json!({"cause":"service_control_shutdown","serviceInstance":runtime.status().service_instance}),
+        );
+        crate::diagnostics::record(
+            &data.join("logs"),
+            "service_shutdown_started",
+            serde_json::json!({
+                "control":match stop_signal.load(Ordering::Relaxed) { 1 => "stop", 2 => "shutdown", _ => "unknown" },
+            }),
+        );
+        let shutdown = runtime.shutdown();
+        crate::diagnostics::record(
+            &data.join("logs"),
+            "service_shutdown_finished",
+            serde_json::json!({"code":shutdown.as_ref().err().map(|error| &error.code)}),
+        );
+        shutdown?;
         Ok(())
     })();
     let final_status = report_status(&handle, ServiceState::Stopped);
+    let _ = crate::diagnostics::flush(Duration::from_millis(200));
     result.and(final_status)
 }
 
@@ -602,6 +685,7 @@ struct ServiceSession {
     retired: VecDeque<(String, u64, u64)>,
     shutting_down: bool,
     cleanup_sequence: u64,
+    diagnostic_directory: PathBuf,
 }
 
 fn begin_owner_cleanup(
@@ -610,15 +694,36 @@ fn begin_owner_cleanup(
     reason: StopReason,
 ) -> Result<()> {
     session.cleanup_sequence += 1;
-    runtime.submit(
-        format!(
-            "owner-cleanup-{}-{}",
-            session.id.as_deref().unwrap_or("none"),
-            session.cleanup_sequence
-        ),
+    let operation_id = format!(
+        "owner-cleanup-{}-{}",
+        session.id.as_deref().unwrap_or("none"),
+        session.cleanup_sequence
+    );
+    let _scope = crate::diagnostics::scope(serde_json::json!({
+        "cause":reason,"ownerSession":session.id,"intentRevision":session.intent_revision,
+        "operationId":operation_id,
+    }));
+    crate::diagnostics::record(
+        &session.diagnostic_directory,
+        "service_owner_stop_requested",
+        serde_json::json!({
+            "operationId":operation_id,"reason":reason,
+        }),
+    );
+    let submitted = runtime.submit(
+        operation_id,
         session.intent_revision,
         RuntimeRequest::Stop(reason),
-    )?;
+    );
+    crate::diagnostics::record(
+        &session.diagnostic_directory,
+        "service_owner_stop_admission",
+        serde_json::json!({
+            "accepted":submitted.is_ok(),"code":submitted.as_ref().err().map(|error| &error.code),
+            "operationId":submitted.as_ref().ok().map(|operation| &operation.id),
+        }),
+    );
+    submitted?;
     session.closing = true;
     Ok(())
 }
@@ -628,7 +733,42 @@ fn handle_request(
     session: &Mutex<ServiceSession>,
     authenticated: AuthenticatedRequest,
 ) -> Reply {
+    let lifecycle = authenticated.envelope.request.lifecycle_request();
+    let _scope = crate::diagnostics::scope(authenticated.envelope.diagnostic_fields());
+    let _owner_scope = crate::diagnostics::scope(serde_json::json!({
+        "ownerPid":authenticated.owner.pid,"serviceInstance":runtime.status().service_instance,
+    }));
     let mut session = session.lock().unwrap_or_else(|error| error.into_inner());
+    let logs = session.diagnostic_directory.clone();
+    if lifecycle {
+        crate::diagnostics::record(
+            &logs,
+            "service_request_received",
+            authenticated.envelope.diagnostic_fields(),
+        );
+    }
+    let reply = handle_session_request(runtime, &mut session, authenticated);
+    drop(session);
+    if lifecycle || reply.error.is_some() {
+        crate::diagnostics::record(
+            &logs,
+            "service_request_finished",
+            serde_json::json!({
+                "admission":if reply.error.is_none() { "accepted" } else { "rejected" },
+                "code":reply.error.as_ref().map(|error| &error.code),
+                "operationId":reply.operation.as_ref().map(|operation| &operation.id),
+                "operationPhase":reply.operation.as_ref().map(|operation| &operation.phase),
+            }),
+        );
+    }
+    reply
+}
+
+fn handle_session_request(
+    runtime: &CoreRuntime,
+    session: &mut ServiceSession,
+    authenticated: AuthenticatedRequest,
+) -> Reply {
     if session.shutting_down {
         return Reply::from_result(Err(AppError::new(
             "service_stopping",
@@ -867,6 +1007,7 @@ mod control_tests {
             retired: VecDeque::new(),
             shutting_down: false,
             cleanup_sequence: 0,
+            diagnostic_directory: PathBuf::new(),
         })
     }
 
@@ -882,6 +1023,60 @@ mod control_tests {
                 request,
             },
         }
+    }
+
+    #[test]
+    fn admission_logs_correlate_accepted_and_rejected_requests_without_config() {
+        let runtime = CoreRuntime::queued_for_test();
+        let session = session();
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let logs = std::env::temp_dir().join(format!("service-origin-{}", hex::encode(nonce)));
+        session.lock().unwrap().diagnostic_directory = logs.clone();
+        assert!(
+            handle_request(&runtime, &session, request("stop", 2, 20, Request::Stop))
+                .error
+                .is_none()
+        );
+        let stale = handle_request(
+            &runtime,
+            &session,
+            request(
+                "stale-start",
+                1,
+                19,
+                Request::Start {
+                    config: "secret: must-not-be-logged".into(),
+                },
+            ),
+        );
+        assert_eq!(stale.error.unwrap().code, "operation_cancelled");
+        assert!(crate::diagnostics::flush(Duration::from_secs(2)));
+        let contents = fs::read_to_string(logs.join("recovery.log")).unwrap();
+        assert!(!contents.contains("must-not-be-logged"));
+        let events: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let admissions: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"] == "service_request_finished")
+            .collect();
+        assert_eq!(admissions.len(), 2);
+        assert_eq!(admissions[0]["data"]["admission"], "accepted");
+        assert_eq!(admissions[0]["data"]["operationPhase"], "queued");
+        assert_eq!(admissions[0]["context"]["serviceRequestId"], "stop");
+        assert_eq!(
+            admissions[0]["context"]["operationId"],
+            "00000000000000000000000000000001:stop"
+        );
+        assert_eq!(admissions[1]["data"]["admission"], "rejected");
+        assert_eq!(admissions[1]["data"]["code"], "operation_cancelled");
+        assert_eq!(admissions[1]["context"]["serviceRequestId"], "stale-start");
+        assert_eq!(admissions[1]["context"]["intentRevision"], 1);
+        assert_eq!(admissions[1]["context"]["requestSequence"], 19);
+        assert_eq!(admissions[1]["context"]["ownerPid"], std::process::id());
+        fs::remove_dir_all(logs).unwrap();
     }
 
     #[test]
