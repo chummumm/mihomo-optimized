@@ -936,7 +936,19 @@ mod tests {
         let end = ordinary.len() - 22;
         let central = u32::from_le_bytes(ordinary[end + 16..end + 20].try_into().unwrap()) as usize;
         let mut linked = ordinary.clone();
+        // The creator OS determines how ZIP external attributes are interpreted.
+        // ZipWriter defaults to DOS on Windows, so make this a Unix link on every host.
+        linked[central + 5] = zip::System::Unix as u8;
         linked[central + 38..central + 42].copy_from_slice(&(0o120777u32 << 16).to_le_bytes());
+        {
+            let mut archive = zip::ZipArchive::new(Cursor::new(&linked)).unwrap();
+            let member = archive.by_index(0).unwrap();
+            assert_eq!(member.unix_mode(), Some(0o120777));
+            assert!(
+                member.is_symlink(),
+                "fixture must encode an actual ZIP symlink"
+            );
+        }
         assert!(extract_fixture(&linked).is_err());
         let mut corrupt = ordinary.clone();
         let payload = corrupt
