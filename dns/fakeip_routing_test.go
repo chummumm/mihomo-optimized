@@ -257,11 +257,12 @@ func TestDNSRuleRoutingFakeIPFilterRoutesRealQueries(t *testing.T) {
 				}
 				// Connections may be shared across questions, so inspect the
 				// frozen route's pool separately from new physical dial events.
-				prepared, _, err := rs.Resolver.prepareDNSRouting(ctx, new(D.Msg).SetQuestion(D.Fqdn(test.name), test.typeCode))
+				query := new(D.Msg).SetQuestion(D.Fqdn(test.name), test.typeCode)
+				prepared, _, err := rs.Resolver.prepareDNSRouting(ctx, query)
 				if err != nil {
 					t.Fatal(err)
 				}
-				main, _ := rs.Resolver.dnsQueryServers(prepared)
+				main, _ := rs.Resolver.dnsQueryServers(prepared, query)
 				if len(main) != 1 || main[0].Address() != "udp://"+test.destination+":53" {
 					t.Fatalf("wrong real resolver pool: %v, want %s", main, test.destination)
 				}

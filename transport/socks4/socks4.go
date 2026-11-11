@@ -44,6 +44,24 @@ var (
 var subnet = netip.PrefixFrom(netip.IPv4Unspecified(), 24)
 
 func ServerHandshake(rw io.ReadWriter, authenticator auth.Authenticator) (addr string, command Command, user string, err error) {
+	addr, command, user, err = ServerRequest(rw, authenticator)
+	if err != nil {
+		return
+	}
+	host, portString, _ := net.SplitHostPort(addr)
+	port, _ := strconv.Atoi(portString)
+	ip := net.ParseIP(host)
+	if ip == nil {
+		ip = net.IPv4(0, 0, 0, 1)
+	}
+	err = WriteResponse(rw, RequestGranted, &net.TCPAddr{IP: ip, Port: port})
+	return
+}
+
+// ServerRequest authenticates and reads a CONNECT request without granting it.
+// Rejected requests are answered immediately; accepted requests need a response
+// after the outbound connection has been established.
+func ServerRequest(rw io.ReadWriter, authenticator auth.Authenticator) (addr string, command Command, user string, err error) {
 	var req [8]byte
 	if _, err = io.ReadFull(rw, req[:]); err != nil {
 		return
@@ -56,6 +74,7 @@ func ServerHandshake(rw io.ReadWriter, authenticator auth.Authenticator) (addr s
 
 	if command = req[1]; command != CmdConnect {
 		err = errCommandNotSupported
+		_ = WriteResponse(rw, RequestRejected, nil)
 		return
 	}
 
@@ -67,7 +86,6 @@ func ServerHandshake(rw io.ReadWriter, authenticator auth.Authenticator) (addr s
 	var (
 		host   string
 		port   string
-		code   uint8
 		userID []byte
 	)
 	if userID, err = readUntilNull(rw); err != nil {
@@ -91,24 +109,34 @@ func ServerHandshake(rw io.ReadWriter, authenticator auth.Authenticator) (addr s
 	}
 
 	// SOCKS4 only support USERID auth.
-	if authenticator == nil || authenticator.Verify(user, "") {
-		code = RequestGranted
-	} else {
-		code = RequestIdentdMismatched
+	if authenticator != nil && !authenticator.Verify(user, "") {
 		err = ErrRequestIdentdMismatched
-	}
-
-	var reply [8]byte
-	reply[0] = 0x00 // reply code
-	reply[1] = code // result code
-	copy(reply[4:8], dstIP.AsSlice())
-	copy(reply[2:4], dstPort)
-
-	_, wErr := rw.Write(reply[:])
-	if err == nil {
-		err = wErr
+		_ = WriteResponse(rw, RequestIdentdMismatched, &net.TCPAddr{
+			IP:   dstIP.AsSlice(),
+			Port: int(binary.BigEndian.Uint16(dstPort)),
+		})
 	}
 	return
+}
+
+// WriteResponse writes a SOCKS4 response. An unavailable or non-IPv4 bound
+// address is represented by the unspecified IPv4 address.
+func WriteResponse(w io.Writer, code Code, bound net.Addr) error {
+	var reply [8]byte
+	reply[1] = code
+	if bound != nil {
+		host, portString, err := net.SplitHostPort(bound.String())
+		if err == nil {
+			port, _ := strconv.ParseUint(portString, 10, 16)
+			binary.BigEndian.PutUint16(reply[2:4], uint16(port))
+			copy(reply[4:8], net.ParseIP(host).To4())
+		}
+	}
+	n, err := w.Write(reply[:])
+	if err == nil && n != len(reply) {
+		err = io.ErrShortWrite
+	}
+	return err
 }
 
 func ClientHandshake(rw io.ReadWriter, addr string, command Command, userID string) (err error) {

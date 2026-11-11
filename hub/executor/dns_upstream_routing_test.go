@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/metacubex/mihomo/component/resolver"
@@ -8,18 +10,15 @@ import (
 	"github.com/metacubex/mihomo/dns"
 )
 
-func TestDNSUpstreamRuleRoutingReportsAppliedConfiguration(t *testing.T) {
+func TestGeneralDoesNotExposeRemovedDNSUpstreamRoutingFlag(t *testing.T) {
 	preserveUpdateConfiguration(t)
-	if GetGeneral().DNSUpstreamRuleRouting {
-		t.Fatal("unconfigured upstream routing should be disabled")
+	publishUpdateConfiguration(&config.Config{General: &config.General{}})
+	wire, err := json.Marshal(GetGeneral())
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, enabled := range []bool{true, false} {
-		cfg := &config.Config{General: &config.General{DNSUpstreamRuleRouting: enabled}}
-		publishUpdateConfiguration(cfg)
-		cfg.General.DNSUpstreamRuleRouting = !enabled
-		if got := GetGeneral().DNSUpstreamRuleRouting; got != enabled {
-			t.Fatalf("API reported a mutable candidate flag: got %v want %v", got, enabled)
-		}
+	if strings.Contains(string(wire), "dns-upstream-rule-routing") {
+		t.Fatalf("removed flag remains in the API: %s", wire)
 	}
 }
 
@@ -37,10 +36,11 @@ func TestDNSUpstreamRuleRoutingNodeBootstrapWithAndWithoutDNSService(t *testing.
 	})
 	for _, localDNS := range []bool{true, false} {
 		updateDNS(&config.DNS{
-			Enable:                 localDNS,
-			DNSUpstreamRuleRouting: true,
-			NameServer:             []dns.NameServer{{Addr: "192.0.2.53:53"}},
-			DefaultNameserver:      []dns.NameServer{{Addr: "192.0.2.54:53"}},
+			Enable:              localDNS,
+			DNSRuleRouting:      true,
+			UpstreamRuleRouting: true,
+			NameServer:          []dns.NameServer{{Addr: "192.0.2.53:53"}},
+			DefaultNameserver:   []dns.NameServer{{Addr: "192.0.2.54:53"}},
 		}, false)
 		if dnsResolverOwner == nil || resolver.ProxyServerHostResolver != dnsResolverOwner.BootstrapResolver {
 			t.Fatal("upstream routing left node resolution dependent on business DNS")

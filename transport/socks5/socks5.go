@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"syscall"
 
 	"github.com/metacubex/mihomo/component/auth"
 )
@@ -107,6 +108,18 @@ type User struct {
 
 // ServerHandshake fast-tracks SOCKS initialization to get target address to connect on server side.
 func ServerHandshake(rw net.Conn, authenticator auth.Authenticator) (addr Addr, command Command, user string, err error) {
+	addr, command, user, err = ServerRequest(rw, authenticator)
+	if err != nil {
+		return
+	}
+	err = WriteResponse(rw, 0, rw.LocalAddr())
+	return
+}
+
+// ServerRequest completes authentication and reads the command without sending
+// a success response. CONNECT is answered after dialing; UDP ASSOCIATE can be
+// answered immediately by the listener that owns its control connection.
+func ServerRequest(rw net.Conn, authenticator auth.Authenticator) (addr Addr, command Command, user string, err error) {
 	// Read RFC 1928 for request and reply structure and sizes.
 	buf := make([]byte, MaxAddrLen)
 	// read VER, NMETHODS, METHODS
@@ -187,26 +200,56 @@ func ServerHandshake(rw net.Conn, authenticator auth.Authenticator) (addr Addr, 
 	command = buf[1]
 	addr, err = ReadAddr(rw, buf)
 	if err != nil {
+		if errors.Is(err, ErrAddressNotSupported) {
+			_ = WriteResponse(rw, ErrAddressNotSupported, nil)
+		}
 		return
 	}
 
 	switch command {
 	case CmdConnect, CmdUDPAssociate:
-		// Acquire server listened address info
-		localAddr := ParseAddrToSocksAddr(rw.LocalAddr())
-		if localAddr == nil {
-			err = ErrAddressNotSupported
-		} else {
-			// write VER REP RSV ATYP BND.ADDR BND.PORT
-			_, err = rw.Write(bytes.Join([][]byte{{5, 0, 0}, localAddr}, []byte{}))
-		}
-	case CmdBind:
-		fallthrough
 	default:
 		err = ErrCommandNotSupported
+		_ = WriteResponse(rw, ErrCommandNotSupported, nil)
 	}
 
 	return
+}
+
+// WriteResponse writes the result of a SOCKS5 request using the outbound bound
+// address when it is available.
+func WriteResponse(w io.Writer, code Error, bound net.Addr) error {
+	addr := ParseAddrToSocksAddr(bound)
+	if addr == nil {
+		addr = Addr{AtypIPv4, 0, 0, 0, 0, 0, 0}
+	}
+	reply := append([]byte{Version, byte(code), 0}, addr...)
+	n, err := w.Write(reply)
+	if err == nil && n != len(reply) {
+		err = io.ErrShortWrite
+	}
+	return err
+}
+
+// ReplyCodeForError preserves a SOCKS5 reply or maps the socket errors also
+// recognized by sing-box. Errors without such a cause use general failure.
+func ReplyCodeForError(err error) Error {
+	var reply Error
+	if errors.As(err, &reply) && reply >= ErrGeneralFailure && reply <= ErrAddressNotSupported {
+		return reply
+	}
+	switch {
+	case errors.Is(err, syscall.ENETUNREACH):
+		return ErrNetworkUnreachable
+	case errors.Is(err, syscall.EHOSTUNREACH):
+		return ErrHostUnreachable
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return ErrConnectionRefused
+	case errors.Is(err, syscall.EPERM):
+		return ErrConnectionNotAllowed
+	default:
+		return ErrGeneralFailure
+	}
 }
 
 // ClientHandshake fast-tracks SOCKS initialization to get target address to connect on client side.
@@ -270,8 +313,18 @@ func ClientHandshake(rw io.ReadWriter, addr Addr, command Command, user *User) (
 	if _, err := io.ReadFull(rw, buf[:3]); err != nil {
 		return nil, err
 	}
-
-	return ReadAddr(rw, buf)
+	if buf[0] != Version {
+		return nil, errors.New("SOCKS version error")
+	}
+	replyCode := Error(buf[1])
+	bound, err := ReadAddr(rw, buf)
+	if err != nil {
+		return nil, err
+	}
+	if replyCode != 0 {
+		return nil, replyCode
+	}
+	return bound, nil
 }
 
 func ReadAddr(r io.Reader, b []byte) (Addr, error) {

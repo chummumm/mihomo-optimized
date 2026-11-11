@@ -112,12 +112,7 @@ func (r *Resolver) directDNSQueryEligible(ctx context.Context, query *D.Msg) boo
 	if kind := route.plan.Type(); kind != C.Direct && kind != C.Compatible {
 		return false
 	}
-	main, fallback := r.dnsQueryServers(ctx)
-	if matched := r.matchPolicy(query); len(matched) != 0 {
-		main, fallback = matched, nil
-	} else if isIPRequest(query.Question[0]) && len(fallback) != 0 && r.shouldOnlyQueryFallback(query) {
-		main, fallback = fallback, nil
-	}
+	main, fallback := r.dnsQueryServers(ctx, query)
 	automatic, explicit := dnsQueryCapabilities(query, main, fallback)
 	return automatic && !explicit
 }

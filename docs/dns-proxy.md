@@ -21,7 +21,7 @@ dns:
 
 开关默认 `false`。内置 DNS 可使用 `normal`、`redir-host` 或 `fake-ip`；从内核 `mihomo-optimized-v1.0.3` 起，FakeIP 与 DNS 分流可以同时开启，只有需要真实解析的查询才进入 DNS 分流。
 
-从 `1.0.25` 起，可另行开启顶层 `dns-upstream-rule-routing`，让 DNS 服务器连接独立匹配规则，业务选池仍由 `dns-rule-routing` 决定。新开关默认 `false`，示例与兼容边界见 [DNS 上游连接独立选路](#dns-上游连接独立选路)。
+从 `1.0.29` 起，DNS 服务器连接统一使用 `dns.respect-rules` 控制：开启业务分流时，`false` 继承业务出口，`true` 按解析器自身地址独立匹配规则。`respect-rules` 默认 `false`；旧 `dns-upstream-rule-routing` 已移除，不保留别名，配置矩阵与迁移见 [DNS 上游连接独立选路](#dns-上游连接独立选路)。
 
 ## FakeIP 与真实查询的优先级
 
@@ -103,7 +103,7 @@ dns:
 
 `dns.listen`、TUN DNS 劫持以及适用的内部解析，在需要真实查询时共用已有 QNAME 选路核心。在 Rule 模式中，先选出实际叶子，再按下表处理：
 
-表中传输行为采用默认的 `dns-upstream-rule-routing: false`；另行开启该开关时，池的选择保持不变，实际 DNS 连接改用各解析器自己的规则结果。
+表中传输行为采用默认的 `dns.respect-rules: false`；同时开启 `dns.respect-rules` 时，池的选择保持不变，实际 DNS 连接改用各解析器自己的规则结果。命中 `nameserver-policy` 时，按下文规则覆盖池而不改变业务出口。
 
 | 选路结果 | 内置 DNS 上游与传输 |
 | --- | --- |
@@ -179,44 +179,59 @@ rules:
 
 原生 UDP / TCP、DoT、DoH / HTTP/3 和 DoQ 上游，只要没有固定出口，都属于自动范围，配置端口不构成例外。`#RULES` 也属于自动范围。`#Group`、`#DIRECT`、`#interface` 或显式适配器保留自身原有传输行为；其他未接入自动路由的特殊解析器也保留旧行为。
 
-先选池，再判断**所选池**的例外：未用到的直连池显式上游不会削弱 main 的 REJECT；选中直连池时，也不受未用到的 main / fallback 显式配置影响。如果选中集合混有显式上游，显式分支仍可回答，即使自动分支被拒绝或失败。希望拒绝动作覆盖整个查询时，所选池应全部使用自动上游，可以使用明文或加密协议。所有候选都在自动范围之外时，保留旧行为，不运行新增选池。
+先选池，再判断**所选池**的例外：未用到的直连池显式上游不会削弱 main 的 REJECT；选中直连池时，也不受未用到的 main / fallback 显式配置影响。如果选中集合混有显式上游，显式分支仍可回答，即使自动分支被拒绝或失败。希望拒绝动作覆盖整个查询时，所选池应全部使用自动上游，可以使用明文或加密协议。存在直连池时，即使所有候选都指定显式出口，仍先由业务路径选池，再使用该池的显式出口；没有直连池且所选 policy / main 全部显式时，不额外建立业务传输计划。
 
 节点域名、解析器自身域名使用独立 bootstrap。`proxy-server-nameserver` 继续供节点解析；未配置时，启用本功能使用独立 `default-nameserver`，不会回到待建立的业务代理中引导自己。普通出站已确定实际叶子后，其内部目标解析继承该叶子和接口 / mark，不重跑业务规则；可依据该叶子选择 DNS 池。
 
-Global / Direct 模式不建立自动 QNAME 计划。内置 DNS 继续原 `respect-rules` 语义：`false` 不会因 Global 模式强制走 GLOBAL，`true` 仍交给原 DNSDialer。Rule 模式中，`dns-upstream-rule-routing` 关闭时，自动范围内的 `respect-rules` / `#RULES` 由 QNAME 计划接管；开启时改按下节所述的解析器地址计划传输。
+Global / Direct 模式不建立自动 QNAME 计划。内置 DNS 继续原 `respect-rules` 语义：`false` 不会因 Global 模式强制走 GLOBAL，`true` 仍交给原 DNSDialer。Rule 模式且 `dns-rule-routing: true` 时，`respect-rules: false` 让自动范围（包括 `#RULES`）继承业务计划；`true` 使用下节的独立解析器地址计划。显式 `#GLOBAL`、`#DIRECT`、策略组与网卡出口继续优先。
 
-开启 `dns-rule-routing` 时，以下业务域名策略停用，也不加载其专属 provider / geosite 条件：
+### nameserver-policy 与直连池
 
-- `nameserver-policy`
-- `direct-nameserver-follow-policy`
-- `fallback-filter.domain`
-- `fallback-filter.geosite`
+`nameserver-policy` 可在 `dns-rule-routing: true` 时使用。它按当前查询域名选择 DNS 服务器，业务 DIRECT / 代理出口仍由业务规则决定：
 
-这些策略不会因切到 Global / Direct 而恢复；关闭开关并重新应用完整配置后恢复原语义。`fallback-lazy-query`、`fallback-filter.geoip/ipcidr` 继续用于实际选中的 main / fallback 路径。TXT / MX / HTTPS 等原本不用 fallback 的查询，不把闲置 fallback 算作拒绝动作的例外。
+| 业务选择 | 命中 policy 后使用的池 |
+| --- | --- |
+| 代理出口 | policy 完整替换 main / fallback |
+| DIRECT / Compatible，没有 `direct-nameserver` | policy 完整替换 main / fallback |
+| DIRECT / Compatible，有直连池，`direct-nameserver-follow-policy: false`（默认） | 继续使用直连池 |
+| DIRECT / Compatible，有直连池，`direct-nameserver-follow-policy: true` | policy 完整替换直连池 |
+
+例如内网解析器必须直连时，可显式指定它的出口；该设置不会把对应网站连接改为 DIRECT：
+
+```yaml
+dns:
+  nameserver-policy:
+    "+.corp.example": "10.0.0.53#DIRECT"
+  direct-nameserver-follow-policy: true
+```
+
+每轮查询只匹配一次 policy，并冻结实际池；能力判定、独立上游选路、答案缓存、在途合并、预取及测速都使用这个结果。私有 policy 池或直连池失败不会转向公共 main / fallback。策略使用 `rule-set:` 或 `geosite:` 时会正常加载并校验引用；升级前曾被忽略的无效条目需要修正。预取会重新检查当前策略，实际池已变化时停止旧作用域的预取，等待该作用域出现新的真实请求。
+
+开启 `dns-rule-routing` 时，只有 `fallback-filter.domain` / `fallback-filter.geosite` 继续停用，不加载这两个字段专属的 geosite 条件。它们不会因切到 Global / Direct 而恢复；关闭开关并完整重载后恢复原语义。`fallback-lazy-query`、`fallback-filter.geoip/ipcidr` 继续用于未被 policy 覆盖的实际 main / fallback 路径。TXT / MX / HTTPS 等原本不用 fallback 的查询，不把闲置 fallback 算作拒绝动作的例外。
 
 hosts、系统 hosts、回答类型控制、`proxy-server-nameserver-policy` 等原有基础能力仍保留。该功能不是 SmartDNS 全部配置或行为的兼容实现。
 
 ## DNS 上游连接独立选路
 
-顶层 `dns-upstream-rule-routing` 从 `1.0.25` 起提供，默认 `false`，仅在 Rule 模式对内置 DNS 的自动上游生效。它匹配 DNS 服务器自己的域名、引导解析得到的真实 IP、实际端口和配置对应的传输类型，再冻结该服务器本次使用的实际出口。UDP / TCP 任意端口、DoT、DoH（含 HTTP/3）和 DoQ 都适用；原有 TLS SNI、证书校验、HTTP Host、URL 与 ECS 参数保留。
+从 `1.0.29` 起，同时开启顶层 `dns-rule-routing` 和 `dns.respect-rules`，即可在 Rule 模式让内置 DNS 的自动上游按解析器自身地址独立选路。它匹配 DNS 服务器自己的域名、引导解析得到的真实 IP、实际端口和配置对应的传输类型，再冻结该服务器本次使用的实际出口。UDP / TCP 任意端口、DoT、DoH（含 HTTP/3）和 DoQ 都适用；原有 TLS SNI、证书校验、HTTP Host、URL 与 ECS 参数保留。
 
-两个顶层开关分别控制业务选池和 DNS 连接：
-
-| `dns-rule-routing` | `dns-upstream-rule-routing` | Rule 模式的行为 |
+| `dns-rule-routing`（顶层） | `dns.respect-rules` | Rule 模式的行为 |
 | --- | --- | --- |
-| `false` | `false` | 原有 DNS 池、策略与传输配置 |
+| `false` | `false` | 原生 DNS 池、策略与传输配置 |
+| `false` | `true` | 原生 respect-rules 行为及适用范围；不启用业务选池或扩展到所有自动池 |
 | `true` | `false` | 按业务域名选池，自动 DNS 传输继承业务实际出口 |
-| `false` | `true` | 保留原有 DNS 选池和域名策略，只让自动 DNS 连接按解析器地址匹配规则；不会单独开启业务 DIRECT 测速 |
-| `true` | `true` | 按业务域名选池及执行拒绝 / 测速策略，DNS 连接再按解析器地址选择独立出口 |
+| `true` | `true` | 按业务域名选池及执行拒绝 / 测速策略，自动 DNS 连接再按解析器地址选择独立出口 |
+
+旧顶层 `dns-upstream-rule-routing` 已删除，不保留兼容别名。请删除旧键，按上表设置后完整重载。已有 `dns-rule-routing: true`、`respect-rules: true` 的历史配置，如果以前依赖 DNS 继承业务出口，需明确改为 `respect-rules: false`；无法仅根据旧 YAML 自动判断这个意图。过去 `dns-rule-routing: false` 加旧独立开关的全池独立行为没有同义替代：保持业务分流关闭时使用原生 respect-rules 范围，必要的 direct / default 等出口需显式配置。
 
 下面是合并到现有配置的片段。`Proxy` 表示已经存在的代理策略组或节点，需替换为自己的名称；域名、IP 和 ECS 网段都是文档示例，需替换为实际可达且支持相应参数的 DNS 服务：
 
 ```yaml
 mode: rule
 dns-rule-routing: true
-dns-upstream-rule-routing: true
 dns:
   enable: true
+  respect-rules: true
   default-nameserver: [192.0.2.53]
   proxy-server-nameserver: [192.0.2.53]
   direct-nameserver:
@@ -235,11 +250,11 @@ DNS 连接使用完整的普通规则匹配，可使用域名、`IP-CIDR` / `IP-
 
 `NETWORK` 依据配置对应的传输类型建立一次计划：普通 UDP、DoQ 和强制 `#h3=true` 的 DoH 按 UDP，TCP、DoT 及可协商 HTTP/1.1、HTTP/2、HTTP/3 的 DoH 按 TCP。后续协商到 HTTP/3 或由 UDP 截断重试 TCP 时沿用已冻结出口，不按新协议再次选路；实际使用 UDP 时仍检查该出口的 UDP 能力。
 
-自动范围覆盖业务解析所用的 `nameserver`、`direct-nameserver`、适用的 `fallback` 和 `default-nameserver`。`#Group`、`#DIRECT`、`#interface` 及显式适配器优先，保留其既有传输配置；`#RULES` 仍属于自动范围。`proxy-server-nameserver`、其 policy 和节点的根 bootstrap 不被新开关接管，继续按原配置解析节点及解析器自身域名，避免代理连接依赖自身 DNS 的循环。Global / Direct 模式保持原 DNSDialer / `respect-rules` 行为。
+自动范围覆盖实际选中的 `nameserver`、`nameserver-policy`、`direct-nameserver`、适用的 `fallback` 和业务 `default-nameserver`。`#Group`、`#DIRECT`、`#interface` 及显式适配器优先，保留其既有传输配置；`#RULES` 仍属于自动范围。`proxy-server-nameserver`、其 policy 和节点的根 bootstrap 不被业务独立选路接管，继续按原配置解析节点及解析器自身域名，避免代理连接依赖自身 DNS 的循环。Global / Direct 模式保持原 DNSDialer / `respect-rules` 行为。
 
 准备本次路由与缓存作用域时，只读取字面 IP、hosts 或仍新鲜的 bootstrap 缓存，不发起网络解析。尚未知地址的解析器在实际参与交换的分支中才引导解析，不要求健康上游等待其他服务器，未使用的 lazy fallback 也不会提前解析。只要本次相关上游尚未全部冻结，整轮查询就保守地跳过共享答案缓存、候选缓存和双栈比较缓存的读写，也不登记预取；正常网络查询与答案处理继续运行。后续查询在 bootstrap 缓存新鲜、相关上游均可确定时恢复缓存复用。持续无法解析的服务器可能使包含它的整个组合持续降低缓存命中率；这不会用另一条旧路由的缓存补齐未知身份。
 
-修改任一顶层开关都需完整重载配置。`GET /configs` 返回已生效值，`PATCH /configs` 不接受这两个字段；使用 `PUT /configs` 或原有完整重载入口应用。
+修改 `dns-rule-routing`、`dns.respect-rules` 或 DNS 池 / policy 都需完整重载配置。`GET /configs` 返回顶层 `dns-rule-routing`，不再返回旧独立开关；`PATCH /configs` 不用于修改这些 DNS 配置，使用 `PUT /configs` 或原有完整重载入口应用。
 
 ## 可选 IP 测速
 
@@ -489,7 +504,7 @@ payload:
 
 关闭一条这样的逻辑查询会中断该交换，不关闭同一 HTTP/2 或 QUIC 连接上的其他查询，也不触发该查询的自动重试或后台刷新。正常完成后逻辑记录离开活动列表，共享传输可以继续存在。经普通代理转发的 DNS 显示为普通连接，不再生成逐查询 QNAME 记录。普通 SSH 的反向映射或嗅探显示不在本功能修改范围内。
 
-更改 `dns-rule-routing` 或 `dns-upstream-rule-routing` 应重新加载完整配置。`GET /configs` 返回生效值，`PATCH /configs` 不接受这两个字段；可通过原 `PUT /configs` 完整重载。省略任一开关等同于关闭该开关。DNS 接入使用已有 `dns.listen` 或显式 TUN DNS 劫持。
+更改 `dns-rule-routing`、`dns.respect-rules` 或 nameserver policy 应重新加载完整配置。`GET /configs` 仅保留顶层 `dns-rule-routing`，旧独立开关已移除；使用原 `PUT /configs` 完整重载。省略 `dns-rule-routing` 或 `dns.respect-rules` 分别等同于该项 `false`。DNS 接入使用已有 `dns.listen` 或显式 TUN DNS 劫持。
 
 完整配置重载（`PUT /configs` 或 SIGHUP）会重建当前配置的主、直连、节点域名和 bootstrap 解析器的答案缓存，以及候选缓存、测速和预取状态，即使 DNS 配置内容没有变化也一样。真实 IP → 域名映射按上述黑名单约束继承；fake-IP 有单独的继承与持久化逻辑。`PATCH /configs` 修改部分运行设置不等于完整重载，`force=true` 也不是“强制清空全部 DNS 缓存”的开关。客户端系统和浏览器自己的 DNS 缓存不受内核 reload 控制。
 

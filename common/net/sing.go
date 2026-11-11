@@ -76,17 +76,21 @@ func Relay(leftConn, rightConn net.Conn) {
 	go func() {
 		_, err := bufio.Copy(leftConn, rightConn)
 		if err == nil {
-			_ = closeWrite(leftConn)
-		} else {
+			err = closeWrite(leftConn)
+		}
+		if err != nil {
 			_ = leftConn.Close()
+			_ = rightConn.Close()
 		}
 		close(ch)
 	}()
 
 	_, err := bufio.Copy(rightConn, leftConn)
 	if err == nil {
-		_ = closeWrite(rightConn)
-	} else {
+		err = closeWrite(rightConn)
+	}
+	if err != nil {
+		_ = leftConn.Close()
 		_ = rightConn.Close()
 	}
 	<-ch

@@ -2,7 +2,6 @@
 # socks-port: 7891 # SOCKS5 代理端口
 mixed-port: 10801 # HTTP(S) 和 SOCKS 代理混合端口
 # dns-rule-routing: false # 内置 DNS 按查询域名选择上游池与出站；普通代理入站不自动接管目标 53 的 DNS
-# dns-upstream-rule-routing: false # Rule 模式下，DNS 连接独立按解析器域名/IP 匹配规则；与业务选池开关独立，完整重载生效
 # redir-port: 7892 # 透明代理端口，用于 Linux 和 MacOS
 
 # Transparent proxy server port for Linux (TProxy TCP and TProxy UDP)
@@ -313,11 +312,11 @@ dns:
 
   # use-hosts: true # 查询 hosts
 
-  # 配置后面的nameserver、fallback和nameserver-policy向dns服务器的连接过程是否遵守遵守rules规则
-  # 如果为false（默认值）则这三部分的dns服务器在未特别指定的情况下会直连
-  # 如果为true，将会按照rules的规则匹配链接方式（走代理或直连），如果有特别指定则任然以指定值为准
-  # 仅当proxy-server-nameserver非空时可以开启此选项, 强烈不建议和prefer-h3一起使用
-  # 此外，这三者配置中的dns服务器如果出现域名会采用default-nameserver配置项解析，也请确保正确配置default-nameserver
+  # DNS 服务器连接是否按规则选路，显式 #策略组/#DIRECT/#网卡 出口优先。
+  # dns-rule-routing=true 且 Rule 模式：false 继承业务出口；true 按解析器自身域名/IP 独立选路。
+  # dns-rule-routing=false：保留原生 nameserver/fallback/nameserver-policy 的 respect-rules 行为；
+  # 此原生模式开启 respect-rules 仍要求 proxy-server-nameserver 非空，不扩展到 direct/default 池。
+  # 解析器域名由 default-nameserver 引导；修改后完整重载。旧 dns-upstream-rule-routing 已移除。
   respect-rules: false
 
   # DNS 主要域名配置
@@ -344,7 +343,8 @@ dns:
   #   - tcp://1.1.1.1
   #   - 'tcp://1.1.1.1#ProxyGroupName' # 指定 DNS 过代理查询，ProxyGroupName 为策略组名或节点名，过代理配置优先于配置出口网卡，当找不到策略组或节点名则设置为出口网卡
 
-  # 专用于节点域名解析的 DNS 服务器，非必要配置项，如果不填则遵循nameserver-policy、nameserver和fallback的配置
+  # 专用于节点域名解析。dns-rule-routing=true 时，未配置则使用独立 default-nameserver；
+  # 未开启业务分流时保留原生 nameserver-policy/nameserver/fallback 行为。
   # proxy-server-nameserver:
   #   - https://doh.pub/dns-query
   #   - tls://223.5.5.5:853
@@ -354,9 +354,9 @@ dns:
   # 专用于direct出口域名解析的 DNS 服务器，非必要配置项，如果不填则遵循nameserver-policy、nameserver和fallback的配置
   # direct-nameserver:
   #   - system://
-  # direct-nameserver-follow-policy: false # 是否遵循nameserver-policy，默认为不遵守，仅当direct-nameserver不为空时生效
+  # direct-nameserver-follow-policy: false # 有直连池时是否由 nameserver-policy 覆盖；没有直连池仍使用主 policy
 
-  # 配置 fallback 使用条件
+  # 配置 fallback 使用条件；dns-rule-routing=true 时仅 domain/geosite 条件停用
   # fallback-filter:
   #   geoip: true    # 配置是否使用 geoip
   #   geoip-code: CN # 当 nameserver 解析出域名的 IP 查询 geoip 库为 CN 时， 使用 nameserver 中的 DNS 查询结果
@@ -374,6 +374,7 @@ dns:
   # fallback-lazy-query: false # 默认值为 false ，如果为 true 会先判断来自 nameserver 的结果是否满足 fallback-filter 后再发起查询
 
   # 配置查询域名使用的 DNS 服务器
+  # 业务分流开启时也生效，只覆盖 DNS 池；私有池失败不会查询公共 main/fallback。
   nameserver-policy:
     #   'www.baidu.com': '114.114.114.114'
     #   '+.internal.crop.com': '10.0.0.1'

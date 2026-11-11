@@ -376,7 +376,17 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.28
+              printf '%s\n\n' '## 本次更新：1.0.29
+
+          - 实现 #74：移除顶层 dns-upstream-rule-routing，统一使用 dns.respect-rules。开启 dns-rule-routing 时，respect-rules=false 让 DNS 连接继承业务出口，true 让自动 DNS 上游按解析器自身地址独立选路；关闭 dns-rule-routing 时保留原生 respect-rules 行为。旧开关不再兼容，请直接修改 YAML 后完整重载。
+          - 实现 #76：在自动 DNS 分流中支持 nameserver-policy 与 direct-nameserver-follow-policy。策略只覆盖解析服务器，保留业务出口和显式 DNS 出口优先级；私有解析池失败不转向公共池，缓存、预取和上游选路使用同一实际池。
+          - 接通 TCP 建连成功和失败反馈：mips / gVisor TUN 和 SOCKS CONNECT 支持延迟确认，TProxy / Redir / system / mixed TCP 在首次关闭前处理失败。AnyTLS、Hysteria2、sing-mux 使用现有协议失败回复，不修改协议格式。
+          - 保留 HTTP CONNECT 提前 200、普通 HTTP 502 和 REJECT-DROP；支持 CloseWrite 的 TCP 路径保留正常半关闭，其他协议保持各自关闭语义，异常复制及时结束两端。嗅探读取可能提前接受连接，已接受的系统 TCP 不能还原成 SYN 阶段的拒绝；本次不扩展 UDP 错误协议，也不保证解决特定应用的安全错误。
+          - 当前 mipstack 在连接已被嗅探提前接受后，异常关闭仍可能先发 FIN 再发 RST；本轮保留固定栈依赖，未将该情况宣称为精确错误还原。未接受的 SYN 失败直接拒绝，静默 DROP 保持不响应。
+
+          [配置与边界](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.29/docs/dns-proxy.md) · [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.29/docs/releases.md)
+
+          ## 1.0.28
 
           - 修复 Windows 强制结束内核后，已离场的软件设备别名残留导致反复启动失败的问题。创建时使用稳定的本产品专属 GUID 和设备类型；仅当实际 GUID、别名、精确软件设备实例及原生属性全部匹配，而且 Windows 明确确认不在场时，才通过普通创建重新枚举同一个实例。
           - 活动、外部及身份不明的网卡仍返回冲突，不打开接管、不删除、不改名，也不主动调用全局孤儿设备清理。Windows 同实例单句柄规则仲裁并发拥有者；同名预检查不原子保留全系统名称。旧 Meta/通用 GUID 残留无法证明归属，请正常停止原内核后升级，或选择未占用的 tun.device 名称。

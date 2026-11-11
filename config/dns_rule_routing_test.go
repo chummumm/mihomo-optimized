@@ -44,7 +44,7 @@ func TestDNSRuleRoutingConfig(t *testing.T) {
 	}
 }
 
-func TestDNSRuleRoutingIgnoresBusinessPoliciesBeforeLoading(t *testing.T) {
+func TestDNSRuleRoutingKeepsNameserverPoliciesWithoutLoadingDomainFallback(t *testing.T) {
 	raw, err := UnmarshalRawConfig([]byte(`
 dns-rule-routing: true
 dns:
@@ -53,7 +53,7 @@ dns:
   fallback: [1.1.1.1]
   default-nameserver: [9.9.9.9]
   nameserver-policy:
-    "rule-set:missing-provider": 8.8.8.8
+    "+.private.example": 8.8.8.8
   direct-nameserver: [127.0.0.1:6553]
   direct-nameserver-follow-policy: true
   proxy-server-nameserver: [9.9.9.9]
@@ -71,10 +71,10 @@ dns:
 	}
 	parsed, err := parseDNS(raw, nil)
 	if err != nil {
-		t.Fatalf("inactive policies were still evaluated: %v", err)
+		t.Fatalf("inactive domain fallback was still evaluated: %v", err)
 	}
-	if !parsed.DNSRuleRouting || len(parsed.NameServerPolicy) != 0 || parsed.DirectFollowPolicy || len(parsed.FallbackDomainFilter) != 0 {
-		t.Fatalf("business policies remain active: %+v", parsed)
+	if !parsed.DNSRuleRouting || len(parsed.NameServerPolicy) != 1 || !parsed.DirectFollowPolicy || len(parsed.FallbackDomainFilter) != 0 {
+		t.Fatalf("nameserver policy or domain fallback activation changed: %+v", parsed)
 	}
 	if len(parsed.NameServer) != 1 || len(parsed.Fallback) != 1 || !parsed.FallbackLazyQuery || len(parsed.FallbackIPFilter) != 1 || len(parsed.DirectNameServer) != 1 || len(parsed.ProxyServerPolicy) != 1 {
 		t.Fatalf("unrelated resolver settings were discarded: %+v", parsed)
@@ -84,11 +84,11 @@ dns:
 	}
 	raw.DNSRuleRouting = false
 	if _, err := parseDNS(raw, nil); err == nil {
-		t.Fatal("switching off did not restore policy validation")
+		t.Fatal("switching off did not restore domain fallback validation")
 	}
 }
 
-func TestDNSRuleRoutingRestoresValidPoliciesWhenDisabled(t *testing.T) {
+func TestDNSRuleRoutingPreservesValidNameserverPoliciesAcrossReloads(t *testing.T) {
 	raw, err := UnmarshalRawConfig([]byte(`
 dns-rule-routing: true
 dns:
@@ -117,8 +117,27 @@ dns:
 		if enabled {
 			want = 0
 		}
-		if len(parsed.NameServerPolicy) != want || len(parsed.FallbackDomainFilter) != want || parsed.DirectFollowPolicy == enabled {
-			t.Fatalf("policy restoration failed, flag=%v: %+v", enabled, parsed)
+		if len(parsed.NameServerPolicy) != 1 || len(parsed.FallbackDomainFilter) != want || !parsed.DirectFollowPolicy {
+			t.Fatalf("policy selection failed, flag=%v: %+v", enabled, parsed)
+		}
+	}
+}
+
+func TestDNSRuleRoutingValidatesNameserverPolicyProviders(t *testing.T) {
+	raw, err := UnmarshalRawConfig([]byte(`
+dns:
+  nameserver: [192.0.2.53]
+  default-nameserver: [192.0.2.54]
+  nameserver-policy:
+    "rule-set:missing-provider": 192.0.2.55
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, enabled := range []bool{false, true} {
+		raw.DNSRuleRouting = enabled
+		if _, err := parseDNS(raw, nil); err == nil || !strings.Contains(err.Error(), "missing-provider") {
+			t.Fatalf("flag=%v did not validate the active nameserver policy: %v", enabled, err)
 		}
 	}
 }
@@ -169,7 +188,7 @@ dns:
   default-nameserver: [192.0.2.54]
   respect-rules: true
   nameserver-policy:
-    'rule-set:inactive-missing-provider': 192.0.2.55
+    '+.private.example': 192.0.2.55
 `))
 			if err != nil {
 				t.Fatal(err)
@@ -192,7 +211,7 @@ dns:
 				if !parsed.FakeIPSkipper.ShouldSkipped("real.example") || parsed.FakeIPSkipper.ShouldSkipped("fake.example") {
 					t.Fatal("parsing changed the fake-ip-filter decision")
 				}
-				if len(parsed.NameServerPolicy) != 0 || len(parsed.NameServer) != 1 || len(parsed.DirectNameServer) != 1 || len(parsed.DefaultNameserver) != 1 {
+				if len(parsed.NameServerPolicy) != 1 || len(parsed.NameServer) != 1 || len(parsed.DirectNameServer) != 1 || len(parsed.DefaultNameserver) != 1 {
 					t.Fatal("FakeIP changed the real resolver pools or rule-routing policy")
 				}
 				general, err := parseGeneral(raw)

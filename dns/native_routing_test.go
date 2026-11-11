@@ -211,8 +211,9 @@ func TestDNSRuleRoutingNativePriorityAndLegacyDirectResolver(t *testing.T) {
 	nativeRoutingTestDestination(t, leaf, "198.51.100.53")
 	for _, mode := range []tunnel.TunnelMode{tunnel.Global, tunnel.Direct} {
 		tunnel.SetMode(mode)
-		ctx, _, err := rs.Resolver.prepareDNSRouting(routingTestContext(leaf, routingTestOrigin()), routingTestQuery("mode.example", 8))
-		main, _ := rs.Resolver.dnsQueryServers(ctx)
+		query := routingTestQuery("mode.example", 8)
+		ctx, _, err := rs.Resolver.prepareDNSRouting(routingTestContext(leaf, routingTestOrigin()), query)
+		main, _ := rs.Resolver.dnsQueryServers(ctx, query)
 		if err != nil || queryRoute(ctx) != nil || main[0] != rs.Resolver.main[0] {
 			t.Fatalf("mode %s activated native DNS pool selection", mode)
 		}

@@ -207,7 +207,7 @@ func ApplyConfig(cfg *config.Config, force bool) error {
 	// candidate config: the DNS routing flag and resolver policy change together.
 	tunnel.SetDNSRuleRouting(cfg.General.DNSRuleRouting)
 	if cfg.General.DNSRuleRouting {
-		log.Infoln("DNS rule routing enabled; nameserver-policy and domain fallback policies are inactive")
+		log.Infoln("DNS rule routing enabled; nameserver-policy overrides the selected DNS pool; domain fallback policies are inactive")
 	}
 	updateDNS(cfg.DNS, cfg.General.IPv6)
 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
@@ -259,10 +259,9 @@ func GetGeneral() *config.General {
 	if auth := authStore.Default.Authenticator(); auth != nil {
 		authenticator = auth.Users()
 	}
-	var proxyForceIP, dnsUpstreamRuleRouting bool
+	var proxyForceIP bool
 	if applied := CurrentUpdateConfiguration(); applied != nil {
 		proxyForceIP = applied.General.ProxyForceIP
-		dnsUpstreamRuleRouting = applied.General.DNSUpstreamRuleRouting
 	}
 
 	general := &config.General{
@@ -285,16 +284,15 @@ func GetGeneral() *config.General {
 			InboundTfo:        inbound.Tfo(),
 			InboundMPTCP:      inbound.MPTCP(),
 		},
-		DNSRuleRouting:         tunnel.DNSRuleRoutingEnabled(),
-		DNSUpstreamRuleRouting: dnsUpstreamRuleRouting,
-		ProxyForceIP:           proxyForceIP,
-		Mode:                   tunnel.Mode(),
-		UnifiedDelay:           adapter.UnifiedDelay.Load(),
-		LogLevel:               log.Level(),
-		IPv6:                   !resolver.DisableIPv6,
-		Interface:              dialer.DefaultInterface.Load(),
-		RoutingMark:            int(dialer.DefaultRoutingMark.Load()),
-		TransparentProxy:       transparentproxy.CurrentConfig(),
+		DNSRuleRouting:   tunnel.DNSRuleRoutingEnabled(),
+		ProxyForceIP:     proxyForceIP,
+		Mode:             tunnel.Mode(),
+		UnifiedDelay:     adapter.UnifiedDelay.Load(),
+		LogLevel:         log.Level(),
+		IPv6:             !resolver.DisableIPv6,
+		Interface:        dialer.DefaultInterface.Load(),
+		RoutingMark:      int(dialer.DefaultRoutingMark.Load()),
+		TransparentProxy: transparentproxy.CurrentConfig(),
 		GeoXUrl: config.GeoXUrl{
 			GeoIp:   geodata.GeoIpUrl(),
 			Mmdb:    geodata.MmdbUrl(),
@@ -408,7 +406,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		resolver.DefaultService = nil
 		resolver.ProxyServerHostResolver = nil
 		resolver.DirectHostResolver = nil
-		if c.DNSRuleRouting || c.DNSUpstreamRuleRouting {
+		if c.DNSRuleRouting {
 			// Keep proxy-host bootstrap independent of business DNS, including
 			// when the local DNS service is disabled.
 			r := dns.NewResolver(dns.Config{
@@ -434,7 +432,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 	ipv6 := c.IPv6 && generalIPv6
 	r := dns.NewResolver(dns.Config{
 		RuleRouting:          c.DNSRuleRouting,
-		UpstreamRuleRouting:  c.DNSUpstreamRuleRouting,
+		UpstreamRuleRouting:  c.UpstreamRuleRouting,
 		Main:                 c.NameServer,
 		Fallback:             c.Fallback,
 		IPv6:                 ipv6,
@@ -482,7 +480,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 
 	if r.ProxyResolver.Invalid() {
 		resolver.ProxyServerHostResolver = r.ProxyResolver
-	} else if c.DNSRuleRouting || c.DNSUpstreamRuleRouting {
+	} else if c.DNSRuleRouting {
 		resolver.ProxyServerHostResolver = r.BootstrapResolver
 	} else {
 		resolver.ProxyServerHostResolver = r.Resolver

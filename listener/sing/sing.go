@@ -104,6 +104,14 @@ func (h *ListenerHandler) IsSpecialFqdn(fqdn string) bool {
 }
 
 func (h *ListenerHandler) ParseSpecialFqdn(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+	if !h.IsSpecialFqdn(metadata.Destination.Fqdn) {
+		return errors.New("not special fqdn")
+	}
+	// These requests enter a local mux or packet service instead of the TCP
+	// dial path. Acknowledge that service before it starts reading its protocol.
+	if err := network.ReportHandshakeSuccess(conn); err != nil {
+		return err
+	}
 	switch metadata.Destination.Fqdn {
 	case mux.Destination.Fqdn:
 		return h.muxService.NewConnection(ctx, conn, UpstreamMetadata(metadata))

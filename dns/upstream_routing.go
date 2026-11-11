@@ -105,14 +105,7 @@ func (r *Resolver) prepareDNSUpstreamRouting(ctx context.Context, message *D.Msg
 		return ctx, nil
 	}
 	state := &dnsUpstreamRoute{plans: make(map[*dnsDialer]*dnsUpstreamPlan), systems: make(map[*systemClient]dnsSystemUpstreams), cacheable: true}
-	main, fallback := r.dnsQueryServers(ctx)
-	if matched := r.matchPolicy(message); len(matched) != 0 {
-		main, fallback = matched, nil
-	} else if !isIPRequest(message.Question[0]) {
-		fallback = nil
-	} else if len(fallback) != 0 && r.shouldOnlyQueryFallback(message) {
-		main, fallback = fallback, nil
-	}
+	main, fallback := r.dnsQueryServers(ctx, message)
 	var dialers []*dnsDialer
 	var identities []string
 	seen := make(map[*dnsDialer]bool)

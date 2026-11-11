@@ -51,7 +51,6 @@ import (
 type General struct {
 	Inbound
 	DNSRuleRouting           bool                    `json:"dns-rule-routing"`
-	DNSUpstreamRuleRouting   bool                    `json:"dns-upstream-rule-routing"`
 	ProxyForceIP             bool                    `json:"proxy-force-ip"`
 	Mode                     T.TunnelMode            `json:"mode"`
 	UnifiedDelay             bool                    `json:"unified-delay"`
@@ -157,42 +156,42 @@ type NTP struct {
 
 // DNS config
 type DNS struct {
-	DNSRuleRouting         bool
-	DNSUpstreamRuleRouting bool
-	Enable                 bool
-	Observability          bool
-	PreferH3               bool
-	IPv6                   bool
-	IPv6Timeout            uint
-	UseHosts               bool
-	UseSystemHosts         bool
-	NameServer             []dns.NameServer
-	Fallback               []dns.NameServer
-	FallbackIPFilter       []C.IpMatcher
-	FallbackDomainFilter   []C.DomainMatcher
-	FallbackLazyQuery      bool
-	Listen                 string
-	ListenRoutingMark      int
-	EnhancedMode           C.DNSMode
-	RedirHostFilter        *trie.DomainSet
-	DefaultNameserver      []dns.NameServer
-	CacheAlgorithm         string
-	CacheMaxSize           int
-	SpeedCheck             dns.SpeedCheckConfig
-	CacheOptions           *dns.CacheOptions
-	AnswerPolicy           dns.AnswerPolicy
-	DualStack              dns.DualStackConfig
-	FakeIPRange            netip.Prefix
-	FakeIPPool             *fakeip.Pool
-	FakeIPRange6           netip.Prefix
-	FakeIPPool6            *fakeip.Pool
-	FakeIPSkipper          *fakeip.Skipper
-	FakeIPTTL              int
-	NameServerPolicy       []dns.Policy
-	ProxyServerNameserver  []dns.NameServer
-	ProxyServerPolicy      []dns.Policy
-	DirectNameServer       []dns.NameServer
-	DirectFollowPolicy     bool
+	DNSRuleRouting        bool
+	UpstreamRuleRouting   bool // derived from DNSRuleRouting && dns.respect-rules
+	Enable                bool
+	Observability         bool
+	PreferH3              bool
+	IPv6                  bool
+	IPv6Timeout           uint
+	UseHosts              bool
+	UseSystemHosts        bool
+	NameServer            []dns.NameServer
+	Fallback              []dns.NameServer
+	FallbackIPFilter      []C.IpMatcher
+	FallbackDomainFilter  []C.DomainMatcher
+	FallbackLazyQuery     bool
+	Listen                string
+	ListenRoutingMark     int
+	EnhancedMode          C.DNSMode
+	RedirHostFilter       *trie.DomainSet
+	DefaultNameserver     []dns.NameServer
+	CacheAlgorithm        string
+	CacheMaxSize          int
+	SpeedCheck            dns.SpeedCheckConfig
+	CacheOptions          *dns.CacheOptions
+	AnswerPolicy          dns.AnswerPolicy
+	DualStack             dns.DualStackConfig
+	FakeIPRange           netip.Prefix
+	FakeIPPool            *fakeip.Pool
+	FakeIPRange6          netip.Prefix
+	FakeIPPool6           *fakeip.Pool
+	FakeIPSkipper         *fakeip.Skipper
+	FakeIPTTL             int
+	NameServerPolicy      []dns.Policy
+	ProxyServerNameserver []dns.NameServer
+	ProxyServerPolicy     []dns.Policy
+	DirectNameServer      []dns.NameServer
+	DirectFollowPolicy    bool
 }
 
 // Profile config
@@ -454,7 +453,6 @@ type RawConfig struct {
 	TProxyPort                    int                `yaml:"tproxy-port" json:"tproxy-port"`
 	MixedPort                     int                `yaml:"mixed-port" json:"mixed-port"`
 	DNSRuleRouting                bool               `yaml:"dns-rule-routing" json:"dns-rule-routing"`
-	DNSUpstreamRuleRouting        bool               `yaml:"dns-upstream-rule-routing" json:"dns-upstream-rule-routing"`
 	ProxyForceIP                  bool               `yaml:"proxy-force-ip" json:"proxy-force-ip"`
 	ShadowSocksConfig             string             `yaml:"ss-config" json:"ss-config"`
 	VmessConfig                   string             `yaml:"vmess-config" json:"vmess-config"`
@@ -905,16 +903,15 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 			InboundTfo:        cfg.InboundTfo,
 			InboundMPTCP:      cfg.InboundMPTCP,
 		},
-		DNSRuleRouting:         cfg.DNSRuleRouting,
-		DNSUpstreamRuleRouting: cfg.DNSUpstreamRuleRouting,
-		ProxyForceIP:           cfg.ProxyForceIP,
-		UnifiedDelay:           cfg.UnifiedDelay,
-		Mode:                   cfg.Mode,
-		LogLevel:               cfg.LogLevel,
-		IPv6:                   cfg.IPv6,
-		Interface:              cfg.Interface,
-		RoutingMark:            cfg.RoutingMark,
-		TransparentProxy:       cfg.TransparentProxy.Clone(),
+		DNSRuleRouting:   cfg.DNSRuleRouting,
+		ProxyForceIP:     cfg.ProxyForceIP,
+		UnifiedDelay:     cfg.UnifiedDelay,
+		Mode:             cfg.Mode,
+		LogLevel:         cfg.LogLevel,
+		IPv6:             cfg.IPv6,
+		Interface:        cfg.Interface,
+		RoutingMark:      cfg.RoutingMark,
+		TransparentProxy: cfg.TransparentProxy.Clone(),
 		GeoXUrl: GeoXUrl{
 			GeoIp:   cfg.GeoXUrl.GeoIp,
 			Mmdb:    cfg.GeoXUrl.Mmdb,
@@ -1565,8 +1562,6 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 	if rawCfg.DNSRuleRouting {
 		// Work on a copy: disabling the feature on the next full reload must
 		// restore the user's original resolver policy, not a mutated config.
-		cfg.NameServerPolicy = nil
-		cfg.DirectNameServerFollowPolicy = false
 		cfg.FallbackFilter.Domain = nil
 		cfg.FallbackFilter.GeoSite = nil
 		// Hosts and FakeIP answer before the real resolver. Queries which need
@@ -1576,30 +1571,30 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		return nil, fmt.Errorf("if DNS configuration is turned on, NameServer cannot be empty")
 	}
 
-	if cfg.RespectRules && len(cfg.ProxyServerNameserver) == 0 && !rawCfg.DNSRuleRouting && !rawCfg.DNSUpstreamRuleRouting {
+	if cfg.RespectRules && len(cfg.ProxyServerNameserver) == 0 && !rawCfg.DNSRuleRouting {
 		return nil, fmt.Errorf("if “respect-rules” is turned on, “proxy-server-nameserver” cannot be empty")
 	}
 
 	dnsCfg := &DNS{
-		DNSRuleRouting:         rawCfg.DNSRuleRouting,
-		DNSUpstreamRuleRouting: rawCfg.DNSUpstreamRuleRouting,
-		Enable:                 cfg.Enable,
-		Observability:          cfg.Observability == nil || *cfg.Observability,
-		Listen:                 cfg.Listen,
-		ListenRoutingMark:      cfg.ListenRoutingMark,
-		PreferH3:               cfg.PreferH3,
-		IPv6Timeout:            cfg.IPv6Timeout,
-		IPv6:                   cfg.IPv6,
-		UseHosts:               cfg.UseHosts,
-		UseSystemHosts:         cfg.UseSystemHosts,
-		EnhancedMode:           cfg.EnhancedMode,
-		RedirHostFilter:        redirHostFilter,
-		CacheAlgorithm:         cfg.CacheAlgorithm,
-		CacheMaxSize:           cfg.CacheMaxSize,
-		SpeedCheck:             speedCheck,
-		CacheOptions:           cacheOptions,
-		AnswerPolicy:           answerPolicy,
-		DualStack:              dualStack,
+		DNSRuleRouting:      rawCfg.DNSRuleRouting,
+		UpstreamRuleRouting: rawCfg.DNSRuleRouting && cfg.RespectRules,
+		Enable:              cfg.Enable,
+		Observability:       cfg.Observability == nil || *cfg.Observability,
+		Listen:              cfg.Listen,
+		ListenRoutingMark:   cfg.ListenRoutingMark,
+		PreferH3:            cfg.PreferH3,
+		IPv6Timeout:         cfg.IPv6Timeout,
+		IPv6:                cfg.IPv6,
+		UseHosts:            cfg.UseHosts,
+		UseSystemHosts:      cfg.UseSystemHosts,
+		EnhancedMode:        cfg.EnhancedMode,
+		RedirHostFilter:     redirHostFilter,
+		CacheAlgorithm:      cfg.CacheAlgorithm,
+		CacheMaxSize:        cfg.CacheMaxSize,
+		SpeedCheck:          speedCheck,
+		CacheOptions:        cacheOptions,
+		AnswerPolicy:        answerPolicy,
+		DualStack:           dualStack,
 	}
 	if dnsCfg.NameServer, err = parseNameServer(cfg.NameServer, cfg.RespectRules, cfg.PreferH3); err != nil {
 		return nil, err

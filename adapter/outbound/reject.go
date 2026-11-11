@@ -101,6 +101,8 @@ func NewPassRule() *Reject {
 
 type nopConn struct{}
 
+func (nopConn) Rejection() C.AdapterType { return C.Reject }
+
 func (rw nopConn) Read(b []byte) (int, error) { return 0, io.EOF }
 
 func (rw nopConn) ReadBuffer(buffer *buf.Buffer) error { return io.EOF }
@@ -134,6 +136,8 @@ func (npc nopPacketConn) SetReadDeadline(time.Time) error  { return nil }
 func (npc nopPacketConn) SetWriteDeadline(time.Time) error { return nil }
 
 type dropConn struct{}
+
+func (dropConn) Rejection() C.AdapterType { return C.RejectDrop }
 
 func (rw dropConn) Read(b []byte) (int, error) { return 0, io.EOF }
 func (rw dropConn) ReadBuffer(buffer *buf.Buffer) error {

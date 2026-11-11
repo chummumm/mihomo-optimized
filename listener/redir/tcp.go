@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/keepalive"
 	C "github.com/metacubex/mihomo/constant"
 )
@@ -91,7 +92,7 @@ func newListener(addr string, tunnel C.Tunnel, managed bool, additions ...inboun
 func handleRedir(conn net.Conn, tunnel C.Tunnel, additions ...inbound.Addition) {
 	target, err := parserPacket(conn)
 	if err != nil {
-		conn.Close()
+		_ = N.CloseOnHandshakeFailure(conn, err)
 		return
 	}
 	keepalive.TCPKeepAlive(conn)

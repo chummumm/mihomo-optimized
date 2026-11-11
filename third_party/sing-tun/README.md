@@ -4,6 +4,15 @@ Simple transparent proxy library.
 
 For Linux, Windows, macOS and iOS.
 
+## Mihomo Optimized patches
+
+This pinned copy includes the Windows ownership fixes and deferred TCP
+handshakes documented in [MIHOMO_PATCH.md](MIHOMO_PATCH.md). Pending mips/gvisor
+connections reject failed outbounds with RST, while an explicit drop leaves the
+SYN unanswered. Sniffing can accept a connection early; the pinned mipstack may
+then emit FIN followed by RST on an abortive close. This is an existing stack
+boundary, not a promise to reproduce the remote operating system's error.
+
 ## License
 
 ```

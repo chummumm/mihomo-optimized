@@ -40,32 +40,31 @@ func configRouter() http.Handler {
 }
 
 type configSchema struct {
-	Port                   *int                     `json:"port"`
-	SocksPort              *int                     `json:"socks-port"`
-	RedirPort              *int                     `json:"redir-port"`
-	TProxyPort             *int                     `json:"tproxy-port"`
-	MixedPort              *int                     `json:"mixed-port"`
-	DNSRuleRouting         *bool                    `json:"dns-rule-routing"`
-	DNSUpstreamRuleRouting *bool                    `json:"dns-upstream-rule-routing"`
-	TransparentProxy       *transparentproxy.Config `json:"transparent-proxy"`
-	Tun                    *tunSchema               `json:"tun"`
-	TuicServer             *tuicServerSchema        `json:"tuic-server"`
-	ShadowSocksConfig      *string                  `json:"ss-config"`
-	VmessConfig            *string                  `json:"vmess-config"`
-	TcptunConfig           *string                  `json:"tcptun-config"`
-	UdptunConfig           *string                  `json:"udptun-config"`
-	AllowLan               *bool                    `json:"allow-lan"`
-	SkipAuthPrefixes       *[]netip.Prefix          `json:"skip-auth-prefixes"`
-	LanAllowedIPs          *[]netip.Prefix          `json:"lan-allowed-ips"`
-	LanDisAllowedIPs       *[]netip.Prefix          `json:"lan-disallowed-ips"`
-	BindAddress            *string                  `json:"bind-address"`
-	Mode                   *tunnel.TunnelMode       `json:"mode"`
-	LogLevel               *log.LogLevel            `json:"log-level"`
-	IPv6                   *bool                    `json:"ipv6"`
-	Sniffing               *bool                    `json:"sniffing"`
-	TcpConcurrent          *bool                    `json:"tcp-concurrent"`
-	FindProcessMode        *process.FindProcessMode `json:"find-process-mode"`
-	InterfaceName          *string                  `json:"interface-name"`
+	Port              *int                     `json:"port"`
+	SocksPort         *int                     `json:"socks-port"`
+	RedirPort         *int                     `json:"redir-port"`
+	TProxyPort        *int                     `json:"tproxy-port"`
+	MixedPort         *int                     `json:"mixed-port"`
+	DNSRuleRouting    *bool                    `json:"dns-rule-routing"`
+	TransparentProxy  *transparentproxy.Config `json:"transparent-proxy"`
+	Tun               *tunSchema               `json:"tun"`
+	TuicServer        *tuicServerSchema        `json:"tuic-server"`
+	ShadowSocksConfig *string                  `json:"ss-config"`
+	VmessConfig       *string                  `json:"vmess-config"`
+	TcptunConfig      *string                  `json:"tcptun-config"`
+	UdptunConfig      *string                  `json:"udptun-config"`
+	AllowLan          *bool                    `json:"allow-lan"`
+	SkipAuthPrefixes  *[]netip.Prefix          `json:"skip-auth-prefixes"`
+	LanAllowedIPs     *[]netip.Prefix          `json:"lan-allowed-ips"`
+	LanDisAllowedIPs  *[]netip.Prefix          `json:"lan-disallowed-ips"`
+	BindAddress       *string                  `json:"bind-address"`
+	Mode              *tunnel.TunnelMode       `json:"mode"`
+	LogLevel          *log.LogLevel            `json:"log-level"`
+	IPv6              *bool                    `json:"ipv6"`
+	Sniffing          *bool                    `json:"sniffing"`
+	TcpConcurrent     *bool                    `json:"tcp-concurrent"`
+	FindProcessMode   *process.FindProcessMode `json:"find-process-mode"`
+	InterfaceName     *string                  `json:"interface-name"`
 }
 
 type tunSchema struct {
@@ -356,10 +355,6 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
 		if general.DNSRuleRouting != nil {
 			status = http.StatusBadRequest
 			return fmt.Errorf("dns-rule-routing requires a full configuration reload using PUT /configs")
-		}
-		if general.DNSUpstreamRuleRouting != nil {
-			status = http.StatusBadRequest
-			return fmt.Errorf("dns-upstream-rule-routing requires a full configuration reload using PUT /configs")
 		}
 		if general.TransparentProxy != nil {
 			status = http.StatusBadRequest

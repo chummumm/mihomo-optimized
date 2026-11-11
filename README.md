@@ -6,9 +6,11 @@
 
 [下载 Releases](https://github.com/chummumm/mihomo-optimized/releases) · [构建状态](https://github.com/chummumm/mihomo-optimized/actions/workflows/build.yml) · [完整配置说明](docs/dns-proxy.md) · [验证记录](docs/dns-rule-routing-validation.md)
 
+**1.0.29 更新：** [统一 DNS 配置与建连反馈](docs/releases.md#1029dns-配置统一与-tcp-建连反馈)。DNS 上游独立选路统一使用 `dns.respect-rules`，`nameserver-policy` 与直连池的 follow-policy 可在自动分流中使用；移除旧 `dns-upstream-rule-routing`，升级时请按下文迁移并完整重载。TCP 入站接通既有握手成功 / 失败反馈，协议与系统栈边界见发行说明。
+
 **1.0.28 修复：** [Windows TUN 强制退出后的恢复](docs/releases.md#1028windows-tun-强制退出后的恢复)，以创建时的产品专属身份和 Windows 明确的“不在场”设备状态，允许重新枚举本产品的同一个设备实例；活动实例、外部网卡及身份不明的旧残留仍返回冲突。包含 [1.0.26 的 Wi-Fi 切换与 TUN 恢复修复](docs/releases.md#1026wi-fi-切换与-windows-tun-恢复)；配套桌面 0.2.6 支持恢复期间及时停止。
 
-**1.0.25 新增：** [DNS 上游连接独立按规则选路](docs/dns-proxy.md#dns-上游连接独立选路)。顶层 `dns-upstream-rule-routing` 默认 `false`；在 Rule 模式开启后，业务域名仍可选择直连池及其 ECS，DNS 服务器自身的域名 / IP 则可通过规则走代理。该开关与 `dns-rule-routing` 独立，显式出口和节点引导解析保持原有边界，修改后需完整重载。
+[DNS 上游连接独立按规则选路](docs/dns-proxy.md#dns-上游连接独立选路)：在 Rule 模式同时开启 `dns-rule-routing` 与 `dns.respect-rules` 后，业务域名决定直连 / 代理池和可选 IP 优选，DNS 服务器自身的域名 / IP 决定传输出口。显式出口和节点引导解析保持原有优先级。关闭 `dns-rule-routing` 时，`respect-rules` 保留原生 Mihomo 行为及适用范围。
 
 **1.0.23 新增：** [LAN 后台预连接](docs/lan-preconnect.md) · [代理目标 IP 与 DNS 地址族策略（issue #61）](docs/proxy-force-ip.md) · [Windows 桌面恢复协议](docs/desktop-managed.md#local-health-and-resume-recovery)。`normal` 模式继续保留；LAN 预连接不增加节点配置。
 
@@ -24,9 +26,9 @@
 | 代理节点 | `nameserver`，以及按原设置适用的 `fallback` |
 | REJECT / REJECT-DROP | 进入真实解析的自动查询在读取缓存前拒绝 / 静默丢弃；显式传输例外见下文 |
 
-判断依据是**策略组最终选择的实际出口类型**，组名和节点名不参与这个判断。组切到 DIRECT 就走直连池，选择代理节点就走代理池。`direct-nameserver` 为空时，保留原 `nameserver` / `fallback` 行为。
+判断依据是**策略组最终选择的实际出口类型**，组名和节点名不参与这个判断。组切到 DIRECT 就走直连池，选择代理节点就走代理池。`direct-nameserver` 为空时，保留原 `nameserver-policy` / `nameserver` / `fallback` 行为。`nameserver-policy` 可为内网等域名覆盖解析服务器；有直连池时，DIRECT 是否采用该覆盖由 `direct-nameserver-follow-policy` 决定，业务出口不随之改变。
 
-一次逻辑查询只选择一次业务实际出口；默认情况下，上游重试、main / fallback 和 UDP 截断后的 TCP 重试沿用它。另行开启 `dns-upstream-rule-routing` 时，各自动 DNS 上游按自身地址冻结独立的传输出口，业务选池和拒绝 / 测速依据保持不变。直连池失败不会偷偷借用代理池。缓存按解析器池、业务及 DNS 传输出口、来源等作用域隔离，切组不会混用另一个出口的回答。
+一次逻辑查询只选择一次业务实际出口；默认情况下，上游重试、main / fallback 和 UDP 截断后的 TCP 重试沿用它。同时开启 `dns.respect-rules` 时，各自动 DNS 上游按自身地址冻结独立的传输出口，业务选池和拒绝 / 测速依据保持不变。直连池和命中的 policy 池失败都不会借用其他公共池。缓存按解析器池、业务及 DNS 传输出口、来源等作用域隔离，切组不会混用另一个出口的回答。
 
 DNS 分流通过内置解析器提供，普通代理连接保持原转发行为：
 
@@ -45,7 +47,7 @@ UDP、TCP 和 DoT 上游在实际出口固定时共享连接，多个查询通�
 
 新增的 DNS 面板数据由本机控制器提供，查询记录、趋势和上游统计只保存在进程内存中，不写数据库或日志文件，也不发送遥测。无需维护第二份分流规则；观测不会改变 DNS 回答和出口选择。优化范围、缓存安全边界及测试方式见 [DNS 性能说明](docs/dns-performance.md)。
 
-正式版本采用 **`mihomo-optimized-vX.Y.Z`**，当前源码版本为 `mihomo-optimized-v1.0.28`。tag、发行标题、`version.txt` 和运行内核版本一致；`PROJECT_VERSION` 记录独立项目版本，上游 mihomo 的版本与提交另存于 `UPSTREAM_VERSION` / `UPSTREAM_COMMIT`。源码哈希保留在 BUILDINFO 中。**旧版 `v1.19.32-optimized-N` 及更早内核首次切换到新系列，需要手动安装一次**；新系列随后可通过 YAML 启用内核后台检查和更新，详见[更新说明](docs/releases.md#内核自动更新)。
+正式版本采用 **`mihomo-optimized-vX.Y.Z`**，当前源码版本为 `mihomo-optimized-v1.0.29`。tag、发行标题、`version.txt` 和运行内核版本一致；`PROJECT_VERSION` 记录独立项目版本，上游 mihomo 的版本与提交另存于 `UPSTREAM_VERSION` / `UPSTREAM_COMMIT`。源码哈希保留在 BUILDINFO 中。**旧版 `v1.19.32-optimized-N` 及更早内核首次切换到新系列，需要手动安装一次**；新系列随后可通过 YAML 启用内核后台检查和更新，详见[更新说明](docs/releases.md#内核自动更新)。
 
 ## 启动资源下载
 
@@ -382,7 +384,7 @@ FakeIP 的 IPv6 与 HTTPS / SVCB 处理也保持原行为：应使用虚拟地�
 
 ## 可选 DNS 设置
 
-以下表格中的字段均放在原 `dns:` 下。`dns-rule-routing` 与 `dns-upstream-rule-routing` 则放在 YAML 顶层，默认均为 `false`：前者按业务域名选池，后者按 DNS 服务器地址选择传输出口。两者可同时开启，配置示例与冷启动缓存边界见 [DNS 上游连接独立选路](docs/dns-proxy.md#dns-上游连接独立选路)。
+以下表格中的字段均放在原 `dns:` 下，`dns-rule-routing` 放在 YAML 顶层。两者分工为：`dns-rule-routing: true` 按业务域名选池；此时 `dns.respect-rules: false` 让自动 DNS 传输继承业务出口，`true` 则按 DNS 服务器地址独立选路。两个字段默认均为 `false`；配置矩阵与冷启动缓存边界见 [DNS 上游连接独立选路](docs/dns-proxy.md#dns-上游连接独立选路)。
 
 | 观测与映射字段 | 默认值 | 生效条件与关闭方式 |
 | --- | --- | --- |
@@ -469,11 +471,12 @@ dns:
 | 顶层 `external-ui`、`external-ui-url`、`external-ui-name` | 始终忽略；关闭自动更新也不会恢复旧目录或来源 | 面板固定使用工作目录的 `ui` 和本仓库 `clash-dashboard-dist`；工作目录由 `-d` 指定 |
 | 命令行 `-ext-ui`，含其旧环境变量 `CLASH_OVERRIDE_EXTERNAL_UI_DIR` | 接受旧入口但忽略路径值 | 改用 `-d` 选择内核工作目录，面板始终放在其中的 `ui` |
 | 旧浏览器保存的面板 / 内核自动更新偏好 | 自面板 `0.4.0` 起不再生效，更新控件与浏览器更新计时器已移除 | 将策略迁移为上面的四个 YAML 顶层字段；在 YAML 编辑器“保存并重新加载”，或手工修改文件后完整重载 |
-| `dns.nameserver-policy` | 仅在 `dns-rule-routing: true` 时停用 | 改用原业务 `rules`；设 `dns-rule-routing: false` 并完整重载后，原 DNS 策略恢复 |
-| `dns.direct-nameserver-follow-policy` | 仅在 `dns-rule-routing: true` 时停用 | 同上；未开启本项目路由时保留原行为 |
-| `dns.fallback-filter.domain` / `dns.fallback-filter.geosite` | 仅在 `dns-rule-routing: true` 时停用对应域名筛选 | 同上；`fallback` 及仍适用的 IP 过滤保留 |
+| 顶层 `dns-upstream-rule-routing` | 自 `1.0.29` 起移除，不保留别名；旧键不再生效 | 删除旧键；开启 `dns-rule-routing` 后，用 `dns.respect-rules` 选择继承业务出口（`false`）或独立上游选路（`true`） |
+| `dns.nameserver-policy` | 自 `1.0.29` 起在自动分流中生效，只覆盖 DNS 服务器池 | 内网 / 私有域名可保留策略；此前被忽略的无效 provider 或 geosite 条目需修正，业务出口仍由业务规则决定 |
+| `dns.direct-nameserver-follow-policy` | 自 `1.0.29` 起在自动分流中生效，默认 `false` | 有直连池时控制 DIRECT 是否采用 policy；没有直连池时继续使用 main policy |
+| `dns.fallback-filter.domain` / `dns.fallback-filter.geosite` | 仅在 `dns-rule-routing: true` 时停用对应域名筛选 | 设 `dns-rule-routing: false` 并完整重载后恢复；`fallback` 及仍适用的 IP 过滤保留 |
 
-`default-nameserver`、`proxy-server-nameserver`、`proxy-server-nameserver-policy`、hosts、缓存以及可适用的 fallback IP 过滤没有被这张表中的域名策略停用一并移除。`respect-rules` 也没有永久失效：自动 QNAME 计划覆盖其范围内的按解析器地址二次选路，其他原有模式保持原行为。
+`default-nameserver`、`proxy-server-nameserver`、`proxy-server-nameserver-policy`、hosts、缓存以及可适用的 fallback IP 过滤没有被这张表中的域名策略停用一并移除。`dns.respect-rules` 是上游规则选路的统一配置项：配合 `dns-rule-routing: true` 使用独立计划，关闭业务分流时保留原生范围。历史配置若已写 `respect-rules: true`，但此前依赖业务出口继承，升级时必须改为 `false`；不能从旧 YAML 自动识别这个意图。过去只开旧独立开关而关闭业务分流的全池行为不再提供同义开关，需根据原生适用范围或显式 DNS 出口调整配置。
 
 ## 生效条件与兼容边界
 
@@ -483,8 +486,8 @@ dns:
 - **规则顺序不变。** IN / SRC / PROCESS、端口和网络属性仍可参与；QNAME 用于域名规则。网站目标 IP / GEOIP / ASN 尚未知，不拿解析器 IP 代替，也不为选路递归解析同一个名字。
 - **按 QNAME 分流的入口是内置 DNS。** 内置 DNS 已知 QNAME，配置的 UDP / TCP 任意端口及 DoH / DoT / DoQ / H3 均可自动选池和选出口。普通代理入站不自动接管明文 DNS，也不解密客户端 DoH；显式 TUN DNS 劫持仍可将请求送入内置 DNS。
 - **显式 DNS 传输仍是例外。** `#Group` / `#DIRECT` / `#interface` 等保留旧行为；先选池，再判断该池的例外。混有显式上游时，显式分支可独立回答；未选池不会削弱自动分支的拒绝动作。
-- **不另写 DNS 域名策略。** 开启时停用 `nameserver-policy`、`direct-nameserver-follow-policy`、`fallback-filter.domain/geosite`；`fallback` 的适用 IP 过滤、hosts、基础解析等保留。关闭开关并完整重载可恢复原策略。
-- **respect-rules 的旧模式行为保留。** 非 Rule 模式不建立新计划；在自动范围内，QNAME 计划代替按解析器地址二次选路。
+- **可按需覆盖 DNS 服务器。** 通常只维护业务规则；内网等域名可配置 `nameserver-policy`。选定池和策略覆盖只计算一次，路由、缓存、预取和测速使用同一结果，私有池失败不借用公共池。仅 `fallback-filter.domain/geosite` 在业务分流开启时继续停用，适用的 IP 过滤、hosts 和基础解析保留。
+- **respect-rules 区分业务与 DNS 连接。** Rule 模式下开启业务分流时，`false` 继承业务出口，`true` 使用解析器自身地址独立选路；业务分流关闭或 Global / Direct 模式保留原行为。
 
 可按路由作用域复用的原生上游使用冻结的出口身份，切换叶子后使用相应连接池；每个配置上游最多保留 64 个路由作用域客户端，只淘汰空闲项，重载会取消并关闭旧池。这里的 `64` 是作用域客户端数，**不是全局 socket 数量上限**。QNAME 和来源端口不进入连接池键；回答缓存和在途查询仍采用各自更严格的作用域，避免连接共享变成答案串用。
 

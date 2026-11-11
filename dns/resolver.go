@@ -45,6 +45,7 @@ type Resolver struct {
 	ipv6Timeout           time.Duration
 	main                  []dnsClient
 	direct                []dnsClient
+	directFollowPolicy    bool
 	fallback              []dnsClient
 	fallbackDomainFilters []C.DomainMatcher
 	fallbackIPFilters     []C.IpMatcher
@@ -342,11 +343,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 			return r.ipExchange(ctx, m)
 		}
 
-		if matched := r.matchPolicy(m); len(matched) != 0 {
-			result, cache, err = r.exchangeBatch(ctx, matched, m)
-			return
-		}
-		main, _ := r.dnsQueryServers(ctx)
+		main, _ := r.dnsQueryServers(ctx, m)
 		result, cache, err = r.exchangeBatch(ctx, main, m)
 		return
 	}
@@ -451,18 +448,7 @@ func (r *Resolver) shouldOnlyQueryFallback(m *D.Msg) bool {
 }
 
 func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
-	main, fallback := r.dnsQueryServers(ctx)
-	if matched := r.matchPolicy(m); len(matched) != 0 {
-		res := <-r.asyncExchange(ctx, matched, m)
-		return res.Msg, res.Error
-	}
-
-	onlyFallback := len(fallback) != 0 && r.shouldOnlyQueryFallback(m)
-
-	if onlyFallback {
-		res := <-r.asyncExchange(ctx, fallback, m)
-		return res.Msg, res.Error
-	}
+	main, fallback := r.dnsQueryServers(ctx, m)
 
 	mainContext := ctx
 	filterBeforeSelection := len(fallback) != 0 && r.speedCheckEligible(ctx, main, m)
@@ -881,6 +867,7 @@ func NewResolver(config Config) (rs Resolvers) {
 		clientOwner:         owner,
 		ruleRouting:         config.RuleRouting,
 		upstreamRuleRouting: config.UpstreamRuleRouting,
+		directFollowPolicy:  config.DirectFollowPolicy,
 		ipv6:                config.IPv6,
 		main:                cacheTransform(config.Main, defaultResolver),
 		cache:               config.newCache(),

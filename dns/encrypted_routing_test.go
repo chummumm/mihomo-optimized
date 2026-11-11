@@ -625,7 +625,7 @@ func encryptedRoutingRawExchange(r *Resolver, ctx context.Context, query *D.Msg)
 	if err != nil || immediate != nil {
 		return immediate, err
 	}
-	clients, _ := r.dnsQueryServers(ctx)
+	clients, _ := r.dnsQueryServers(ctx, query)
 	return clients[0].ExchangeContext(ctx, query)
 }
 

@@ -4,7 +4,9 @@ package tun
 
 import (
 	"context"
+	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/metacubex/gvisor/pkg/tcpip"
@@ -26,6 +28,8 @@ type TCPForwarder struct {
 	inet6LoopbackAddress []tcpip.Address
 	tun                  GVisorTun
 	forwarder            *tcp.Forwarder
+	done                 chan struct{}
+	closeOnce            sync.Once
 }
 
 func NewTCPForwarder(ctx context.Context, stack *stack.Stack, handler Handler) *TCPForwarder {
@@ -40,9 +44,14 @@ func NewTCPForwarderWithLoopback(ctx context.Context, stack *stack.Stack, handle
 		inet4LoopbackAddress: common.Map(inet4LoopbackAddress, AddressFromAddr),
 		inet6LoopbackAddress: common.Map(inet6LoopbackAddress, AddressFromAddr),
 		tun:                  tun,
+		done:                 make(chan struct{}),
 	}
 	forwarder.forwarder = tcp.NewForwarder(stack, 0, 1024, forwarder.Forward)
 	return forwarder
+}
+
+func (f *TCPForwarder) Close() {
+	f.closeOnce.Do(func() { close(f.done) })
 }
 
 func (f *TCPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
@@ -78,47 +87,85 @@ func (f *TCPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pac
 }
 
 func (f *TCPForwarder) Forward(r *tcp.ForwarderRequest) {
+	id := r.ID()
+	metadata := M.Metadata{
+		Source:      M.SocksaddrFrom(AddrFromAddress(id.RemoteAddress), id.RemotePort),
+		Destination: M.SocksaddrFrom(AddrFromAddress(id.LocalAddress), id.LocalPort),
+	}
+	conn := newLazyTCPConn(f.ctx, metadata.Destination.TCPAddr(), metadata.Source.TCPAddr())
+	go func() {
+		defer conn.cancel(net.ErrClosed)
+		defer conn.Close()
+		if err := f.handler.NewConnection(conn.ctx, conn, metadata); err != nil {
+			_ = conn.HandshakeFailure(err)
+		}
+	}()
+	conn.runHandshake(f.done, func(ctx context.Context) (halfCloseTCPConn, error) {
+		return acceptGVisorTCP(ctx, r)
+	}, func() error {
+		r.Complete(true)
+		return nil
+	}, func() error {
+		r.Complete(false)
+		return nil
+	})
+}
+
+func acceptGVisorTCP(ctx context.Context, r *tcp.ForwarderRequest) (halfCloseTCPConn, error) {
+	if err := ctx.Err(); err != nil {
+		r.Complete(false)
+		return nil, err
+	}
 	var wq waiter.Queue
-	var cancel context.CancelFunc
-	if parentDone := f.ctx.Done(); parentDone != nil {
-		var handshakeCtx context.Context
-		handshakeCtx, cancel = context.WithCancel(context.Background())
+	done := make(chan struct{})
+	if ctx.Done() != nil {
 		go func() {
 			select {
-			case <-parentDone:
-				wq.Notify(wq.Events())
-			case <-handshakeCtx.Done():
+			case <-ctx.Done():
+				// Cancellation can race CreateEndpoint's waiter registration.
+				// Keep waking it until the handshake has observed cancellation.
+				ticker := time.NewTicker(time.Millisecond)
+				defer ticker.Stop()
+				for {
+					wq.Notify(waiter.WritableEvents)
+					select {
+					case <-done:
+						return
+					case <-ticker.C:
+					}
+				}
+			case <-done:
 			}
 		}()
 	}
 	endpoint, err := r.CreateEndpoint(&wq)
-	if cancel != nil {
-		cancel()
-	}
+	close(done)
 	if err != nil {
 		r.Complete(true)
-		return
+		return nil, gonet.TranslateNetstackError(err)
 	}
 	r.Complete(false)
+	if err := ctx.Err(); err != nil {
+		endpoint.Abort()
+		return nil, err
+	}
 	endpoint.SocketOptions().SetKeepAlive(true)
 	keepAliveIdle := tcpip.KeepaliveIdleOption(15 * time.Second)
 	endpoint.SetSockOpt(&keepAliveIdle)
 	keepAliveInterval := tcpip.KeepaliveIntervalOption(15 * time.Second)
 	endpoint.SetSockOpt(&keepAliveInterval)
-	tcpConn := gonet.NewTCPConn(&wq, endpoint)
-	lAddr := tcpConn.RemoteAddr()
-	rAddr := tcpConn.LocalAddr()
-	if lAddr == nil || rAddr == nil {
-		tcpConn.Close()
-		return
-	}
-	go func() {
-		var metadata M.Metadata
-		metadata.Source = M.SocksaddrFromNet(lAddr)
-		metadata.Destination = M.SocksaddrFromNet(rAddr)
-		hErr := f.handler.NewConnection(f.ctx, tcpConn, metadata)
-		if hErr != nil {
-			endpoint.Abort()
-		}
-	}()
+	return &gVisorTCPConn{TCPConn: gonet.NewTCPConn(&wq, endpoint), endpoint: endpoint}, nil
+}
+
+type gVisorTCPConn struct {
+	*gonet.TCPConn
+	endpoint tcpip.Endpoint
+}
+
+func (c *gVisorTCPConn) SetLinger(seconds int) error {
+	c.endpoint.SocketOptions().SetLinger(tcpip.LingerOption{
+		Enabled: seconds >= 0,
+		Timeout: time.Duration(seconds) * time.Second,
+	})
+	return nil
 }

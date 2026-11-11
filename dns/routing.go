@@ -75,6 +75,9 @@ func (r *Resolver) prepareDNSRouting(ctx context.Context, message *D.Msg) (conte
 	// outside this scope; inheriting a parent's QNAME plan could route bootstrap
 	// or a different business question through the wrong frozen outbound.
 	ctx = context.WithValue(ctx, dnsQueryRouteKey{}, (*dnsQueryRoute)(nil))
+	policy := r.matchPolicy(message)
+	pool := r.dnsPoolForQuery(message, false, policy)
+	ctx = context.WithValue(ctx, dnsQueryPoolKey{}, pool)
 	if r.bootstrap {
 		return icontext.WithDNSBootstrap(ctx), nil, nil
 	}
@@ -83,19 +86,15 @@ func (r *Resolver) prepareDNSRouting(ctx context.Context, message *D.Msg) (conte
 	}
 	var automatic bool
 	var upstreamNetwork C.NetWork
-	clientSets := [][]dnsClient{r.main}
-	// Only IP lookups use fallback (see exchangeWithoutCache). An unused
-	// explicit fallback must not exempt TXT/MX/etc. from their main route's
-	// rejection, or cause a group selection for an entirely fixed main.
-	if isIPRequest(message.Question[0]) {
-		clientSets = append(clientSets, r.fallback)
-	}
+	clientSets := [][]dnsClient{pool.main, pool.fallback}
 	origin := icontext.DNSRoutingMetadata(ctx)
 	nativePool := len(r.direct) > 0 && (origin == nil || origin.SpecialProxy == "")
+	var directPool *dnsQueryPool
 	if nativePool {
 		// A direct pool may be the only automatic DNS transport. It must not
 		// be ruled out by an explicit, but unselected, main pool.
-		clientSets = append(clientSets, r.direct)
+		directPool = r.dnsPoolForQuery(message, true, policy)
+		clientSets = append(clientSets, directPool.main)
 	}
 	for _, clients := range clientSets {
 		for _, client := range clients {
@@ -106,8 +105,19 @@ func (r *Resolver) prepareDNSRouting(ctx context.Context, message *D.Msg) (conte
 			automatic = automatic || auto
 		}
 	}
-	if !automatic {
+	if !automatic && !nativePool {
 		return ctx, nil, nil
+	}
+	if !automatic {
+		// Even explicit transports need the business decision when it chooses
+		// between main/policy and direct pools. Their explicit exits remain
+		// independent of that decision once the effective pool is selected.
+		for _, clients := range clientSets {
+			if len(clients) != 0 {
+				upstreamNetwork = dnsRoutingNetwork(clients[0])
+				break
+			}
+		}
 	}
 	wire, err := message.Pack()
 	if err != nil {
@@ -139,16 +149,14 @@ func (r *Resolver) prepareDNSRouting(ctx context.Context, message *D.Msg) (conte
 		origin = plan.OriginMetadata()
 	}
 	state := &dnsQueryRoute{plan: plan, origin: origin, err: err}
-	if nativePool {
-		state.pool, state.main, state.fallback = "main", r.main, r.fallback
-		if err == nil && (plan.Type() == C.Direct || plan.Type() == C.Compatible) {
-			// Use the existing direct clients without recursing through their
-			// Resolver: this question must keep its already selected leaf.
-			state.pool, state.main, state.fallback = "direct", r.direct, nil
-		}
+	if nativePool && err == nil && (plan.Type() == C.Direct || plan.Type() == C.Compatible) {
+		// Select the existing direct clients without another Resolver call or
+		// another policy match; this question keeps its selected business leaf.
+		pool = directPool
+		ctx = context.WithValue(ctx, dnsQueryPoolKey{}, pool)
 	}
-	main, fallback := r.dnsQueryServersWithRoute(state)
-	_, explicit := dnsQueryCapabilities(message, main, fallback)
+	state.pool, state.main, state.fallback = pool.name, pool.main, pool.fallback
+	_, explicit := dnsQueryCapabilities(message, pool.main, pool.fallback)
 	if err != nil && !explicit {
 		return ctx, nil, err
 	}
@@ -173,6 +181,10 @@ func dnsCacheKey(ctx context.Context, question D.Question) string {
 	key := question.String()
 	if route := queryRoute(ctx); route != nil && !icontext.DNSBootstrap(ctx) {
 		key = route.key
+	} else if pool := queryPool(ctx); pool != nil && pool.resolver.ruleRouting && !icontext.DNSBootstrap(ctx) {
+		// An entirely explicit policy may need no business plan. Its answer
+		// still belongs to the actual pool, including live provider changes.
+		key += "|dns-pool:" + dnsPoolIdentity(pool.name, pool.main, pool.fallback)
 	}
 	return dnsUpstreamCacheKey(ctx, key)
 }

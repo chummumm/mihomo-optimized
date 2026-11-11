@@ -13,7 +13,7 @@ case "${1:-test}" in
     python3 scripts/test-release-build.py
     CGO_ENABLED=0 go test -tags with_gvisor -count=1 -timeout=5m \
       ./adapter ./common/arc/... ./common/lru/... ./common/net/... ./common/singleflight/... ./component/trie/... ./component/easytier/... ./component/fakeip/... ./component/dnsmessage/... ./component/dnsstats/... ./component/process/... ./component/resolver/... ./component/http/... ./component/resource/... ./component/geodata/... ./component/mmdb/... ./component/updater/... ./context/... ./dns/... ./listener/sing_tun/... ./transport/socks4/... ./transport/socks5/... \
-      ./tunnel/... ./component/lanpreconnect/... ./rules/logic/... ./rules/provider/... ./adapter/provider/... ./config/... \
+      ./tunnel/... ./listener/socks/... ./listener/sing/... ./listener/anytls/... ./component/lanpreconnect/... ./rules/logic/... ./rules/provider/... ./adapter/provider/... ./config/... \
       ./hub/route/... ./hub/executor/... ./component/desktop/...
     CGO_ENABLED=0 go test -tags with_gvisor -count=1 -timeout=5m \
       . ./component/transparentproxy ./component/dialer ./listener ./listener/redir ./listener/tproxy
@@ -33,6 +33,11 @@ case "${1:-test}" in
       -run '^TestLANWireGuardNativePreparationBeforeBusiness$'
     CGO_ENABLED=1 go test -race -tags with_gvisor -count=1 -timeout=5m ./component/dnsstats/...
     CGO_ENABLED=1 go test -race -tags with_gvisor -count=1 -timeout=5m ./common/net/... ./common/singleflight/...
+    CGO_ENABLED=1 go test -race -tags with_gvisor -count=1 -timeout=5m \
+      ./tunnel ./listener/socks ./listener/sing ./listener/anytls \
+      -run 'TCPHandshake|Socks|SOCKS|Lazy|Handshake|AnyTLS'
+    CGO_ENABLED=1 go test -race -tags with_gvisor -count=1 -timeout=5m \
+      github.com/metacubex/sing-tun -run 'TCP|Handshake'
     CGO_ENABLED=1 go test -race -tags with_gvisor -count=1 -timeout=5m ./adapter/outbound \
       -run 'DNSObservability|DNSStatsIdentity|DirectDestination|EasyTier|LAN|ProxyTarget|TargetIPFamily'
     CGO_ENABLED=1 go test -race -tags with_gvisor -count=1 -timeout=5m \

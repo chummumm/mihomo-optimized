@@ -2,6 +2,20 @@
 
 项目使用独立版本 **`mihomo-optimized-vX.Y.Z`**，首版为 `mihomo-optimized-v1.0.0`。`main` 的源码、依赖或构建配置变更在全部测试和完整编译成功后生成固定提交的 GitHub Release。Latest 仅在该构建仍对应当前 `main` 时更新；PR 只做合并前检查，不生成正式发布包。纯文档变更不消耗版本号，也不触发自动发布。
 
+## 1.0.29：DNS 配置统一与 TCP 建连反馈
+
+实现 issue [#74](https://github.com/chummumm/mihomo-optimized/issues/74)：移除顶层 `dns-upstream-rule-routing` 及其 API 字段，不保留别名，统一使用 `dns.respect-rules`。在 Rule 模式开启 `dns-rule-routing` 时，respect-rules=false 让自动 DNS 连接继承业务出口，true 让 DNS 上游按解析器自身域名 / IP 独立选路。关闭业务分流时，respect-rules 保留原生行为及适用范围；Global / Direct 和显式 DNS 出口优先级保持。
+
+**DNS 升级迁移：** 删除旧键，明确填写所需的 `dns.respect-rules` 后完整重载。历史配置若已写 `dns-rule-routing: true` 和 `respect-rules: true`，但此前使用业务出口继承，升级时需将 respect-rules 改为 false；无法从该 YAML 自动辨认原意。过去只开启旧独立开关、关闭业务分流的全池独立行为没有同义开关，需按原生 respect-rules 范围或显式上游出口调整。配置矩阵见 [DNS 上游连接独立选路](dns-proxy.md#dns-上游连接独立选路)。
+
+实现 issue [#76](https://github.com/chummumm/mihomo-optimized/issues/76)：在自动分流中启用 `nameserver-policy` 与 `direct-nameserver-follow-policy`。策略只覆盖 DNS 服务器池，业务出口仍由 QNAME 规则决定；有直连池时遵循 follow-policy，没有直连池时保留主 policy。每轮查询冻结一个实际池，路由能力、独立上游选路、缓存 / singleflight、预取和测速使用同一结果；私有池失败不查询公共池。全部上游指定显式出口时仍能按业务选择 direct / main 池，再保留该池的显式传输行为。
+
+此前被忽略的 nameserver policy 现在会正常加载并校验，升级前应修正无效 provider / geosite 引用。节点域名及其根 bootstrap 继续隔离；业务分流开启时，`fallback-filter.domain/geosite` 仍停用，适用的 fallback IP 过滤继续保留。动态 policy 改变实际池后，不混用旧缓存和在途请求，也不让旧池的热度继续驱动新池预取。
+
+TCP 入站接通既有握手成功 / 失败反馈：mips / gVisor TUN 和 SOCKS CONNECT 支持延迟确认；TProxy、Redir、system / mixed TCP 在首次关闭前处理失败。AnyTLS、Hysteria2 和 sing-mux 使用现有协议回复，不增加协议字段。支持 `CloseWrite` 的 TCP 路径保留正常半关闭，其他协议保持各自的关闭语义；异常复制及时结束两端，REJECT-DROP 保持原行为。
+
+HTTP CONNECT 仍可提前返回 200，普通 HTTP 保留 502；嗅探读取也可能提前接受连接。尚未接受的 mips / gVisor 连接可在出站失败时直接拒绝；已经提前接受的 mips 连接受当前底层栈限制，关闭时仍可能先发 FIN 再发 RST。已接受的系统 TCP 不能还原为 SYN 阶段的失败。本次不扩展 UDP 错误协议，也不承诺恢复所有远端 errno 或解决特定应用的安全错误；发布验证以对应提交的 Actions 结果为准。
+
 ## 1.0.28：Windows TUN 强制退出后的恢复
 
 修复 Windows 内核被强制结束后，TUN 别名残留导致后续启动持续报同名冲突的问题。正常关闭 Wintun 会显式卸载设备；强制退出只关闭操作系统持有的资源，软件设备可能变成“不在场”但仍保留系统记录。1.0.27 的同名预检查会在进入原生创建前挡住这种残留，反复重启也无法恢复。
@@ -34,7 +48,7 @@ Windows 对确认归属的 TUN 地址、自动路由缺失优先原地补齐，�
 
 ## 1.0.25：DNS 上游连接独立按规则选路
 
-实现 issue [#69](https://github.com/chummumm/mihomo-optimized/issues/69)：新增顶层 `dns-upstream-rule-routing`，默认 `false`，仅在 Rule 模式让内置 DNS 的自动上游按解析器自身域名 / IP 选择实际出口。它与 `dns-rule-routing` 独立；两者同时开启时，业务域名仍决定 direct / main 池、ECS、拒绝与 DIRECT 测速，DNS 连接可另外走代理。支持 UDP、TCP、DoT、DoH / HTTP/3 和 DoQ，以及解析器 IP 的 IP-CIDR / GEOIP 等完整规则。配置示例见 [DNS 上游连接独立选路](dns-proxy.md#dns-上游连接独立选路)。
+实现 issue [#69](https://github.com/chummumm/mihomo-optimized/issues/69)：新增顶层 `dns-upstream-rule-routing`，默认 `false`，仅在 Rule 模式让内置 DNS 的自动上游按解析器自身域名 / IP 选择实际出口。它与 `dns-rule-routing` 独立；两者同时开启时，业务域名仍决定 direct / main 池、ECS、拒绝与 DIRECT 测速，DNS 连接可另外走代理。支持 UDP、TCP、DoT、DoH / HTTP/3 和 DoQ，以及解析器 IP 的 IP-CIDR / GEOIP 等完整规则。这是 1.0.25 的历史行为；1.0.29 已移除该开关，当前配置与迁移见 [DNS 上游连接独立选路](dns-proxy.md#dns-上游连接独立选路)。
 
 显式 `#Group` / `#DIRECT` / `#interface` 和适配器优先，`proxy-server-nameserver` / policy 与节点根 bootstrap 保持原有独立引导；Global / Direct 继续使用旧 DNSDialer 行为。解析器规则选中的真实 IP 固定到实际连接，保留 TLS、HTTP 及 ECS 设置。答案、候选、双栈缓存和连接作用域区分业务计划与 DNS 传输计划，后台刷新重新检查当前路由。开关修改需完整配置重载，`PATCH /configs` 不接受修改。
 

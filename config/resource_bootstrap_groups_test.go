@@ -234,16 +234,27 @@ func TestResourceBootstrapMissingProviderAndEmptyFallback(t *testing.T) {
 }
 
 func TestResourceBootstrapGroupProbeConcurrencyCancellationAndWarmCache(t *testing.T) {
-	var active, maxActive, started atomic.Int32
+	const probeConcurrency = 10
+	var active, activeProbes, maxProbes, started, gets atomic.Int32
+	probesReady := make(chan struct{})
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		count := active.Add(1)
+		active.Add(1)
 		defer active.Add(-1)
-		started.Add(1)
+		if r.Method != http.MethodHead {
+			gets.Add(1)
+			<-r.Context().Done()
+			return
+		}
+		count := activeProbes.Add(1)
+		defer activeProbes.Add(-1)
 		for {
-			old := maxActive.Load()
-			if count <= old || maxActive.CompareAndSwap(old, count) {
+			old := maxProbes.Load()
+			if count <= old || maxProbes.CompareAndSwap(old, count) {
 				break
 			}
+		}
+		if started.Add(1) == probeConcurrency {
+			close(probesReady)
 		}
 		<-r.Context().Done()
 	}))
@@ -257,24 +268,48 @@ func TestResourceBootstrapGroupProbeConcurrencyCancellationAndWarmCache(t *testi
 		names = append(names, name)
 		raw.Proxy = append(raw.Proxy, node)
 	}
-	raw.ResourceBootstrap = &ResourceBootstrap{Proxy: "group", Timeout: 3}
-	raw.ProxyGroup = []map[string]any{{"name": "group", "type": "url-test", "proxies": names, "url": "http://probe.invalid/stall", "timeout": 1000}}
-	ctx := resource.WithBootstrapTimeout(context.Background(), 150*time.Millisecond)
+	// The barrier tests the probe limit and cancellation without requiring all
+	// SOCKS handshakes to finish within a short probe budget. Deadline budgeting
+	// is covered by TestResourceBootstrapHungProbeReservesActualDownloadBudget.
+	raw.ResourceBootstrap = &ResourceBootstrap{Proxy: "group", Timeout: 20}
+	raw.ProxyGroup = []map[string]any{{"name": "group", "type": "url-test", "proxies": names, "url": "http://probe.invalid/stall", "timeout": 10000}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	scope, err := newResourceBootstrap(ctx, raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer scope.Close()
-	if started.Load() != 0 {
+	if started.Load() != 0 || gets.Load() != 0 {
 		t.Fatal("warm configuration performed network probes")
 	}
-	start := time.Now()
-	_, err = bootstrapGroupRead(scope, "/rules", "")
-	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
-		t.Fatalf("probe deadline not shared: %v %s", err, time.Since(start))
+	result := make(chan error, 1)
+	go func() {
+		_, err := bootstrapGroupRead(scope, "/rules", "")
+		result <- err
+	}()
+	select {
+	case <-probesReady:
+	case err := <-result:
+		t.Fatalf("resource read finished before probes were ready: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("probe concurrency did not reach %d: started=%d", probeConcurrency, started.Load())
 	}
-	if maxActive.Load() > 10 || maxActive.Load() < 2 {
-		t.Fatalf("probe concurrency=%d", maxActive.Load())
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("probe cancellation not shared: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("probe cancellation did not stop resource read: %s", time.Since(start))
+	}
+	if maxProbes.Load() != probeConcurrency {
+		t.Fatalf("probe concurrency=%d, want %d", maxProbes.Load(), probeConcurrency)
+	}
+	if gets.Load() != 0 {
+		t.Fatalf("canceled probes started resource GET: %d", gets.Load())
 	}
 	_ = scope.Close()
 	deadline := time.Now().Add(time.Second)

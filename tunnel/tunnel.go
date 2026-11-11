@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -561,49 +562,56 @@ func handleUDPConn(packet C.PacketAdapter) {
 	sender.Send(packet) // nonblocking
 }
 
-func handleTCPConn(connCtx C.ConnContext) {
+func handleTCPConn(connCtx C.ConnContext) (err error) {
+	conn := connCtx.Conn()
+	handshakeComplete := false
+	defer func() {
+		if err != nil && !handshakeComplete {
+			// A peer which no longer reads must not keep a failed handshake
+			// alive indefinitely while we send its protocol error response.
+			_ = conn.SetWriteDeadline(time.Now().Add(C.DefaultTCPTimeout))
+			_ = N.CloseOnHandshakeFailure(conn, err)
+		} else {
+			_ = conn.Close()
+		}
+	}()
 	if !isHandle(connCtx.Metadata().Type) {
-		_ = connCtx.Conn().Close()
-		return
+		return errors.New("tunnel is not accepting connections")
 	}
-
-	defer func(conn net.Conn) {
-		_ = conn.Close()
-	}(connCtx.Conn())
 
 	metadata := connCtx.Metadata()
 	if !metadata.Valid() {
 		log.Warnln("[Metadata] not valid: %#v", metadata)
-		return
+		return errors.New("invalid connection metadata")
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
 
-	preHandleFailed := false
-	if err := preHandleMetadata(metadata); err != nil {
-		log.Debugln("[Metadata PreHandle] error: %s", err)
-		preHandleFailed = true
+	preHandleErr := preHandleMetadata(metadata)
+	if preHandleErr != nil {
+		log.Debugln("[Metadata PreHandle] error: %s", preHandleErr)
 	}
 
-	conn := connCtx.Conn()
 	conn.ResetPeeked() // reset before sniffer
 	if sniffingEnable && snifferDispatcher.Enable() {
 		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
 		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
 		if snifferDispatcher.TCPSniff(conn, metadata) {
 			// we now have a domain name
-			preHandleFailed = false
+			preHandleErr = nil
 		}
 	}
 
 	// If both trials have failed, we can do nothing but give up
-	if preHandleFailed {
+	if preHandleErr != nil {
 		log.Debugln("[Metadata PreHandle] failed to sniff a domain for connection %s --> %s, give up",
 			metadata.SourceDetail(), metadata.RemoteAddress())
-		return
+		return preHandleErr
 	}
 
 	peekMutex := sync.Mutex{}
-	if !conn.Peeked() {
+	// A speculative read would acknowledge lazy SOCKS/TUN handshakes before
+	// routing. Only a real sniffer read is allowed to need the client payload.
+	if !conn.Peeked() && !N.NeedHandshake(conn) {
 		peekMutex.Lock()
 		go func() {
 			defer peekMutex.Unlock()
@@ -616,7 +624,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	proxy, rule, err := resolveMetadata(metadata)
 	if err != nil {
 		log.Warnln("[Metadata] parse failed: %s", err.Error())
-		return
+		return err
 	}
 
 	dialMetadata := metadata
@@ -659,12 +667,6 @@ func handleTCPConn(connCtx C.ConnContext) {
 				done(&err)
 				if err != nil {
 					_ = remoteConn.Close()
-					for _, chain := range remoteConn.Chains() {
-						if chain == "REJECT" {
-							err = nil
-							return
-						}
-					}
 					remoteConn = nil
 				}
 			}()
@@ -693,9 +695,13 @@ func handleTCPConn(connCtx C.ConnContext) {
 		logMetadataErr(metadata, rule, proxy, err)
 	})
 	if err != nil {
-		return
+		return err
 	}
 	logMetadata(metadata, rule, remoteConn)
+
+	// Reject adapters return a synthetic connection, including through proxy
+	// groups. Inspect that actual result instead of selecting the group again.
+	rejection, rejected := N.FindUpstream[interface{ Rejection() C.AdapterType }](remoteConn, nil)
 
 	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule, int64(peekLen), 0, true)
 	defer func(remoteConn C.Conn) {
@@ -706,7 +712,31 @@ func handleTCPConn(connCtx C.ConnContext) {
 	peekMutex.Lock()
 	defer peekMutex.Unlock()
 	_ = conn.SetReadDeadline(time.Time{}) // reset
+	if rejected {
+		if rejection.Rejection() == C.RejectDrop {
+			if !N.DropHandshake(conn) {
+				timer := time.NewTimer(C.DefaultDropTime)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-parent.Done():
+				}
+			}
+			return nil
+		}
+		return syscall.ECONNREFUSED
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetWriteDeadline(deadline)
+	}
+	if err = N.ReportConnHandshakeSuccess(conn, remoteConn); err != nil {
+		return fmt.Errorf("report connection handshake: %w", err)
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
+	handshakeComplete = true
 	handleSocket(conn, remoteConn)
+	return nil
 }
 
 func logMetadataErr(metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err error) {

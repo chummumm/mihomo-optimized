@@ -121,7 +121,7 @@ payload:
 
 `+.` 覆盖指定域名及其子域名。把拦截规则放到应当优先的业务规则位置，它就与其他规则共同使用 Mihomo 现成的匹配算法。自动 DNS 路由在缓存前处理 REJECT，返回 REFUSED 且不查询远端；有域名信息的业务连接同样会被该规则拒绝。SmartDNS 的 `-address #` 通常以 SOA 空回答阻断，两者 DNS 返回码不同，均不返回被阻断域名的公网地址。
 
-这些业务规则遵守既有优先级：Global / Direct 或固定入站出口不被新增自动路由改写。不要另复制到 `nameserver-policy`；开启 `dns-rule-routing` 后该字段停用。
+这些业务规则遵守既有优先级：Global / Direct 或固定入站出口不被新增自动路由改写。无需把业务分流表再复制到 `nameserver-policy`；从 1.0.29 起，该字段可为内网等域名额外指定 DNS 服务器，业务出口保持原规则结果。有直连池时，是否使用这一覆盖由 `direct-nameserver-follow-policy` 决定。
 
 ## 运维设置
 

@@ -168,27 +168,32 @@ func handleSocks(conn net.Conn, tunnel C.Tunnel, store auth.AuthStore, additions
 
 func HandleSocks4(conn net.Conn, tunnel C.Tunnel, store auth.AuthStore, additions ...inbound.Addition) {
 	authenticator := store.Authenticator()
-	addr, _, user, err := socks4.ServerHandshake(conn, authenticator)
+	addr, _, user, err := socks4.ServerRequest(conn, authenticator)
 	if err != nil {
 		conn.Close()
 		return
 	}
+	conn = newLazyConn(conn, socks4.Version)
 	additions = append(additions, inbound.WithInUser(user))
 	tunnel.HandleTCPConn(inbound.NewSocket(socks5.ParseAddr(addr), conn, C.SOCKS4, additions...))
 }
 
 func HandleSocks5(conn net.Conn, tunnel C.Tunnel, store auth.AuthStore, additions ...inbound.Addition) {
 	authenticator := store.Authenticator()
-	target, command, user, err := socks5.ServerHandshake(conn, authenticator)
+	target, command, user, err := socks5.ServerRequest(conn, authenticator)
 	if err != nil {
 		conn.Close()
 		return
 	}
 	if command == socks5.CmdUDPAssociate {
 		defer conn.Close()
+		if err := socks5.WriteResponse(conn, 0, conn.LocalAddr()); err != nil {
+			return
+		}
 		io.Copy(io.Discard, conn)
 		return
 	}
+	conn = newLazyConn(conn, socks5.Version)
 	additions = append(additions, inbound.WithInUser(user))
 	tunnel.HandleTCPConn(inbound.NewSocket(target, conn, C.SOCKS5, additions...))
 }
