@@ -74,6 +74,25 @@ struct ExternalUrl {
     url: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreUpdateRequest { request_id: String }
+
+/// Admission and status never wait for downloads or the lifecycle worker.
+pub fn core_update_control(context: &HostContext, method: &str, params: Map<String, Value>) -> Result<Value> {
+    match method {
+        "desktop_core_update_status" => {
+            decode::<Empty>(params)?;
+            encode(context.core_updates.snapshot())
+        }
+        "desktop_update_core" => {
+            let request: CoreUpdateRequest = decode(params)?;
+            encode(context.core_updates.request(&request.request_id, context.generation())?)
+        }
+        _ => Err(AppError::new("unknown_method", "不支持的内核更新操作")),
+    }
+}
+
 /// Validate lifecycle arguments before an accepted request can cancel a worker.
 pub fn validate_admission(method: &str, params: &Map<String, Value>) -> Result<()> {
     match method {

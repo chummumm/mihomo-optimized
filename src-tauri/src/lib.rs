@@ -3,6 +3,8 @@ mod commands;
 pub mod config;
 pub mod core;
 pub mod core_runtime;
+pub mod core_update;
+pub mod core_update_release;
 #[cfg(all(windows, feature = "desktop"))]
 pub mod desktop;
 pub mod diagnostics;

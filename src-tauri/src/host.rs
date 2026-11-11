@@ -87,9 +87,11 @@ pub struct HostContext {
     pub owner: Arc<UiProcess>,
     pub runtime_generation: Arc<AtomicU64>,
     pub stop_pending: Arc<AtomicUsize>,
+    pub core_updates: crate::core_update::CoreUpdates,
     pub instance: String,
     sequence: Arc<AtomicU64>,
     service: Arc<Mutex<Option<ServiceClient>>>,
+    update_service: Arc<Mutex<Option<ServiceClient>>>,
     service_active: Arc<AtomicBool>,
     service_epoch: Arc<AtomicU64>,
     service_stop: SyncSender<u64>,
@@ -182,6 +184,14 @@ impl HostContext {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub fn set_update_service(&self, client: Option<ServiceClient>) {
+        *self.update_service.lock().unwrap_or_else(|error| error.into_inner()) = client;
+    }
+
+    fn update_service_client(&self) -> Option<ServiceClient> {
+        self.update_service.lock().unwrap_or_else(|error| error.into_inner()).clone()
     }
 
     pub fn publish_status(&self, mut status: DesktopStatus) {
@@ -421,9 +431,11 @@ pub fn run() -> Result<()> {
         owner,
         runtime_generation: Arc::new(AtomicU64::new(0)),
         stop_pending: Arc::new(AtomicUsize::new(0)),
+        core_updates: crate::core_update::CoreUpdates::default(),
         instance: hex::encode(random),
         sequence: Arc::new(AtomicU64::new(0)),
         service: Arc::new(Mutex::new(None)),
+        update_service: Arc::new(Mutex::new(None)),
         service_active: Arc::new(AtomicBool::new(false)),
         service_epoch: Arc::new(AtomicU64::new(0)),
         service_stop,
@@ -487,6 +499,9 @@ pub fn run() -> Result<()> {
                                     control_context.publish_service_observation(status, epoch);
                                 }
                             }
+                            if let Some(client) = control_context.update_service_client() {
+                                let _ = client.accept_stop(revision);
+                            }
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => (),
@@ -517,6 +532,11 @@ pub fn run() -> Result<()> {
                     generation = heartbeat_power.generation();
                 }
                 if !heartbeat_power.suspended() {
+                    // Installer-only ownership must stay alive without
+                    // replacing the direct process's status with service idle.
+                    if let Some(client) = poll_context.update_service_client() {
+                        let _ = client.heartbeat();
+                    }
                     if let Some((client, epoch)) = poll_context.service_observer() {
                         let _scope = poll_context.diagnostic_scope("service_heartbeat");
                         match client.heartbeat() {
@@ -662,6 +682,8 @@ fn protocol_loop(
                         Some(request.id),
                         commands::status(&state, &context, request.params),
                     ))
+                } else if matches!(request.method.as_str(), "desktop_core_update_status" | "desktop_update_core") {
+                    Some(reply(Some(request.id), commands::core_update_control(&context, &request.method, request.params)))
                 } else {
                     let id = request.id;
                     let action = lifecycle_command(&request.method);
@@ -923,7 +945,7 @@ fn operations(
             if action.is_some() {
                 context.record("host_request_started", serde_json::json!({}));
             }
-            let result = if work.stops && work.generation != context.generation() {
+            let mut result = if work.stops && work.generation != context.generation() {
                 // A later Start may replace the desired state, but it cannot
                 // bypass an already accepted Stop's ownership cleanup barrier.
                 state
@@ -956,6 +978,14 @@ fn operations(
                     },
                 )
             };
+            if action.is_some() && work.generation == context.generation() && !stops {
+                if let Ok(mut manager) = state.0.lock() {
+                    manager.begin_operation(work.generation);
+                    if let Err(error) = manager.resume_interrupted_core_update() {
+                        if result.is_ok() { result = Err(error); }
+                    }
+                }
+            }
             if stops {
                 context.stop_pending.fetch_sub(1, Ordering::AcqRel);
             }
@@ -990,6 +1020,18 @@ fn operations(
                 }
                 let _ = context.output.send(Message::Exit);
                 return;
+            }
+        } else if context.stop_pending.load(Ordering::Acquire) == 0 && context.owner_alive() {
+            // Stop admission remains independent and invalidates this token
+            // without waiting for a download or the manager lock.
+            if let Ok(mut manager) = state.0.try_lock() {
+                if manager.can_update_core() {
+                    if let Some(job) = context.core_updates.take_due(context.generation()) {
+                        manager.begin_operation(job.generation);
+                        let result = manager.update_core(&job);
+                        context.core_updates.finish(&job, result);
+                    }
+                }
             }
         }
     }
@@ -1038,9 +1080,11 @@ mod lifecycle_tests {
             }),
             runtime_generation: Arc::new(AtomicU64::new(0)),
             stop_pending: Arc::new(AtomicUsize::new(0)),
+            core_updates: crate::core_update::CoreUpdates::default(),
             instance: "00000000000000000000000000000001".into(),
             sequence: Arc::new(AtomicU64::new(0)),
             service: Arc::new(Mutex::new(None)),
+            update_service: Arc::new(Mutex::new(None)),
             service_active: Arc::new(AtomicBool::new(false)),
             service_epoch: Arc::new(AtomicU64::new(0)),
             service_stop,

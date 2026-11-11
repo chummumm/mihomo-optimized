@@ -17,6 +17,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "desktop_core_update.rs"]
+mod core_update;
+
 #[derive(Clone)]
 pub struct HostState(pub Arc<Mutex<DesktopManager>>);
 
@@ -257,6 +260,7 @@ pub struct DesktopManager {
     pub dirty: bool,
     pub exiting: bool,
     updating: bool,
+    core_update_interrupted: bool,
     run_intent: bool,
     resume_pending: Option<u64>,
     communication_recovery: Option<RecoveryWindow>,
@@ -308,6 +312,7 @@ impl DesktopManager {
             dirty: false,
             exiting: false,
             updating: false,
+            core_update_interrupted: false,
             run_intent,
             resume_pending: None,
             communication_recovery: None,
@@ -329,6 +334,17 @@ impl DesktopManager {
         {
             Ok(()) => (),
             Err(error) => manager.last_error = Some(error.message),
+        }
+        if let Ok(document) = config::read(&manager.config_path) {
+            match crate::core_update::Policy::from_config(&document.content) {
+                Ok(policy) => manager.app.core_updates.configure(policy),
+                Err(error) => manager.last_error = Some(error.message),
+            }
+        }
+        if let Ok(executable) = core::fixed_core_path() {
+            if let Ok(version) = crate::core_update_release::executable_version(&executable, &manager.cancellation) {
+                manager.app.core_updates.observe_version(&version);
+            }
         }
         Ok(manager)
     }
@@ -618,6 +634,7 @@ impl DesktopManager {
     fn start_once(&mut self, persist: bool, expected_revision: Option<&str>) -> Result<()> {
         self.require_idle_update()?;
         self.cancellation.check()?;
+        self.core_update_interrupted = false;
         if self.phase == Phase::Running {
             return Ok(());
         }
@@ -645,6 +662,7 @@ impl DesktopManager {
             self.running = None;
             self.app.pause_service_observation();
             self.cancellation.check()?;
+            self.recover_core_update_before_start()?;
             self.running = Some(self.new_running_core()?);
             self.attempted_config_revision = Some(revision.clone());
             self.conflict_config_revision = None;
@@ -663,6 +681,8 @@ impl DesktopManager {
             self.cancellation.check()?;
             self.applied_config = Some(content.clone());
             self.applied_config_revision = Some(revision);
+            self.app.core_updates.configure(crate::core_update::Policy::from_config(&content)?);
+            if let Some(version) = &self.core_status.version { self.app.core_updates.observe_version(version); }
             self.applied_proxy_port = config::mixed_port(&content).ok();
             if !self.core_status.running {
                 return Err(AppError::new("core_start_failed", "内核尚未就绪"));
@@ -721,6 +741,7 @@ impl DesktopManager {
 
     pub fn stop(&mut self, persist: bool) -> Result<()> {
         let started = Instant::now();
+        self.core_update_interrupted = false;
         self.record_lifecycle(
             "desktop_stop_requested",
             serde_json::json!({"persistIntent":persist}),
@@ -1135,6 +1156,7 @@ impl DesktopManager {
         self.require_idle_update()?;
         let (content, revision) = self.read_runtime_source(None)?;
         if self.phase != Phase::Running {
+            self.app.core_updates.configure(crate::core_update::Policy::from_config(&content)?);
             return Ok(());
         }
         if self.preferences.system_proxy {
@@ -1183,6 +1205,7 @@ impl DesktopManager {
         self.core_status = status;
         self.applied_config = Some(content.clone());
         self.applied_config_revision = Some(revision);
+        self.app.core_updates.configure(crate::core_update::Policy::from_config(&content)?);
         self.last_error = None;
         self.applied_proxy_port = config::mixed_port(&content).ok();
         if self.preferences.system_proxy {
@@ -1804,6 +1827,7 @@ mod cleanup_observation_tests {
                 dirty: false,
                 exiting: false,
                 updating: false,
+                core_update_interrupted: false,
                 run_intent: true,
                 resume_pending: None,
                 communication_recovery: None,
@@ -1952,6 +1976,47 @@ mod cleanup_observation_tests {
             observed_at: core::observed_now(),
             ..CoreStatus::default()
         }
+    }
+
+    #[test]
+    fn newer_reload_resumes_an_interrupted_core_update_with_the_new_config() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.installed_runtime(CoreStatus {
+            process_state: "exited".into(), stop_reason: Some(StopReason::CoreUpdate), ..CoreStatus::default()
+        });
+        fixture.manager.core_update_interrupted = true;
+        let revised = SOURCE.replace("device: utun", "device: revised");
+        config::atomic_write(&fixture.manager.config_path, revised.as_bytes()).unwrap();
+        fixture.runtime.lock().unwrap().starts.push_back(Ok(ready(223)));
+        fixture.manager.reload_config(false).unwrap();
+        assert!(!fixture.manager.core_status.running);
+        fixture.manager.resume_interrupted_core_update().unwrap();
+        assert!(fixture.manager.core_status.running);
+        assert_eq!(fixture.manager.applied_config.as_deref(), Some(revised.as_str()));
+        assert_eq!(fixture.runtime.lock().unwrap().actions, ["stop", "start:revised"]);
+        assert!(!fixture.manager.core_update_interrupted);
+    }
+
+    #[test]
+    fn explicit_stop_consumes_interrupted_update_without_a_late_restart() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.installed_runtime(CoreStatus { process_state: "exited".into(), ..CoreStatus::default() });
+        fixture.manager.core_update_interrupted = true;
+        fixture.manager.stop(true).unwrap();
+        fixture.manager.resume_interrupted_core_update().unwrap();
+        assert!(!fixture.manager.run_intent);
+        assert!(!fixture.manager.core_status.running);
+        assert_eq!(fixture.runtime.lock().unwrap().actions, ["stop"]);
+    }
+
+    #[test]
+    fn cancelled_command_cannot_resume_interrupted_update_under_a_new_intent() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.installed_runtime(CoreStatus { process_state: "exited".into(), ..CoreStatus::default() });
+        fixture.manager.core_update_interrupted = true;
+        fixture.manager.app.runtime_generation.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(fixture.manager.resume_interrupted_core_update().unwrap_err().code, "operation_cancelled");
+        assert!(fixture.runtime.lock().unwrap().actions.is_empty());
     }
 
     #[test]

@@ -94,7 +94,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311 pyflakes==3.4.0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pyflakes desktop/tests/windows_smoke.py desktop/tests/upgrade_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_smoke.py
+          python -m pyflakes desktop/tests/windows_smoke.py desktop/tests/upgrade_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_smoke.py desktop/tests/core_update_smoke.py
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
       - name: Verify the unchanged web dashboard
@@ -192,6 +192,9 @@ jobs:
         run: python core-src/scripts/test-resource-bootstrap.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe --report artifacts/verification/resource-bootstrap-core.json
       - name: Test legacy installer upgrade and automatic TUN recovery
         run: ./desktop/tests/setup-windows.ps1
+      - name: Test independent automatic core updates while running, in TUN and stopped
+        timeout-minutes: 35
+        run: python desktop/tests/core_update_smoke.py
       - name: Test installed native UI, system proxy, TUN forwarding and cleanup
         run: python desktop/tests/windows_smoke.py
       - name: Render original design with the same Windows fixtures and dimensions
