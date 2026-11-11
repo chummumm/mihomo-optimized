@@ -143,6 +143,7 @@ impl<C: AwakeClock> OwnerLease<C> {
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     UserStop,
+    CoreUpdate,
     OwnerLost,
     LeaseExpired,
     UnexpectedExit,

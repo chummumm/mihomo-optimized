@@ -340,5 +340,28 @@ public static partial class L
         catalog["重试读取"] = "Retry read";
         catalog["重试读取状态"] = "Retry status read";
         catalog["隐藏"] = "Hide";
+        catalog["内核、规则与 Geo 数据"] = "Core, rules and Geo data";
+        catalog["检查并更新"] = "Check and update";
+        catalog["正在检查并更新…"] = "Checking and updating…";
+        catalog["刷新更新状态"] = "Refresh update status";
+        catalog["内置面板任务明细"] = "Bundled dashboard task details";
+        catalog["内核按 YAML 中的 core-auto-update 和 core-update-interval 独立更新。此处也更新规则与 Geo 数据；桌面应用更新在设置页进行。"] = "The core updates independently using core-auto-update and core-update-interval in YAML. Rules and Geo data also update here; desktop application updates are in Settings.";
+        catalog["内核可独立检查更新；启动内核后也可更新规则与 Geo 数据。"] = "Core updates can be checked independently. Start the core to update rules and Geo data as well.";
+        catalog["上次内核更新请求结果未确认，请核对当前版本。"] = "The previous core update request is unconfirmed. Check the current version.";
+        catalog["无法读取内核更新状态，请刷新后重试。"] = "Could not read the core update status. Refresh and try again.";
+        catalog["请先保存或放弃配置草稿，再检查更新。"] = "Save or discard the configuration draft before checking for updates.";
+        catalog["内核更新请求结果未确认，正在读取状态。"] = "The core update request is unconfirmed. Reading its status.";
+        catalog["正在独立更新内核；完成后保留原有运行与 TUN 设置。"] = "Updating the core independently. The current running and TUN settings will be preserved.";
+        catalog["内核已重新连接，先前资源更新结果需要核对。"] = "The core reconnected. Previous resource update results need verification.";
+        catalog["当前版本暂不可用"] = "Current version unavailable";
+        catalog["正在读取内核更新状态…"] = "Reading core update status…";
+        catalog["每 {0} 小时"] = "Every {0} hours";
+        catalog["正在切换内核"] = "Switching cores";
+        catalog["内核更新失败"] = "Core update failed";
+        catalog["正在下载内核"] = "Downloading the core";
+        catalog["正在验证内核"] = "Verifying the core";
+        catalog["等待当前操作完成"] = "Waiting for the current operation";
+        catalog["更新已取消"] = "Update cancelled";
+        catalog["这里更新桌面应用与内置组件；内核可在配置页独立更新，并沿用 YAML 中的自动更新设置。配置与日志会保留。"] = "Update the desktop application and bundled components here. The core can update independently on the Configuration page using its YAML automatic-update settings. Configuration and logs are preserved.";
     }
 }

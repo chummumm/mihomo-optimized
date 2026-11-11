@@ -187,11 +187,17 @@ impl HostContext {
     }
 
     pub fn set_update_service(&self, client: Option<ServiceClient>) {
-        *self.update_service.lock().unwrap_or_else(|error| error.into_inner()) = client;
+        *self
+            .update_service
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = client;
     }
 
     fn update_service_client(&self) -> Option<ServiceClient> {
-        self.update_service.lock().unwrap_or_else(|error| error.into_inner()).clone()
+        self.update_service
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     pub fn publish_status(&self, mut status: DesktopStatus) {
@@ -682,8 +688,14 @@ fn protocol_loop(
                         Some(request.id),
                         commands::status(&state, &context, request.params),
                     ))
-                } else if matches!(request.method.as_str(), "desktop_core_update_status" | "desktop_update_core") {
-                    Some(reply(Some(request.id), commands::core_update_control(&context, &request.method, request.params)))
+                } else if matches!(
+                    request.method.as_str(),
+                    "desktop_core_update_status" | "desktop_update_core"
+                ) {
+                    Some(reply(
+                        Some(request.id),
+                        commands::core_update_control(&context, &request.method, request.params),
+                    ))
                 } else {
                     let id = request.id;
                     let action = lifecycle_command(&request.method);
@@ -982,7 +994,9 @@ fn operations(
                 if let Ok(mut manager) = state.0.lock() {
                     manager.begin_operation(work.generation);
                     if let Err(error) = manager.resume_interrupted_core_update() {
-                        if result.is_ok() { result = Err(error); }
+                        if result.is_ok() {
+                            result = Err(error);
+                        }
                     }
                 }
             }

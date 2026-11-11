@@ -116,9 +116,9 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
         var urlRow = new Grid(); urlRow.ColumnDefinitions.Add(new ColumnDefinition()); urlRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); urlRow.Children.Add(importUrl); Grid.SetColumn(importUrlButton, 1); urlRow.Children.Add(importUrlButton);
         overview.Children.Add(ImportRow("link", "从 URL 导入", "返回完整 YAML 配置的 HTTP / HTTPS 地址", null, urlRow));
         var pasteRow = ImportRow("code", "粘贴 YAML", "把整份配置粘贴到文本框中", Action("粘贴 YAML", "PasteConfig", Paste)); pasteRow.Margin = new Thickness(0); overview.Children.Add(pasteRow);
-        var resourceHeading = Ui.Label("规则与 Geo 数据", 14, true); resourceHeading.Margin = new Thickness(1, 0, 0, 8); resources = new ResourceUpdatePanel(session);
+        var resourceHeading = Ui.Label("内核、规则与 Geo 数据", 14, true); resourceHeading.Margin = new Thickness(1, 0, 0, 8); resources = new ResourceUpdatePanel(session);
         resourcesTarget = new Border { Child = Ui.Column(resourceHeading, resources), BorderThickness = new Thickness(2), Padding = new Thickness(0), Margin = new Thickness(-2, 26, -2, -2), CornerRadius = new CornerRadius(4), Focusable = true }.Id("set-resources");
-        resourcesTarget.BorderBrush = Brushes.Transparent; L.Bind(resourcesTarget, AutomationProperties.NameProperty, "规则与 Geo 数据"); overview.Children.Add(resourcesTarget);
+        resourcesTarget.BorderBrush = Brushes.Transparent; L.Bind(resourcesTarget, AutomationProperties.NameProperty, "内核、规则与 Geo 数据"); overview.Children.Add(resourcesTarget);
         void AdaptOverview() { currentCard.Padding = PageContainerWidth <= 560 ? new Thickness(16) : new Thickness(24, 20, 24, 20); countsBadge.Visibility = PageContainerWidth <= 560 ? Visibility.Collapsed : Visibility.Visible; }
         SizeChanged += (_, _) => { AdaptOverview(); UpdateEditorMetrics(); };
         TransitionSurface.SizeChanged += (_, args) => { if (args.WidthChanged) AdaptOverview(); };
@@ -263,7 +263,7 @@ public sealed class ProfilesPage : NativePage, IPageBackNavigation
     public override async Task RefreshAsync()
     {
         if (!loaded && !dirty && !Busy && !importOpening && !Session.IsUpdating) await ReadDocument();
-        resources.UpdateAvailability(PageToken); if (IsRunning) await Task.WhenAll(resources.RefreshAsync(PageToken), RefreshSummary());
+        resources.UpdateAvailability(PageToken); await Task.WhenAll(resources.RefreshAsync(PageToken), RefreshSummary());
     }
     protected override void OnStatusChanged()
     {

@@ -329,6 +329,16 @@ pub fn application_path() -> Result<PathBuf> {
 }
 
 pub fn protected_install_dir() -> Result<PathBuf> {
+    checked_install_dir(false)
+}
+
+/// Service startup and its privileged maintenance start repair an interrupted
+/// rename. Ordinary client construction must not undo an active update.
+pub fn protected_install_dir_for_core_recovery() -> Result<PathBuf> {
+    checked_install_dir(true)
+}
+
+fn checked_install_dir(recover_core: bool) -> Result<PathBuf> {
     let executable = std::env::current_exe().map_err(|e| AppError::io("无法定位程序", e))?;
     reject_reparse_path(&executable)?;
     let directory = executable
@@ -350,6 +360,25 @@ pub fn protected_install_dir() -> Result<PathBuf> {
         .take_while(|path| path.starts_with(&program_files))
     {
         require_admin_protected(ancestor)?;
+    }
+    if recover_core {
+        let core = directory.join("mihomo-core.exe");
+        let (backup, marker) = crate::core::core_update_recovery_paths(&core)?;
+        // Establish the same owner/DACL/link boundary for every recovery input
+        // before interpreting its journal or moving a byte as SYSTEM.
+        for path in [&core, &backup, &marker] {
+            reject_reparse_path(path)?;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_file() => {
+                    reject_hard_links(path)?;
+                    require_admin_protected(path)?;
+                }
+                Ok(_) => return Err(AppError::new("unsafe_file", "内核恢复文件必须为普通文件")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(AppError::io("无法检查内核恢复文件", error)),
+            }
+        }
+        crate::core::recover_core_update(&core, false)?;
     }
     for filename in [
         "mihomo-core.exe",

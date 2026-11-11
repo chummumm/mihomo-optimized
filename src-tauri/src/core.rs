@@ -1,5 +1,6 @@
 use crate::{
     config,
+    core_update_release::{self, PreparedCoreUpdate},
     error::{AppError, Result},
     lifecycle::{self, Cancellation, RecoveryWindow, StopReason, HEALTH_INTERVAL},
 };
@@ -15,6 +16,10 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[path = "core_update_transaction.rs"]
+mod replacement;
+use replacement::CoreReplacement;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const TOTAL_STOP_TIMEOUT: Duration = Duration::from_secs(12);
@@ -344,6 +349,26 @@ pub struct CoreStatus {
     pub service_instance: Option<String>,
     pub status_sequence: u64,
     pub intent_revision: u64,
+    pub core_update: Option<CoreUpdateStatus>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoreUpdateStatus {
+    pub phase: String,
+    pub version: Option<String>,
+}
+
+struct PendingCoreUpdate {
+    intent_revision: u64,
+    version: String,
+    prepared: Option<PreparedCoreUpdate>,
+    replacement: Option<CoreReplacement>,
+    previous_source: Option<String>,
+    previous_tun: bool,
+    was_running: bool,
+    stopped_for_update: bool,
+    installation_started: bool,
 }
 
 pub fn observed_now() -> u64 {
@@ -469,6 +494,8 @@ pub struct CoreSupervisor {
     tun_recovery: Option<TunRecovery>,
     diagnostic_health: Option<serde_json::Value>,
     diagnostic_health_at: Option<u64>,
+    pending_core_update: Option<PendingCoreUpdate>,
+    core_update_status: Option<CoreUpdateStatus>,
 }
 
 pub fn http_client() -> Result<Client> {
@@ -670,6 +697,22 @@ pub fn fixed_core_path() -> Result<PathBuf> {
     ))
 }
 
+/// Restore only after the caller establishes that an unconfirmed new child is
+/// no longer running. Service startup passes false to repair only a rename gap.
+pub fn recover_core_update(executable: &Path, restore_unconfirmed: bool) -> Result<()> {
+    CoreReplacement::recover(executable, restore_unconfirmed)
+}
+
+pub fn core_update_recovery_paths(executable: &Path) -> Result<(PathBuf, PathBuf)> {
+    replacement::journal_paths(executable)
+}
+
+/// A desktop host can detect a privileged recovery obligation without reading
+/// the service-owned journal. Only the fixed sibling marker is inspected.
+pub fn core_update_needs_recovery(executable: &Path) -> Result<bool> {
+    CoreReplacement::needs_recovery(executable)
+}
+
 pub fn quiet_command(executable: &Path) -> Command {
     #[allow(unused_mut)]
     let mut command = Command::new(executable);
@@ -718,6 +761,8 @@ impl CoreSupervisor {
             tun_recovery: None,
             diagnostic_health: None,
             diagnostic_health_at: None,
+            pending_core_update: None,
+            core_update_status: None,
         }
     }
 
@@ -781,14 +826,289 @@ impl CoreSupervisor {
             },
             observed_at: self.observed_at,
             intent_revision: self.cancellation.as_ref().map_or(0, Cancellation::revision),
+            core_update: self.core_update_status.clone(),
             ..CoreStatus::default()
         }
     }
 
-    pub fn start(&mut self, source: String, tun: bool) -> Result<CoreStatus> {
+    /// Download and verify a candidate while the current process keeps serving.
+    /// The stage belongs to one accepted host intent, not a caller-chosen path.
+    pub fn prepare_core_update(
+        &mut self,
+        proxy_port: Option<u16>,
+        intent_revision: u64,
+    ) -> Result<CoreStatus> {
         self.check_cancelled()?;
+        if proxy_port == Some(0) {
+            return Err(AppError::new("core_update_proxy", "内核更新代理端口无效"));
+        }
+        self.abort_core_update(true)?;
+        let cancellation = self.update_cancellation()?;
+        let proxy = proxy_port.map(|port| format!("http://127.0.0.1:{port}"));
+        let prepared =
+            core_update_release::prepare(&self.executable, proxy.as_deref(), &cancellation)?;
+        self.check_cancelled()?;
+        let Some(prepared) = prepared else {
+            self.core_update_status = Some(CoreUpdateStatus {
+                phase: "up_to_date".into(),
+                version: Some(core_update_release::executable_version(
+                    &self.executable,
+                    &cancellation,
+                )?),
+            });
+            return Ok(self.status());
+        };
+        let version = prepared.version().to_owned();
+        self.pending_core_update = Some(PendingCoreUpdate {
+            intent_revision,
+            version: version.clone(),
+            prepared: Some(prepared),
+            replacement: None,
+            previous_source: None,
+            previous_tun: false,
+            was_running: false,
+            stopped_for_update: false,
+            installation_started: false,
+        });
+        self.core_update_status = Some(CoreUpdateStatus {
+            phase: "prepared".into(),
+            version: Some(version),
+        });
+        Ok(self.status())
+    }
+
+    /// Commit only after this owner can stop every child it launched. A host
+    /// owning a direct child stops it before asking the privileged file owner.
+    pub fn commit_core_update(&mut self, intent_revision: u64) -> Result<CoreStatus> {
+        self.check_cancelled()?;
+        let mut pending = self.take_core_update(intent_revision, true)?;
+        if pending.replacement.is_some() {
+            self.pending_core_update = Some(pending);
+            return Ok(self.status());
+        }
+        let result =
+            (|| {
+                let cancellation = self.update_cancellation()?;
+                let prepared = pending.prepared.as_ref().ok_or_else(|| {
+                    AppError::new("core_update_not_prepared", "尚未准备可安装的内核")
+                })?;
+                prepared.verify(&cancellation)?;
+                pending.was_running = self.child.is_some() && self.desired_running;
+                pending.previous_source = self.source.clone();
+                pending.previous_tun = self.tun;
+                // This bypasses the public Stop's abort path: pending is exclusively
+                // owned by this transaction until readiness or rollback completes.
+                self.stop_for_cause(StopReason::CoreUpdate, "core_update_replace")?;
+                pending.stopped_for_update = true;
+                self.check_cancelled()?;
+                pending.installation_started = true;
+                let replacement = CoreReplacement::install(
+                    &self.executable,
+                    prepared.executable(),
+                    prepared.expected_sha256(),
+                    &cancellation,
+                )?;
+                pending.replacement = Some(replacement);
+                self.check_cancelled()?;
+                if pending.was_running {
+                    let source = pending.previous_source.clone().ok_or_else(|| {
+                        AppError::new("core_update_source", "无法恢复内核运行配置")
+                    })?;
+                    self.start_after_core_update(source, pending.previous_tun)?;
+                    self.check_cancelled()?;
+                    if self.version.as_deref() != Some(pending.version.as_str()) {
+                        return Err(AppError::new(
+                            "core_update_version",
+                            "新内核返回的运行版本不匹配",
+                        ));
+                    }
+                }
+                Ok(())
+            })();
+        if let Err(error) = result {
+            let rollback = self.restore_core_update(&mut pending, true);
+            if let Err(rollback) = rollback {
+                self.pending_core_update = Some(pending);
+                return Err(AppError::new(
+                    "core_update_restore_failed",
+                    format!("{}；恢复旧内核失败：{}", error.message, rollback.message),
+                ));
+            }
+            return Err(error);
+        }
+        self.core_update_status = Some(CoreUpdateStatus {
+            phase: "committed".into(),
+            version: Some(pending.version.clone()),
+        });
+        self.pending_core_update = Some(pending);
+        Ok(self.status())
+    }
+
+    /// A direct host acknowledges its own new child's readiness here. The TUN
+    /// service already checked readiness during commit, but uses the same ack.
+    pub fn complete_core_update(
+        &mut self,
+        accept: bool,
+        intent_revision: u64,
+    ) -> Result<CoreStatus> {
+        if !accept && self.pending_core_update.is_none() {
+            // Recovery after a service restart. The authenticated host must have
+            // stopped its direct child before requesting an unconfirmed rollback.
+            if CoreReplacement::has_unconfirmed(&self.executable)? {
+                self.stop_for_cause(StopReason::CoreUpdate, "core_update_recover")?;
+                CoreReplacement::recover(&self.executable, true)?;
+                self.core_update_status = Some(CoreUpdateStatus {
+                    phase: "rolled_back".into(),
+                    version: None,
+                });
+            } else {
+                // A commit failure may already have restored and restarted the
+                // old core. Repeating rollback must not stop that good process.
+                CoreReplacement::recover(&self.executable, false)?;
+            }
+            return Ok(self.status());
+        }
+        if accept {
+            self.check_cancelled()?;
+        }
+        let mut pending = self.take_core_update(intent_revision, accept)?;
+        let result = if accept {
+            match pending.replacement.as_mut() {
+                Some(replacement) => replacement.accept(),
+                None => Err(AppError::new("core_update_not_committed", "新内核尚未提交")),
+            }
+        } else {
+            let resume = pending.intent_revision == intent_revision;
+            self.restore_core_update(&mut pending, resume)
+        };
+        if let Err(error) = result {
+            self.pending_core_update = Some(pending);
+            return Err(error);
+        }
+        if accept {
+            self.core_update_status = Some(CoreUpdateStatus {
+                phase: "confirmed".into(),
+                version: Some(pending.version),
+            });
+        }
+        Ok(self.status())
+    }
+
+    fn update_cancellation(&self) -> Result<Cancellation> {
+        self.cancellation
+            .clone()
+            .ok_or_else(|| AppError::new("core_update_owner", "内核更新缺少有效的生命周期所有者"))
+    }
+
+    fn take_core_update(
+        &mut self,
+        intent_revision: u64,
+        require_exact: bool,
+    ) -> Result<PendingCoreUpdate> {
+        if require_exact
+            && self
+                .pending_core_update
+                .as_ref()
+                .map(|pending| pending.intent_revision)
+                != Some(intent_revision)
+        {
+            return Err(AppError::new(
+                "core_update_not_prepared",
+                "内核更新已取消或不属于当前操作",
+            ));
+        }
+        self.pending_core_update
+            .take()
+            .ok_or_else(|| AppError::new("core_update_not_prepared", "尚未准备可安装的内核"))
+    }
+
+    fn abort_core_update(&mut self, resume_previous: bool) -> Result<()> {
+        let Some(mut pending) = self.pending_core_update.take() else {
+            return Ok(());
+        };
+        if pending.replacement.is_some() && !pending.was_running {
+            self.pending_core_update = Some(pending);
+            return Err(AppError::new(
+                "core_update_pending",
+                "请先确认桌面内核已退出并完成内核更新回滚",
+            ));
+        }
+        if let Err(error) = self.restore_core_update(&mut pending, resume_previous) {
+            self.pending_core_update = Some(pending);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn abort_core_update_for_stop(&mut self) -> Result<()> {
+        // A privileged file owner may not own the direct host's new process.
+        // Stop cancels work but leaves this backup until that host explicitly
+        // confirms process exit through Complete(false).
+        if self
+            .pending_core_update
+            .as_ref()
+            .is_some_and(|pending| pending.replacement.is_some() && !pending.was_running)
+        {
+            return Ok(());
+        }
+        self.abort_core_update(false)
+    }
+
+    fn restore_core_update(
+        &mut self,
+        pending: &mut PendingCoreUpdate,
+        resume_previous: bool,
+    ) -> Result<()> {
+        if let Some(replacement) = &pending.replacement {
+            // Cleanup is deliberately not cancellable. Stop must confirm exit
+            // before touching a running executable or launching the old image.
+            self.stop_for_cause(StopReason::CoreUpdate, "core_update_rollback")?;
+            replacement.rollback()?;
+            pending.replacement = None;
+        } else if pending.installation_started {
+            // An interrupted install may have left a durable rename-gap record.
+            CoreReplacement::recover(&self.executable, true)?;
+        }
+        self.core_update_status = Some(CoreUpdateStatus {
+            phase: "rolled_back".into(),
+            version: None,
+        });
+        if resume_previous
+            && pending.stopped_for_update
+            && pending.was_running
+            && self.check_cancelled().is_ok()
+        {
+            if let Some(source) = pending.previous_source.clone() {
+                self.start_after_core_update(source, pending.previous_tun)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn start(&mut self, source: String, tun: bool) -> Result<CoreStatus> {
+        self.start_for(source, tun, StopReason::UserStop)
+    }
+
+    pub(crate) fn start_after_core_update(
+        &mut self,
+        source: String,
+        tun: bool,
+    ) -> Result<CoreStatus> {
+        self.start_for(source, tun, StopReason::CoreUpdate)
+    }
+
+    fn start_for(&mut self, source: String, tun: bool, reason: StopReason) -> Result<CoreStatus> {
+        self.check_cancelled()?;
+        self.abort_core_update(false)?;
         let budget = OperationBudget::new(&source)?;
-        self.stop_for_cause(StopReason::UserStop, "start_replace")?;
+        self.stop_for_cause(
+            reason,
+            if reason == StopReason::CoreUpdate {
+                "core_update_start_replace"
+            } else {
+                "start_replace"
+            },
+        )?;
         self.check_cancelled()?;
         self.source = Some(source);
         self.tun = tun;
@@ -1337,6 +1657,7 @@ impl CoreSupervisor {
 
     fn reload_inner(&mut self, source: String) -> Result<CoreStatus> {
         self.check_cancelled()?;
+        self.abort_core_update(true)?;
         let budget = OperationBudget::new(&source)?;
         self.log_start = fs::metadata(self.logs.join("core.log")).map_or(0, |file| file.len());
         if self.child.is_none() {
@@ -2032,8 +2353,10 @@ impl CoreSupervisor {
     }
 
     pub fn stop_for(&mut self, reason: StopReason) -> Result<()> {
+        self.abort_core_update_for_stop()?;
         let cause = match reason {
             StopReason::UserStop => "requested_stop",
+            StopReason::CoreUpdate => "core_update",
             StopReason::OwnerLost => "owner_lost",
             StopReason::LeaseExpired => "lease_expired",
             StopReason::UnexpectedExit => "unexpected_exit",
@@ -2275,7 +2598,12 @@ impl Drop for CoreSupervisor {
                 self.job = None;
             }
         } else {
-            let _ = self.stop_for_cause(StopReason::UserStop, "drop_cleanup");
+            if self
+                .stop_for_cause(StopReason::UserStop, "drop_cleanup")
+                .is_ok()
+            {
+                let _ = self.abort_core_update_for_stop();
+            }
         }
     }
 }
@@ -2287,6 +2615,196 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
+
+    struct UpdateFixture {
+        core: CoreSupervisor,
+        directory: PathBuf,
+    }
+
+    impl UpdateFixture {
+        fn committed(owned: bool) -> Self {
+            use sha2::{Digest, Sha256};
+            let mut random = [0u8; 12];
+            getrandom::getrandom(&mut random).unwrap();
+            let directory =
+                std::env::temp_dir().join(format!("core-update-owner-{}", hex::encode(random)));
+            fs::create_dir(&directory).unwrap();
+            let executable = directory.join("mihomo-core.exe");
+            let candidate = directory.join("candidate.exe");
+            fs::write(&executable, b"old core bytes").unwrap();
+            fs::write(&candidate, b"new core bytes").unwrap();
+            let cancellation = Cancellation::new(Arc::new(std::sync::atomic::AtomicU64::new(7)), 7);
+            let replacement = CoreReplacement::install(
+                &executable,
+                &candidate,
+                &hex::encode(Sha256::digest(b"new core bytes")),
+                &cancellation,
+            )
+            .unwrap();
+            let mut core =
+                CoreSupervisor::new(executable, directory.join("home"), directory.join("logs"));
+            core.set_cancellation(cancellation);
+            core.pending_core_update = Some(PendingCoreUpdate {
+                intent_revision: 7,
+                version: "mihomo-optimized-v1.0.30".into(),
+                prepared: None,
+                replacement: Some(replacement),
+                previous_source: Some(config::INITIAL_CONFIG.into()),
+                previous_tun: owned,
+                was_running: owned,
+                stopped_for_update: true,
+                installation_started: true,
+            });
+            core.core_update_status = Some(CoreUpdateStatus {
+                phase: "committed".into(),
+                version: Some("mihomo-optimized-v1.0.30".into()),
+            });
+            Self { core, directory }
+        }
+        fn bytes(&self) -> Vec<u8> {
+            fs::read(&self.core.executable).unwrap()
+        }
+    }
+
+    impl Drop for UpdateFixture {
+        fn drop(&mut self) {
+            let _ = self
+                .core
+                .stop_for_cause(StopReason::Shutdown, "test_cleanup");
+            if let Some(mut pending) = self.core.pending_core_update.take() {
+                let _ = self.core.restore_core_update(&mut pending, false);
+            }
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn external_update_stop_retains_backup_until_host_confirms_exit() {
+        let mut fixture = UpdateFixture::committed(false);
+        fixture.core.stop_for(StopReason::UserStop).unwrap();
+        assert_eq!(fixture.bytes(), b"new core bytes");
+        assert!(fixture.core.pending_core_update.is_some());
+        assert!(!fixture.core.status().desired_running);
+        let status = fixture.core.complete_core_update(false, 8).unwrap();
+        assert_eq!(fixture.bytes(), b"old core bytes");
+        assert_eq!(status.core_update.unwrap().phase, "rolled_back");
+        assert!(!status.running && status.pid.is_none());
+    }
+
+    #[test]
+    fn external_update_cannot_be_accepted_by_a_new_intent() {
+        let mut fixture = UpdateFixture::committed(false);
+        let error = fixture.core.complete_core_update(true, 8).err().unwrap();
+        assert_eq!(error.code, "core_update_not_prepared");
+        assert_eq!(fixture.bytes(), b"new core bytes");
+        fixture.core.complete_core_update(true, 7).unwrap();
+        assert!(fixture.core.pending_core_update.is_none());
+        assert_eq!(fixture.bytes(), b"new core bytes");
+        assert_eq!(
+            fixture.core.status().core_update.unwrap().phase,
+            "confirmed"
+        );
+    }
+
+    #[test]
+    fn canceled_update_cannot_restart_or_acknowledge_candidate() {
+        let mut fixture = UpdateFixture::committed(false);
+        let revision = Arc::new(std::sync::atomic::AtomicU64::new(8));
+        fixture
+            .core
+            .set_cancellation(Cancellation::new(revision.clone(), 7));
+        assert_eq!(
+            fixture
+                .core
+                .complete_core_update(true, 7)
+                .err()
+                .unwrap()
+                .code,
+            "operation_cancelled"
+        );
+        fixture.core.stop_for(StopReason::UserStop).unwrap();
+        assert_eq!(fixture.bytes(), b"new core bytes");
+        fixture
+            .core
+            .set_cancellation(Cancellation::new(revision, 8));
+        fixture.core.complete_core_update(false, 8).unwrap();
+        assert_eq!(fixture.bytes(), b"old core bytes");
+        assert!(fixture.core.child.is_none() && !fixture.core.desired_running);
+    }
+
+    #[test]
+    fn external_pending_update_rejects_start_until_explicit_rollback() {
+        let mut fixture = UpdateFixture::committed(false);
+        assert_eq!(
+            fixture
+                .core
+                .start(config::INITIAL_CONFIG.into(), false)
+                .err()
+                .unwrap()
+                .code,
+            "core_update_pending"
+        );
+        assert_eq!(fixture.bytes(), b"new core bytes");
+        assert!(fixture.core.child.is_none());
+        fixture.core.complete_core_update(false, 8).unwrap();
+        assert_eq!(fixture.bytes(), b"old core bytes");
+    }
+
+    #[test]
+    fn owned_update_stop_restores_old_file_without_restarting() {
+        let mut fixture = UpdateFixture::committed(true);
+        let child = quiet_command(&std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "core::tests::readiness_owned_process",
+            ])
+            .env("MIHOMO_READINESS_TEST_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        fixture.core.child = Some(child);
+        fixture.core.desired_running = true;
+        fixture.core.stop_for(StopReason::UserStop).unwrap();
+        assert_eq!(fixture.bytes(), b"old core bytes");
+        assert!(fixture.core.child.is_none());
+        assert!(!fixture.core.desired_running);
+        assert!(fixture.core.pending_core_update.is_none());
+    }
+
+    #[test]
+    fn repeating_completed_rollback_preserves_the_restored_running_core() {
+        let mut fixture = UpdateFixture::committed(true);
+        let pending = fixture.core.pending_core_update.take().unwrap();
+        pending.replacement.as_ref().unwrap().rollback().unwrap();
+        fixture.core.core_update_status = Some(CoreUpdateStatus {
+            phase: "rolled_back".into(),
+            version: None,
+        });
+        let child = quiet_command(&std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "core::tests::readiness_owned_process",
+            ])
+            .env("MIHOMO_READINESS_TEST_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        fixture.core.child = Some(child);
+        fixture.core.desired_running = true;
+        for _ in 0..2 {
+            let status = fixture.core.complete_core_update(false, 7).unwrap();
+            assert_eq!(status.pid, Some(pid));
+            assert!(status.running && status.desired_running);
+            assert_eq!(fixture.bytes(), b"old core bytes");
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum ReadinessScenario {

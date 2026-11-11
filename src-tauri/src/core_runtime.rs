@@ -33,6 +33,9 @@ pub enum RuntimeRequest {
     Start(String),
     Reload(String),
     Stop(StopReason),
+    PrepareCoreUpdate { proxy_port: Option<u16> },
+    CommitCoreUpdate,
+    CompleteCoreUpdate { accept: bool },
 }
 
 impl RuntimeRequest {
@@ -41,6 +44,9 @@ impl RuntimeRequest {
             Self::Start(_) => "starting",
             Self::Reload(_) => "reloading",
             Self::Stop(_) => "stopping",
+            Self::PrepareCoreUpdate { .. } => "preparing_core_update",
+            Self::CommitCoreUpdate => "updating_core",
+            Self::CompleteCoreUpdate { .. } => "finishing_core_update",
         }
     }
     fn fingerprint(&self) -> String {
@@ -50,6 +56,9 @@ impl RuntimeRequest {
         match self {
             Self::Start(source) | Self::Reload(source) => digest.update(source),
             Self::Stop(reason) => digest.update(format!("{reason:?}")),
+            Self::PrepareCoreUpdate { proxy_port } => digest.update(format!("{proxy_port:?}")),
+            Self::CommitCoreUpdate => (),
+            Self::CompleteCoreUpdate { accept } => digest.update([u8::from(*accept)]),
         }
         hex::encode(digest.finalize())
     }
@@ -288,7 +297,7 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
     core.record_lifecycle("core_runtime_started", serde_json::json!({}));
     let mut last_poll = Instant::now() - Duration::from_secs(2);
     while !shared.shutdown.load(Ordering::Acquire) {
-        let (work, reconcile, revision, intent_revision) = {
+        let (work, reconcile, revision, intent_revision, intended_running) = {
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.pending.is_none()
                 && state.reconcile.is_none()
@@ -315,6 +324,7 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
                 state.reconcile.take(),
                 shared.revision.load(Ordering::Acquire),
                 state.status.intent_revision,
+                state.status.desired_running,
             )
         };
         if let Some(work) = work {
@@ -333,8 +343,30 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
             } else {
                 match work.request {
                     RuntimeRequest::Start(source) => core.start(source, true),
-                    RuntimeRequest::Reload(source) => core.reload(source),
+                    RuntimeRequest::Reload(source) => {
+                        // A superseded update may have stopped the old process
+                        // before the new Reload arrived. Resume only under this
+                        // newly admitted running intent; Stop remains final.
+                        let observed = core.status();
+                        if intended_running
+                            && observed.pid.is_none()
+                            && observed.process_state == "exited"
+                        {
+                            core.start(source, true)
+                        } else {
+                            core.reload(source)
+                        }
+                    }
                     RuntimeRequest::Stop(reason) => core.stop_for(reason).map(|_| core.status()),
+                    RuntimeRequest::PrepareCoreUpdate { proxy_port } => {
+                        core.prepare_core_update(proxy_port, work.intent_revision)
+                    }
+                    RuntimeRequest::CommitCoreUpdate => {
+                        core.commit_core_update(work.intent_revision)
+                    }
+                    RuntimeRequest::CompleteCoreUpdate { accept } => {
+                        core.complete_core_update(accept, work.intent_revision)
+                    }
                 }
             };
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -407,6 +439,89 @@ mod tests {
 
     fn queued_runtime() -> CoreRuntime {
         CoreRuntime::queued_for_test()
+    }
+
+    #[test]
+    fn stop_cancels_queued_core_update_without_starting_a_stopped_core() {
+        let runtime = queued_runtime();
+        runtime
+            .submit(
+                "update:prepare".into(),
+                7,
+                RuntimeRequest::PrepareCoreUpdate {
+                    proxy_port: Some(7890),
+                },
+            )
+            .unwrap();
+        assert!(!runtime.status().desired_running);
+        let token = Cancellation::new(runtime.shared.revision.clone(), 1);
+        runtime
+            .submit(
+                "update:stop".into(),
+                8,
+                RuntimeRequest::Stop(StopReason::UserStop),
+            )
+            .unwrap();
+        assert!(token.check().is_err());
+        let replay = runtime
+            .submit(
+                "update:prepare".into(),
+                7,
+                RuntimeRequest::PrepareCoreUpdate {
+                    proxy_port: Some(7890),
+                },
+            )
+            .unwrap();
+        assert_eq!(replay.phase, "cancelled");
+        assert!(!runtime.status().desired_running);
+        assert_eq!(runtime.shared.revision.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn update_stage_replay_cannot_change_proxy_or_acknowledgement() {
+        let runtime = queued_runtime();
+        runtime
+            .submit(
+                "update:prepare".into(),
+                7,
+                RuntimeRequest::PrepareCoreUpdate {
+                    proxy_port: Some(7890),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .submit(
+                    "update:prepare".into(),
+                    7,
+                    RuntimeRequest::PrepareCoreUpdate {
+                        proxy_port: Some(8080)
+                    }
+                )
+                .err()
+                .unwrap()
+                .code,
+            "service_request_conflict"
+        );
+        runtime
+            .submit(
+                "update:complete".into(),
+                7,
+                RuntimeRequest::CompleteCoreUpdate { accept: false },
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .submit(
+                    "update:complete".into(),
+                    7,
+                    RuntimeRequest::CompleteCoreUpdate { accept: true }
+                )
+                .err()
+                .unwrap()
+                .code,
+            "service_request_conflict"
+        );
     }
 
     #[test]
@@ -494,6 +609,108 @@ mod tests {
                 .id,
             "session:stop"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_reload_resumes_only_the_newly_accepted_running_intent() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut nonce = [0u8; 8];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let directory = std::env::temp_dir().join(format!("mihomo-reload-{}", hex::encode(nonce)));
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("owned-core-fixture");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\necho $$ >> validation.pids\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = CoreRuntime::spawn(CoreSupervisor::new(
+            executable,
+            directory.join("runtime"),
+            directory.join("logs"),
+        ))
+        .unwrap();
+        let pid_file = directory.join("runtime/validation.pids");
+        let pids = || -> Vec<u32> {
+            std::fs::read_to_string(&pid_file)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.parse().ok())
+                .collect()
+        };
+        runtime
+            .submit(
+                "session:first".into(),
+                41,
+                RuntimeRequest::Start(crate::config::INITIAL_CONFIG.into()),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pids().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(pids().len(), 1, "first owned validation is running");
+        runtime
+            .submit(
+                "session:reload".into(),
+                42,
+                RuntimeRequest::Reload(crate::config::INITIAL_CONFIG.into()),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pids().len() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let children = pids();
+        assert_eq!(
+            children.len(),
+            2,
+            "Reload resumes the accepted running intent"
+        );
+        assert_ne!(children[0], children[1]);
+        assert_eq!(
+            runtime.operation("session:first").unwrap().phase,
+            "cancelled"
+        );
+        assert!(runtime.status().desired_running);
+        runtime
+            .submit(
+                "session:stop".into(),
+                43,
+                RuntimeRequest::Stop(StopReason::UserStop),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while matches!(
+            runtime.operation("session:stop").unwrap().phase.as_str(),
+            "queued" | "running"
+        ) && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            runtime.operation("session:reload").unwrap().phase,
+            "cancelled"
+        );
+        assert_eq!(
+            runtime.operation("session:stop").unwrap().phase,
+            "succeeded"
+        );
+        assert!(!runtime.status().desired_running);
+        assert!(runtime.status().pid.is_none());
+        for pid in children {
+            assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+        }
+        runtime.shutdown().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Arc::strong_count(&runtime.shared) > 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(Arc::strong_count(&runtime.shared), 1);
+        assert!(crate::diagnostics::flush(Duration::from_secs(2)));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]

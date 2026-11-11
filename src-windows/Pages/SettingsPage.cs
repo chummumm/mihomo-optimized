@@ -215,10 +215,10 @@ public sealed class SettingsPage : NativePage
         tunDeviceEffectiveName.Margin = new Thickness(0, 4, 0, 0);
         tunDeviceCard = Row("set-tun-device", "router", "TUN 网卡名称", "", null,
             Ui.Column(tunDeviceConfiguredName, tunDeviceEffectiveName), descriptionBlock: tunDeviceHint);
-        var tunSection = Section("TUN 与系统服务",
+        var tunSection = Section("TUN 与桌面服务",
             Row("set-tun", "shield-lock", "TUN 模式", "TUN 通过系统服务运行。首次启用会请求管理员授权；服务模式需要安装版。", SettingToggle(tun), focus: tun),
             tunDeviceCard,
-            Row("set-service", "shield-check", "系统服务", "", Actions(installService, uninstallService), null, installService, serviceStatus));
+            Row("set-service", "shield-check", "桌面服务", "", Actions(installService, uninstallService), null, installService, serviceStatus));
         var updates = Section("版本与更新",
             UpdateCard(),
             Row("set-about", "info", "Mihomo Optimized", "", openProject, null, openProject, versions));
@@ -361,7 +361,7 @@ public sealed class SettingsPage : NativePage
         }
         responsiveRows.Add(Adapt); Adapt(false);
         content.Children.Add(progressBar);
-        var hint = Ui.Hint("应用、内核和内置界面一起升级；配置与日志会保留。"); hint.Margin = new Thickness(16, 4, 16, 12); hint.LineHeight = 16; hint.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
+        var hint = Ui.Hint("这里更新桌面应用与内置组件；内核可在配置页独立更新，并沿用 YAML 中的自动更新设置。配置与日志会保留。"); hint.Margin = new Thickness(16, 4, 16, 12); hint.LineHeight = 16; hint.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
         content.Children.Add(hint);
         progress.Margin = new Thickness(16, 0, 16, 12); progress.Visibility = Visibility.Collapsed; content.Children.Add(progress);
         releaseNotesToggle.Style = FluentControls.Style("Ghost");
@@ -480,7 +480,7 @@ public sealed class SettingsPage : NativePage
         bool installed = service.Bool("installed"), running = service.Bool("running");
         versions.Text = L.F("客户端 {0} · 内核 {1}", status.Text("appVersion", fallback: "—"), status.Text("coreVersion", fallback: L.T("尚未启动")));
         installedVersion.Text = update.Text("currentVersion", fallback: status.Text("appVersion", fallback: "—"));
-        serviceStatus.Text = L.T(installed ? running ? "正在运行" : "已安装" : "未安装");
+        serviceStatus.Text = L.T(installed ? running ? "正在运行" : "已安装" : "未安装") + " · " + L.T("用于 TUN 和安装版内核更新。");
         var device = Session.TunDevice;
         tunDeviceCard.Visibility = device.Available ? Visibility.Visible : Visibility.Collapsed;
         tunDeviceConfiguredName.Text = L.F("配置名称：{0}", string.IsNullOrWhiteSpace(device.ConfiguredName) ? L.T("内核默认名称") : device.ConfiguredName);
@@ -509,7 +509,7 @@ public sealed class SettingsPage : NativePage
         uninstallService.Visibility = installed ? Visibility.Visible : Visibility.Collapsed;
         installService.IsEnabled = !DesktopBusy && capability.Bool("serviceManagement") && !installed;
         uninstallService.IsEnabled = !DesktopBusy && capability.Bool("serviceManagement") && installed && !status.Bool("tun");
-        L.Bind(uninstallService, ToolTipProperty, status.Bool("tun") ? "请先关闭 TUN 模式，再卸载服务。" : "卸载本机 TUN 服务");
+        L.Bind(uninstallService, ToolTipProperty, status.Bool("tun") ? "请先关闭 TUN 模式，再卸载服务。" : "卸载桌面服务；TUN 与安装版内核更新将不可用。");
         openConfig.IsEnabled = openLogs.IsEnabled = openProject.IsEnabled = Session.Ready && !Session.IsUpdating;
         runtimeStatus.Text = Session.IsDirty ? L.T("配置编辑器中有未保存的修改，请先保存或放弃后再修改网络设置。")
             : !IsRunning ? L.T("启动内核后可修改代理模式、局域网访问和端口。") : "";

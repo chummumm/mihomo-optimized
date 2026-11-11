@@ -16,11 +16,11 @@ internal static class SearchTargets
         new("set-ports", "混合代理端口", "port mixed http socks 端口 混合"),
         new("set-probe", "测速 URL", "probe url latency speed test 测速 探测 延迟"),
         new("set-tun", "TUN 模式", "tun virtual adapter 虚拟网卡"),
-        new("set-service", "系统服务", "service administrator tun 服务 管理员 安装 卸载"),
+        new("set-service", "桌面服务", "service administrator tun core update 服务 管理员 安装 卸载 内核 更新"),
         new("desktop-app-update", "桌面应用", "update version release 更新 版本 发行 安装"),
         new("set-about", "关于 Mihomo Optimized", "about version github project 关于 版本 项目"),
         new("set-config-folder", "配置文件夹", "config directory folder 配置 目录 文件夹"),
         new("set-log-folder", "日志文件夹", "log directory folder 日志 目录 文件夹"),
-        new("set-resources", "资源与规则集", "geo geoip geosite rule provider 规则集 资源", "profiles")
+        new("set-resources", "内核、规则与 Geo 数据", "kernel core update auto geo geoip geosite rule provider 内核 更新 自动 规则集 资源", "profiles")
     ];
 }

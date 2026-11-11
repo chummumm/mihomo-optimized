@@ -13,6 +13,7 @@ WindowPlacementGeometryTests.Run();
 HostRecoveryIntentTests.Run();
 DesktopStatusTests.Run();
 TunDeviceStateTests.Run();
+CoreUpdateStateTests.Run();
 await LifecycleDiagnosticsTests.RunAsync();
 
 static StreamReader Reader(string text) => new(new MemoryStream(Encoding.UTF8.GetBytes(text)), Encoding.UTF8);

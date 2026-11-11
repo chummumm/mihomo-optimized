@@ -43,7 +43,7 @@ use windows_sys::Win32::{
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 const RESPONSE_RESERVE: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 fn operation_timeout(request: &Request) -> Result<Duration> {
     match request {
@@ -52,7 +52,11 @@ fn operation_timeout(request: &Request) -> Result<Duration> {
                 .checked_add(RESPONSE_RESERVE)
                 .ok_or_else(|| AppError::new("config_invalid", "服务操作时限超出系统支持范围"))
         }
-        Request::Stop => Ok(Duration::from_secs(18)),
+        Request::Stop | Request::CompleteCoreUpdate { accept: true } => Ok(Duration::from_secs(18)),
+        Request::PrepareCoreUpdate { .. } => Ok(Duration::from_secs(900)),
+        Request::CommitCoreUpdate {} | Request::CompleteCoreUpdate { accept: false } => {
+            Ok(Duration::from_secs(480))
+        }
         _ => Ok(CONTROL_TIMEOUT),
     }
 }
@@ -80,6 +84,9 @@ pub enum Request {
     Reconcile { generation: u64 },
     Heartbeat,
     Operation { id: String },
+    PrepareCoreUpdate { proxy_port: Option<u16> },
+    CommitCoreUpdate {},
+    CompleteCoreUpdate { accept: bool },
 }
 
 impl Request {
@@ -92,13 +99,22 @@ impl Request {
             Self::Reconcile { .. } => "reconcile",
             Self::Heartbeat => "heartbeat",
             Self::Operation { .. } => "operation",
+            Self::PrepareCoreUpdate { .. } => "prepare_core_update",
+            Self::CommitCoreUpdate { .. } => "commit_core_update",
+            Self::CompleteCoreUpdate { .. } => "complete_core_update",
         }
     }
 
     pub(crate) fn lifecycle_request(&self) -> bool {
         matches!(
             self,
-            Self::Start { .. } | Self::Stop | Self::Reload { .. } | Self::Reconcile { .. }
+            Self::Start { .. }
+                | Self::Stop
+                | Self::Reload { .. }
+                | Self::Reconcile { .. }
+                | Self::PrepareCoreUpdate { .. }
+                | Self::CommitCoreUpdate { .. }
+                | Self::CompleteCoreUpdate { .. }
         )
     }
 
@@ -129,7 +145,12 @@ impl Envelope {
         });
         if matches!(
             self.request,
-            Request::Start { .. } | Request::Stop | Request::Reload { .. }
+            Request::Start { .. }
+                | Request::Stop
+                | Request::Reload { .. }
+                | Request::PrepareCoreUpdate { .. }
+                | Request::CommitCoreUpdate {}
+                | Request::CompleteCoreUpdate { .. }
         ) {
             fields["operationId"] =
                 serde_json::json!(format!("{}:{}", self.owner_session, self.request_id));
@@ -260,8 +281,43 @@ impl Client {
     }
 
     pub fn call(&self, request: Request, cancellation: &Cancellation) -> Result<CoreStatus> {
+        let timeout = operation_timeout(&request)?;
+        self.call_timeout(request, cancellation, timeout)
+    }
+
+    /// The source influences only our wait budget and never crosses the IPC
+    /// update boundary. The privileged owner uses its own applied source.
+    pub fn core_update_call(
+        &self,
+        request: Request,
+        cancellation: &Cancellation,
+        source: Option<&str>,
+    ) -> Result<CoreStatus> {
+        let timeout = match &request {
+            Request::CommitCoreUpdate {} | Request::CompleteCoreUpdate { accept: false } => {
+                config::resource_bootstrap_timeout(source.unwrap_or(config::INITIAL_CONFIG))?
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(Duration::from_secs(120)))
+                    .ok_or_else(|| {
+                        AppError::new("config_invalid", "内核更新总时限超出系统支持范围")
+                    })?
+            }
+            Request::PrepareCoreUpdate { .. } | Request::CompleteCoreUpdate { accept: true } => {
+                operation_timeout(&request)?
+            }
+            _ => return Err(AppError::new("invalid_arguments", "不是内核更新操作")),
+        };
+        self.call_timeout(request, cancellation, timeout)
+    }
+
+    fn call_timeout(
+        &self,
+        request: Request,
+        cancellation: &Cancellation,
+        timeout: Duration,
+    ) -> Result<CoreStatus> {
         cancellation.check()?;
-        let deadline = deadline_after(operation_timeout(&request)?)?;
+        let deadline = deadline_after(timeout)?;
         let envelope = self.envelope(request, cancellation.revision())?;
         let _scope = crate::diagnostics::scope(envelope.diagnostic_fields());
         let started = Instant::now();
@@ -833,6 +889,28 @@ fn write_bytes(handle: HANDLE, buffer: &[u8], timeout: Duration) -> Result<()> {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[test]
+    fn core_update_ipc_does_not_accept_paths_urls_or_digests() {
+        for payload in [
+            r#"{"command":"prepare_core_update","proxy_port":7890,"url":"https://attacker.invalid/core.zip"}"#,
+            r#"{"command":"commit_core_update","path":"C:\\user\\evil.exe"}"#,
+            r#"{"command":"complete_core_update","accept":true,"sha256":"anything"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Request>(payload).is_err(),
+                "{payload}"
+            );
+        }
+        let request: Request =
+            serde_json::from_str(r#"{"command":"prepare_core_update","proxy_port":7890}"#).unwrap();
+        assert!(request.lifecycle_request());
+        assert!(!request.bulk());
+        assert_eq!(
+            operation_timeout(&request).unwrap(),
+            Duration::from_secs(900)
+        );
+    }
 
     #[test]
     fn diagnostics_map_lifecycle_ids_without_serializing_request_payloads() {

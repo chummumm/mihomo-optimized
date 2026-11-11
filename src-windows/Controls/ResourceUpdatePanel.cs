@@ -8,11 +8,12 @@ using Mihomo.Desktop.Services;
 
 namespace Mihomo.Desktop.Controls;
 
-/// <summary>Follows a controller-owned update task; a lost POST is observed, never replayed.</summary>
+/// <summary>Observes host-owned core updates and controller-owned resource tasks without replaying writes.</summary>
 internal sealed class ResourceUpdatePanel : UserControl
 {
     private readonly AppSession session;
     private readonly StackPanel rows = new();
+    private readonly CoreUpdateRow coreRow = new();
     private readonly TextBlock summary = Ui.Muted("");
     private readonly Button start;
     private readonly MenuItem refresh;
@@ -23,6 +24,11 @@ internal sealed class ResourceUpdatePanel : UserControl
     private readonly HashSet<string> open = new(StringComparer.Ordinal);
     private JsonElement snapshot;
     private JsonElement previous;
+    private CoreUpdateState coreUpdate = new();
+    private string coreProblem = "";
+    private string? awaitingCoreRequest;
+    private bool coreReadFailed;
+    private bool coreUnconfirmed;
     private string controller = "";
     private string? awaitingRequest;
     private string? awaitingInstance;
@@ -37,23 +43,25 @@ internal sealed class ResourceUpdatePanel : UserControl
     private long lastRead;
     private long? failedSince;
     private CancellationToken pageToken;
-    public bool NeedsRefresh => !busy && !unsupported && (!followExpired && (Active || awaitingRequest is not null) || !Active && Environment.TickCount64 - lastRead >= 30000);
+    public bool NeedsRefresh => !busy && !session.IsUpdating && (coreUpdate.Active || awaitingCoreRequest is not null
+        || !unsupported && !followExpired && (Active || awaitingRequest is not null)
+        || Environment.TickCount64 - lastRead >= 30000);
     private bool Running => session.Runtime.RuntimeAvailable;
     private bool Active => snapshot.Text("state") is "running" or "restarting";
 
     public ResourceUpdatePanel(AppSession session)
     {
         this.session = session; this.Id("ResourceUpdateTable");
-        start = Button("检查并更新资源", "UpdateResources", StartAsync);
+        start = Button("检查并更新", "UpdateResources", StartAsync);
         refresh = L.Bind(new MenuItem().Id("RefreshResources"), HeaderedItemsControl.HeaderProperty, "刷新状态"); refresh.Click += async (_, _) => { try { await RefreshAsync(pageToken); } catch (OperationCanceledException) { } catch (Exception error) { problem = error.Message; Render(); } };
-        managedDetails = L.Bind(new MenuItem().Id("ResourceManagedDetails"), HeaderedItemsControl.HeaderProperty, "内核与面板任务明细");
+        managedDetails = L.Bind(new MenuItem().Id("ResourceManagedDetails"), HeaderedItemsControl.HeaderProperty, "内置面板任务明细");
         var menu = new ContextMenu(); menu.Items.Add(refresh); menu.Items.Add(managedDetails); ContextMenu = menu;
         var footerContent = new Grid(); footerContent.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); footerContent.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); footerContent.ColumnDefinitions.Add(new ColumnDefinition()); footerContent.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); summary.Margin = new Thickness(0, 0, 16, 0); summary.LineHeight = 16; summary.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; footerContent.Children.Add(summary); Grid.SetColumn(start, 1); footerContent.Children.Add(start);
         var footer = new Border { Child = footerContent, Padding = new Thickness(16, 12, 16, 12), MinHeight = 56 }; footer.SetResourceReference(Border.BackgroundProperty, "SubtleSurfaceBrush");
-        var policy = Ui.Hint("以下更新仅处理规则与地理数据库。应用、内核及内置界面由桌面更新统一管理。"); policy.LineHeight = 16; policy.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; policy.Margin = new Thickness(0, 0, 0, 4);
+        var policy = Ui.Hint("内核按 YAML 中的 core-auto-update 和 core-update-interval 独立更新。此处也更新规则与 Geo 数据；桌面应用更新在设置页进行。"); policy.LineHeight = 16; policy.LineStackingStrategy = LineStackingStrategy.BlockLineHeight; policy.Margin = new Thickness(0, 0, 0, 4);
         var schedule = Ui.Hint("检查时间按系统的时钟和时区显示，发现变化后才会实际更新。"); schedule.LineHeight = 16; schedule.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
         sources = new Border { Child = Ui.Column(policy, schedule), Padding = new Thickness(16, 12, 16, 12), BorderThickness = new Thickness(0, 1, 0, 0) }; sources.SetResourceReference(Border.BorderBrushProperty, "DividerBrush");
-        var card = Ui.Card(Ui.Column(rows, sources, footer), 0); card.CornerRadius = new CornerRadius(4); card.Margin = new Thickness(0); Content = card; L.Changed += Render;
+        var card = Ui.Card(Ui.Column(coreRow, rows, sources, footer), 0); card.CornerRadius = new CornerRadius(4); card.Margin = new Thickness(0); Content = card; L.Changed += Render;
         SizeChanged += (_, _) => { var compact = FindContainerWidth() <= 560; Grid.SetColumn(start, compact ? 0 : 1); Grid.SetRow(start, compact ? 1 : 0); start.HorizontalAlignment = compact ? HorizontalAlignment.Left : HorizontalAlignment.Right; start.Margin = new Thickness(0, compact ? 8 : 0, 0, 0); };
     }
     private Button Button(string title, string id, Func<Task> operation)
@@ -67,17 +75,53 @@ internal sealed class ResourceUpdatePanel : UserControl
     public void UpdateAvailability(CancellationToken token)
     {
         pageToken = token;
+        coreRow.Render(coreUpdate, coreProblem, coreUnconfirmed);
         if (!Running)
         {
-            rows.Children.Clear(); sources.Visibility = Visibility.Collapsed;
-            summary.Text = L.T(session.Runtime.StopRequired ? session.Runtime.Description : "启动内核后可检查并更新规则与 Geo 数据。");
+            rows.Children.Clear();
+            summary.Text = L.T(session.Runtime.StopRequired ? session.Runtime.Description : "内核可独立检查更新；启动内核后也可更新规则与 Geo 数据。");
         }
-        if (Running) sources.Visibility = Visibility.Visible; SetButtons();
+        sources.Visibility = Visibility.Visible; SetButtons();
     }
     public async Task RefreshAsync(CancellationToken cancellationToken)
     {
         pageToken = cancellationToken;
-        if (!Running || busy || session.IsUpdating) { UpdateAvailability(cancellationToken); return; }
+        if (!session.Ready || busy || session.IsUpdating) { UpdateAvailability(cancellationToken); return; }
+        busy = true; SetButtons();
+        try
+        {
+            await ReadCoreUpdateAsync(cancellationToken);
+            // The host status survives a core restart. Do not confuse a temporary
+            // controller outage during replacement with failure of that host task.
+            if (Running && !coreUpdate.Active) await ReadResourcesAsync(cancellationToken);
+        }
+        finally { busy = false; lastRead = Environment.TickCount64; Render(); }
+    }
+
+    private async Task ReadCoreUpdateAsync(CancellationToken cancellationToken)
+    {
+        long started = Environment.TickCount64;
+        try
+        {
+            var data = await session.CommandAsync("desktop_core_update_status", cancellationToken: cancellationToken);
+            coreUpdate = CoreUpdateState.Read(data, started); coreReadFailed = false;
+            if (awaitingCoreRequest is { } request)
+            {
+                coreUnconfirmed = coreUpdate.RequestId != request;
+                awaitingCoreRequest = null;
+            }
+            coreProblem = coreUnconfirmed ? "上次内核更新请求结果未确认，请核对当前版本。" : "";
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception)
+        {
+            coreReadFailed = true;
+            coreProblem = "无法读取内核更新状态，请刷新后重试。";
+        }
+    }
+
+    private async Task ReadResourcesAsync(CancellationToken cancellationToken)
+    {
         var current = session.Status.Get("controller").Text("url") + "\n" + session.Status.Get("controller").Text("secret");
         if (controller != current)
         {
@@ -85,7 +129,7 @@ internal sealed class ResourceUpdatePanel : UserControl
             // Preserve an unfinished result only to label the observed restart, never as success.
             if (!Active) { snapshot = previous = default; restarted = restartVerified = false; }
         }
-        busy = true; SetButtons(); var started = Environment.TickCount64;
+        var started = Environment.TickCount64;
         try
         {
             var data = await session.ApiAsync(HttpMethod.Get, "upgrade/check", cancellationToken: cancellationToken);
@@ -102,15 +146,23 @@ internal sealed class ResourceUpdatePanel : UserControl
                 : "无法读取资源状态，请刷新后重试。";
             if (Environment.TickCount64 - failedSince >= 120000) { awaitingRequest = awaitingInstance = null; followExpired = true; }
         }
-        finally { busy = false; lastRead = Environment.TickCount64; Render(); }
     }
 
     private async Task StartAsync()
     {
         if (session.IsUpdating) throw new InvalidOperationException(L.T("正在安装应用更新，请等待更新完成。"));
-        if (session.IsDirty) throw new InvalidOperationException(L.T("请先保存或放弃配置草稿，再更新资源。"));
-        if (!Running || busy) return;
-        if (snapshot.ValueKind != JsonValueKind.Object || problem.Length > 0 || Active || awaitingRequest is not null) { failedSince = null; followExpired = false; await RefreshAsync(pageToken); return; }
+        if (session.IsDirty) throw new InvalidOperationException(L.T("请先保存或放弃配置草稿，再检查更新。"));
+        if (!session.Ready || busy || coreUpdate.Active) return;
+        if (!coreUpdate.Available || coreReadFailed || Running && !unsupported
+            && (snapshot.ValueKind != JsonValueKind.Object || problem.Length > 0 || Active || awaitingRequest is not null))
+        { failedSince = null; followExpired = false; await RefreshAsync(pageToken); return; }
+        if (!Running || unsupported)
+        {
+            busy = true; SetButtons();
+            try { await StartCoreUpdateAsync(); }
+            finally { busy = false; lastRead = 0; Render(); }
+            return;
+        }
         awaitingRequest = Guid.NewGuid().ToString("N"); awaitingInstance = snapshot.Text("instance_id"); unconfirmed = restarted = restartVerified = false; previous = default; problem = "";
         busy = true; SetButtons(); var started = Environment.TickCount64;
         var headers = new Dictionary<string, string> { ["Idempotency-Key"] = awaitingRequest, ["X-Mihomo-Instance-ID"] = awaitingInstance };
@@ -118,6 +170,9 @@ internal sealed class ResourceUpdatePanel : UserControl
         {
             var data = await session.ApiAsync(HttpMethod.Post, "upgrade/check", cancellationToken: pageToken, headers: headers);
             Accept(data, started, true);
+            // The host accepts a durable intent and waits for the resource task
+            // before replacing the core. Changing pages cannot lose this half.
+            await StartCoreUpdateAsync();
         }
         catch (OperationCanceledException) { unconfirmed = true; throw; }
         catch (Exception)
@@ -127,6 +182,29 @@ internal sealed class ResourceUpdatePanel : UserControl
         }
         finally { busy = false; lastRead = 0; Render(); }
         if (awaitingRequest is not null && !pageToken.IsCancellationRequested) await RefreshAsync(pageToken);
+    }
+
+    private async Task StartCoreUpdateAsync()
+    {
+        var requestId = Guid.NewGuid().ToString("D");
+        awaitingCoreRequest = requestId; coreUnconfirmed = false; coreProblem = "";
+        long started = Environment.TickCount64;
+        try
+        {
+            // This short command only accepts work. The host, not the visible
+            // page, owns downloading, replacement and rollback thereafter.
+            var data = await session.CommandAsync("desktop_update_core", new { request_id = requestId });
+            coreUpdate = CoreUpdateState.Read(data, started); coreReadFailed = false;
+            coreUnconfirmed = coreUpdate.RequestId != requestId;
+            awaitingCoreRequest = null;
+            coreProblem = coreUnconfirmed ? "上次内核更新请求结果未确认，请核对当前版本。" : "";
+        }
+        catch (Exception error)
+        {
+            // A lost reply never starts another update; the next operation is status.
+            coreUnconfirmed = true;
+            coreProblem = error is DesktopException ? error.Message : "内核更新请求结果未确认，正在读取状态。";
+        }
     }
 
     private void Accept(JsonElement data, long started, bool acceptedPost)
@@ -158,11 +236,12 @@ internal sealed class ResourceUpdatePanel : UserControl
     }
     private void SetButtons()
     {
-        var locked = busy || session.IsUpdating || !Running;
+        var locked = busy || session.IsUpdating || !session.Ready;
         refresh.IsEnabled = !locked;
-        start.IsEnabled = !locked && !session.Runtime.IsWorking && session.BusyCommand is null && !unsupported && !session.IsDirty && (!Active || followExpired);
-        var title = busy || Active && !followExpired ? "正在更新资源…" : problem.Length > 0 || awaitingRequest is not null ? "刷新资源更新状态" : "检查并更新资源";
-        var progress = busy || Active && !followExpired; var commandState = (progress ? "busy:" : "idle:") + title;
+        start.IsEnabled = !locked && !session.Runtime.IsWorking && session.BusyCommand is null && !session.IsDirty && !coreUpdate.Active && (!Running || !Active || followExpired);
+        var progress = busy || coreUpdate.Active || Running && Active && !followExpired;
+        var title = progress ? "正在检查并更新…" : coreReadFailed || problem.Length > 0 && !unsupported || awaitingRequest is not null || awaitingCoreRequest is not null ? "刷新更新状态" : "检查并更新";
+        var commandState = (progress ? "busy:" : "idle:") + title;
         if (!Equals(start.Tag, commandState))
         {
             start.Tag = commandState;
@@ -173,18 +252,19 @@ internal sealed class ResourceUpdatePanel : UserControl
     }
     private void Render()
     {
+        coreRow.Render(coreUpdate, coreProblem, coreUnconfirmed);
         if (!Running) { UpdateAvailability(pageToken); return; }
         sources.Visibility = Visibility.Visible;
         var current = snapshot.Get("items").Items().ToArray(); var displayed = restarted ? previous.Get("items").Items().Concat(current.Where(item => !previous.Get("items").Items().Any(old => old.Text("id") == item.Text("id")))).ToArray() : current;
         AddGroup("geodata", "GeoData", displayed.Where(item => item.Text("kind") == "geodata").ToArray(), current);
         AddGroup("rule-provider", "规则集", displayed.Where(item => item.Text("kind") == "rule-provider").ToArray(), current);
-        // Desktop-managed tasks stay inspectable from the context menu without adding a third resource section.
-        managedDetails.Items.Clear(); foreach (var item in displayed.Where(item => item.Text("kind") is "kernel" or "ui"))
+        // Only the bundled dashboard remains part of desktop application updates.
+        managedDetails.Items.Clear(); foreach (var item in displayed.Where(item => item.Text("kind") == "ui"))
         {
             var detail = new MenuItem { Header = item.Text("name") + " · " + L.T(Status(item)), ToolTip = item.Text("current_version") }; detail.IsHitTestVisible = false; managedDetails.Items.Add(detail);
         }
         managedDetails.IsEnabled = managedDetails.Items.Count > 0;
-        summary.Text = L.T(problem.Length > 0 ? problem : unconfirmed ? "上次请求的结果未确认；不会自动重复更新。" : restarted ? "内核已重新连接，先前更新结果需要核对。" : snapshot.Text("state") switch
+        summary.Text = L.T(coreUpdate.Active ? "正在独立更新内核；完成后保留原有运行与 TUN 设置。" : problem.Length > 0 ? problem : unconfirmed ? "上次请求的结果未确认；不会自动重复更新。" : restarted ? "内核已重新连接，先前资源更新结果需要核对。" : snapshot.Text("state") switch
         {
             "running" => "正在检查并应用规则与 Geo 数据更新。", "restarting" => "内核正在重新连接…", "partial" => "部分资源更新失败，请查看各项结果。", "completed" => "资源检查和更新已完成。", _ => "检查当前配置中的规则集与 Geo 数据来源，并应用可用的资源更新。"
         });

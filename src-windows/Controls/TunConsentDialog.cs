@@ -24,7 +24,7 @@ internal static class TunConsentDialog
     }
     private static bool Show(Window owner, Func<Task> operation, Action<string> reportError, bool enableTun)
     {
-        var description = Ui.Label("TUN 模式通过一个受限的 Windows 服务接管系统流量。安装时需要一次管理员授权，之后开启或关闭 TUN 都不再需要授权。");
+        var description = Ui.Label("桌面服务用于管理 TUN 虚拟网卡，以及更新安装目录中的内核。安装时需要一次管理员授权，之后内核自动更新不会弹出授权。");
         description.Margin = new Thickness(0, 0, 0, 12);
         var hint = Ui.Hint("服务只接受本应用的请求，卸载应用时会一并移除。仅安装版支持。", 12); hint.LineHeight = 20;
         string label = enableTun ? "安装并开启 TUN" : "安装服务";
@@ -35,7 +35,7 @@ internal static class TunConsentDialog
         actions.ColumnDefinitions.Add(new ColumnDefinition()); actions.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(8) }); actions.ColumnDefinitions.Add(new ColumnDefinition());
         actions.Children.Add(install); Grid.SetColumn(cancel, 2); actions.Children.Add(cancel);
         bool busy = false;
-        var dialog = new FluentDialog(owner, "安装 TUN 系统服务？", Ui.Column(description, hint, actions), []).Id("TunConsentDialog");
+        var dialog = new FluentDialog(owner, "安装桌面服务？", Ui.Column(description, hint, actions), []).Id("TunConsentDialog");
         dialog.CanDismiss = () => !busy;
         install.Click += async (_, _) =>
         {

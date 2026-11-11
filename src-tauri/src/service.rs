@@ -194,7 +194,9 @@ fn set_installed_running(running: bool) -> Result<()> {
     // An old uninstall may leave only this helper behind. Stopping the fixed SCM
     // service must not require the application/core files that were just removed.
     let directory = if running {
-        Some(windows::protected_install_dir()?)
+        // The privileged maintenance start must repair the same fixed rename
+        // gap as SCM startup before requiring the core executable to exist.
+        Some(windows::protected_install_dir_for_core_recovery()?)
     } else {
         None
     };
@@ -466,7 +468,7 @@ fn run_service() -> Result<()> {
     })
     .map_err(service_error)?;
     let result = (|| {
-        let directory = windows::protected_install_dir()?;
+        let directory = windows::protected_install_dir_for_core_recovery()?;
         let data = windows::service_data_dir()?;
         for path in [
             data.parent().unwrap_or(&data).to_path_buf(),
@@ -819,8 +821,20 @@ fn handle_session_request(
             runtime.reconcile(generation);
             Reply::from_result(Ok(runtime.status()))
         }
-        request @ (Request::Start { .. } | Request::Stop | Request::Reload { .. }) => {
-            if !is_owner && matches!(request, Request::Reload { .. }) {
+        request @ (Request::Start { .. }
+        | Request::Stop
+        | Request::Reload { .. }
+        | Request::PrepareCoreUpdate { .. }
+        | Request::CommitCoreUpdate {}
+        | Request::CompleteCoreUpdate { .. }) => {
+            if !is_owner
+                && matches!(
+                    request,
+                    Request::Reload { .. }
+                        | Request::CommitCoreUpdate {}
+                        | Request::CompleteCoreUpdate { accept: true }
+                )
+            {
                 return Reply::from_result(Err(AppError::new(
                     "service_owner_required",
                     "只有当前桌面后台可以重载内核",
@@ -830,6 +844,19 @@ fn handle_session_request(
                 Request::Start { config } => RuntimeRequest::Start(config),
                 Request::Reload { config } => RuntimeRequest::Reload(config),
                 Request::Stop => RuntimeRequest::Stop(StopReason::UserStop),
+                Request::PrepareCoreUpdate { proxy_port } => {
+                    if proxy_port == Some(0) {
+                        return Reply::from_result(Err(AppError::new(
+                            "invalid_arguments",
+                            "内核更新代理端口无效",
+                        )));
+                    }
+                    RuntimeRequest::PrepareCoreUpdate { proxy_port }
+                }
+                Request::CommitCoreUpdate {} => RuntimeRequest::CommitCoreUpdate,
+                Request::CompleteCoreUpdate { accept } => {
+                    RuntimeRequest::CompleteCoreUpdate { accept }
+                }
                 _ => unreachable!(),
             };
             // Replaying an accepted ID returns its retained outcome; an unseen
@@ -858,7 +885,13 @@ fn handle_session_request(
                     "服务已接收更新的用户指令",
                 )));
             }
-            let start = matches!(operation, RuntimeRequest::Start(_));
+            let start = matches!(
+                operation,
+                RuntimeRequest::Start(_)
+                    | RuntimeRequest::PrepareCoreUpdate { .. }
+                    | RuntimeRequest::CommitCoreUpdate
+                    | RuntimeRequest::CompleteCoreUpdate { .. }
+            );
             let result = runtime.submit(key, envelope.intent_revision, operation);
             if result.is_ok() {
                 session.intent_revision = envelope.intent_revision;
@@ -1023,6 +1056,74 @@ mod control_tests {
                 request,
             },
         }
+    }
+
+    #[test]
+    fn core_update_commit_requires_owner_and_cannot_overtake_stop() {
+        let runtime = CoreRuntime::queued_for_test();
+        let session = session();
+        let unauthorized = handle_request(
+            &runtime,
+            &session,
+            request("commit", 1, 1, Request::CommitCoreUpdate {}),
+        );
+        assert_eq!(unauthorized.error.unwrap().code, "service_owner_required");
+        assert!(handle_request(
+            &runtime,
+            &session,
+            request(
+                "prepare",
+                1,
+                2,
+                Request::PrepareCoreUpdate { proxy_port: None }
+            )
+        )
+        .error
+        .is_none());
+        assert!(
+            handle_request(&runtime, &session, request("stop", 2, 3, Request::Stop))
+                .error
+                .is_none()
+        );
+        let stale = handle_request(
+            &runtime,
+            &session,
+            request("late-commit", 1, 4, Request::CommitCoreUpdate {}),
+        );
+        assert_eq!(stale.error.unwrap().code, "operation_cancelled");
+        let rollback = handle_request(
+            &runtime,
+            &session,
+            request(
+                "rollback",
+                2,
+                5,
+                Request::CompleteCoreUpdate { accept: false },
+            ),
+        );
+        assert!(rollback.error.is_none());
+        assert!(!runtime.status().desired_running);
+    }
+
+    #[test]
+    fn invalid_update_proxy_does_not_acquire_service_or_cancel_work() {
+        let runtime = CoreRuntime::queued_for_test();
+        let session = session();
+        let invalid = handle_request(
+            &runtime,
+            &session,
+            request(
+                "prepare",
+                1,
+                1,
+                Request::PrepareCoreUpdate {
+                    proxy_port: Some(0),
+                },
+            ),
+        );
+        assert_eq!(invalid.error.unwrap().code, "invalid_arguments");
+        assert!(session.lock().unwrap().owner.is_none());
+        assert!(runtime.status().operation.is_none());
     }
 
     #[test]
