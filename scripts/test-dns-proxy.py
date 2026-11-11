@@ -457,17 +457,19 @@ def check_rule_control_actions(dns_port, expected_answer):
     print("PASS native rule controls: real round-robin PASS cursor unchanged; TCP/UDP PASS and SUB-RULE PASS-RULE continue past UDP-disabled control groups")
 
 
-def check_builtin_dns(config, api_port, upstream_a, upstream_b):
+def check_builtin_dns(config, api_port, upstream_a, upstream_b, policy_port, policy_answer):
     dns_port = unused_port()
+    with upstream_a.record_lock:
+        before = len(upstream_a.records)
     builtin_config = config.replace("  enable: false\n", f"""  enable: true
   listen: 127.0.0.1:{dns_port}
   enhanced-mode: redir-host
   use-hosts: false
   respect-rules: false
   nameserver: [203.0.113.53]
-  # This unavailable old policy must be inactive when the switch is enabled.
+  # Private policy replaces the main pool and keeps its explicit DNS exit.
   nameserver-policy:
-    'second.example': [127.0.0.1:9]
+    'second.example': ['127.0.0.1:{policy_port}#DIRECT']
 """)
     builtin_config = builtin_config.replace("  - DOMAIN,first.example,A\n", f"""  - AND,((DOMAIN,builtin-udp.example),(IN-NAME,DNS),(IN-PORT,{dns_port}),(SRC-IP-CIDR,127.0.0.1/32),(DST-PORT,53),(NETWORK,udp)),B
   - AND,((DOMAIN,builtin-tcp.example),(IN-NAME,DNS),(IN-PORT,{dns_port}),(SRC-IP-CIDR,127.0.0.1/32),(DST-PORT,53),(NETWORK,tcp)),B
@@ -486,7 +488,7 @@ def check_builtin_dns(config, api_port, upstream_a, upstream_b):
 
     with connect(dns_port) as tcp:
         for index, (name, answer) in enumerate((("first.example", upstream_a.answer),
-                                               ("second.example", upstream_b.answer),
+                                               ("second.example", policy_answer),
                                                ("builtin-tcp.example", upstream_b.answer))):
             query = question(name, 501 + index)
             tcp.sendall(frame(query))
@@ -501,7 +503,7 @@ def check_builtin_dns(config, api_port, upstream_a, upstream_b):
             return udp.recvfrom(65535)[0]
 
         for index, (name, answer) in enumerate((("first.example", upstream_a.answer),
-                                               ("second.example", upstream_b.answer),
+                                               ("second.example", policy_answer),
                                                ("builtin-udp.example", upstream_b.answer))):
             query = question(name, 511 + index)
             check_answer(exchange(query), query, answer)
@@ -656,12 +658,15 @@ def check_builtin_dns(config, api_port, upstream_a, upstream_b):
             active = wait_connections(lambda items: all(item["id"] != transport_id for item in items),
                                       "dashboard close retained the shared DNS transport")
             assert not upstream_connections(active, network), "closed DNS transport was silently replaced"
-    print("PASS built-in DNS TCP/UDP: original QNAME/IN/SRC rules, shared physical connection IDs and exact cumulative/incremental traffic, independent query/source observations, neutral transport metadata, reload/API-close cleanup, disabled nameserver-policy, selector-aware cache/ID and REJECT/DROP")
+    with upstream_a.record_lock:
+        assert not any(name == "second.example" for _, name, _, _ in upstream_a.records[before:]), \
+            "private nameserver-policy queried the public main pool"
+    print("PASS built-in DNS TCP/UDP: original QNAME/IN/SRC rules, private nameserver-policy override and explicit DNS exit without public-pool queries, shared physical connection IDs and exact cumulative/incremental traffic, independent query/source observations, neutral transport metadata, reload/API-close cleanup, selector-aware cache/ID and REJECT/DROP")
 
 
 @contextlib.contextmanager
 def local_plain_dns(answer):
-    """A local direct-pool endpoint, with ordinary DNS on an unprivileged port."""
+    """A local DNS endpoint for direct/policy pools on an unprivileged port."""
     records, lock = [], threading.Lock()
 
     def respond(wire, network):
@@ -1313,13 +1318,19 @@ rules:
                     assert api_request(api_port)["dns-rule-routing"] is True
                     tcp_query(mixed_port, q2, upstream_a.answer)
                     print("PASS native DNS switch reloads leave ordinary forwarding unchanged; unsafe scalar PATCH rejected atomically")
-                    check_builtin_dns(config, api_port, upstream_a, upstream_b)
+                    policy_answer = "198.51.100.44"
+                    with local_plain_dns(policy_answer) as (policy_port, policy_records, policy_lock):
+                        check_builtin_dns(config, api_port, upstream_a, upstream_b, policy_port, policy_answer)
+                        with policy_lock:
+                            assert policy_records and all(row == ("second.example", "udp") for row in policy_records), \
+                                ("private DNS policy received the wrong queries", policy_records)
+                            policy_exchange_count = len(policy_records)
                     native_direct_count = check_native_dns_pools(config, api_port, upstream_a, upstream_b)
                     mapping_exchange_count = check_redir_host_filter(api_port, mixed_port, upstream_a, upstream_b)
                     with record_lock:
                         assert all(target[1] == 53 and target[0] in (resolver[0], resolver_v6[0], resolver_b[0])
                                    for _, _, target, _ in records)
-                        exchange_count = len(records) + native_direct_count + mapping_exchange_count
+                        exchange_count = len(records) + policy_exchange_count + native_direct_count + mapping_exchange_count
                     print(f"PASS actual binary end-to-end: {exchange_count} DNS exchanges plus ordinary TCP/UDP forwarding")
                 except BaseException:
                     log.flush()
