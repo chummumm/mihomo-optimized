@@ -376,7 +376,16 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.29
+              printf '%s\n\n' '## 本次更新：1.0.32
+
+          - 受管内核启动及成功重载后立即启动后台 TUN 健康采样，避免第一次桌面健康查询才开始采样而先返回 pending。
+          - TUN 配置未变化的重载保留已有真实健康观察和原始时间戳；实际设备变更仍立即使旧快照失效，过期观察不会被伪装成新鲜结果。
+          - 健康接口继续直接读取快照，不等待原生设备检查，复用单一采样线程和有界请求合并。配套桌面的提示清理与操作加速由桌面版本交付。
+          - 保留 1.0.31 已合入的上游 v1.19.34 和本地 sing-tun v0.4.29 基线。
+
+          [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.32/docs/releases.md)
+
+          ## 1.0.29
 
           - 实现 #74：移除顶层 dns-upstream-rule-routing，统一使用 dns.respect-rules。开启 dns-rule-routing 时，respect-rules=false 让 DNS 连接继承业务出口，true 让自动 DNS 上游按解析器自身地址独立选路；关闭 dns-rule-routing 时保留原生 respect-rules 行为。旧开关不再兼容，请直接修改 YAML 后完整重载。
           - 实现 #76：在自动 DNS 分流中支持 nameserver-policy 与 direct-nameserver-follow-policy。策略只覆盖解析服务器，保留业务出口和显式 DNS 出口优先级；私有解析池失败不转向公共池，缓存、预取和上游选路使用同一实际池。

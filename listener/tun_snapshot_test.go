@@ -22,6 +22,31 @@ func waitTunSignal(t *testing.T, signal <-chan struct{}) {
 	}
 }
 
+func TestTunNoopReloadPreservesHealthObservation(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(map[bool]string{false: "fresh", true: "expired"}[expired], func(t *testing.T) {
+			live := setupTunHealth(t)
+			InspectTunHealth()
+			if expired {
+				snapshot := currentTunSnapshot()
+				snapshot.observedAt = time.Now().Add(-tunObservationMaxAge - time.Second)
+				publishedTun.Store(&snapshot)
+			}
+			before := CurrentTunObservation()
+			if before.Stale != expired || before.ObservedAt == "" {
+				t.Fatalf("invalid initial observation: %+v", before)
+			}
+			if err := ReCreateTun(GetLastTunConf(), nil); err != nil {
+				t.Fatal(err)
+			}
+			after := CurrentTunObservation()
+			if after != before || live.reloads != 1 || live.closed != 0 {
+				t.Fatalf("no-op reload changed the observation or device: before=%+v after=%+v reloads=%d closed=%d", before, after, live.reloads, live.closed)
+			}
+		})
+	}
+}
+
 func TestTunConfigAndHealthSnapshotsDoNotWaitForNativeCloseOrCreate(t *testing.T) {
 	live := setupTunHealth(t)
 	InspectTunHealth()

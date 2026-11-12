@@ -2,6 +2,18 @@
 
 项目使用独立版本 **`mihomo-optimized-vX.Y.Z`**，首版为 `mihomo-optimized-v1.0.0`。`main` 的源码、依赖或构建配置变更在全部测试和完整编译成功后生成固定提交的 GitHub Release。Latest 仅在该构建仍对应当前 `main` 时更新；PR 只做合并前检查，不生成正式发布包。纯文档变更不消耗版本号，也不触发自动发布。
 
+## 1.0.32：桌面 TUN 健康采样时机
+
+受管内核在成功启动和应用配置后立即提交后台健康采样，复用原有单一观察线程，不再等待桌面首次请求 `/desktop/health` 才启动采样。健康接口仍直接读取带时间戳的快照，不等待 Windows 网卡、地址或路由枚举；真实原生检查延迟时继续返回 pending / stale。
+
+TUN 配置没有变化的重载保留已有真实健康观察及其原始时间戳，避免仅切换模式或重新应用相同配置就把健康状态清空为 pending。实际创建、替换、关闭和修复仍使旧观察失效；已过期的观察不会因为重载变成新鲜结果。
+
+该版本包含启动后无需健康请求即可采样、无变化重载保留新鲜与过期观察、原生采样阻塞时接口仍可读取的回归验证。配套桌面的提示清理和操作耗时改进由桌面版本交付。
+
+## 1.0.31：同步上游 v1.19.34
+
+合入 MetaCubeX mihomo v1.19.34，保留本项目的 EasyTier 实例管理、LAN 预连接及路由等待，同时加入上游未使用主机数据包队列的排空处理。本地修改版 sing-tun 同步到 v0.4.29，并增加依赖版本与本地基线的一致性检查。
+
 ## 1.0.29：DNS 配置统一与 TCP 建连反馈
 
 实现 issue [#74](https://github.com/chummumm/mihomo-optimized/issues/74)：移除顶层 `dns-upstream-rule-routing` 及其 API 字段，不保留别名，统一使用 `dns.respect-rules`。在 Rule 模式开启 `dns-rule-routing` 时，respect-rules=false 让自动 DNS 连接继承业务出口，true 让 DNS 上游按解析器自身域名 / IP 独立选路。关闭业务分流时，respect-rules 保留原生行为及适用范围；Global / Direct 和显式 DNS 出口优先级保持。

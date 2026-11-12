@@ -1,10 +1,16 @@
 package executor
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/metacubex/mihomo/listener"
 )
 
 func waitDesktopObserver(t *testing.T, events <-chan struct{}) {
@@ -56,7 +62,27 @@ func TestDesktopHealthObserverKeepsIdleSnapshotsFreshBeyondClientPoll(t *testing
 }
 
 func TestDesktopHealthObserverCoalescesWhileNativeProbeStalls(t *testing.T) {
+	// Process policy and the observer's sync.Once are lifetime state. Isolate
+	// the controlled worker instead of resetting a live process-wide observer.
+	if os.Getenv("MIHOMO_DESKTOP_HEALTH_OBSERVER_CHILD") != "1" {
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, executable, "-test.run=^TestDesktopHealthObserverCoalescesWhileNativeProbeStalls$", "-test.v")
+		cmd.Env = append(os.Environ(), "MIHOMO_DESKTOP_HEALTH_OBSERVER_CHILD=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("health observer process failed: %v\n%s", err, output)
+		}
+		return
+	}
+	_, setObservation := isolateDesktopRecovery(t)
 	requests, ticks := make(chan struct{}, 1), make(chan time.Time, 1)
+	// Health requests feed this worker, whose native probe can be paused.
+	desktopHealthOnce.Do(func() {})
+	desktopHealthRequests = requests
 	first, blocked, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var clock, lastObservation atomic.Int64
 	var calls, active, overlap atomic.Int32
@@ -64,6 +90,11 @@ func TestDesktopHealthObserverCoalescesWhileNativeProbeStalls(t *testing.T) {
 	var releaseOnce sync.Once
 	base := time.Now()
 	now := func() time.Time { return base.Add(time.Duration(clock.Load())) }
+	healthy := listener.TunObservation{
+		Tun:              listener.TunHealth{Enabled: true, State: "healthy", Device: "test-tun", Index: 42},
+		ConfigGeneration: 1, TunGeneration: 2, CreationCount: 3,
+		ObservedAt: base.UTC().Format(time.RFC3339Nano),
+	}
 	go func() {
 		runDesktopHealthObserver(requests, ticks, now, func() bool {
 			if active.Add(1) != 1 {
@@ -73,11 +104,15 @@ func TestDesktopHealthObserverCoalescesWhileNativeProbeStalls(t *testing.T) {
 			switch calls.Add(1) {
 			case 1:
 				lastObservation.Store(clock.Load())
+				setObservation(healthy)
 				close(first)
 			case 2:
 				close(blocked)
 				<-release
 				lastObservation.Store(clock.Load())
+				fresh := healthy
+				fresh.ObservedAt = now().UTC().Format(time.RFC3339Nano)
+				setObservation(fresh)
 			}
 			return true
 		}, stopped.Load)
@@ -99,16 +134,29 @@ func TestDesktopHealthObserverCoalescesWhileNativeProbeStalls(t *testing.T) {
 	waitDesktopObserver(t, blocked)
 	// Neither time nor a burst of readers may refresh the timestamp or create
 	// another OS probe while the one retained native call is blocked.
-	for i := 0; i < 100; i++ {
-		clock.Store(int64(8 * time.Second))
-		select {
-		case requests <- struct{}{}:
-		default:
+	clock.Store(int64(8 * time.Second))
+	stale := healthy
+	stale.Stale, stale.Tun.State = true, "unavailable"
+	setObservation(stale)
+	readDone := make(chan struct{})
+	var readErr error
+	go func() {
+		defer close(readDone)
+		for i := 0; i < 100; i++ {
+			observation, err := InspectDesktopObservation(context.Background())
+			if err != nil || observation.TunObservation != stale {
+				readErr = fmt.Errorf("health read changed a stalled observation: observation=%+v err=%v", observation, err)
+				return
+			}
+			select {
+			case ticks <- now():
+			default:
+			}
 		}
-		select {
-		case ticks <- now():
-		default:
-		}
+	}()
+	waitDesktopObserver(t, readDone)
+	if readErr != nil {
+		t.Fatal(readErr)
 	}
 	if age := time.Duration(clock.Load() - lastObservation.Load()); age <= 5*time.Second || calls.Load() != 2 || overlap.Load() != 0 {
 		t.Fatalf("stalled native probe became fresh or overlapped: age=%s calls=%d overlap=%d", age, calls.Load(), overlap.Load())
@@ -118,5 +166,10 @@ func TestDesktopHealthObserverCoalescesWhileNativeProbeStalls(t *testing.T) {
 	waitDesktopObserver(t, done)
 	if calls.Load() != 2 || overlap.Load() != 0 {
 		t.Fatalf("queued ticks ran after shutdown: calls=%d overlap=%d", calls.Load(), overlap.Load())
+	}
+	fresh, err := InspectDesktopObservation(context.Background())
+	healthy.ObservedAt = now().UTC().Format(time.RFC3339Nano)
+	if err != nil || fresh.TunObservation != healthy {
+		t.Fatalf("completed probe did not refresh the same device: observation=%+v err=%v", fresh, err)
 	}
 }

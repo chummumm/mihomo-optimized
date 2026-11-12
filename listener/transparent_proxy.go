@@ -135,13 +135,6 @@ func recreateTunLocked(tunConf LC.Tun, tunnel C.Tunnel, repair bool) error {
 }
 
 func recreateTunContextLocked(ctx context.Context, tunConf LC.Tun, tunnel C.Tunnel, repair bool) (err error) {
-	defer func() {
-		tunTransition = ""
-		if err != nil && tunLister == nil && LastTunConf.Enable {
-			tunFailure = err
-		}
-		publishTunStateLocked()
-	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -153,11 +146,20 @@ func recreateTunContextLocked(ctx context.Context, tunConf LC.Tun, tunnel C.Tunn
 	}
 	tunConf.Sort()
 	if !repair && tunConf.Equal(LastTunConf) && (tunLister != nil || !tunConf.Enable) {
+		// No device facts changed. Retain the last real observation and its
+		// original expiry instead of turning a healthy reload into pending.
 		if tunLister != nil {
 			tunLister.OnReload()
 		}
 		return nil
 	}
+	defer func() {
+		tunTransition = ""
+		if err != nil && tunLister == nil && LastTunConf.Enable {
+			tunFailure = err
+		}
+		publishTunStateLocked()
+	}()
 	tunTransition = "replacing"
 	publishTunStateLocked()
 	if (managed || repair) && tunConf.Enable && tunConf.FileDescriptor == 0 && tunConf.Device != "" {
