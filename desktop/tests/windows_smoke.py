@@ -37,6 +37,8 @@ import threading
 import time
 from urllib.parse import urlsplit
 
+from port_fixture import free_port
+
 
 SERVICE_NAME = "MihomoOptimizedService"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -157,12 +159,6 @@ def wait_until(predicate, code: str, timeout: float = 45.0):
         if time.monotonic() >= deadline:
             raise SmokeFailure(code)
         time.sleep(0.1)
-
-
-def free_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
 
 
 def listening(port: int) -> bool:

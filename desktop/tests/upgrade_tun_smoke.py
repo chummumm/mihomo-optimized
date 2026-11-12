@@ -32,7 +32,7 @@ from windows_smoke import (
 
 
 OLD_CORE_SOURCE = "96c428bce6b1e7d68327910dad5f426ad29d2d98"
-CURRENT_CORE_SOURCE = "1f320a8e950928b31c6acd03001d6c56b6a764a2"
+CURRENT_CORE_SOURCE = "6c920c3533e4b6504f983770d7254cf0934baa9a"
 START_TIMEOUT = 60.0
 AUTO_RECOVERY_EVENTS = ("tun_device_auto_recovery", "tun_device_auto_recovery_succeeded")
 
