@@ -127,7 +127,8 @@ internal sealed class HostChannel : IAsyncDisposable
                 {
                     var broken = new DesktopException("host_disconnected", "桌面后台通信中断；请退出后重新打开应用。");
                     Fault(broken, "request_write", error.GetType().Name);
-                    throw broken;
+                    // A read fault may have cancelled this write; preserve the latched first cause.
+                    throw Volatile.Read(ref failure) ?? broken;
                 }
             }
             finally { writes.Release(); }
