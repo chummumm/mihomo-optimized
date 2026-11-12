@@ -59,12 +59,22 @@ func TestResourceBootstrapBudgetAndDiagnostics(t *testing.T) {
 
 func TestResourceBootstrapDownloadCacheAndRuntimeIsolation(t *testing.T) {
 	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		requests.Add(1)
+	releaseRuntime := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) > 1 {
+			// A runtime refresh must cancel; a successful response must not race
+			// the client's deadline timer when the test runner is busy.
+			select {
+			case <-r.Context().Done():
+			case <-releaseRuntime:
+			}
+			return
+		}
 		time.Sleep(35 * time.Millisecond)
 		_, _ = w.Write([]byte("valid rules"))
 	}))
 	defer server.Close()
+	defer close(releaseRuntime)
 	path := filepath.Join(t.TempDir(), "rules.txt")
 	routed := &resourceBootstrapDialer{}
 	scope := NewBootstrap(context.Background(), time.Second, routed, nil)
@@ -83,8 +93,20 @@ func TestResourceBootstrapDownloadCacheAndRuntimeIsolation(t *testing.T) {
 		t.Fatal("download did not use the selected scoped route")
 	}
 	_ = scope.Close()
-	if _, _, err := fetcher.Update(); err == nil {
-		t.Fatal("runtime refresh inherited the larger startup timeout")
+	updated := make(chan error, 1)
+	go func() {
+		_, _, err := fetcher.Update()
+		updated <- err
+	}()
+	watchdog := time.NewTimer(time.Second)
+	defer watchdog.Stop()
+	select {
+	case err := <-updated:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("runtime refresh deadline = %v", err)
+		}
+	case <-watchdog.C:
+		t.Fatal("runtime refresh did not finish before the test watchdog")
 	}
 	if routed.calls.Load() != 1 {
 		t.Fatal("runtime refresh retained the temporary dialer")
