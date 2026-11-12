@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/mihomo/component/updater"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
+	"github.com/metacubex/mihomo/listener"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptest"
@@ -79,6 +80,16 @@ func TestDesktopManagedContracts(t *testing.T) {
 	}
 	if err := executor.ApplyConfig(cfg, true); err != nil {
 		t.Fatal(err)
+	}
+	// The supervisor waits on /desktop and may not ask for health for another
+	// ten seconds. Sampling must already run without any health HTTP request.
+	initialObservation := listener.CurrentTunObservation().ObservedAt
+	deadline := time.Now().Add(5 * time.Second)
+	for listener.CurrentTunObservation().ObservedAt == initialObservation {
+		if time.Now().After(deadline) {
+			t.Fatal("managed startup did not refresh health before the first HTTP request")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	handler := router(true, "wrong-secret", "/untrusted-doh", Cors{AllowOrigins: []string{"*"}})
 	request := func(method, path, body string, authenticated bool) *httptest.ResponseRecorder {

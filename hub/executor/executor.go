@@ -240,6 +240,11 @@ func ApplyConfig(cfg *config.Config, force bool) error {
 	finishUpdates()
 	desktop.SetReady(applyErr == nil)
 	if applyErr == nil && !ShutdownRequested() {
+		if desktop.Enabled() {
+			// Sample before the supervisor's first health poll, and refresh after
+			// reloads without waiting here for a native device inspection.
+			requestDesktopHealthObservation()
+		}
 		bindLANPreconnectUpdates(cfg)
 		tunnel.RefreshLANPreconnect()
 	}
