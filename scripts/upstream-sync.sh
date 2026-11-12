@@ -133,6 +133,16 @@ preserved=(
   PROJECT_VERSION
 )
 git restore --source="$base_commit" --staged --worktree -- "${preserved[@]}"
+
+# v1.19.34 inserts drainHostPackets beside the fork's interface-based accessor.
+# The reviewed fork blob already includes the complete upstream packet-drain
+# fix. Reuse it only for these exact inputs; every other conflict still stops.
+if [[ "$tag" == v1.19.34 && "$upstream_commit" == 0455d0d28c4526937380505153e65a843d8612e8 ]] &&
+   [[ "$(git rev-parse -q --verify :2:adapter/outbound/easytier.go 2>/dev/null || true)" == 0c3b44712b11e188e7fbe411db045f6305637d79 ]] &&
+   [[ "$(git rev-parse -q --verify :3:adapter/outbound/easytier.go 2>/dev/null || true)" == 23962e6f91a08c7970b42ab29e3891655c6c1b68 ]]; then
+  git restore --source="$base_commit" --staged --worktree -- adapter/outbound/easytier.go
+  printf 'Applied reviewed EasyTier conflict resolution for v1.19.34.\n'
+fi
 conflicts=$(git diff --name-only --diff-filter=U)
 if [[ -n "$conflicts" ]]; then
   printf 'Upstream merge requires manual conflict resolution:\n%s\n' "$conflicts" >&2
