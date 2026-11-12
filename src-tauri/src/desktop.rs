@@ -155,6 +155,21 @@ enum RunningCore {
     Fixture(Arc<Mutex<TestRuntime>>),
 }
 
+impl RunningCore {
+    fn service_owned(&self) -> bool {
+        match self {
+            Self::Service(_) => true,
+            Self::Direct(_) => false,
+            #[cfg(test)]
+            Self::Fixture(runtime) => runtime.lock().unwrap().service_owned,
+        }
+    }
+}
+
+fn prefer_installed_service(trusted_install: bool, service: &ServiceStatusView) -> bool {
+    trusted_install && service.installed && service.running
+}
+
 #[cfg(test)]
 type RecoveryCheckpoint = Box<dyn FnMut(&str) + Send>;
 
@@ -163,12 +178,17 @@ type RecoveryCheckpoint = Box<dyn FnMut(&str) + Send>;
 #[cfg(test)]
 #[derive(Default)]
 struct TestRuntime {
+    service_owned: bool,
+    service_available: bool,
     status: CoreStatus,
     starts: VecDeque<Result<CoreStatus>>,
     reloads: VecDeque<Result<CoreStatus>>,
     observations: VecDeque<Result<CoreStatus>>,
     stops: VecDeque<Result<()>>,
+    uninstalls: VecDeque<Result<()>>,
     actions: Vec<String>,
+    tun_requests: Vec<bool>,
+    status_errors: VecDeque<AppError>,
     checkpoint: Option<RecoveryCheckpoint>,
 }
 
@@ -180,13 +200,21 @@ impl TestRuntime {
         }
     }
 
-    fn start(&mut self, source: &str) -> Result<CoreStatus> {
+    fn start(&mut self, source: &str, tun: bool) -> Result<CoreStatus> {
+        self.tun_requests.push(tun);
         self.actions.push(format!(
             "start:{}",
             config::configured_tun_device(source)?.unwrap_or_default()
         ));
         self.checkpoint("start");
-        let result = self.starts.pop_front().expect("unexpected extra start");
+        let result = self
+            .starts
+            .pop_front()
+            .expect("unexpected extra start")
+            .map(|mut status| {
+                status.tun = tun;
+                status
+            });
         self.status = match &result {
             Ok(status) => status.clone(),
             Err(error) => CoreStatus {
@@ -197,22 +225,42 @@ impl TestRuntime {
                 ..CoreStatus::default()
             },
         };
+        self.checkpoint("started");
         result
     }
 
-    fn reload(&mut self, source: &str) -> Result<CoreStatus> {
+    fn reload(&mut self, source: &str, tun: bool) -> Result<CoreStatus> {
+        self.tun_requests.push(tun);
         self.actions.push(format!(
             "reload:{}",
             config::configured_tun_device(source)?.unwrap_or_default()
         ));
-        let result = self.reloads.pop_front().expect("unexpected reload");
+        self.checkpoint("reload");
+        let result = self
+            .reloads
+            .pop_front()
+            .expect("unexpected reload")
+            .map(|mut status| {
+                status.tun = tun;
+                status
+            });
         match &result {
             Ok(status) => self.status = status.clone(),
             Err(error) => {
+                if error.code == "operation_cancelled" {
+                    self.status = CoreStatus {
+                        tun: self.status.tun,
+                        process_state: "exited".into(),
+                        stop_reason: Some(StopReason::UserStop),
+                        observed_at: core::observed_now(),
+                        ..CoreStatus::default()
+                    };
+                }
                 self.status.error_code = Some(error.code.clone());
                 self.status.error = Some(error.message.clone());
             }
         }
+        self.checkpoint("reloaded");
         result
     }
 
@@ -253,6 +301,7 @@ pub struct DesktopManager {
     preferences: Preferences,
     proxy: SystemProxy,
     running: Option<RunningCore>,
+    last_runtime_service: bool,
     phase: Phase,
     core_status: CoreStatus,
     applied_proxy_port: Option<u16>,
@@ -261,6 +310,7 @@ pub struct DesktopManager {
     pub exiting: bool,
     updating: bool,
     core_update_interrupted: bool,
+    interrupted_runtime_revision: Option<u64>,
     run_intent: bool,
     resume_pending: Option<u64>,
     communication_recovery: Option<RecoveryWindow>,
@@ -305,6 +355,7 @@ impl DesktopManager {
             preferences,
             proxy,
             running: None,
+            last_runtime_service: false,
             phase: Phase::Stopped,
             core_status: CoreStatus::default(),
             applied_proxy_port: None,
@@ -313,6 +364,7 @@ impl DesktopManager {
             exiting: false,
             updating: false,
             core_update_interrupted: false,
+            interrupted_runtime_revision: None,
             run_intent,
             resume_pending: None,
             communication_recovery: None,
@@ -480,7 +532,11 @@ impl DesktopManager {
     }
 
     fn active_log_directory(&self) -> PathBuf {
-        if self.preferences.tun {
+        if self
+            .running
+            .as_ref()
+            .map_or(self.last_runtime_service, RunningCore::service_owned)
+        {
             if let Ok(directory) = windows::service_data_dir() {
                 let logs = directory.join("logs");
                 if logs.is_dir() {
@@ -637,6 +693,7 @@ impl DesktopManager {
         self.require_idle_update()?;
         self.cancellation.check()?;
         self.core_update_interrupted = false;
+        self.interrupted_runtime_revision = None;
         if self.phase == Phase::Running {
             return Ok(());
         }
@@ -650,8 +707,10 @@ impl DesktopManager {
             self.conflict_config_revision = None;
         }
         self.publish();
+        let mut confirmed_start = false;
         let mut result = (|| {
             let (content, revision) = self.read_runtime_source(expected_revision)?;
+            let policy = crate::core_update::Policy::from_config(&content)?;
             if self.preferences.system_proxy {
                 config::mixed_port(&content)?;
             }
@@ -666,6 +725,10 @@ impl DesktopManager {
             self.cancellation.check()?;
             self.recover_core_update_before_start()?;
             self.running = Some(self.new_running_core()?);
+            self.last_runtime_service = self
+                .running
+                .as_ref()
+                .is_some_and(RunningCore::service_owned);
             self.attempted_config_revision = Some(revision.clone());
             self.conflict_config_revision = None;
             self.publish();
@@ -673,26 +736,33 @@ impl DesktopManager {
                 RunningCore::Service(client) => client.call(
                     Request::Start {
                         config: content.clone(),
+                        tun: self.preferences.tun,
                     },
                     &self.cancellation,
                 )?,
                 RunningCore::Direct(supervisor) => supervisor.start(content.clone(), false)?,
                 #[cfg(test)]
-                RunningCore::Fixture(runtime) => runtime.lock().unwrap().start(&content)?,
+                RunningCore::Fixture(runtime) => runtime
+                    .lock()
+                    .unwrap()
+                    .start(&content, self.preferences.tun)?,
             };
-            self.cancellation.check()?;
+            if !self.core_status.running {
+                return Err(AppError::new("core_start_failed", "内核尚未就绪"));
+            }
+            // A newer UI intent can arrive just after the service confirms
+            // completion. Retain those applied facts before observing it.
+            self.preferences.tun = self.core_status.tun;
             self.applied_config = Some(content.clone());
             self.applied_config_revision = Some(revision);
-            self.app
-                .core_updates
-                .configure(crate::core_update::Policy::from_config(&content)?);
+            self.app.core_updates.configure(policy);
             if let Some(version) = &self.core_status.version {
                 self.app.core_updates.observe_version(version);
             }
             self.applied_proxy_port = config::mixed_port(&content).ok();
-            if !self.core_status.running {
-                return Err(AppError::new("core_start_failed", "内核尚未就绪"));
-            }
+            self.phase = phase_for_core(&self.core_status);
+            confirmed_start = true;
+            self.cancellation.check()?;
             if self.preferences.system_proxy {
                 self.proxy.enable(config::mixed_port(&content)?)?;
             }
@@ -705,6 +775,15 @@ impl DesktopManager {
             Ok(())
         })();
         if let Some(mut error) = result.as_ref().err().cloned() {
+            if !confirmed_start
+                && self.cancellation.check().is_err()
+                && matches!(
+                    error.code.as_str(),
+                    "operation_cancelled" | "core_termination_unconfirmed"
+                )
+            {
+                self.observe_interrupted_runtime(&error);
+            }
             if error.code != "operation_cancelled" && self.cancellation.check().is_ok() {
                 let _scope = crate::diagnostics::scope(
                     serde_json::json!({"step":"startup_failure_cleanup","triggerCode":error.code}),
@@ -748,6 +827,7 @@ impl DesktopManager {
     pub fn stop(&mut self, persist: bool) -> Result<()> {
         let started = Instant::now();
         self.core_update_interrupted = false;
+        self.interrupted_runtime_revision = None;
         self.record_lifecycle(
             "desktop_stop_requested",
             serde_json::json!({"persistIntent":persist}),
@@ -847,15 +927,33 @@ impl DesktopManager {
             serde_json::json!({"cause":"tun_mode_change","requestedTun":enabled}),
         );
         self.require_idle_update()?;
+        self.cancellation.check()?;
         if self.preferences.tun == enabled {
             return Ok(());
         }
+        let service_owned = self
+            .running
+            .as_ref()
+            .is_some_and(RunningCore::service_owned);
         if enabled {
             config::runtime_config(&self.read_runtime_source(None)?.0, true, 9090)?;
-            self.ensure_service()?;
+            if !service_owned {
+                self.ensure_service()?;
+            }
         }
         let was_running = self.run_intent;
         let previous = self.preferences.tun;
+        if was_running && service_owned && self.core_status.pid.is_some() {
+            let (content, revision) = self.read_runtime_source(None)?;
+            let result = self.apply_runtime_config(content, revision, enabled);
+            // Only confirmed application changes the stored mode. A failed
+            // transaction retains the previous mode and its owned process.
+            if self.cancellation.check().is_ok() {
+                self.persist()?;
+            }
+            self.publish();
+            return result;
+        }
         if was_running {
             self.stop(false)?;
         }
@@ -863,6 +961,11 @@ impl DesktopManager {
         if was_running {
             if let Err(error) = self.start(false) {
                 if error.code == "operation_cancelled" {
+                    self.preferences.tun = if self.core_status.running {
+                        self.core_status.tun
+                    } else {
+                        previous
+                    };
                     return Err(error);
                 }
                 if error.code == "tun_device_conflict"
@@ -1055,7 +1158,8 @@ impl DesktopManager {
 
     fn ensure_service(&self) -> Result<()> {
         #[cfg(test)]
-        if self.test_runtime.is_some() {
+        if let Some(runtime) = &self.test_runtime {
+            runtime.lock().unwrap().service_available = true;
             return Ok(());
         }
         windows::wait_for_service_maintenance("install", Some(&self.cancellation))?;
@@ -1069,10 +1173,21 @@ impl DesktopManager {
     fn new_running_core(&mut self) -> Result<RunningCore> {
         #[cfg(test)]
         if let Some(runtime) = &self.test_runtime {
+            let mut state = runtime.lock().unwrap();
+            state.service_owned = self.preferences.tun || state.service_available;
             return Ok(RunningCore::Fixture(runtime.clone()));
         }
-        if self.preferences.tun {
+        let use_service = if self.preferences.tun {
             self.ensure_service()?;
+            true
+        } else if windows::protected_install_dir().is_ok() {
+            // Ordinary proxy mode can reuse an already running trusted owner,
+            // but must never install/start a service or prompt for elevation.
+            prefer_installed_service(true, &service::status()?)
+        } else {
+            false
+        };
+        if use_service {
             self.cancellation.check()?;
             let client = match self.app.service_client() {
                 Some(client) => client,
@@ -1111,12 +1226,58 @@ impl DesktopManager {
     pub fn uninstall_service(&mut self) -> Result<()> {
         let _scope = crate::diagnostics::scope(serde_json::json!({"cause":"service_uninstall"}));
         self.require_idle_update()?;
-        if self.preferences.tun {
-            self.set_tun(false)?;
+        self.cancellation.check()?;
+        let service_owner = match self.running.as_ref() {
+            Some(RunningCore::Service(client)) => Some(RunningCore::Service(client.clone())),
+            #[cfg(test)]
+            Some(RunningCore::Fixture(runtime)) if runtime.lock().unwrap().service_owned => {
+                Some(RunningCore::Fixture(runtime.clone()))
+            }
+            _ => None,
+        };
+        let resume_direct = service_owner.is_some() && self.run_intent;
+        // The service may also own an ordinary proxy core. Confirm its exit
+        // before unregistering that process owner, regardless of the TUN mode.
+        if service_owner.is_some() {
+            self.stop(false)?;
         }
-        windows::run_elevated_service_action_cancellable("uninstall", Some(&self.cancellation))?;
+        if let Err(error) = self.remove_service_registration() {
+            // Uninstallation can be rejected after Stop succeeded. Retain the
+            // same authenticated owner and its confirmed stopped observation.
+            if let Some(owner) = service_owner {
+                self.running = Some(owner);
+                if let Some(RunningCore::Service(client)) = &self.running {
+                    self.app.set_service_client(Some(client.clone()));
+                }
+            }
+            self.last_error = Some(error.message.clone());
+            self.publish();
+            return Err(error);
+        }
+        self.cancellation.check()?;
+        self.app.set_service_client(None);
+        self.preferences.tun = false;
+        self.persist()?;
+        if resume_direct {
+            self.start(false)?;
+        }
         self.publish();
         Ok(())
+    }
+
+    fn remove_service_registration(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.test_runtime {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.actions.push("uninstall_service".into());
+            let result = runtime.uninstalls.pop_front().unwrap_or(Ok(()));
+            if result.is_ok() {
+                runtime.service_available = false;
+                runtime.service_owned = false;
+            }
+            return result;
+        }
+        windows::run_elevated_service_action_cancellable("uninstall", Some(&self.cancellation))
     }
 
     pub fn read_config(&mut self) -> Result<ConfigDocument> {
@@ -1161,12 +1322,28 @@ impl DesktopManager {
         let _scope = crate::diagnostics::scope(serde_json::json!({"cause":"config_reload"}));
         self.require_idle_update()?;
         let (content, revision) = self.read_runtime_source(None)?;
+        if self
+            .interrupted_runtime_revision
+            .is_some_and(|revision| revision < self.cancellation.revision())
+            && self.run_intent
+            && self.core_status.pid.is_none()
+            && self.core_status.process_state == "exited"
+        {
+            self.cancellation.check()?;
+            return self.start(false);
+        }
         if self.phase != Phase::Running {
             self.app
                 .core_updates
                 .configure(crate::core_update::Policy::from_config(&content)?);
             return Ok(());
         }
+        self.apply_runtime_config(content, revision, self.preferences.tun)
+    }
+
+    fn apply_runtime_config(&mut self, content: String, revision: String, tun: bool) -> Result<()> {
+        self.cancellation.check()?;
+        let policy = crate::core_update::Policy::from_config(&content)?;
         if self.preferences.system_proxy {
             config::mixed_port(&content)?;
         }
@@ -1174,30 +1351,35 @@ impl DesktopManager {
         self.conflict_config_revision = None;
         self.publish();
         let result = match self.running.as_mut() {
-            Some(RunningCore::Direct(core)) => core.reload(content.clone()),
+            Some(RunningCore::Direct(core)) => core.reconfigure(content.clone(), tun),
             Some(RunningCore::Service(client)) => client.call(
                 Request::Reload {
                     config: content.clone(),
+                    tun,
                 },
                 &self.cancellation,
             ),
             #[cfg(test)]
-            Some(RunningCore::Fixture(runtime)) => runtime.lock().unwrap().reload(&content),
+            Some(RunningCore::Fixture(runtime)) => runtime.lock().unwrap().reload(&content, tun),
             None => return Ok(()),
         };
         let status = match result {
             Ok(status) => status,
             Err(error) => {
+                if matches!(
+                    error.code.as_str(),
+                    "operation_cancelled" | "core_termination_unconfirmed"
+                ) {
+                    self.observe_interrupted_runtime(&error);
+                    self.publish();
+                    return Err(error);
+                }
                 self.core_status = self
                     .running
                     .as_mut()
                     .and_then(|running| running_status(running).ok())
                     .unwrap_or_else(|| self.core_status.clone());
-                self.phase = if self.core_status.running {
-                    Phase::Running
-                } else {
-                    Phase::Error
-                };
+                self.phase = phase_for_core(&self.core_status);
                 self.last_error = Some(error.message.clone());
                 self.core_status.error_code = Some(error.code.clone());
                 self.observe_tun_device_conflict();
@@ -1207,22 +1389,80 @@ impl DesktopManager {
                     let _ = self.proxy.restore();
                 }
                 self.publish();
-                return self.recover_tun_device(false).unwrap_or(Err(error));
+                // A newly enabled TUN can encounter the same guarded device
+                // conflict as startup. Keep the target intent only while the
+                // existing confirmed-stop recovery owns its one retry.
+                let previous_tun = self.preferences.tun;
+                if tun && error.code == "tun_device_conflict" {
+                    self.preferences.tun = true;
+                    if let Some(result) = self.recover_tun_device(false) {
+                        if result.is_err() {
+                            self.preferences.tun = previous_tun;
+                            self.persist()?;
+                            self.publish();
+                        }
+                        return result;
+                    }
+                    self.preferences.tun = previous_tun;
+                }
+                return Err(error);
             }
         };
+        // Preserve a confirmed result even when a later UI action supersedes
+        // this request before its caller can publish or change the proxy.
         self.core_status = status;
+        self.preferences.tun = self.core_status.tun;
         self.applied_config = Some(content.clone());
         self.applied_config_revision = Some(revision);
-        self.app
-            .core_updates
-            .configure(crate::core_update::Policy::from_config(&content)?);
+        self.app.core_updates.configure(policy);
+        self.phase = phase_for_core(&self.core_status);
         self.last_error = None;
         self.applied_proxy_port = config::mixed_port(&content).ok();
+        self.cancellation.check()?;
         if self.preferences.system_proxy {
             self.proxy.enable(config::mixed_port(&content)?)?;
         }
         self.publish();
         Ok(())
+    }
+
+    fn observe_interrupted_runtime(&mut self, error: &AppError) {
+        let revision = self.cancellation.revision();
+        let observed = match self.running.as_mut() {
+            Some(RunningCore::Service(client)) => client.confirmed_cancelled_stop(revision),
+            Some(running) => running_status(running),
+            None => Err(AppError::new(
+                "core_termination_unconfirmed",
+                "缺少自有内核停止结果",
+            )),
+        };
+        self.interrupted_runtime_revision = None;
+        match observed {
+            Ok(status)
+                if status.pid.is_none()
+                    && status.process_state == "exited"
+                    && status.operation.is_none() =>
+            {
+                self.core_status = status;
+                self.core_status.error_code = Some("operation_cancelled".into());
+                self.interrupted_runtime_revision = Some(revision);
+                self.phase = phase_for_core(&self.core_status);
+            }
+            _ => {
+                self.core_status.running = false;
+                self.core_status.process_state = "unknown".into();
+                self.core_status.control_state = "unknown".into();
+                self.core_status.operation = Some("stopping".into());
+                self.core_status.listeners_ready = None;
+                self.core_status.error_code = Some("core_termination_unconfirmed".into());
+                self.phase = Phase::Stopping;
+            }
+        }
+        self.core_status.controller = None;
+        self.applied_proxy_port = None;
+        let _ = self.proxy.restore();
+        self.last_error = Some(error.message.clone());
+        self.core_status.error = Some(error.message.clone());
     }
 
     pub fn patch_config(
@@ -1504,11 +1744,18 @@ impl DesktopManager {
             self.conflict_config_revision = None;
             self.publish();
             let status = match self.running.as_ref() {
-                Some(RunningCore::Service(client)) => {
-                    client.call(Request::Start { config: source }, &self.cancellation)?
-                }
+                Some(RunningCore::Service(client)) => client.call(
+                    Request::Start {
+                        config: source,
+                        tun: self.core_status.tun,
+                    },
+                    &self.cancellation,
+                )?,
                 #[cfg(test)]
-                Some(RunningCore::Fixture(runtime)) => runtime.lock().unwrap().start(&source)?,
+                Some(RunningCore::Fixture(runtime)) => runtime
+                    .lock()
+                    .unwrap()
+                    .start(&source, self.core_status.tun)?,
                 _ => {
                     return Err(AppError::new(
                         "recovery_owner_missing",
@@ -1590,7 +1837,13 @@ fn running_status(running: &mut RunningCore) -> Result<CoreStatus> {
         RunningCore::Direct(core) => Ok(core.status()),
         RunningCore::Service(client) => client.status(),
         #[cfg(test)]
-        RunningCore::Fixture(runtime) => Ok(runtime.lock().unwrap().status.clone()),
+        RunningCore::Fixture(runtime) => {
+            let mut runtime = runtime.lock().unwrap();
+            runtime
+                .status_errors
+                .pop_front()
+                .map_or_else(|| Ok(runtime.status.clone()), Err)
+        }
     }
 }
 
@@ -1812,7 +2065,11 @@ mod cleanup_observation_tests {
             let (config_path, logs) = config::data_paths(&directory);
             config::atomic_write(&config_path, source.as_bytes()).unwrap();
             let app = crate::host::test_context();
-            let runtime = Arc::new(Mutex::new(TestRuntime::default()));
+            let runtime = Arc::new(Mutex::new(TestRuntime {
+                service_owned: true,
+                service_available: true,
+                ..TestRuntime::default()
+            }));
             let mut manager = DesktopManager {
                 cancellation: app.cancellation(),
                 app,
@@ -1826,6 +2083,7 @@ mod cleanup_observation_tests {
                 },
                 proxy: SystemProxy::new(directory.clone()),
                 running: None,
+                last_runtime_service: true,
                 phase: Phase::Stopped,
                 core_status: CoreStatus {
                     process_state: "exited".into(),
@@ -1838,6 +2096,7 @@ mod cleanup_observation_tests {
                 exiting: false,
                 updating: false,
                 core_update_interrupted: false,
+                interrupted_runtime_revision: None,
                 run_intent: true,
                 resume_pending: None,
                 communication_recovery: None,
@@ -1864,7 +2123,9 @@ mod cleanup_observation_tests {
             }
         }
 
-        fn installed_runtime(&mut self, status: CoreStatus) {
+        fn installed_runtime(&mut self, mut status: CoreStatus) {
+            status.tun = self.manager.preferences.tun;
+            self.manager.last_runtime_service = self.runtime.lock().unwrap().service_owned;
             self.manager.applied_config =
                 Some(config::read(&self.manager.config_path).unwrap().content);
             self.manager.applied_config_revision =
@@ -1989,6 +2250,404 @@ mod cleanup_observation_tests {
     }
 
     #[test]
+    fn ordinary_mode_only_prefers_an_installed_running_trusted_service() {
+        for trusted in [false, true] {
+            for installed in [false, true] {
+                for running in [false, true] {
+                    assert_eq!(
+                        prefer_installed_service(
+                            trusted,
+                            &ServiceStatusView { installed, running }
+                        ),
+                        trusted && installed && running,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn service_tun_round_trip_reconfigures_the_same_owned_process() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun = false;
+        fixture.installed_runtime(ready(111));
+        fixture
+            .runtime
+            .lock()
+            .unwrap()
+            .reloads
+            .extend([Ok(ready(111)), Ok(ready(111))]);
+        fixture.manager.set_tun(true).unwrap();
+        assert!(fixture.manager.preferences.tun);
+        assert!(config::load_preferences(&fixture.directory).unwrap().tun);
+        fixture.manager.set_tun(false).unwrap();
+        assert!(!fixture.manager.preferences.tun);
+        assert!(!config::load_preferences(&fixture.directory).unwrap().tun);
+        assert_eq!(fixture.manager.core_status.pid, Some(111));
+        assert!(!fixture.manager.core_status.tun);
+        assert_eq!(fixture.manager.applied_config.as_deref(), Some(SOURCE));
+        assert_eq!(
+            fixture.manager.applied_config_revision.as_deref(),
+            Some(config::revision(SOURCE.as_bytes()).as_str())
+        );
+        assert!(fixture.manager.running.as_ref().unwrap().service_owned());
+        let runtime = fixture.runtime.lock().unwrap();
+        assert_eq!(runtime.actions, ["reload:utun", "reload:utun"]);
+        assert_eq!(runtime.tun_requests, [true, false]);
+    }
+
+    #[test]
+    fn failed_service_tun_switch_retains_confirmed_mode_source_and_pid() {
+        for previous in [false, true] {
+            let mut fixture = Fixture::new(SOURCE);
+            fixture.manager.preferences.tun = previous;
+            fixture.manager.persist().unwrap();
+            fixture.installed_runtime(ready(111));
+            let revision = fixture.manager.applied_config_revision.clone();
+            fixture
+                .runtime
+                .lock()
+                .unwrap()
+                .reloads
+                .push_back(Err(AppError::new(
+                    "reload_failed",
+                    "old configuration restored",
+                )));
+            assert_eq!(
+                fixture.manager.set_tun(!previous).unwrap_err().code,
+                "reload_failed"
+            );
+            assert_eq!(fixture.manager.preferences.tun, previous);
+            assert_eq!(
+                config::load_preferences(&fixture.directory).unwrap().tun,
+                previous
+            );
+            assert_eq!(fixture.manager.core_status.pid, Some(111));
+            assert_eq!(fixture.manager.core_status.tun, previous);
+            assert_eq!(fixture.manager.applied_config.as_deref(), Some(SOURCE));
+            assert_eq!(fixture.manager.applied_config_revision, revision);
+            assert_eq!(fixture.runtime.lock().unwrap().actions, ["reload:utun"]);
+        }
+    }
+
+    #[test]
+    fn cancelled_service_tun_switch_never_rolls_back_by_restarting() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun = false;
+        fixture.manager.persist().unwrap();
+        fixture.installed_runtime(ready(111));
+        fixture
+            .runtime
+            .lock()
+            .unwrap()
+            .reloads
+            .push_back(Err(AppError::new("operation_cancelled", "stop accepted")));
+        assert_eq!(
+            fixture.manager.set_tun(true).unwrap_err().code,
+            "operation_cancelled"
+        );
+        assert!(!fixture.manager.preferences.tun);
+        assert!(!config::load_preferences(&fixture.directory).unwrap().tun);
+        assert!(fixture.manager.core_status.pid.is_none());
+        assert!(fixture.manager.core_status.controller.is_none());
+        assert!(fixture.manager.applied_proxy_port.is_none());
+        assert_eq!(
+            fixture.manager.interrupted_runtime_revision,
+            Some(fixture.manager.cancellation.revision())
+        );
+        assert_eq!(fixture.runtime.lock().unwrap().actions, ["reload:utun"]);
+    }
+
+    #[test]
+    fn unconfirmed_cancel_withdraws_old_readiness_and_keeps_the_owner() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun = false;
+        fixture.installed_runtime(ready(111));
+        fixture.manager.applied_proxy_port = Some(7890);
+        {
+            let mut runtime = fixture.runtime.lock().unwrap();
+            runtime
+                .reloads
+                .push_back(Err(AppError::new("operation_cancelled", "cancelled")));
+            runtime
+                .status_errors
+                .push_back(AppError::new("service_unavailable", "query failed"));
+        }
+        assert!(fixture.manager.set_tun(true).is_err());
+        assert!(fixture.manager.phase == Phase::Stopping);
+        assert_eq!(fixture.manager.core_status.process_state, "unknown");
+        assert_eq!(
+            fixture.manager.core_status.error_code.as_deref(),
+            Some("core_termination_unconfirmed")
+        );
+        assert!(fixture.manager.core_status.controller.is_none());
+        assert!(fixture.manager.applied_proxy_port.is_none());
+        assert!(fixture.manager.interrupted_runtime_revision.is_none());
+        assert!(fixture.manager.running.as_ref().unwrap().service_owned());
+        assert_eq!(fixture.runtime.lock().unwrap().actions, ["reload:utun"]);
+    }
+
+    #[test]
+    fn completed_start_or_reload_keeps_applied_facts_when_the_next_intent_arrives() {
+        for start in [false, true] {
+            let mut fixture = Fixture::new(SOURCE);
+            if start {
+                fixture
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .starts
+                    .push_back(Ok(ready(111)));
+            } else {
+                fixture.manager.preferences.tun = false;
+                fixture.installed_runtime(ready(111));
+                fixture
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .reloads
+                    .push_back(Ok(ready(111)));
+            }
+            let context = fixture.manager.app.clone();
+            fixture.runtime.lock().unwrap().checkpoint = Some(Box::new(move |stage| {
+                if stage == if start { "started" } else { "reloaded" } {
+                    context.runtime_generation.fetch_add(1, Ordering::AcqRel);
+                }
+            }));
+            let result = if start {
+                fixture.manager.start(false)
+            } else {
+                fixture.manager.set_tun(true)
+            };
+            assert_eq!(result.unwrap_err().code, "operation_cancelled");
+            assert!(fixture.manager.core_status.running);
+            assert_eq!(fixture.manager.core_status.pid, Some(111));
+            assert!(fixture.manager.core_status.tun);
+            assert!(fixture.manager.preferences.tun);
+            assert!(fixture.manager.phase == Phase::Running);
+            assert_eq!(fixture.manager.applied_config.as_deref(), Some(SOURCE));
+            assert_eq!(fixture.manager.applied_proxy_port, Some(7890));
+            assert!(fixture.manager.interrupted_runtime_revision.is_none());
+            assert_eq!(
+                fixture.runtime.lock().unwrap().actions,
+                [if start { "start:utun" } else { "reload:utun" }]
+            );
+        }
+    }
+
+    #[test]
+    fn new_reload_resumes_a_confirmed_cancel_even_after_status_clears_its_error() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun = false;
+        fixture.installed_runtime(ready(111));
+        fixture
+            .runtime
+            .lock()
+            .unwrap()
+            .reloads
+            .push_back(Err(AppError::new("operation_cancelled", "cancelled")));
+        assert!(fixture.manager.set_tun(true).is_err());
+        fixture.runtime.lock().unwrap().status.error_code = None;
+        fixture.manager.poll();
+        assert!(fixture.manager.core_status.error_code.is_none());
+        let generation = fixture
+            .manager
+            .app
+            .runtime_generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        fixture.manager.begin_operation(generation);
+        fixture
+            .runtime
+            .lock()
+            .unwrap()
+            .starts
+            .push_back(Ok(ready(222)));
+        fixture.manager.reload_config(false).unwrap();
+        assert_eq!(fixture.manager.core_status.pid, Some(222));
+        assert!(!fixture.manager.core_status.tun);
+        assert!(fixture.manager.interrupted_runtime_revision.is_none());
+        assert_eq!(
+            fixture.runtime.lock().unwrap().actions,
+            ["reload:utun", "poll", "stop", "start:utun"]
+        );
+    }
+
+    #[test]
+    fn stop_consumes_cancel_recovery_and_reload_does_not_start_a_stopped_core() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun = false;
+        fixture.installed_runtime(ready(111));
+        fixture
+            .runtime
+            .lock()
+            .unwrap()
+            .reloads
+            .push_back(Err(AppError::new("operation_cancelled", "cancelled")));
+        assert!(fixture.manager.set_tun(true).is_err());
+        fixture.manager.stop(true).unwrap();
+        let generation = fixture
+            .manager
+            .app
+            .runtime_generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        fixture.manager.begin_operation(generation);
+        fixture.manager.reload_config(false).unwrap();
+        assert!(!fixture.manager.run_intent);
+        assert!(fixture.manager.interrupted_runtime_revision.is_none());
+        assert_eq!(
+            fixture.runtime.lock().unwrap().actions,
+            ["reload:utun", "stop"]
+        );
+    }
+
+    #[test]
+    fn log_owner_survives_stop_and_failed_start_until_the_owner_changes() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun = false;
+        fixture.installed_runtime(ready(111));
+        fixture.manager.stop(false).unwrap();
+        assert!(fixture.manager.last_runtime_service);
+        fixture
+            .runtime
+            .lock()
+            .unwrap()
+            .starts
+            .push_back(Err(AppError::new("config_invalid", "invalid")));
+        assert!(fixture.manager.start(false).is_err());
+        assert!(fixture.manager.running.is_none());
+        assert!(fixture.manager.last_runtime_service);
+        {
+            let mut runtime = fixture.runtime.lock().unwrap();
+            runtime.service_available = false;
+            runtime.starts.push_back(Ok(ready(222)));
+        }
+        fixture.manager.start(false).unwrap();
+        assert!(!fixture.manager.last_runtime_service);
+        fixture.manager.stop(false).unwrap();
+        assert!(!fixture.manager.last_runtime_service);
+    }
+
+    #[test]
+    fn uninstall_stops_service_owned_ordinary_core_before_direct_restart() {
+        for tun in [false, true] {
+            let mut fixture = Fixture::new(SOURCE);
+            fixture.manager.preferences.tun = tun;
+            fixture.installed_runtime(ready(111));
+            fixture
+                .runtime
+                .lock()
+                .unwrap()
+                .starts
+                .push_back(Ok(ready(222)));
+            fixture.manager.uninstall_service().unwrap();
+            assert_eq!(
+                fixture.runtime.lock().unwrap().actions,
+                ["stop", "uninstall_service", "start:utun"]
+            );
+            assert_eq!(fixture.manager.core_status.pid, Some(222));
+            assert!(!fixture.manager.preferences.tun);
+            assert!(!fixture.manager.running.as_ref().unwrap().service_owned());
+            assert_eq!(fixture.runtime.lock().unwrap().tun_requests, [false]);
+        }
+    }
+
+    #[test]
+    fn uninstall_never_abandons_an_unconfirmed_owned_process() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun = false;
+        fixture.installed_runtime(ready(111));
+        fixture
+            .runtime
+            .lock()
+            .unwrap()
+            .stops
+            .push_back(Err(AppError::new(
+                "core_termination_unconfirmed",
+                "still owned",
+            )));
+        assert_eq!(
+            fixture.manager.uninstall_service().unwrap_err().code,
+            "core_termination_unconfirmed"
+        );
+        assert_eq!(fixture.runtime.lock().unwrap().actions, ["stop"]);
+        assert!(fixture.manager.running.as_ref().unwrap().service_owned());
+    }
+
+    #[test]
+    fn failed_uninstall_keeps_old_intent_and_the_confirmed_stopped_state() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.installed_runtime(ready(111));
+        fixture
+            .runtime
+            .lock()
+            .unwrap()
+            .uninstalls
+            .push_back(Err(AppError::new("elevation_cancelled", "cancelled")));
+        assert_eq!(
+            fixture.manager.uninstall_service().unwrap_err().code,
+            "elevation_cancelled"
+        );
+        assert!(fixture.manager.preferences.tun);
+        assert!(fixture.manager.run_intent);
+        assert!(fixture.manager.core_status.pid.is_none());
+        assert!(fixture.manager.running.as_ref().unwrap().service_owned());
+        assert_eq!(
+            fixture.runtime.lock().unwrap().actions,
+            ["stop", "uninstall_service"]
+        );
+    }
+
+    #[test]
+    fn service_uninstall_never_drops_a_direct_core() {
+        for rejected in [false, true] {
+            let mut fixture = Fixture::new(SOURCE);
+            fixture.manager.preferences.tun = false;
+            fixture.runtime.lock().unwrap().service_owned = false;
+            fixture.installed_runtime(ready(111));
+            if rejected {
+                fixture
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .uninstalls
+                    .push_back(Err(AppError::new("elevation_cancelled", "cancelled")));
+            }
+            assert_eq!(fixture.manager.uninstall_service().is_err(), rejected);
+            assert_eq!(fixture.manager.core_status.pid, Some(111));
+            assert!(!fixture.manager.running.as_ref().unwrap().service_owned());
+            assert_eq!(
+                fixture.runtime.lock().unwrap().actions,
+                ["uninstall_service"]
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_service_lease_recovery_keeps_the_applied_tun_mode() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun = false;
+        fixture.installed_runtime(CoreStatus {
+            process_state: "exited".into(),
+            stop_reason: Some(StopReason::LeaseExpired),
+            ..CoreStatus::default()
+        });
+        fixture
+            .runtime
+            .lock()
+            .unwrap()
+            .starts
+            .push_back(Ok(ready(222)));
+        fixture
+            .manager
+            .recover_lease(fixture.manager.app.generation());
+        assert!(fixture.manager.core_status.running);
+        assert!(!fixture.manager.core_status.tun);
+        assert_eq!(fixture.runtime.lock().unwrap().tun_requests, [false]);
+    }
+
+    #[test]
     fn newer_reload_resumes_an_interrupted_core_update_with_the_new_config() {
         let mut fixture = Fixture::new(SOURCE);
         fixture.installed_runtime(CoreStatus {
@@ -2094,6 +2753,7 @@ mod cleanup_observation_tests {
             let mut fixture = Fixture::new(SOURCE);
             if enable {
                 fixture.manager.preferences.tun = false;
+                fixture.runtime.lock().unwrap().service_owned = false;
                 fixture.installed_runtime(ready(111));
             }
             fixture
@@ -2132,6 +2792,7 @@ mod cleanup_observation_tests {
                 "lease" => {
                     fixture.manager.core_status = CoreStatus {
                         process_state: "exited".into(),
+                        tun: true,
                         stop_reason: Some(StopReason::LeaseExpired),
                         ..CoreStatus::default()
                     };

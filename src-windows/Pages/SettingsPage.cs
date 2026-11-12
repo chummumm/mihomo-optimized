@@ -102,6 +102,7 @@ public sealed class SettingsPage : NativePage
     private readonly Dictionary<string, TextBox> ports;
     private readonly HashSet<string> portDrafts = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim runtimeRead = new(1, 1);
+    private readonly RuntimeConfigReader configReader;
     private readonly DispatcherTimer focusTimer = new() { Interval = TimeSpan.FromSeconds(3) };
     private SettingCard? highlighted;
     private JsonElement runtime;
@@ -120,9 +121,12 @@ public sealed class SettingsPage : NativePage
 
     private bool DesktopBusy => changing || !Session.Ready || Session.IsUpdating || Session.BusyCommand is not null || Session.Runtime.IsWorking;
     private bool RuntimeEditable => !DesktopBusy && IsRunning && !Session.IsDirty && runtimeIdentity == ControllerIdentity;
+    private string RuntimeReadSource => ControllerIdentity + "\n" + Session.Status.Text("statusInstance")
+        + "\n" + Session.Status.Number("pid").ToString(CultureInfo.InvariantCulture) + "\n" + IsRunning;
 
     public SettingsPage(AppSession session) : base(session, "settings", "设置", "")
     {
+        configReader = new(() => RuntimeReadSource, ReadRuntimeSnapshot, ApplyRuntimeSnapshot);
         SetPageMaxWidth(1000);
         ports = new(StringComparer.Ordinal) { ["mixed-port"] = mixedPort, ["port"] = httpPort, ["socks-port"] = socksPort };
         theme.SelectionChanged += (_, _) => { if (!applying && theme.SelectedValue is string value) Session.SetTheme(value); };
@@ -453,7 +457,7 @@ public sealed class SettingsPage : NativePage
     }
     protected override Task LiveAsync(CancellationToken cancellationToken) => PollAsync(TimeSpan.FromSeconds(5), async () =>
     {
-        if (!changing && runtimeRead.CurrentCount > 0) await ReadRuntime();
+        if (!changing && !configReader.IsReading) await ReadRuntime();
     }, cancellationToken);
     protected override void OnStatusChanged()
     {
@@ -514,7 +518,7 @@ public sealed class SettingsPage : NativePage
         runtimeStatus.Text = Session.IsDirty ? L.T("配置编辑器中有未保存的修改，请先保存或放弃后再修改网络设置。")
             : !IsRunning ? L.T("启动内核后可修改代理模式、局域网访问和端口。") : "";
         runtimeStatus.Visibility = runtimeStatus.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
-        if (status.Text("lastError").Length > 0) Message(status.Text("lastError"), true);
+        UpdateRuntimeNotice();
         if (!checking && !installing && !Session.IsUpdating && Session.Update.Text("currentVersion").Length > 0 && Session.Update.GetRawText() != renderedUpdate) RenderUpdate(Session.Update);
         if (renderedUpdate.Length == 0 && !checking) updateStatus.Text = "";
         ApplyProbeControls(); ApplyUpdateControls();
@@ -524,22 +528,27 @@ public sealed class SettingsPage : NativePage
         toggle.IsChecked = enabled; toggle.Content = L.T(enabled ? "开" : "关");
     }
 
-    private async Task ReadRuntime(bool force = false)
+    private Task ReadRuntime(bool force = false)
     {
-        if (!IsRunning) return;
+        if (!IsRunning) return Task.CompletedTask;
         // An already submitted change still needs readback if the window is hidden to the tray.
-        var cancellation = force ? CancellationToken.None : PageToken;
+        return force ? configReader.ReadAfterChangeAsync(CancellationToken.None) : configReader.RefreshAsync(PageToken);
+    }
+    private async Task<JsonElement> ReadRuntimeSnapshot(CancellationToken cancellation)
+    {
         await runtimeRead.WaitAsync(cancellation);
         try
         {
-            if (!IsRunning) return;
-            string identity = ControllerIdentity;
-            var result = await Session.ApiAsync(HttpMethod.Get, "configs", cancellationToken: cancellation);
-            if (!IsRunning || identity != ControllerIdentity || (changing && !force)) return;
-            runtime = result; runtimeIdentity = identity;
-            ApplyRuntime(force); ApplyStatus();
+            if (!IsRunning) throw new OperationCanceledException();
+            return await Session.ApiAsync(HttpMethod.Get, "configs", cancellationToken: cancellation);
         }
         finally { runtimeRead.Release(); }
+    }
+    private void ApplyRuntimeSnapshot(JsonElement result, bool afterChange)
+    {
+        if (!IsRunning || changing && !afterChange) return;
+        runtime = result; runtimeIdentity = ControllerIdentity;
+        ApplyRuntime(afterChange); ApplyStatus();
     }
     private void ApplyRuntime(bool force = false)
     {

@@ -70,7 +70,16 @@ internal sealed class HostChannel : IAsyncDisposable
         start.ArgumentList.Add("--parent-pid");
         start.ArgumentList.Add(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         if (!allowAutostart) start.ArgumentList.Add("--no-autostart");
-        process = Process.Start(start) ?? throw new DesktopException("host_start_failed", "无法启动桌面后台");
+        Record("host_process_starting", ("allowAutostart", allowAutostart), ("origin", LifecycleDiagnostics.Code(origin)));
+        long processStart = Stopwatch.GetTimestamp();
+        try { process = Process.Start(start) ?? throw new DesktopException("host_start_failed", "无法启动桌面后台"); }
+        catch (Exception error)
+        {
+            Record("host_process_start_failed", ("durationMs", (long)Stopwatch.GetElapsedTime(processStart).TotalMilliseconds),
+                ("code", LifecycleDiagnostics.ErrorCode(error)), ("errorType", error.GetType().Name));
+            throw;
+        }
+        long processStartMs = (long)Stopwatch.GetElapsedTime(processStart).TotalMilliseconds;
         hostPid = process.Id;
         Process ownedProcess = process;
         try
@@ -82,7 +91,7 @@ internal sealed class HostChannel : IAsyncDisposable
         {
             Record("host_exit_observer_unavailable", ("errorType", error.GetType().Name));
         }
-        Record("host_process_started", ("allowAutostart", allowAutostart), ("origin", LifecycleDiagnostics.Code(origin)));
+        Record("host_process_started", ("allowAutostart", allowAutostart), ("origin", LifecycleDiagnostics.Code(origin)), ("processStartMs", processStartMs));
         reader = ReadAsync(process, lifetimeToken);
         // Diagnostics can contain paths; drain stderr without forwarding potentially sensitive text into the UI.
         _ = DrainAsync(process.StandardError, lifetimeToken);

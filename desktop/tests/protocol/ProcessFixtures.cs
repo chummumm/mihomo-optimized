@@ -70,6 +70,15 @@ internal static class ProcessFixtures
             if (text.Contains("private-fixture-", StringComparison.Ordinal)) throw new Exception("Request payload leaked into lifecycle evidence");
             var records = text.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(line => JsonDocument.Parse(line).RootElement.Clone()).ToArray();
             JsonElement Data(string name) => records.Single(record => record.GetProperty("event").GetString() == name).GetProperty("data");
+            var starting = records.Single(record => record.GetProperty("event").GetString() == "host_process_starting");
+            var started = records.Single(record => record.GetProperty("event").GetString() == "host_process_started");
+            if (started.GetProperty("sequence").GetInt64() <= starting.GetProperty("sequence").GetInt64()
+                || started.GetProperty("timeMs").GetInt64() < starting.GetProperty("timeMs").GetInt64()
+                || started.GetProperty("data").GetProperty("processStartMs").GetInt64() < 0)
+                throw new Exception("Host process creation lost its separate startup timing");
+            string[] startFields = ["channelId", "hostInstance", "hostPid", "allowAutostart", "origin", "processStartMs"];
+            if (started.GetProperty("data").EnumerateObject().Any(field => !startFields.Contains(field.Name)))
+                throw new Exception("Host startup timing included unexpected potentially private fields");
             var sent = Data("host_request_sent");
             if (sent.GetProperty("channelId").GetString() != channelId || sent.GetProperty("hostPid").GetInt32() != hostPid
                 || sent.GetProperty("hostInstance").GetString() != "fixture-host-" + hostPid

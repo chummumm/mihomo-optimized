@@ -11,11 +11,14 @@ public partial class App : Application
     private InstanceBroker? instance;
     private AutomationServer? automation;
     private AppSession? session;
+    private readonly Stopwatch startupTime = Stopwatch.StartNew();
 
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
         NativeFaultDiagnostics.Attach(this, e.Args);
+        var stageTime = Stopwatch.StartNew();
+        string stage = "single_instance";
         try
         {
             if (e.Args.FirstOrDefault() is "--install" or "--uninstall" or "--stop-for-update" or "--start-if-installed")
@@ -36,14 +39,23 @@ public partial class App : Application
                 return;
             }
             if (e.Args.Contains("--quit")) { Shutdown(); return; }
+            var instanceDuration = stageTime.Elapsed;
+            stage = "session_initialize"; stageTime.Restart();
             session = new AppSession();
+            session.RecordStartupStage("single_instance", instanceDuration);
+            session.RecordStartupStage(stage, stageTime.Elapsed);
+            stage = "initial_theme"; stageTime.Restart();
             session.ApplyTheme();
+            session.RecordStartupStage(stage, stageTime.Elapsed);
+            stage = "window_initialize"; stageTime.Restart();
             var window = new MainWindow(session);
+            session.RecordStartupStage(stage, stageTime.Elapsed);
             MainWindow = window;
             EventHandler? initializeBackdrop = null;
             initializeBackdrop = (_, _) =>
             {
                 window.ContentRendered -= initializeBackdrop;
+                session.RecordStartupStage("application_first_render", startupTime.Elapsed);
                 _ = Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
                 {
                     if (!Dispatcher.HasShutdownStarted && !SystemParameters.HighContrast && Controls.FluentMotion.Enabled)
@@ -58,8 +70,11 @@ public partial class App : Application
                 if (accepted) _ = FinishRemoteExitAsync(window);
                 return accepted;
             }).Task.Unwrap());
+            stage = "window_show"; stageTime.Restart();
             if (!e.Args.Contains("--tray")) window.Show();
             else { window.Show(); window.HideToTray(); }
+            session.RecordStartupStage(stage, stageTime.Elapsed);
+            stage = "ui_host_start"; stageTime.Restart();
             int automationIndex = Array.IndexOf(e.Args, "--automation-pipe");
             if (automationIndex >= 0)
             {
@@ -67,11 +82,16 @@ public partial class App : Application
                 automation = new AutomationServer(e.Args[automationIndex + 1], session, (method, args) => Dispatcher.InvokeAsync(() => window.AutomationAsync(method, args)).Task.Unwrap());
                 automation.Start();
             }
-            try { await session.StartAsync(); }
-            catch (Exception error) { session.Notify(error.Message, true); window.ShowMain(); }
+            try { await session.StartAsync(); session.RecordStartupStage(stage, stageTime.Elapsed); }
+            catch (Exception error)
+            {
+                session.RecordStartupStage(stage, stageTime.Elapsed, error);
+                session.Notify(error.Message, true); window.ShowMain();
+            }
         }
         catch (Exception error)
         {
+            session?.RecordStartupStage(stage, stageTime.Elapsed, error);
             // An installer waits for --quit's exit code; a hidden modal dialog
             // would leave that maintenance invocation blocked indefinitely.
             if (!e.Args.Contains("--quit")) MessageBox.Show(L.T(error.Message), "Mihomo Optimized", MessageBoxButton.OK, MessageBoxImage.Error);

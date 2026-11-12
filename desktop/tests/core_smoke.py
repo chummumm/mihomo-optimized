@@ -9,7 +9,6 @@ reload, local rule updates and shutdown; it does not test TUN or Windows UAC.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import http.client
 import http.server
@@ -24,6 +23,8 @@ import tempfile
 import threading
 import time
 
+from port_fixture import available_ports
+
 
 class SmokeFailure(Exception):
     pass
@@ -32,16 +33,6 @@ class SmokeFailure(Exception):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise SmokeFailure(message)
-
-
-def available_ports(count: int) -> list[int]:
-    # Hold every reservation until all ports are distinct. The supervisor's
-    # authenticated PID check below detects a different process winning a bind.
-    with contextlib.ExitStack() as stack:
-        listeners = [stack.enter_context(socket.socket()) for _ in range(count)]
-        for listener in listeners:
-            listener.bind(("127.0.0.1", 0))
-        return [listener.getsockname()[1] for listener in listeners]
 
 
 def is_listening(port: int) -> bool:
