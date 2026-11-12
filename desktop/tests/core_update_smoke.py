@@ -311,6 +311,25 @@ class CoreUpdateAcceptance(Acceptance):
                 "core_update_policy_row_incomplete")
         row["normalResourcePageShowsCoreState"] = True
 
+    def service_core_account(self, status: dict) -> dict:
+        import win32api
+        import win32security
+
+        identity = self.managed_core(status)
+        require(status.get("service", {}).get("running") is True, "core_update_service_owner_missing")
+        process = win32api.OpenProcess(0x1000, False, identity["pid"])
+        try:
+            token = win32security.OpenProcessToken(process, win32security.TOKEN_QUERY)
+            try:
+                user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+                require(win32security.ConvertSidToStringSid(user) == "S-1-5-18",
+                        "core_update_service_core_not_system")
+            finally:
+                token.Close()
+        finally:
+            process.Close()
+        return {"account": "LocalSystem", "pid": identity["pid"]}
+
     def scenario(self, name: str, *, running: bool, tun: bool) -> None:
         row, mixed, content = self.seed_scenario(name, running=running, tun=tun)
         self.stage = name
@@ -319,6 +338,7 @@ class CoreUpdateAcceptance(Acceptance):
             before = self.phase("running")
             self.observe_intent(running=True, tun=tun)
             previous_pid = self.managed_core(before)["pid"]
+            row["baselineCoreAccount"] = self.service_core_account(before)
             require(self.runtime_json("version").get("version") == BASELINE_VERSION,
                     "core_update_baseline_not_running")
             task = self.driver.invoke("desktop_core_update_status")
@@ -344,6 +364,7 @@ class CoreUpdateAcceptance(Acceptance):
         if running:
             require(status.get("phase") == "running", "core_update_running_intent_not_restored")
             current_pid = self.managed_core(status)["pid"]
+            row["updatedCoreAccount"] = self.service_core_account(status)
             require(current_pid != previous_pid and self.runtime_json("version").get("version") == item["current_version"],
                     "core_update_runtime_version_mismatch")
             configuration = self.runtime_json("configs")
@@ -352,9 +373,6 @@ class CoreUpdateAcceptance(Acceptance):
                 require(status.get("service", {}).get("running") is True
                         and configuration["tun"].get("device") == "MihomoCoreUpdateTun",
                         "core_update_tun_service_not_restored")
-            else:
-                row["updatedCoreToken"] = self.desktop.check_gui(
-                    self.processes.identity(current_pid), self.processes)
             wait_until(self.socks.roundtrip if tun else lambda: self.proxy_roundtrip(mixed),
                        "core_update_forwarding_not_restored", 25)
             row["previousPid"] = previous_pid
@@ -377,9 +395,26 @@ class CoreUpdateAcceptance(Acceptance):
         row["intentPreserved"] = True
         self.verify_core_row(row)
         if running and tun:
-            # The SYSTEM service installed these bytes. A later ordinary
-            # (medium-integrity) start must still have read/execute permission.
+            # TUN off now stays with the same authenticated service owner.
             self.driver.invoke("desktop_set_tun", {"enabled": False})
+            ordinary = self.phase("running")
+            self.observe_intent(running=True, tun=False)
+            require(self.managed_core(ordinary)["pid"] == current_pid
+                    and self.runtime_json("configs").get("tun", {}).get("enable") is False,
+                    "core_update_tun_disable_restarted_core")
+            row["tunDisabledCoreAccount"] = self.service_core_account(ordinary)
+            wait_until(lambda: self.proxy_roundtrip(mixed), "core_update_tun_disabled_forwarding_failed", 20)
+            row["tunDisabledSameCore"] = True
+            # Retain the original ACL regression: after a confirmed Stop and
+            # removal of the fixture service, a medium-integrity process must
+            # still be able to execute the binary installed by SYSTEM.
+            self.driver.invoke("desktop_stop")
+            wait_until(lambda: not self.processes.at_paths([self.core]), "core_update_service_core_survived_stop")
+            self.service_action("uninstall")
+            wait_until(lambda: not service_installed() and not self.processes.at_paths([self.helper]),
+                       "core_update_service_owner_not_removed", 20)
+            self.service_owned = False
+            self.driver.invoke("desktop_start")
             direct = self.phase("running")
             self.observe_intent(running=True, tun=False)
             direct_pid = self.managed_core(direct)["pid"]

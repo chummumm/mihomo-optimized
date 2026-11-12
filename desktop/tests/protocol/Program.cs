@@ -2,6 +2,12 @@ using System.Text;
 using System.Text.Json;
 using Mihomo.Desktop.Services;
 
+if (args.FirstOrDefault() == "--verify-ready-to-run")
+{
+    if (args.Length != 2) throw new ArgumentException("Expected one published application assembly path");
+    ReadyToRunArtifact.Verify(args[1]);
+    return;
+}
 if (args.FirstOrDefault() == "--stdio") { await ProcessFixtures.HostAsync(); return; }
 if (args.FirstOrDefault() == "--broker-fixture" && OperatingSystem.IsWindows())
 {
@@ -12,6 +18,8 @@ if (args.FirstOrDefault() == "--broker-fixture" && OperatingSystem.IsWindows())
 WindowPlacementGeometryTests.Run();
 HostRecoveryIntentTests.Run();
 DesktopStatusTests.Run();
+PageNoticeStateTests.Run();
+await RuntimeConfigReaderTests.RunAsync();
 TunDeviceStateTests.Run();
 CoreUpdateStateTests.Run();
 await LifecycleDiagnosticsTests.RunAsync();

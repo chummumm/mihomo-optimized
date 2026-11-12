@@ -30,9 +30,9 @@ const CLEANUP_RESERVE: Duration = STOP_TIMEOUT;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_DIAGNOSTIC_BYTES: usize = 4096;
 
-/// Validation and the main process share one resource deadline. The additional
-/// reserve is for confirming readiness or restoring the previous runtime, never
-/// another full download allowance.
+/// Reload validation and application share one resource deadline. A fresh
+/// process validates during its own startup. The reserve confirms readiness or
+/// restores the previous runtime, never grants another full download allowance.
 struct OperationBudget {
     resources: Instant,
     total: Instant,
@@ -328,6 +328,8 @@ pub struct Controller {
 #[serde(default, rename_all = "camelCase")]
 pub struct CoreStatus {
     pub running: bool,
+    /// Last confirmed runtime mode, retained while the process is stopped.
+    pub tun: bool,
     pub controller: Option<Controller>,
     pub version: Option<String>,
     pub error: Option<String>,
@@ -459,6 +461,62 @@ fn tun_reason_code(reason: Option<&str>) -> &'static str {
     }
 }
 
+struct ScalarConfigPatch {
+    before: serde_json::Map<String, serde_json::Value>,
+    after: serde_json::Map<String, serde_json::Value>,
+}
+
+fn scalar_config_change(previous: &str, next: &str) -> Result<Option<ScalarConfigPatch>> {
+    let mut previous = config::parse(previous)?;
+    let mut next = config::parse(next)?;
+    // These defaults match the core's RawConfig defaults. Values outside the
+    // desktop's scalar settings stay on the fully validated reload path.
+    let scalar = |document: &mut serde_yaml::Mapping, field: &str| {
+        let value = match document.remove(field) {
+            None => match field {
+                "mode" => serde_json::json!("rule"),
+                "allow-lan" => serde_json::json!(false),
+                "log-level" => serde_json::json!("info"),
+                _ => serde_json::json!(0),
+            },
+            Some(value) => serde_json::to_value(value).ok()?,
+        };
+        let valid = match field {
+            "mode" => value
+                .as_str()
+                .is_some_and(|value| matches!(value, "rule" | "global" | "direct")),
+            "allow-lan" => value.is_boolean(),
+            "log-level" => value.as_str().is_some_and(|value| {
+                matches!(value, "silent" | "error" | "warning" | "info" | "debug")
+            }),
+            _ => value.as_u64().is_some_and(|port| port <= u16::MAX as u64),
+        };
+        valid.then_some(value)
+    };
+    let mut patch = ScalarConfigPatch {
+        before: serde_json::Map::new(),
+        after: serde_json::Map::new(),
+    };
+    for field in [
+        "mode",
+        "allow-lan",
+        "log-level",
+        "port",
+        "socks-port",
+        "mixed-port",
+    ] {
+        let (Some(before), Some(after)) = (scalar(&mut previous, field), scalar(&mut next, field))
+        else {
+            return Ok(None);
+        };
+        if before != after {
+            patch.before.insert(field.into(), before);
+            patch.after.insert(field.into(), after);
+        }
+    }
+    Ok((previous == next && !patch.after.is_empty()).then_some(patch))
+}
+
 pub struct CoreSupervisor {
     executable: PathBuf,
     home: PathBuf,
@@ -483,6 +541,7 @@ pub struct CoreSupervisor {
     last_health_check: Duration,
     health_blocked: bool,
     health_deferred: bool,
+    initial_health_check: Option<RecoveryWindow>,
     stop_reason: Option<StopReason>,
     error_code: Option<String>,
     exit_code: Option<i32>,
@@ -750,6 +809,7 @@ impl CoreSupervisor {
             last_health_check: Duration::ZERO,
             health_blocked: false,
             health_deferred: false,
+            initial_health_check: None,
             stop_reason: None,
             error_code: None,
             exit_code: None,
@@ -787,6 +847,7 @@ impl CoreSupervisor {
                 && !self.health_blocked
                 && !self.health_deferred
                 && self.recovery.is_none(),
+            tun: self.tun,
             controller: self.controller.clone(),
             version: self.version.clone(),
             error: self.error.clone(),
@@ -1178,6 +1239,7 @@ impl CoreSupervisor {
     }
 
     fn launch(&mut self, budget: &OperationBudget) -> Result<()> {
+        let preparation_started = Instant::now();
         self.check_cancelled()?;
         fs::create_dir_all(&self.home).map_err(|e| AppError::io("无法创建运行目录", e))?;
         fs::create_dir_all(&self.logs).map_err(|e| AppError::io("无法创建日志目录", e))?;
@@ -1202,8 +1264,12 @@ impl CoreSupervisor {
         config::atomic_write(&self.home.join("config.yaml"), runtime.as_bytes())?;
         self.rotate_log()?;
         self.log_start = fs::metadata(self.logs.join("core.log")).map_or(0, |file| file.len());
-        self.validate(&controller, budget)?;
+        // There is no old process to protect here. The main process performs
+        // the same parse/resource validation as -t before managed readiness;
+        // its complete stdout/stderr remains in core.log on startup failure.
+        self.record_lifecycle("core_start_stage", serde_json::json!({"stage":"prepare","durationMs":preparation_started.elapsed().as_millis()}));
         self.check_cancelled()?;
+        let spawn_started = Instant::now();
         let stdout = self.open_log()?;
         let stderr = stdout
             .try_clone()
@@ -1218,6 +1284,10 @@ impl CoreSupervisor {
             .spawn()
             .map_err(|e| AppError::io("无法启动配套内核", e))?;
         self.child = Some(child);
+        self.record_lifecycle(
+            "core_start_stage",
+            serde_json::json!({"stage":"spawn","durationMs":spawn_started.elapsed().as_millis()}),
+        );
         self.diagnostic_health = None;
         self.diagnostic_health_at = None;
         self.record_lifecycle("core_spawned", serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"tun":self.tun,"generation":self.recovery_generation}));
@@ -1230,8 +1300,12 @@ impl CoreSupervisor {
         }
         self.controller = Some(controller.clone());
         self.check_cancelled()?;
-        self.wait_ready(&controller, &source, budget.work_deadline())?;
+        let readiness_started = Instant::now();
+        let ready = self.wait_ready(&controller, &source, budget.work_deadline());
+        self.record_lifecycle("core_start_stage", serde_json::json!({"stage":"readiness","durationMs":readiness_started.elapsed().as_millis(),"success":ready.is_ok(),"errorCode":ready.as_ref().err().map(|error| &error.code)}));
+        ready?;
         self.check_cancelled()?;
+        let version_started = Instant::now();
         if let Ok(timeout) = remaining(budget.work_deadline()) {
             self.version = http_client()?
                 .get(format!("{}/version", controller.url))
@@ -1246,6 +1320,8 @@ impl CoreSupervisor {
                         .map(str::to_string)
                 });
         }
+        self.record_lifecycle("core_start_stage", serde_json::json!({"stage":"version","durationMs":version_started.elapsed().as_millis(),"success":self.version.is_some()}));
+        self.check_cancelled()?;
         self.error = None;
         self.error_code = None;
         self.stop_reason = None;
@@ -1253,6 +1329,7 @@ impl CoreSupervisor {
         self.health_deferred = false;
         self.recovery = None;
         self.last_health_check = lifecycle::awake_now()?;
+        self.begin_health_observation();
         self.control_state = "ready".into();
         self.listeners_ready = Some(true);
         self.observed_at = observed_now();
@@ -1264,6 +1341,17 @@ impl CoreSupervisor {
                 "desktopVersion":env!("CARGO_PKG_VERSION"),"coreVersion":self.version}),
         );
         Ok(())
+    }
+
+    fn begin_health_observation(&mut self) {
+        self.initial_health_check = self.tun.then(|| {
+            // A failed clock read must not extend the initial grace period.
+            RecoveryWindow::new(
+                self.recovery_generation,
+                lifecycle::awake_now().unwrap_or(self.last_health_check),
+            )
+        });
+        self.tun_health = Some(if self.tun { "checking" } else { "disabled" }.into());
     }
 
     fn rotate_log(&self) -> Result<()> {
@@ -1314,6 +1402,16 @@ impl CoreSupervisor {
         &mut self,
         controller: &Controller,
         source: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.wait_ready_for(controller, source, self.tun, deadline)
+    }
+
+    fn wait_ready_for(
+        &mut self,
+        controller: &Controller,
+        source: &str,
+        tun: bool,
         deadline: Instant,
     ) -> Result<()> {
         let client = http_client()?;
@@ -1378,10 +1476,13 @@ impl CoreSupervisor {
                         )));
                     }
                 }
-                self.verify_listeners(&client, controller, &expected, deadline)
+                self.verify_listeners_for(&client, controller, &expected, tun, deadline)
             })();
             match probe {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.check_cancelled()?;
+                    return Ok(());
+                }
                 Err(ReadinessFailure::Fatal(error)) => return Err(error),
                 Err(ReadinessFailure::Temporary(error)) => last_failure = Some(error),
             }
@@ -1519,7 +1620,26 @@ impl CoreSupervisor {
         expected: &serde_yaml::Mapping,
         deadline: Instant,
     ) -> std::result::Result<(), ReadinessFailure> {
+        self.verify_listeners_for(client, controller, expected, self.tun, deadline)
+    }
+
+    fn verify_listeners_for(
+        &self,
+        client: &Client,
+        controller: &Controller,
+        expected: &serde_yaml::Mapping,
+        tun: bool,
+        deadline: Instant,
+    ) -> std::result::Result<(), ReadinessFailure> {
         let actual = read_readiness_json(client, controller, "/configs", deadline)?;
+        Self::verify_listener_snapshot(&actual, expected, tun)
+    }
+
+    fn verify_listener_snapshot(
+        actual: &serde_json::Value,
+        expected: &serde_yaml::Mapping,
+        tun: bool,
+    ) -> std::result::Result<(), ReadinessFailure> {
         // Mihomo reports these values from its actual TCP listeners, so a port bind
         // failure cannot be mistaken for a successful config application.
         for field in ["port", "socks-port", "mixed-port"] {
@@ -1545,7 +1665,7 @@ impl CoreSupervisor {
             }
         }
         if let Some(enabled) = actual["tun"]["enable"].as_bool() {
-            if enabled != self.tun {
+            if enabled != tun {
                 return Err(ReadinessFailure::Temporary(AppError::new(
                     "tun_not_ready",
                     "TUN 实际设备尚未就绪",
@@ -1559,6 +1679,23 @@ impl CoreSupervisor {
         &mut self,
         controller: &Controller,
         source: &str,
+        resource_deadline: Instant,
+        completion_deadline: Instant,
+    ) -> Result<()> {
+        self.apply_runtime_for(
+            controller,
+            source,
+            self.tun,
+            resource_deadline,
+            completion_deadline,
+        )
+    }
+
+    fn apply_runtime_for(
+        &mut self,
+        controller: &Controller,
+        source: &str,
+        tun: bool,
         resource_deadline: Instant,
         completion_deadline: Instant,
     ) -> Result<()> {
@@ -1641,27 +1778,246 @@ impl CoreSupervisor {
         }
         // HTTP success alone cannot prove the actual listener/TUN application
         // succeeded. Only this owned PID's managed readiness can confirm it.
-        self.wait_ready(controller, source, completion_deadline)
+        self.wait_ready_for(controller, source, tun, completion_deadline)
+    }
+
+    fn runtime_json(
+        &self,
+        controller: &Controller,
+        method: reqwest::Method,
+        endpoint: &str,
+        body: Option<serde_json::Value>,
+        deadline: Instant,
+    ) -> Result<serde_json::Value> {
+        let mutation = method == reqwest::Method::PATCH;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|_| AppError::new("http_init_failed", "无法初始化本地控制连接"))?;
+        let request = client
+            .request(method, format!("{}{endpoint}", controller.url))
+            .bearer_auth(&controller.secret)
+            .timeout(remaining(deadline)?.min(CONTROL_TIMEOUT));
+        let request = if let Some(body) = body {
+            request.json(&body)
+        } else {
+            request
+        };
+        let result = wait_cancellable(self.cancellation.as_ref(), deadline, async move {
+            let transport_error = || {
+                AppError::new(
+                    if mutation {
+                        "config_patch_unconfirmed"
+                    } else {
+                        "core_readiness_unavailable"
+                    },
+                    "本地运行配置请求未能确认完成",
+                )
+            };
+            let mut response = request.send().await.map_err(|_| transport_error())?;
+            if !response.status().is_success() {
+                return Err(AppError::new(
+                    if mutation {
+                        "config_patch_failed"
+                    } else {
+                        "core_readiness_unavailable"
+                    },
+                    "内核拒绝本地运行配置请求",
+                ));
+            }
+            if mutation {
+                return Ok(serde_json::Value::Null);
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| transport_error())? {
+                if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+                    return Err(AppError::new(
+                        "core_controller_incompatible",
+                        "内核运行状态响应过大",
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            serde_json::from_slice(&bytes)
+                .map_err(|_| AppError::new("core_controller_incompatible", "内核运行状态响应无效"))
+        });
+        result.map_err(|error| {
+            if mutation && error.code == "core_operation_timeout" {
+                AppError::new("config_patch_unconfirmed", "本地设置更新结果尚未确认")
+            } else {
+                error
+            }
+        })
+    }
+
+    fn verify_config_patch(
+        &self,
+        controller: &Controller,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        source: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let identity =
+            self.runtime_json(controller, reqwest::Method::GET, "/desktop", None, deadline)?;
+        verify_managed_identity(&identity, self.child.as_ref().map(Child::id)).map_err(
+            |error| match error {
+                ReadinessFailure::Temporary(error) | ReadinessFailure::Fatal(error) => error,
+            },
+        )?;
+        let actual =
+            self.runtime_json(controller, reqwest::Method::GET, "/configs", None, deadline)?;
+        self.check_cancelled()?;
+        if patch
+            .iter()
+            .any(|(key, value)| actual.get(key) != Some(value))
+            || actual["tun"]["enable"].as_bool() != Some(self.tun)
+        {
+            return Err(AppError::new(
+                "config_patch_readback_mismatch",
+                "内核设置回读与请求不一致",
+            ));
+        }
+        // PATCH can return 204 even when a native listener bind failed. Verify
+        // all actual listener ports, including those a LAN change recreated.
+        Self::verify_listener_snapshot(&actual, &config::parse(source)?, self.tun).map_err(
+            |error| match error {
+                ReadinessFailure::Temporary(error) | ReadinessFailure::Fatal(error) => error,
+            },
+        )
+    }
+
+    fn apply_config_patch(
+        &self,
+        controller: &Controller,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        source: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let patched = self.runtime_json(
+            controller,
+            reqwest::Method::PATCH,
+            "/configs",
+            Some(serde_json::Value::Object(patch.clone())),
+            deadline,
+        );
+        match patched {
+            Ok(_) => self.verify_config_patch(controller, patch, source, deadline),
+            Err(error) if error.code == "config_patch_unconfirmed" => {
+                // The reply may have been lost after application. A readback of
+                // the desired scalar is safe: any late identical PATCH agrees.
+                self.verify_config_patch(controller, patch, source, deadline)
+                    .map_err(|readback| {
+                        if readback.code == "operation_cancelled" {
+                            readback
+                        } else {
+                            error
+                        }
+                    })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn reconfigure_scalars(
+        &mut self,
+        controller: &Controller,
+        source: String,
+        previous: &str,
+        port: u16,
+        patch: ScalarConfigPatch,
+    ) -> Result<CoreStatus> {
+        let started = Instant::now();
+        let deadline = started + CONTROL_TIMEOUT * 4;
+        let identity =
+            self.runtime_json(controller, reqwest::Method::GET, "/desktop", None, deadline)?;
+        verify_managed_identity(&identity, self.child.as_ref().map(Child::id)).map_err(
+            |error| match error {
+                ReadinessFailure::Temporary(error) | ReadinessFailure::Fatal(error) => error,
+            },
+        )?;
+        let path = self.home.join("config.yaml");
+        let old_runtime = config::runtime_config(previous, self.tun, port)?;
+        let runtime = config::runtime_config(&source, self.tun, port)?;
+        self.check_cancelled()?;
+        config::atomic_write(&path, runtime.as_bytes())?;
+        let result = self.apply_config_patch(controller, &patch.after, &source, deadline);
+        self.record_lifecycle("core_config_patch_result", serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"keys":patch.after.keys().collect::<Vec<_>>(),"durationMs":started.elapsed().as_millis(),"success":result.is_ok(),"errorCode":result.as_ref().err().map(|error| &error.code)}));
+        if let Err(error) = result {
+            let restored_file = config::atomic_write(&path, old_runtime.as_bytes());
+            let uncertain = matches!(
+                error.code.as_str(),
+                "operation_cancelled" | "config_patch_unconfirmed"
+            );
+            let restored = !uncertain
+                && restored_file.is_ok()
+                && self
+                    .apply_config_patch(
+                        controller,
+                        &patch.before,
+                        previous,
+                        Instant::now() + CONTROL_TIMEOUT * 3,
+                    )
+                    .is_ok();
+            let cancellation = self.check_cancelled().err();
+            if !restored || cancellation.is_some() {
+                // An unanswered PATCH could still be queued in the core. An old
+                // value readback cannot prove it will stay old; process exit can.
+                self.stop_for(StopReason::UserStop)?;
+            }
+            if let Some(cancellation) = cancellation {
+                restored_file?;
+                return Err(cancellation);
+            }
+            let failure = AppError::new(
+                if restored {
+                    "config_patch_failed"
+                } else {
+                    "config_patch_unconfirmed"
+                },
+                if restored {
+                    "配置已保存，但设置未能应用；已恢复先前运行配置"
+                } else {
+                    "配置已保存，设置更新或回滚未能确认；自有内核已停止"
+                },
+            );
+            self.error_code = Some(failure.code.clone());
+            self.error = Some(failure.message.clone());
+            return Err(failure);
+        }
+        self.source = Some(source);
+        if !self.health_blocked && !self.health_deferred && self.recovery.is_none() {
+            self.error = None;
+            self.error_code = None;
+        }
+        self.observed_at = observed_now();
+        Ok(self.status())
     }
 
     pub fn reload(&mut self, source: String) -> Result<CoreStatus> {
+        self.reconfigure(source, self.tun)
+    }
+
+    /// Apply a configuration and runtime mode as one owned operation. The
+    /// previous source/mode remains authoritative until readback succeeds.
+    pub fn reconfigure(&mut self, source: String, tun: bool) -> Result<CoreStatus> {
         let started = Instant::now();
         self.record_lifecycle(
             "core_reload",
-            serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"tun":self.tun}),
+            serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"tun":self.tun,"requestedTun":tun}),
         );
-        let result = self.reload_inner(source);
+        let result = self.reconfigure_inner(source, tun);
         self.record_lifecycle("core_reload_result", serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"durationMs":started.elapsed().as_millis(),"success":result.is_ok(),"errorCode":result.as_ref().err().map(|error|&error.code)}));
         result
     }
 
-    fn reload_inner(&mut self, source: String) -> Result<CoreStatus> {
+    fn reconfigure_inner(&mut self, source: String, tun: bool) -> Result<CoreStatus> {
         self.check_cancelled()?;
         self.abort_core_update(true)?;
         let budget = OperationBudget::new(&source)?;
         self.log_start = fs::metadata(self.logs.join("core.log")).map_or(0, |file| file.len());
         if self.child.is_none() {
             self.source = Some(source);
+            self.tun = tun;
             return Ok(self.status());
         }
         let controller = self
@@ -1675,18 +2031,31 @@ impl CoreSupervisor {
             .and_then(|v| v.parse::<u16>().ok())
             .ok_or_else(|| AppError::new("controller_invalid", "本地控制接口无效"))?;
         let previous = self.source.clone().unwrap_or_default();
-        let runtime = config::runtime_config(&source, self.tun, port)?;
+        if tun == self.tun {
+            if let Some(patch) = scalar_config_change(&previous, &source)? {
+                return self.reconfigure_scalars(&controller, source, &previous, port, patch);
+            }
+        }
+        let previous_tun = self.tun;
+        let runtime = config::runtime_config(&source, tun, port)?;
         config::atomic_write(&self.home.join("config.yaml"), runtime.as_bytes())?;
-        if let Err(error) = self.validate(&controller, &budget) {
+        let validation_started = Instant::now();
+        let validation = self.validate(&controller, &budget);
+        self.record_lifecycle("core_reload_stage", serde_json::json!({"stage":"validation","durationMs":validation_started.elapsed().as_millis(),"success":validation.is_ok()}));
+        if let Err(error) = validation {
+            if error.code == "operation_cancelled" {
+                self.stop_for(StopReason::UserStop)?;
+            }
             let old = config::runtime_config(&previous, self.tun, port)?;
             config::atomic_write(&self.home.join("config.yaml"), old.as_bytes())?;
             self.error = Some(error.message.clone());
             self.error_code = Some(error.code.clone());
             return Err(error);
         }
-        if let Err(error) = self.apply_runtime(
+        if let Err(error) = self.apply_runtime_for(
             &controller,
             &source,
+            tun,
             budget.resources,
             budget.work_deadline(),
         ) {
@@ -1694,6 +2063,8 @@ impl CoreSupervisor {
                 // A cancelled PUT may already be executing in the core. Do not
                 // race it with rollback; confirmed process exit is the barrier.
                 self.stop_for(StopReason::UserStop)?;
+                let old = config::runtime_config(&previous, previous_tun, port)?;
+                config::atomic_write(&self.home.join("config.yaml"), old.as_bytes())?;
                 return Err(error);
             }
             let rollback_deadline = Instant::now()
@@ -1703,8 +2074,18 @@ impl CoreSupervisor {
             let rollback = (|| {
                 let old = config::runtime_config(&previous, self.tun, port)?;
                 config::atomic_write(&self.home.join("config.yaml"), old.as_bytes())?;
-                self.apply_runtime(&controller, &previous, rollback_deadline, rollback_deadline)
+                self.apply_runtime_for(
+                    &controller,
+                    &previous,
+                    previous_tun,
+                    rollback_deadline,
+                    rollback_deadline,
+                )
             })();
+            if let Err(cancelled) = self.check_cancelled() {
+                self.stop_for(StopReason::UserStop)?;
+                return Err(cancelled);
+            }
             if rollback.is_ok() {
                 let restored = AppError::new(
                     if error.code == "tun_device_conflict" {
@@ -1751,6 +2132,12 @@ impl CoreSupervisor {
             return Err(AppError::new(code, self.error.clone().unwrap_or_default()));
         }
         self.source = Some(source);
+        self.tun = tun;
+        self.recovery = None;
+        self.health_blocked = false;
+        self.health_deferred = false;
+        self.tun_recovery = None;
+        self.begin_health_observation();
         self.error = None;
         self.error_code = None;
         self.observed_at = observed_now();
@@ -1841,19 +2228,30 @@ impl CoreSupervisor {
             self.tun_health = Some("degraded".into());
             return Ok(HealthCheck::NeedsRestart);
         }
-        if health["stale"].as_bool() == Some(true) {
-            return Err(ReadinessFailure::Temporary(AppError::new(
-                "tun_health_unavailable",
-                "TUN 状态快照待刷新，保留内核并继续检查",
-            )));
-        }
-        let state = health["tun"]["state"].as_str().unwrap_or("invalid");
         if health["tun"]["enabled"].as_bool() != Some(self.tun) {
             return Err(fatal(
                 "tun_configuration_mismatch",
                 "TUN 运行意图与自有运行模式不一致",
             ));
         }
+        if health["stale"].as_bool() == Some(true) {
+            if self.tun
+                && self.initial_health_check.is_some()
+                && health["observed_at"].as_str() == Some("")
+                && tun_reason_code(health["tun"]["reason"].as_str()) == "observation_pending"
+            {
+                return Err(ReadinessFailure::Temporary(AppError::new(
+                    "tun_health_pending",
+                    "正在确认 TUN 初始状态",
+                )));
+            }
+            self.tun_health = Some("unavailable".into());
+            return Err(ReadinessFailure::Temporary(AppError::new(
+                "tun_health_unavailable",
+                "TUN 状态快照待刷新，保留内核并继续检查",
+            )));
+        }
+        let state = health["tun"]["state"].as_str().unwrap_or("invalid");
         self.tun_health = Some(state.into());
         match state {
             "conflict" => {
@@ -2128,7 +2526,7 @@ impl CoreSupervisor {
         let reconciling = self.recovery.is_some();
         match self.check_local_health(reconciling || self.health_deferred) {
             Ok(HealthCheck::Ready) => {
-                if reconciling || self.health_deferred {
+                if reconciling || self.health_deferred || self.initial_health_check.is_some() {
                     crate::diagnostics::record(
                         &self.logs,
                         "core_recovered",
@@ -2139,6 +2537,7 @@ impl CoreSupervisor {
                 }
                 self.recovery = None;
                 self.health_deferred = false;
+                self.initial_health_check = None;
             }
             Ok(HealthCheck::NeedsRestart) => {
                 self.schedule_health_restart(AppError::new(
@@ -2147,6 +2546,28 @@ impl CoreSupervisor {
                 ))?;
             }
             Err(ReadinessFailure::Temporary(error)) => {
+                if error.code == "tun_health_pending" {
+                    let exhausted = self
+                        .initial_health_check
+                        .as_mut()
+                        .expect("initial observation requires an active grace period")
+                        .failed(now);
+                    self.record_lifecycle("core_health_retry", serde_json::json!({"generation":self.recovery_generation,"code":error.code,"exhausted":exhausted}));
+                    if exhausted {
+                        self.initial_health_check = None;
+                        self.tun_health = Some("unavailable".into());
+                        self.health_deferred = true;
+                        self.recovery = None;
+                        self.error_code = Some("tun_health_unavailable".into());
+                        self.error = Some("TUN 初始状态仍无法确认，保留内核并继续检查".into());
+                    } else {
+                        // Initial read-only sampling is not a recovery task and
+                        // must not hide the ready controller or block actions.
+                        self.tun_health = Some("checking".into());
+                    }
+                    return Ok(());
+                }
+                self.initial_health_check = None;
                 if error.code == "core_readiness_unavailable" {
                     self.control_state = "unreachable".into();
                 } else if matches!(
@@ -2203,6 +2624,7 @@ impl CoreSupervisor {
                 }
             }
             Err(ReadinessFailure::Fatal(error)) => {
+                self.initial_health_check = None;
                 if error.code == "operation_cancelled" {
                     return Err(error);
                 }
@@ -2282,6 +2704,7 @@ impl CoreSupervisor {
                     self.record_lifecycle("core_restart_scheduled", serde_json::json!({"cause":"unexpected_exit","exitCode":exit.code(),"delayMs":1000,"generation":self.recovery_generation}));
                 }
                 self.recovery = None;
+                self.initial_health_check = None;
             }
         }
         while self
@@ -2338,7 +2761,8 @@ impl CoreSupervisor {
             && !self.termination_unconfirmed
         {
             let now = lifecycle::awake_now()?;
-            if self.recovery.is_some()
+            if self.initial_health_check.is_some()
+                || self.recovery.is_some()
                 || now.saturating_sub(self.last_health_check) >= HEALTH_INTERVAL
             {
                 self.observe_health(now)?;
@@ -2402,6 +2826,7 @@ impl CoreSupervisor {
             self.desired_running = false;
             self.restart_at = None;
             self.recovery = None;
+            self.initial_health_check = None;
             self.health_blocked = false;
             self.health_deferred = false;
             self.tun_recovery = None;
@@ -2820,6 +3245,8 @@ mod tests {
         HealthDegraded,
         HealthConflict,
         HealthUnavailable,
+        HealthInitialPending,
+        HealthStale,
         HealthRecoveryUnavailableOnce,
         HealthBusyOnce,
         HealthBusyUntilReleased,
@@ -2846,6 +3273,7 @@ mod tests {
         recovery_requests: Arc<std::sync::Mutex<Vec<String>>>,
         health_busy: Arc<AtomicBool>,
         health_unavailable: Arc<AtomicBool>,
+        health_pending: Arc<AtomicBool>,
         finished: Arc<AtomicBool>,
         server: Option<thread::JoinHandle<()>>,
         _occupied_port: Option<TcpListener>,
@@ -2895,6 +3323,8 @@ mod tests {
                     | ReadinessScenario::HealthDegraded
                     | ReadinessScenario::HealthConflict
                     | ReadinessScenario::HealthUnavailable
+                    | ReadinessScenario::HealthInitialPending
+                    | ReadinessScenario::HealthStale
                     | ReadinessScenario::HealthRecoveryUnavailableOnce
                     | ReadinessScenario::HealthBusyOnce
                     | ReadinessScenario::HealthBusyUntilReleased
@@ -2950,6 +3380,11 @@ mod tests {
                 ReadinessScenario::HealthUnavailable
             )));
             let stop = finished.clone();
+            let health_pending = Arc::new(AtomicBool::new(matches!(
+                scenario,
+                ReadinessScenario::HealthInitialPending
+            )));
+            let pending = health_pending.clone();
             let reads = config_reads.clone();
             let recoveries = recovery_reads.clone();
             let busy = health_busy.clone();
@@ -3001,7 +3436,10 @@ mod tests {
                             health_enabled,
                             "legacy core must not receive a health request"
                         );
-                        let state = if unavailable.load(Ordering::SeqCst) {
+                        let initial_pending = pending.load(Ordering::SeqCst);
+                        let stale =
+                            initial_pending || matches!(scenario, ReadinessScenario::HealthStale);
+                        let state = if unavailable.load(Ordering::SeqCst) || stale {
                             "unavailable"
                         } else {
                             match scenario {
@@ -3031,7 +3469,7 @@ mod tests {
                             } else {
                                 serde_json::Value::Null
                             };
-                            (200, serde_json::json!({"managed":true,"api_version":1,"state":"running","pid":pid,"core_instance":"fixture-instance","config_generation":1,"tun_generation":1,"recovery":recovery,"stale":false,"tun":{"enabled":true,"state":state,"repairable":state=="degraded"}}).to_string())
+                            (200, serde_json::json!({"managed":true,"api_version":1,"state":"running","pid":pid,"core_instance":"fixture-instance","config_generation":1,"tun_generation":1,"recovery":recovery,"stale":stale,"observed_at":if initial_pending {""} else {"2026-01-01T00:00:00Z"},"tun":{"enabled":true,"state":state,"repairable":state=="degraded","reason":if initial_pending {"TUN health observation is pending"} else if stale {"TUN health observation is stale"} else {""}}}).to_string())
                         }
                     } else if request.starts_with("post /desktop/recovery ") {
                         let length = request
@@ -3135,6 +3573,7 @@ mod tests {
                 recovery_requests,
                 health_busy,
                 health_unavailable,
+                health_pending,
                 finished,
                 server: Some(server),
                 _occupied_port: occupied_port,
@@ -3187,6 +3626,572 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum ConfigurationScenario {
+        Healthy,
+        LostPatchReply,
+        IgnoreFirstPatch,
+        UnconfirmedPatch,
+        HoldPatch,
+        HoldRollback,
+        RejectFirstPut,
+        BindFailure,
+    }
+
+    struct ConfigurationFixture {
+        core: CoreSupervisor,
+        directory: PathBuf,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        patch_seen: Arc<AtomicBool>,
+        release_patch: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+        server: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ConfigurationFixture {
+        fn new(scenario: ConfigurationScenario) -> Self {
+            let directory = diagnostic_test_directory("configuration");
+            let home = directory.join("runtime");
+            fs::create_dir_all(&home).unwrap();
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let mut child = diagnostic_test_child();
+            let pid = child.id();
+            let mut child_input = child.stdin.take();
+            let source = "mixed-port: 7890\nmode: rule\n".to_string();
+            let mut core = CoreSupervisor::new(
+                directory.join("no-validator"),
+                home.clone(),
+                directory.join("logs"),
+            );
+            core.child = Some(child);
+            core.source = Some(source.clone());
+            core.desired_running = true;
+            core.controller = Some(Controller {
+                url: format!("http://127.0.0.1:{port}"),
+                secret: "configuration-fixture-secret".into(),
+            });
+            core.control_state = "ready".into();
+            core.listeners_ready = Some(true);
+            config::atomic_write(
+                &home.join("config.yaml"),
+                config::runtime_config(&source, false, port)
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mutations = requests.clone();
+            let patch_seen = Arc::new(AtomicBool::new(false));
+            let seen = patch_seen.clone();
+            let release_patch = Arc::new(AtomicBool::new(false));
+            let release = release_patch.clone();
+            let finished = Arc::new(AtomicBool::new(false));
+            let stop = finished.clone();
+            let server = thread::spawn(move || {
+                let mut actual = serde_json::json!({"port":0,"socks-port":0,"mixed-port":7890,"mode":"rule","allow-lan":false,"log-level":"info","tun":{"enable":false}});
+                while !stop.load(Ordering::Acquire) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(error) => panic!("configuration fixture accept failed: {error}"),
+                    };
+                    configure_readiness_fixture_stream(&stream);
+                    let mut request = Vec::new();
+                    let mut byte = [0u8];
+                    while request.len() < 4096 && !request.ends_with(b"\r\n\r\n") {
+                        if stream.read(&mut byte).ok() != Some(1) {
+                            break;
+                        }
+                        request.push(byte[0]);
+                    }
+                    if !request.ends_with(b"\r\n\r\n") {
+                        continue;
+                    }
+                    let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                    assert!(
+                        request.contains("authorization: bearer configuration-fixture-secret\r\n")
+                    );
+                    let length = request
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    let mut bytes = vec![0u8; length];
+                    stream.read_exact(&mut bytes).unwrap();
+                    let (status, body) = if request.starts_with("get /desktop ") {
+                        (200, serde_json::json!({"managed":true,"api_version":1,"state":"running","pid":pid}).to_string())
+                    } else if request.starts_with("get /configs ") {
+                        if matches!(scenario, ConfigurationScenario::UnconfirmedPatch)
+                            && !mutations.lock().unwrap().is_empty()
+                        {
+                            (503, "{}".into())
+                        } else {
+                            (200, actual.to_string())
+                        }
+                    } else if request.starts_with("patch /configs ") {
+                        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        assert!(
+                            body.as_object().unwrap().keys().all(|key| [
+                                "mode",
+                                "allow-lan",
+                                "log-level",
+                                "port",
+                                "socks-port",
+                                "mixed-port"
+                            ]
+                            .contains(&key.as_str())),
+                            "scalar PATCH must not alter unrelated runtime fields"
+                        );
+                        let attempt = {
+                            let mut requests = mutations.lock().unwrap();
+                            requests.push("PATCH".into());
+                            requests.len()
+                        };
+                        if !matches!(
+                            scenario,
+                            ConfigurationScenario::IgnoreFirstPatch
+                                | ConfigurationScenario::HoldRollback
+                        ) || attempt != 1
+                        {
+                            for (key, value) in body.as_object().unwrap() {
+                                actual[key] = value.clone();
+                            }
+                        }
+                        if matches!(scenario, ConfigurationScenario::BindFailure) {
+                            if attempt == 1 {
+                                if let Some(port) = body["mixed-port"].as_u64() {
+                                    assert!(
+                                        TcpListener::bind(("127.0.0.1", port as u16)).is_err(),
+                                        "fixture must hold a real conflicting port"
+                                    );
+                                }
+                                actual["mixed-port"] = serde_json::json!(0);
+                            } else {
+                                actual["mixed-port"] = serde_json::json!(7890);
+                            }
+                        }
+                        if !matches!(scenario, ConfigurationScenario::HoldRollback) || attempt == 2
+                        {
+                            seen.store(true, Ordering::Release);
+                        }
+                        if matches!(scenario, ConfigurationScenario::HoldPatch)
+                            || matches!(scenario, ConfigurationScenario::HoldRollback)
+                                && attempt == 2
+                        {
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            while !release.load(Ordering::Acquire)
+                                && !stop.load(Ordering::Acquire)
+                                && Instant::now() < deadline
+                            {
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                            continue;
+                        }
+                        if matches!(scenario, ConfigurationScenario::UnconfirmedPatch)
+                            || matches!(scenario, ConfigurationScenario::LostPatchReply)
+                                && attempt == 1
+                        {
+                            continue;
+                        }
+                        (204, String::new())
+                    } else if request.starts_with("put /configs?") {
+                        let attempt = {
+                            let mut requests = mutations.lock().unwrap();
+                            requests.push("PUT".into());
+                            requests.len()
+                        };
+                        if matches!(scenario, ConfigurationScenario::RejectFirstPut) && attempt == 1
+                        {
+                            (400, "{}".into())
+                        } else {
+                            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                            let runtime =
+                                fs::read_to_string(body["path"].as_str().unwrap()).unwrap();
+                            let runtime = config::parse(&runtime).unwrap();
+                            actual["mode"] = serde_json::json!(runtime
+                                .get("mode")
+                                .and_then(serde_yaml::Value::as_str)
+                                .unwrap_or("rule"));
+                            actual["tun"]["enable"] =
+                                serde_json::json!(runtime.get("tun").unwrap()["enable"]
+                                    .as_bool()
+                                    .unwrap());
+                            (204, String::new())
+                        }
+                    } else if request.starts_with("post /desktop/shutdown ") {
+                        child_input.take();
+                        (204, String::new())
+                    } else {
+                        panic!(
+                            "unexpected configuration request: {}",
+                            request.lines().next().unwrap_or_default()
+                        );
+                    };
+                    let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            Self {
+                core,
+                directory,
+                requests,
+                patch_seen,
+                release_patch,
+                finished,
+                server: Some(server),
+            }
+        }
+
+        fn runtime(&self) -> serde_yaml::Mapping {
+            config::parse(&fs::read_to_string(self.core.home.join("config.yaml")).unwrap()).unwrap()
+        }
+
+        #[cfg(unix)]
+        fn allow_validation(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let executable = self.directory.join("validator");
+            fs::write(
+                &executable,
+                "#!/bin/sh\nprintf 'validated\\n' >> validation-runs\nexit 0\n",
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            self.core.executable = executable;
+        }
+    }
+
+    impl Drop for ConfigurationFixture {
+        fn drop(&mut self) {
+            self.release_patch.store(true, Ordering::Release);
+            let _ = self.core.stop();
+            self.finished.store(true, Ordering::Release);
+            if let Some(server) = self.server.take() {
+                server.join().unwrap();
+            }
+            crate::diagnostics::flush(Duration::from_secs(2));
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn scalar_delta_requires_only_valid_whitelisted_semantic_changes() {
+        let changed =
+            scalar_config_change("mixed-port: 7890\n", "mode: global\nmixed-port: 7890\n")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            serde_json::Value::Object(changed.before),
+            serde_json::json!({"mode":"rule"})
+        );
+        assert_eq!(
+            serde_json::Value::Object(changed.after),
+            serde_json::json!({"mode":"global"})
+        );
+        let changed = scalar_config_change("mixed-port: 7890\n", "# comment\nmixed-port: 7900\nmode: direct\nallow-lan: true\nlog-level: debug\nport: 7888\nsocks-port: 7889\n").unwrap().unwrap();
+        assert_eq!(
+            serde_json::Value::Object(changed.before),
+            serde_json::json!({"mode":"rule","allow-lan":false,"log-level":"info","port":0,"socks-port":0,"mixed-port":7890})
+        );
+        assert_eq!(
+            serde_json::Value::Object(changed.after),
+            serde_json::json!({"mode":"direct","allow-lan":true,"log-level":"debug","port":7888,"socks-port":7889,"mixed-port":7900})
+        );
+        for next in [
+            "mode: rule\n",
+            "mode: invalid\n",
+            "mode: false\n",
+            "mode: global\ndns:\n  enable: true\n",
+            "mode: global\ntun:\n  enable: true\n",
+            "allow-lan: unknown\n",
+            "port: 65536\n",
+            "log-level: private\n",
+            "log-level: null\n",
+        ] {
+            assert!(scalar_config_change("mode: rule\n", next)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn mode_patch_preserves_owned_pid_and_persists_confirmed_runtime_without_validation() {
+        for scenario in [
+            ConfigurationScenario::Healthy,
+            ConfigurationScenario::LostPatchReply,
+        ] {
+            let mut fixture = ConfigurationFixture::new(scenario);
+            let pid = fixture.core.status().pid;
+            let source = "mode: global\nmixed-port: 7890\n".to_string();
+            let status = fixture.core.reload(source.clone()).unwrap();
+            assert!(status.running && status.desired_running && !status.tun);
+            assert_eq!(status.pid, pid);
+            assert!(status.error_code.is_none());
+            assert_eq!(fixture.core.source.as_ref(), Some(&source));
+            assert_eq!(
+                fixture
+                    .runtime()
+                    .get("mode")
+                    .and_then(serde_yaml::Value::as_str),
+                Some("global")
+            );
+            assert_eq!(*fixture.requests.lock().unwrap(), ["PATCH"]);
+        }
+    }
+
+    #[test]
+    fn all_scalar_settings_can_toggle_repeatedly_without_reload_or_pid_change() {
+        let mut fixture = ConfigurationFixture::new(ConfigurationScenario::Healthy);
+        let pid = fixture.core.status().pid;
+        let original = fixture.core.source.clone().unwrap();
+        let changed = "mixed-port: 7900\nmode: global\nallow-lan: true\nlog-level: debug\nport: 7888\nsocks-port: 7889\n";
+        for source in [changed, &original, changed, &original] {
+            let status = fixture.core.reload(source.into()).unwrap();
+            assert_eq!(status.pid, pid);
+            assert!(status.running && status.desired_running && status.error_code.is_none());
+            assert_eq!(fixture.core.source.as_deref(), Some(source));
+        }
+        assert_eq!(
+            *fixture.requests.lock().unwrap(),
+            ["PATCH", "PATCH", "PATCH", "PATCH"]
+        );
+        assert_eq!(
+            fixture
+                .runtime()
+                .get("mixed-port")
+                .and_then(serde_yaml::Value::as_u64),
+            Some(7890)
+        );
+    }
+
+    #[test]
+    fn scalar_port_and_lan_changes_require_actual_listeners_even_after_http_success() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let requested = occupied.local_addr().unwrap().port();
+        for source in [
+            format!("mixed-port: {requested}\nmode: rule\n"),
+            "mixed-port: 7890\nmode: rule\nallow-lan: true\n".into(),
+        ] {
+            let mut fixture = ConfigurationFixture::new(ConfigurationScenario::BindFailure);
+            let pid = fixture.core.status().pid;
+            let previous = fixture.core.source.clone();
+            let error = fixture.core.reload(source).err().unwrap();
+            assert_eq!(error.code, "config_patch_failed");
+            let status = fixture.core.status();
+            assert_eq!(status.pid, pid);
+            assert!(status.running && status.desired_running);
+            assert_eq!(fixture.core.source, previous);
+            assert_eq!(
+                fixture
+                    .runtime()
+                    .get("mixed-port")
+                    .and_then(serde_yaml::Value::as_u64),
+                Some(7890)
+            );
+            assert_eq!(*fixture.requests.lock().unwrap(), ["PATCH", "PATCH"]);
+        }
+    }
+
+    #[test]
+    fn mismatched_mode_readback_restores_previous_runtime_and_source() {
+        let mut fixture = ConfigurationFixture::new(ConfigurationScenario::IgnoreFirstPatch);
+        let pid = fixture.core.status().pid;
+        let previous = fixture.core.source.clone();
+        let error = fixture
+            .core
+            .reload("mixed-port: 7890\nmode: global\n".into())
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "config_patch_failed");
+        assert_eq!(fixture.core.source, previous);
+        assert_eq!(fixture.core.status().pid, pid);
+        assert!(fixture.core.status().running && fixture.core.desired_running);
+        assert_eq!(
+            fixture
+                .runtime()
+                .get("mode")
+                .and_then(serde_yaml::Value::as_str),
+            Some("rule")
+        );
+        assert_eq!(*fixture.requests.lock().unwrap(), ["PATCH", "PATCH"]);
+    }
+
+    #[test]
+    fn unconfirmed_mode_mutation_stops_owned_process_before_returning_old_source() {
+        let mut fixture = ConfigurationFixture::new(ConfigurationScenario::UnconfirmedPatch);
+        let previous = fixture.core.source.clone();
+        let error = fixture
+            .core
+            .reload("mixed-port: 7890\nmode: global\n".into())
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "config_patch_unconfirmed");
+        assert!(fixture.core.child.is_none());
+        assert!(!fixture.core.desired_running && !fixture.core.termination_unconfirmed);
+        assert_eq!(fixture.core.source, previous);
+        assert_eq!(
+            fixture
+                .runtime()
+                .get("mode")
+                .and_then(serde_yaml::Value::as_str),
+            Some("rule")
+        );
+        assert_eq!(
+            *fixture.requests.lock().unwrap(),
+            ["PATCH"],
+            "unknown mutation must not race a rollback PATCH"
+        );
+    }
+
+    #[test]
+    fn stop_cancels_mode_transport_and_confirms_exit_without_committing_target() {
+        for scenario in [
+            ConfigurationScenario::HoldPatch,
+            ConfigurationScenario::HoldRollback,
+        ] {
+            let mut fixture = ConfigurationFixture::new(scenario);
+            let revision = Arc::new(std::sync::atomic::AtomicU64::new(1));
+            fixture.core.cancellation = Some(Cancellation::new(revision.clone(), 1));
+            let seen = fixture.patch_seen.clone();
+            let release = fixture.release_patch.clone();
+            let canceller = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !seen.load(Ordering::Acquire) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                let accepted = seen.load(Ordering::Acquire);
+                revision.store(2, Ordering::Release);
+                release.store(true, Ordering::Release);
+                assert!(
+                    accepted,
+                    "cancellation is synchronized after the core accepts PATCH"
+                );
+            });
+            let previous = fixture.core.source.clone();
+            let started = Instant::now();
+            let error = fixture
+                .core
+                .reload("mixed-port: 7890\nmode: global\n".into())
+                .err()
+                .unwrap();
+            canceller.join().unwrap();
+            assert_eq!(error.code, "operation_cancelled");
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(fixture.core.child.is_none() && !fixture.core.desired_running);
+            assert_eq!(fixture.core.source, previous);
+            let expected = if matches!(scenario, ConfigurationScenario::HoldRollback) {
+                vec!["PATCH", "PATCH"]
+            } else {
+                vec!["PATCH"]
+            };
+            assert_eq!(*fixture.requests.lock().unwrap(), expected);
+            assert_eq!(
+                fixture
+                    .runtime()
+                    .get("mode")
+                    .and_then(serde_yaml::Value::as_str),
+                Some("rule")
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_source_or_tun_changes_keep_the_full_validation_path() {
+        for (source, tun) in [
+            (
+                "mixed-port: 7890\nmode: global\ndns:\n  enable: true\n",
+                false,
+            ),
+            ("mixed-port: 7890\nmode: global\n", true),
+        ] {
+            let mut fixture = ConfigurationFixture::new(ConfigurationScenario::Healthy);
+            let previous = fixture.core.source.clone();
+            let pid = fixture.core.status().pid;
+            assert!(
+                fixture.core.reconfigure(source.into(), tun).is_err(),
+                "missing validator must fail before a full reload"
+            );
+            assert!(fixture.requests.lock().unwrap().is_empty());
+            assert_eq!(fixture.core.source, previous);
+            assert_eq!(fixture.core.status().pid, pid);
+            assert!(!fixture.core.tun);
+            assert_eq!(
+                fixture
+                    .runtime()
+                    .get("mode")
+                    .and_then(serde_yaml::Value::as_str),
+                Some("rule")
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tun_reconfiguration_uses_full_apply_and_keeps_pid_in_both_directions() {
+        let mut fixture = ConfigurationFixture::new(ConfigurationScenario::Healthy);
+        fixture.allow_validation();
+        let pid = fixture.core.status().pid;
+        let source = format!(
+            "{}dns:\n  enable: true\n",
+            fixture.core.source.clone().unwrap()
+        );
+        let enabled = fixture.core.reconfigure(source.clone(), true).unwrap();
+        assert_eq!(enabled.pid, pid);
+        assert!(enabled.tun && enabled.running && enabled.desired_running);
+        assert_eq!(enabled.tun_health.as_deref(), Some("checking"));
+        let disabled = fixture.core.reconfigure(source, false).unwrap();
+        assert_eq!(disabled.pid, pid);
+        assert!(!disabled.tun && disabled.running && disabled.desired_running);
+        assert_eq!(disabled.tun_health.as_deref(), Some("disabled"));
+        assert_eq!(
+            fixture.runtime().get("tun").unwrap()["enable"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(*fixture.requests.lock().unwrap(), ["PUT", "PUT"]);
+        assert_eq!(
+            fs::read_to_string(fixture.core.home.join("validation-runs"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_tun_reconfiguration_rolls_back_mode_file_and_runtime_intent() {
+        let mut fixture = ConfigurationFixture::new(ConfigurationScenario::RejectFirstPut);
+        fixture.allow_validation();
+        let pid = fixture.core.status().pid;
+        let previous = fixture.core.source.clone();
+        let error = fixture
+            .core
+            .reconfigure(
+                "mixed-port: 7890\nmode: global\ndns:\n  enable: true\n".into(),
+                true,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "reload_failed");
+        assert_eq!(fixture.core.source, previous);
+        let status = fixture.core.status();
+        assert_eq!(status.pid, pid);
+        assert!(!status.tun && status.running && status.desired_running);
+        let runtime = fixture.runtime();
+        assert_eq!(
+            runtime.get("mode").and_then(serde_yaml::Value::as_str),
+            Some("rule")
+        );
+        assert_eq!(runtime.get("tun").unwrap()["enable"].as_bool(), Some(false));
+        assert_eq!(*fixture.requests.lock().unwrap(), ["PUT", "PUT"]);
     }
 
     fn diagnostic_events(directory: &Path) -> Vec<serde_json::Value> {
@@ -3376,6 +4381,66 @@ mod tests {
         fixture.wait(Duration::from_secs(2)).unwrap();
         assert_eq!(fixture.config_reads.load(Ordering::SeqCst), 2);
         assert_eq!(fixture.core.child.as_ref().unwrap().id(), original_pid);
+    }
+
+    #[test]
+    fn initial_tun_observation_runs_on_next_poll_without_blocking_ready_state() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthInitialPending);
+        let pid = fixture.core.status().pid;
+        fixture.core.last_health_check = lifecycle::awake_now().unwrap();
+        fixture.core.begin_health_observation();
+        let status = fixture.core.poll().unwrap();
+        assert_eq!(status.tun_health.as_deref(), Some("checking"));
+        assert!(status.running && !status.recovering && status.error_code.is_none());
+        assert!(
+            fixture.core.diagnostic_health.is_some(),
+            "first poll must sample without waiting ten seconds"
+        );
+        assert!(fixture.core.recovery.is_none());
+        fixture.health_pending.store(false, Ordering::SeqCst);
+        let ready = fixture.core.poll().unwrap();
+        assert_eq!(ready.tun_health.as_deref(), Some("healthy"));
+        assert_eq!(ready.pid, pid);
+        assert!(ready.running && ready.error.is_none());
+        assert!(fixture.core.initial_health_check.is_none());
+        assert_eq!(fixture.recovery_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn initial_tun_observation_exhausts_without_restarting_and_can_recover() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthInitialPending);
+        let pid = fixture.core.status().pid;
+        fixture.core.begin_health_observation();
+        for _ in 0..3 {
+            fixture.core.poll().unwrap();
+        }
+        let status = fixture.core.status();
+        assert_eq!(status.pid, pid);
+        assert_eq!(status.tun_health.as_deref(), Some("unavailable"));
+        assert_eq!(status.error_code.as_deref(), Some("tun_health_unavailable"));
+        assert!(fixture.core.health_deferred && fixture.core.recovery.is_none());
+        assert!(fixture.core.initial_health_check.is_none() && fixture.core.restart_at.is_none());
+        fixture.health_pending.store(false, Ordering::SeqCst);
+        fixture
+            .core
+            .observe_health(lifecycle::awake_now().unwrap())
+            .unwrap();
+        let ready = fixture.core.status();
+        assert!(ready.running && ready.error.is_none() && ready.error_code.is_none());
+        assert_eq!(ready.pid, pid);
+    }
+
+    #[test]
+    fn initial_tun_grace_never_hides_a_previously_observed_stale_snapshot() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::HealthStale);
+        let pid = fixture.core.status().pid;
+        fixture.core.begin_health_observation();
+        let status = fixture.core.poll().unwrap();
+        assert_eq!(status.pid, pid);
+        assert_eq!(status.tun_health.as_deref(), Some("unavailable"));
+        assert_eq!(status.error_code.as_deref(), Some("tun_health_unavailable"));
+        assert!(fixture.core.initial_health_check.is_none());
+        assert!(fixture.core.restart_at.is_none());
     }
 
     #[test]
@@ -4019,7 +5084,7 @@ mod tests {
         let cause =
             format!("configure tun interface: adapter \"utun\"{TUN_DEVICE_CONFLICT_SUFFIX}");
         fs::write(&executable, format!(
-            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = '-t' ]; then exit 0; fi\ndone\nprintf '%s\\n' '{cause}'\nexit 1\n"
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> launches\nfor argument in \"$@\"; do\n  if [ \"$argument\" = '-t' ]; then exit 0; fi\ndone\nprintf '%s\\n' '{cause}'\nexit 1\n"
         )).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let source = format!("{}tun:\n  device: utun\n", config::INITIAL_CONFIG);
@@ -4033,6 +5098,13 @@ mod tests {
         supervisor.desired_running = true;
         supervisor.restart_at = Some(Instant::now());
         let failed = supervisor.poll().unwrap();
+        let launches = fs::read_to_string(directory.join("runtime").join("launches")).unwrap();
+        assert_eq!(
+            launches.lines().count(),
+            1,
+            "fresh startup must use the main process's own validation only"
+        );
+        assert!(!launches.split_whitespace().any(|argument| argument == "-t"));
         assert_eq!(failed.error_code.as_deref(), Some("tun_device_conflict"));
         assert!(failed.error.as_deref().unwrap().contains(&cause));
         assert_eq!(failed.process_state, "exited");

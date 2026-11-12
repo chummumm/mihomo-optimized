@@ -13,6 +13,8 @@ public static partial class L
         catalog["正在应用配置"] = "Applying configuration";
         catalog["正在重启内核"] = "Restarting the core";
         catalog["正在恢复 TUN"] = "Recovering TUN";
+        catalog["正在检查 TUN"] = "Checking TUN";
+        catalog["内核已就绪，正在确认 TUN 状态。"] = "The core is ready. Checking the TUN status.";
         catalog["状态待确认"] = "Waiting for status";
         catalog["TUN 需要处理"] = "TUN needs attention";
         catalog["TUN 恢复失败"] = "TUN recovery failed";

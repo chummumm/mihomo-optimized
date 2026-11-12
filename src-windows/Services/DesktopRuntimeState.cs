@@ -8,6 +8,7 @@ internal enum DesktopRuntimePhase
     Stopped,
     Starting,
     Running,
+    CheckingTun,
     Reloading,
     Restarting,
     Recovering,
@@ -51,6 +52,7 @@ internal sealed record DesktopRuntimeState
         DesktopRuntimePhase.Stopped => "未运行",
         DesktopRuntimePhase.Starting => "正在启动",
         DesktopRuntimePhase.Running => "运行中",
+        DesktopRuntimePhase.CheckingTun => "正在检查 TUN",
         DesktopRuntimePhase.Reloading => "正在应用配置",
         DesktopRuntimePhase.Restarting => "正在重启内核",
         DesktopRuntimePhase.Recovering => "正在恢复内核",
@@ -72,6 +74,7 @@ internal sealed record DesktopRuntimeState
         DesktopRuntimePhase.Starting => "正在校验配置、准备所需资源并等待内核就绪，可随时停止。",
         DesktopRuntimePhase.Restarting => "正在停止旧内核并准备重新启动，可随时停止。",
         DesktopRuntimePhase.Reloading => "正在应用已保存的配置，可随时停止内核。",
+        DesktopRuntimePhase.CheckingTun => "内核已就绪，正在确认 TUN 状态。",
         DesktopRuntimePhase.Recovering => "正在核验本地内核与网络设备，可随时停止恢复。",
         DesktopRuntimePhase.RepairingTun => "内核进程仍在运行，正在恢复本机 TUN 设备。",
         DesktopRuntimePhase.RecoveringTunDevice => "正在自动恢复 TUN 接口，可随时停止。原配置文件保持不变。",
@@ -93,6 +96,7 @@ internal sealed record DesktopRuntimeState
     {
         DesktopRuntimePhase.RepairingTun => "正在恢复 TUN",
         DesktopRuntimePhase.RecoveringTunDevice => "正在自动恢复 TUN",
+        DesktopRuntimePhase.CheckingTun => "正在检查 TUN",
         DesktopRuntimePhase.TunFailed => "TUN 恢复失败",
         DesktopRuntimePhase.TunDeviceConflict => "网卡名称冲突",
         DesktopRuntimePhase.TunDegraded => "TUN 需要处理",
@@ -144,8 +148,12 @@ internal sealed record DesktopRuntimeState
         else if (error == "tun_device_conflict" && phase != "recovering" && (alive || process == "exited")) state = DesktopRuntimePhase.TunDeviceConflict;
         else if (alive && tunRequested && (error is "tun_recovery_failed" or "tun_recovery_needs_restart" or "tun_restart_required" || tunHealth == "failed")) state = DesktopRuntimePhase.TunFailed;
         else if (alive && tunRequested && (tunHealth is "degraded" or "conflict" or "disabled" || error is "tun_not_repairable" or "tun_ownership_conflict")) state = DesktopRuntimePhase.TunDegraded;
-        else if (alive && (tunRequested && tunHealth == "unavailable" || control is "unknown" or "unreachable" or "busy")) state = DesktopRuntimePhase.Uncertain;
+        else if (alive && (tunRequested && (tunHealth == "unavailable" || error == "tun_health_unavailable") || control is "unknown" or "unreachable" or "busy")) state = DesktopRuntimePhase.Uncertain;
         else if (alive && phase == "error") state = DesktopRuntimePhase.Uncertain;
+        // Initial sampling keeps a ready controller usable. Existing errors
+        // and stale observations retain their attention state above.
+        else if (alive && tunRequested && tunHealth == "checking") state = error.Length == 0
+            ? DesktopRuntimePhase.CheckingTun : DesktopRuntimePhase.Uncertain;
         else if (phase == "recovering") state = DesktopRuntimePhase.Recovering;
         else if (process == "exited" && phase == "error") state = DesktopRuntimePhase.Exited;
         else if (process == "unknown" && phase != "connecting") state = DesktopRuntimePhase.Uncertain;

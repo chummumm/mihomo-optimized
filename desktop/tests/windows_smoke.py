@@ -1621,6 +1621,7 @@ class Acceptance:
         self.lifecycle_service_stop_pid: int | None = None
         self.lifecycle_core_exits: set[int] = set()
         self.lifecycle_frame_errors: dict[Path, int] = {}
+        self.lightweight_settings: list[dict] = []
         self.stage = "preflight"
         self.report = {"passed": False, "platform": "windows", "tests": {}, "diagnostics": []}
 
@@ -2799,6 +2800,128 @@ class Acceptance:
                 connection.close()
         return wait_until(observe, "health_probe_busy_timeout", max(0, deadline - time.monotonic()))
 
+    def fresh_health(self, running: dict) -> dict:
+        expected = "healthy" if running.get("tun") else "disabled"
+        deadline = time.monotonic() + 8
+
+        def ready():
+            observed = self.local_health_request(running, "/desktop/health", deadline=deadline)
+            return observed if (observed.get("stale") is False and observed.get("observed_at")
+                                and observed.get("tun", {}).get("state") == expected) else None
+
+        return wait_until(ready, "settings_health_not_fresh", max(0, deadline - time.monotonic()))
+
+    def check_lightweight_settings(self, running: dict, owner: str) -> None:
+        """Exercise each supported scalar against the real core and saved YAML."""
+        self.stage = "lightweight_settings_" + owner
+        started_at_ms = int(time.time() * 1000)
+        before = self.managed_core(running)
+        health = self.fresh_health(running)
+        actual = self.runtime_json("configs")
+        port = actual["mixed-port"]
+        require(port > 0, "settings_fixture_mixed_port_missing")
+        was_proxy = running.get("systemProxy") is True
+        self.driver.invoke("desktop_set_system_proxy", {"enabled": True})
+        operations = []
+        changes = [("mode", "global"), ("mode", "rule"), ("mode", "direct"), ("mode", actual["mode"]),
+                   ("allow-lan", not actual["allow-lan"]), ("allow-lan", actual["allow-lan"]),
+                   ("log-level", "warning"), ("log-level", actual["log-level"])]
+        for name in ("socks-port", "port", "mixed-port"):
+            candidate = free_port()
+            self.ports.add(candidate)
+            changes.extend(((name, candidate), (name, actual[name])))
+        try:
+            for key, value in changes:
+                started = time.monotonic()
+                self.driver.invoke("desktop_patch_config", {"patch": {key: value}})
+                duration = round((time.monotonic() - started) * 1000, 1)
+                current = self.phase("running")
+                require(self.managed_core(current)["pid"] == before["pid"]
+                        and current.get("controller") == running.get("controller"),
+                        "scalar_setting_restarted_core_" + key)
+                confirmed = self.runtime_json("configs")
+                require(confirmed.get(key) == value, "scalar_setting_readback_failed_" + key)
+                document = self.driver.invoke("desktop_read_config")
+                literal = json.dumps(value)
+                spellings = [re.escape(literal)]
+                if isinstance(value, str):
+                    spellings += [re.escape(value), re.escape("'" + value + "'")]
+                require(re.search(r"(?m)^" + re.escape(key) + r":\s*(?:" + "|".join(spellings) + r")\s*$",
+                                  document["content"]), "scalar_setting_not_saved_" + key)
+                for listener in ("mixed-port", "port", "socks-port"):
+                    if confirmed[listener] > 0:
+                        require(listening(confirmed[listener]), "scalar_setting_listener_missing_" + listener)
+                after = self.fresh_health(current)
+                for fact in ("config_generation", "tun_generation", "creation_count"):
+                    require(after.get(fact) == health.get(fact), "scalar_setting_recreated_tun_" + fact)
+                require(after.get("tun", {}).get("identity") == health.get("tun", {}).get("identity"),
+                        "scalar_setting_changed_tun_identity")
+                require(self.wininet.read()["server"] == f"127.0.0.1:{confirmed['mixed-port']}",
+                        "scalar_setting_system_proxy_not_confirmed")
+                operations.append({"key": key, "durationMs": duration})
+            # A real bind failure can still produce HTTP 204. Retain the owned
+            # process and the old proxy address only after rollback is verified.
+            with socket.socket() as occupied:
+                occupied.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                occupied.bind(("127.0.0.1", 0))
+                occupied.listen(1)
+                blocked_port = occupied.getsockname()[1]
+                self.driver.invoke("desktop_patch_config", {"patch": {"mixed-port": blocked_port}},
+                                   expected_error="config_patch_failed")
+                restored = self.phase("running")
+                require(self.managed_core(restored)["pid"] == before["pid"]
+                        and self.runtime_json("configs")["mixed-port"] == port and listening(port),
+                        "scalar_bind_failure_not_rolled_back")
+                require(self.wininet.read()["server"] == f"127.0.0.1:{port}",
+                        "scalar_bind_failure_changed_system_proxy")
+                # The rejected saved revision remains visible to the user;
+                # explicitly correct it and confirm it applies before continuing.
+                self.driver.invoke("desktop_patch_config", {"patch": {"mixed-port": port}})
+                require(self.managed_core(self.phase("running"))["pid"] == before["pid"],
+                        "scalar_bind_failure_correction_restarted_core")
+        finally:
+            self.driver.invoke("desktop_set_system_proxy", {"enabled": was_proxy})
+        require(self.runtime_json("configs")["mode"] == actual["mode"], "scalar_settings_mode_not_restored")
+        row = {"owner": owner, "corePid": before["pid"], "sameCorePid": True,
+               "startedAtMs": started_at_ms, "finishedAtMs": int(time.time() * 1000),
+               "sameTunIdentity": True, "additionalTunCreations": 0, "savedAndReadBack": True,
+               "systemProxyFollowedConfirmedPort": True, "occupiedPortRolledBack": True,
+               "operations": operations}
+        self.lightweight_settings.append(row)
+        self.report["lightweightSettings"] = self.lightweight_settings
+        self.mark(self.stage)
+
+    def check_service_tun_switch(self, running: dict) -> dict:
+        """TUN changes may replace the device, but must retain the service core."""
+        self.stage = "service_tun_switch"
+        before = self.managed_core(running)
+        operations = []
+        for index, enabled in enumerate((False, True, False, True)):
+            started = time.monotonic()
+            self.driver.invoke("desktop_set_tun", {"enabled": enabled})
+            duration = round((time.monotonic() - started) * 1000, 1)
+            current = self.phase("running")
+            require(current.get("tun") is enabled and current.get("service", {}).get("running") is True
+                    and self.managed_core(current)["pid"] == before["pid"]
+                    and current.get("controller") == running.get("controller"),
+                    "service_tun_switch_restarted_core")
+            require(self.runtime_json("configs")["tun"]["enable"] is enabled,
+                    "service_tun_switch_runtime_mismatch")
+            require(json.loads((self.directory / "preferences.json").read_text(encoding="utf-8"))["tun"] is enabled,
+                    "service_tun_switch_preference_mismatch")
+            self.fresh_health(current)
+            if enabled:
+                wait_until(self.socks.roundtrip, "service_tun_switch_forwarding_failed")
+            elif index == 0:
+                self.check_lightweight_settings(current, "service_normal")
+                self.stage = "service_tun_switch"
+            require(self.wininet.read() == self.proxy_disabled, "service_tun_switch_changed_system_proxy")
+            operations.append({"enabled": enabled, "durationMs": duration})
+        self.report[self.stage] = {"sameCorePid": True, "sameController": True,
+                                   "tunForwardingAfterEachEnable": True, "operations": operations}
+        self.mark(self.stage)
+        return self.phase("running")
+
     def check_local_resume_health(self, running: dict, *, remove_route: bool = False) -> None:
         """Exercise the local resume boundary; this is not a simulated OS sleep."""
         self.stage = "local_tun_recovery" if remove_route else "local_healthy_resume"
@@ -2823,8 +2946,8 @@ class Acceptance:
 
             return wait_until(ready, code, max(0, deadline - time.monotonic()))
 
-        # The first read starts an independent observer and may return the
-        # pending snapshot. All polls share this one deadline, including busy
+        # Startup has already queued the independent observer; a native sample
+        # may still be pending. All polls share one deadline, including busy
         # HTTP replies; each observed snapshot must still belong to this core.
         expected_health = {"healthy" if running.get("tun") else "disabled"}
         health = wait_for_health(time.monotonic() + 8, expected_health, "initial_local_health_not_ready")
@@ -3039,6 +3162,29 @@ class Acceptance:
             ui = self.lifecycle_records(self.directory / "logs", "ui-recovery")
             host = self.lifecycle_records(self.directory / "logs", "recovery")
             service = self.lifecycle_records(service_logs, "recovery")
+            scalar_evidence = []
+            expected_keys = {"mode", "allow-lan", "log-level", "port", "socks-port", "mixed-port"}
+            for scenario in self.lightweight_settings:
+                patches = [row["data"] for row in host + service
+                           if row.get("event") == "core_config_patch_result"
+                           and row.get("data", {}).get("corePid") == scenario["corePid"]
+                           and scenario["startedAtMs"] <= row.get("timeMs", 0) <= scenario["finishedAtMs"]
+                           and row.get("data", {}).get("success") is True]
+                keys = {key for patch in patches for key in patch.get("keys", [])}
+                if not expected_keys <= keys:
+                    return None
+                scalar_evidence.append({"owner": scenario["owner"], "keys": sorted(keys),
+                                        "coreDurationsMs": [row["durationMs"] for row in patches]})
+            require(len(scalar_evidence) == 3, "scalar_settings_owner_coverage_incomplete")
+            core_stages = [row["data"] for row in host + service if row.get("event") == "core_start_stage"]
+            ui_stages = [row["data"] for row in ui if row.get("event") == "ui_startup_stage"]
+            if not {"prepare", "spawn", "readiness", "version"} <= {row.get("stage") for row in core_stages}:
+                return None
+            if not {"initial_theme", "window_initialize", "window_show", "host_launch", "initial_status"} <= {row.get("stage") for row in ui_stages}:
+                return None
+            self.report["startupStages"] = {"core": core_stages, "ui": ui_stages,
+                                            "includesDeliberatelyHeldResourceFixture": True}
+            self.report["scalarPatchEvidence"] = scalar_evidence
             started = next((row for row in ui if row.get("event") == "host_recovery_started"
                             and row.get("processId") == expected["uiPid"]
                             and row.get("data", {}).get("oldHostPid") == expected["oldHostPid"]), None)
@@ -3249,6 +3395,9 @@ class Acceptance:
         wait_until(lambda: self.driver.snapshot().get("ready") is True, "desktop_ui_not_loaded")
         failed = self.phase("error")
         require(bool(failed.get("lastError")) and failed.get("controller") is None, "startup_failure_not_reported")
+        self.driver.navigate("settings")
+        wait_until(lambda: self.driver.ui("settingsRuntimeNotice").get("name"),
+                   "settings_runtime_failure_not_visible")
         self.driver.navigate("profiles")
         wait_until(lambda: bool(self.driver.snapshot().get("error")), "recovery_error_not_available")
         edit = self.driver.ui("EditConfig")
@@ -3269,6 +3418,10 @@ class Acceptance:
         self.driver.invoke("desktop_start")
         running = self.phase("running")
         self.managed_core(running)
+        self.driver.navigate("settings")
+        wait_until(lambda: not self.driver.ui("settingsRuntimeNotice").get("name"),
+                   "settings_recovered_runtime_notice_not_cleared")
+        self.mark("settings_runtime_notice_recovery")
         self.mark("startup_recovery")
 
         self.stage = "config_revision"
@@ -3363,6 +3516,7 @@ class Acceptance:
         self.report["screenshot"] = "windows-settings.png"
         self.mark("single_instance_and_native_ui")
 
+        self.check_lightweight_settings(self.phase("running"), "direct")
         self.check_native_titlebar_pointer()
         self.check_native_redesign_ui(valid, base)
         self.check_local_resume_health(self.phase("running"))
@@ -3409,6 +3563,24 @@ class Acceptance:
             self.report["resourceBootstrap"]["servicePreparationProxyChecks"] = self.resources.pending_proxy_checks - service_proxy_checks
             self.mark("resource_bootstrap_service")
             self.mark("tun_service_identity")
+            self.check_lightweight_settings(tun, "service_tun")
+            tun = self.check_service_tun_switch(self.phase("running"))
+            # Measure an actual TUN process start with this run's resources
+            # already cached, separately from the deliberately delayed cold case.
+            self.stage = "warm_tun_startup"
+            require(service_cache.is_file(), "warm_tun_resource_cache_missing")
+            self.driver.invoke("desktop_stop")
+            warm_started = time.monotonic()
+            self.driver.invoke("desktop_start")
+            tun = self.phase("running")
+            tun_core_pid = self.managed_core(tun)["pid"]
+            require(tun.get("tun") is True and tun.get("lastError") is None,
+                    "warm_tun_start_failed")
+            self.report["tunWarmStartup"] = {"cachedResources": True,
+                                              "readyMilliseconds": round((time.monotonic() - warm_started) * 1000, 1)}
+            self.fresh_health(tun)
+            wait_until(self.socks.roundtrip, "warm_tun_start_forwarding_failed")
+            self.mark("warm_tun_startup")
             self.check_service_proxy_recovery(tun, mixed)
             self.check_local_resume_health(self.phase("running"), remove_route=True)
             tun = self.phase("running")

@@ -52,6 +52,8 @@ public abstract class NativePage : UserControl
     private Thickness? pagePadding;
     private bool reservePageGutter = true;
     private readonly TextBlock notice = Ui.Text("");
+    private readonly TextBlock runtimeNotice = Ui.Text("");
+    private readonly PageNoticeState noticeState = new();
     private CancellationTokenSource? lifetime;
     private string controllerIdentity = "";
     private bool runtimeAvailable;
@@ -96,7 +98,11 @@ public abstract class NativePage : UserControl
         header = new FluentPageHeader(heading, Tools).Id(key + "PageHeader");
         layout.Children.Add(header);
         notice.Margin = new Thickness(0, 0, 0, 12); notice.Visibility = Visibility.Collapsed;
-        notice.Id(key + "Notice"); Grid.SetRow(notice, 1); layout.Children.Add(notice);
+        notice.Id(key + "Notice");
+        runtimeNotice.Margin = notice.Margin; runtimeNotice.Visibility = Visibility.Collapsed;
+        runtimeNotice.Id(key + "RuntimeNotice");
+        var notices = new StackPanel(); notices.Children.Add(runtimeNotice); notices.Children.Add(notice);
+        Grid.SetRow(notices, 1); layout.Children.Add(notices);
         Grid.SetRow(Body, 2); layout.Children.Add(Body);
         pagePresenter.Content = pageBox; viewport.Children.Add(pagePresenter); Content = viewport;
         SizeChanged += (_, _) => UpdatePageMetrics();
@@ -130,7 +136,8 @@ public abstract class NativePage : UserControl
     protected void SetHeaderVisible(bool visible)
     {
         header.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
-        notice.Visibility = visible && !string.IsNullOrEmpty(notice.Text) ? Visibility.Visible : Visibility.Collapsed;
+        RenderNotice(notice, noticeState.Operation);
+        RenderNotice(runtimeNotice, noticeState.Runtime);
     }
     protected void SetPagePadding(Thickness? padding) { pagePadding = padding; UpdatePageMetrics(); }
     protected void SetPageMaxWidth(double width) { pageMaxWidth = width; UpdatePageMetrics(); }
@@ -231,8 +238,24 @@ public abstract class NativePage : UserControl
     }
     protected void Message(string text, bool error = false)
     {
-        L.Bind(notice, TextBlock.TextProperty, text); notice.Visibility = string.IsNullOrEmpty(text) || header.Visibility != Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
-        notice.SetResourceReference(TextBlock.ForegroundProperty, error ? "DangerBrush" : "TextSecondaryBrush");
+        noticeState.ShowOperation(text, error);
+        RenderNotice(notice, noticeState.Operation);
+    }
+    protected void UpdateRuntimeNotice()
+    {
+        noticeState.ObserveRuntime(Session.Status, Session.Runtime);
+        RenderNotice(runtimeNotice, noticeState.Runtime);
+    }
+    private void RenderNotice(TextBlock target, PageNotice message)
+    {
+        L.Bind(target, TextBlock.TextProperty, message.Text);
+        target.Visibility = message.IsVisible && header.Visibility == Visibility.Visible ? Visibility.Visible : Visibility.Collapsed;
+        target.SetResourceReference(TextBlock.ForegroundProperty, message.Kind switch
+        {
+            PageNoticeKind.Error => "DangerBrush",
+            PageNoticeKind.Warning => "WarningBrush",
+            _ => "TextSecondaryBrush"
+        });
     }
     protected async Task RunAsync(Func<Task> operation, Button? button = null)
     {

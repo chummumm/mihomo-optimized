@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Http;
@@ -124,21 +125,28 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
     public async Task StartAsync()
     {
         if (started) return;
+        var stageTime = Stopwatch.StartNew();
+        string stage = "network_observer_start";
         try
         {
             diagnostics.Record("ui_started", new { channelId = host.ChannelId });
             networkDiagnostics.Start();
+            RecordStartupStage(stage, stageTime.Elapsed);
+            stage = "host_launch"; stageTime.Restart();
             host.Start();
+            RecordStartupStage(stage, stageTime.Elapsed);
             started = true;
-            ApplyTheme();
             _ = PollAsync();
+            stage = "initial_status"; stageTime.Restart();
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
             var channel = host;
             ApplyStatus(await channel.CallAsync("desktop_status", null, timeout.Token, new HostCallContext("initial_handshake", runIntent.Revision)), channel);
+            RecordStartupStage(stage, stageTime.Elapsed);
             _ = CheckUpdateOnLaunchAsync();
         }
         catch (Exception error)
         {
+            RecordStartupStage(stage, stageTime.Elapsed, error);
             diagnostics.Record("ui_start_failed", new { code = LifecycleDiagnostics.ErrorCode(error), errorType = error.GetType().Name, channelId = host.ChannelId, hostPid = host.HostPid });
             Ready = false;
             SetRuntimeSnapshotState(false, "");
@@ -147,6 +155,14 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
             throw;
         }
     }
+
+    internal void RecordStartupStage(string stage, TimeSpan duration, Exception? failure = null) =>
+        diagnostics.Record("ui_startup_stage", new
+        {
+            stage = LifecycleDiagnostics.Code(stage), durationMs = (long)duration.TotalMilliseconds,
+            outcome = failure is null ? "succeeded" : "failed",
+            code = failure is null ? null : LifecycleDiagnostics.ErrorCode(failure)
+        });
 
     public async Task<JsonElement> CommandAsync(string method, object? args = null, CancellationToken cancellationToken = default)
     {
@@ -687,8 +703,13 @@ public sealed class AppSession : INotifyPropertyChanged, IAsyncDisposable
                 var mode = HostChannel.Text(parsed.RootElement, "mode");
                 if (mode is "rule" or "global" or "direct" or "script") Dispatch(() =>
                 {
-                    if (controllerToken.IsCancellationRequested || RuntimeMode == mode) return;
-                    RuntimeMode = mode;
+                    lock (runtimeSnapshotGate)
+                    {
+                        if (controllerToken.IsCancellationRequested || RuntimeMode == mode || !runtimeSnapshotsRunning
+                            || runtimeSnapshotWrites != 0 || requestController != runtimeSnapshotController
+                            || snapshotGeneration != runtimeSnapshotGeneration) return;
+                        RuntimeMode = mode;
+                    }
                     PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(RuntimeMode)));
                 });
             }

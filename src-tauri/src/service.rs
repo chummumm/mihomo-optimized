@@ -841,8 +841,8 @@ fn handle_session_request(
                 )));
             }
             let operation = match request {
-                Request::Start { config } => RuntimeRequest::Start(config),
-                Request::Reload { config } => RuntimeRequest::Reload(config),
+                Request::Start { config, tun } => RuntimeRequest::Start { config, tun },
+                Request::Reload { config, tun } => RuntimeRequest::Reload { config, tun },
                 Request::Stop => RuntimeRequest::Stop(StopReason::UserStop),
                 Request::PrepareCoreUpdate { proxy_port } => {
                     if proxy_port == Some(0) {
@@ -887,7 +887,7 @@ fn handle_session_request(
             }
             let start = matches!(
                 operation,
-                RuntimeRequest::Start(_)
+                RuntimeRequest::Start { .. }
                     | RuntimeRequest::PrepareCoreUpdate { .. }
                     | RuntimeRequest::CommitCoreUpdate
                     | RuntimeRequest::CompleteCoreUpdate { .. }
@@ -1059,6 +1059,143 @@ mod control_tests {
     }
 
     #[test]
+    fn ordinary_and_tun_cores_share_owner_replay_and_stop_guards() {
+        for tun in [false, true] {
+            let runtime = CoreRuntime::queued_for_test();
+            let session = session();
+            let reload = |tun| Request::Reload {
+                config: "mixed-port: 7890".into(),
+                tun,
+            };
+            let unowned = handle_request(&runtime, &session, request("unowned", 1, 1, reload(tun)));
+            assert_eq!(unowned.error.unwrap().code, "service_owner_required");
+            let started = handle_request(
+                &runtime,
+                &session,
+                request(
+                    "start",
+                    1,
+                    2,
+                    Request::Start {
+                        config: "mixed-port: 7890".into(),
+                        tun,
+                    },
+                ),
+            );
+            assert!(started.error.is_none());
+            for command in [
+                Request::Start {
+                    config: "mixed-port: 7890".into(),
+                    tun: !tun,
+                },
+                reload(!tun),
+            ] {
+                let mut foreign = request("foreign", 2, 3, command);
+                foreign.envelope.owner_session = "00000000000000000000000000000002".into();
+                assert_eq!(
+                    handle_request(&runtime, &session, foreign)
+                        .error
+                        .unwrap()
+                        .code,
+                    "service_owner_busy"
+                );
+            }
+            let switched =
+                handle_request(&runtime, &session, request("switch", 2, 4, reload(!tun)));
+            assert!(switched.error.is_none());
+            let first_id = switched.operation.unwrap().id;
+            let replay = handle_request(&runtime, &session, request("switch", 2, 4, reload(!tun)));
+            assert_eq!(replay.operation.unwrap().id, first_id);
+            let changed = handle_request(&runtime, &session, request("switch", 2, 4, reload(tun)));
+            assert_eq!(changed.error.unwrap().code, "service_request_conflict");
+            let stopped = handle_request(&runtime, &session, request("stop", 3, 5, Request::Stop));
+            assert!(stopped.error.is_none());
+            let stale = handle_request(
+                &runtime,
+                &session,
+                request("late-switch", 2, 6, reload(tun)),
+            );
+            assert_eq!(stale.error.unwrap().code, "operation_cancelled");
+            let replay = handle_request(&runtime, &session, request("switch", 2, 4, reload(!tun)));
+            assert_eq!(replay.operation.unwrap().phase, "cancelled");
+            assert!(!runtime.status().desired_running);
+        }
+    }
+
+    #[test]
+    fn cancelled_lifecycle_stop_uses_old_intent_and_cannot_stop_a_new_owner_operation() {
+        for newer_intent in [false, true] {
+            let runtime = CoreRuntime::queued_for_test();
+            let session = session();
+            let start = |tun| Request::Start {
+                config: "mixed-port: 7890".into(),
+                tun,
+            };
+            assert!(
+                handle_request(&runtime, &session, request("start", 5, 1, start(false)))
+                    .error
+                    .is_none()
+            );
+            assert!(handle_request(
+                &runtime,
+                &session,
+                request(
+                    "switch",
+                    6,
+                    2,
+                    Request::Reload {
+                        config: "mixed-port: 7890".into(),
+                        tun: true
+                    }
+                )
+            )
+            .error
+            .is_none());
+            if newer_intent {
+                assert!(handle_request(
+                    &runtime,
+                    &session,
+                    request("new-start", 7, 3, start(false))
+                )
+                .error
+                .is_none());
+            }
+            let cancel = handle_request(&runtime, &session, request("stop-6", 6, 4, Request::Stop));
+            if newer_intent {
+                assert_eq!(cancel.error.unwrap().code, "operation_cancelled");
+                assert!(runtime.status().desired_running);
+                assert_eq!(runtime.status().intent_revision, 7);
+            } else {
+                assert!(cancel.error.is_none());
+                assert!(!runtime.status().desired_running);
+                assert_eq!(runtime.status().intent_revision, 6);
+                assert_eq!(
+                    runtime
+                        .operation("00000000000000000000000000000001:switch")
+                        .unwrap()
+                        .phase,
+                    "cancelled"
+                );
+                let replay = handle_request(
+                    &runtime,
+                    &session,
+                    request(
+                        "switch",
+                        6,
+                        2,
+                        Request::Reload {
+                            config: "mixed-port: 7890".into(),
+                            tun: true,
+                        },
+                    ),
+                );
+                assert_eq!(replay.operation.unwrap().phase, "cancelled");
+                assert!(!runtime.status().desired_running);
+            }
+        }
+    }
+
+    #[test]
     fn core_update_commit_requires_owner_and_cannot_overtake_stop() {
         let runtime = CoreRuntime::queued_for_test();
         let session = session();
@@ -1148,6 +1285,7 @@ mod control_tests {
                 19,
                 Request::Start {
                     config: "secret: must-not-be-logged".into(),
+                    tun: true,
                 },
             ),
         );
@@ -1195,6 +1333,7 @@ mod control_tests {
                 19,
                 Request::Start {
                     config: "mixed-port: 7890".into(),
+                    tun: true,
                 },
             ),
         );
@@ -1218,6 +1357,7 @@ mod control_tests {
                 19,
                 Request::Start {
                     config: "mixed-port: 7890".into(),
+                    tun: true,
                 },
             ),
         );
@@ -1235,6 +1375,7 @@ mod control_tests {
             99,
             Request::Start {
                 config: "mixed-port: 7890".into(),
+                tun: true,
             },
         );
         session.lock().unwrap().shutting_down = true;
@@ -1257,6 +1398,7 @@ mod control_tests {
                 1,
                 Request::Start {
                     config: "mixed-port: 7890".into(),
+                    tun: true,
                 },
             ),
         );
@@ -1276,6 +1418,7 @@ mod control_tests {
                 2,
                 Request::Start {
                     config: "mixed-port: 7890".into(),
+                    tun: true,
                 },
             ),
         );
@@ -1318,6 +1461,7 @@ mod control_tests {
                 10,
                 Request::Start {
                     config: "mixed-port: 7890".into(),
+                    tun: true,
                 },
             ),
         );
@@ -1333,6 +1477,7 @@ mod control_tests {
                 12,
                 Request::Start {
                     config: "mixed-port: 7890".into(),
+                    tun: true,
                 },
             ),
         );
@@ -1347,6 +1492,7 @@ mod control_tests {
                 10,
                 Request::Start {
                     config: "mixed-port: 7890".into(),
+                    tun: true,
                 },
             ),
         );
@@ -1361,6 +1507,7 @@ mod control_tests {
                 10,
                 Request::Start {
                     config: "mixed-port: 7890".into(),
+                    tun: true,
                 },
             ),
         );
@@ -1374,6 +1521,7 @@ mod control_tests {
                 13,
                 Request::Start {
                     config: "mixed-port: 7890".into(),
+                    tun: true,
                 },
             ),
         );
@@ -1394,6 +1542,7 @@ mod control_tests {
                 1,
                 Request::Start {
                     config: "mixed-port: 7890".into(),
+                    tun: true,
                 },
             ),
         );

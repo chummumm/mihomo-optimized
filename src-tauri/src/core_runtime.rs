@@ -30,8 +30,8 @@ pub struct RuntimeOperation {
 
 #[derive(Clone)]
 pub enum RuntimeRequest {
-    Start(String),
-    Reload(String),
+    Start { config: String, tun: bool },
+    Reload { config: String, tun: bool },
     Stop(StopReason),
     PrepareCoreUpdate { proxy_port: Option<u16> },
     CommitCoreUpdate,
@@ -41,8 +41,8 @@ pub enum RuntimeRequest {
 impl RuntimeRequest {
     fn name(&self) -> &'static str {
         match self {
-            Self::Start(_) => "starting",
-            Self::Reload(_) => "reloading",
+            Self::Start { .. } => "starting",
+            Self::Reload { .. } => "reloading",
             Self::Stop(_) => "stopping",
             Self::PrepareCoreUpdate { .. } => "preparing_core_update",
             Self::CommitCoreUpdate => "updating_core",
@@ -54,7 +54,10 @@ impl RuntimeRequest {
         let mut digest = Sha256::new();
         digest.update(self.name());
         match self {
-            Self::Start(source) | Self::Reload(source) => digest.update(source),
+            Self::Start { config, tun } | Self::Reload { config, tun } => {
+                digest.update([u8::from(*tun)]);
+                digest.update(config);
+            }
             Self::Stop(reason) => digest.update(format!("{reason:?}")),
             Self::PrepareCoreUpdate { proxy_port } => digest.update(format!("{proxy_port:?}")),
             Self::CommitCoreUpdate => (),
@@ -213,7 +216,7 @@ impl CoreRuntime {
             state.status.desired_running = false;
             state.status.recovering = false;
             state.reconcile = None;
-        } else if matches!(request, RuntimeRequest::Start(_)) {
+        } else if matches!(request, RuntimeRequest::Start { .. }) {
             state.status.desired_running = true;
         }
         stamp(&self.shared, &mut state);
@@ -342,8 +345,8 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
                 Err(cancelled())
             } else {
                 match work.request {
-                    RuntimeRequest::Start(source) => core.start(source, true),
-                    RuntimeRequest::Reload(source) => {
+                    RuntimeRequest::Start { config, tun } => core.start(config, tun),
+                    RuntimeRequest::Reload { config, tun } => {
                         // A superseded update may have stopped the old process
                         // before the new Reload arrived. Resume only under this
                         // newly admitted running intent; Stop remains final.
@@ -352,9 +355,9 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
                             && observed.pid.is_none()
                             && observed.process_state == "exited"
                         {
-                            core.start(source, true)
+                            core.start(config, tun)
                         } else {
-                            core.reload(source)
+                            core.reconfigure(config, tun)
                         }
                     }
                     RuntimeRequest::Stop(reason) => core.stop_for(reason).map(|_| core.status()),
@@ -531,7 +534,10 @@ mod tests {
             .submit(
                 "session:start".into(),
                 1,
-                RuntimeRequest::Start("mixed-port: 7890".into()),
+                RuntimeRequest::Start {
+                    config: "mixed-port: 7890".into(),
+                    tun: true,
+                },
             )
             .unwrap();
         let revision = runtime.shared.revision.load(Ordering::Acquire);
@@ -545,7 +551,10 @@ mod tests {
             .submit(
                 "session:start".into(),
                 1,
-                RuntimeRequest::Start("mixed-port: 7890".into()),
+                RuntimeRequest::Start {
+                    config: "mixed-port: 7890".into(),
+                    tun: true,
+                },
             )
             .unwrap();
         assert_eq!(replay.id, first.id);
@@ -556,7 +565,10 @@ mod tests {
                 .submit(
                     "session:start".into(),
                     1,
-                    RuntimeRequest::Start("mixed-port: 7891".into())
+                    RuntimeRequest::Start {
+                        config: "mixed-port: 7891".into(),
+                        tun: true
+                    }
                 )
                 .err()
                 .unwrap()
@@ -566,13 +578,53 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_replay_cannot_change_tun_without_a_new_operation() {
+        for start in [false, true] {
+            let runtime = queued_runtime();
+            let request = |tun| {
+                if start {
+                    RuntimeRequest::Start {
+                        config: "mixed-port: 7890".into(),
+                        tun,
+                    }
+                } else {
+                    RuntimeRequest::Reload {
+                        config: "mixed-port: 7890".into(),
+                        tun,
+                    }
+                }
+            };
+            let first = runtime
+                .submit("session:mode".into(), 3, request(false))
+                .unwrap();
+            let revision = runtime.shared.revision.load(Ordering::Acquire);
+            let replay = runtime
+                .submit("session:mode".into(), 3, request(false))
+                .unwrap();
+            assert_eq!(first.id, replay.id);
+            assert_eq!(
+                runtime
+                    .submit("session:mode".into(), 3, request(true))
+                    .err()
+                    .unwrap()
+                    .code,
+                "service_request_conflict"
+            );
+            assert_eq!(runtime.shared.revision.load(Ordering::Acquire), revision);
+        }
+    }
+
+    #[test]
     fn stop_cancels_queued_work_and_replay_cannot_resurrect_it() {
         let runtime = queued_runtime();
         runtime
             .submit(
                 "session:start".into(),
                 1,
-                RuntimeRequest::Start("mixed-port: 7890".into()),
+                RuntimeRequest::Start {
+                    config: "mixed-port: 7890".into(),
+                    tun: true,
+                },
             )
             .unwrap();
         let token = Cancellation::new(runtime.shared.revision.clone(), 1);
@@ -593,7 +645,10 @@ mod tests {
             .submit(
                 "session:start".into(),
                 1,
-                RuntimeRequest::Start("mixed-port: 7890".into()),
+                RuntimeRequest::Start {
+                    config: "mixed-port: 7890".into(),
+                    tun: true,
+                },
             )
             .unwrap();
         assert_eq!(replay.phase, "cancelled");
@@ -644,7 +699,10 @@ mod tests {
             .submit(
                 "session:first".into(),
                 41,
-                RuntimeRequest::Start(crate::config::INITIAL_CONFIG.into()),
+                RuntimeRequest::Start {
+                    config: crate::config::INITIAL_CONFIG.into(),
+                    tun: false,
+                },
             )
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -652,11 +710,19 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(pids().len(), 1, "first owned validation is running");
+        let applied: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(directory.join("runtime/config.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied["tun"]["enable"].as_bool(), Some(false));
         runtime
             .submit(
                 "session:reload".into(),
                 42,
-                RuntimeRequest::Reload(crate::config::INITIAL_CONFIG.into()),
+                RuntimeRequest::Reload {
+                    config: crate::config::INITIAL_CONFIG.into(),
+                    tun: true,
+                },
             )
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -670,6 +736,11 @@ mod tests {
             "Reload resumes the accepted running intent"
         );
         assert_ne!(children[0], children[1]);
+        let applied: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(directory.join("runtime/config.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied["tun"]["enable"].as_bool(), Some(true));
         assert_eq!(
             runtime.operation("session:first").unwrap().phase,
             "cancelled"
@@ -740,7 +811,10 @@ mod tests {
             .submit(
                 "session:start".into(),
                 41,
-                RuntimeRequest::Start(crate::config::INITIAL_CONFIG.into()),
+                RuntimeRequest::Start {
+                    config: crate::config::INITIAL_CONFIG.into(),
+                    tun: true,
+                },
             )
             .unwrap();
         let pid_file = directory.join("runtime/validation.pid");

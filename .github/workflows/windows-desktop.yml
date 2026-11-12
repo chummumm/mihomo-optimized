@@ -166,6 +166,8 @@ jobs:
         run: cargo test --locked --target x86_64-pc-windows-msvc --lib
       - name: Build native WPF application, host and NSIS installer
         run: python scripts/build-native-desktop.py
+      - name: Verify published Windows x64 ReadyToRun application
+        run: dotnet run --project desktop/tests/protocol/ProtocolTests.csproj -c Release -- --verify-ready-to-run dist-native/mihomo-optimized.dll
       - name: Assemble installer and portable distribution
         run: python scripts/package-desktop.py
       - name: Cache completed Windows compilation

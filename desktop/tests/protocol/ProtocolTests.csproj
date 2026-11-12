@@ -16,6 +16,8 @@
     <Compile Include="../../../src-windows/Services/WindowPlacementGeometry.cs" Link="WindowPlacementGeometry.cs" />
     <Compile Include="../../../src-windows/Services/ConfigApplicationState.cs" Link="ConfigApplicationState.cs" />
     <Compile Include="../../../src-windows/Services/DesktopRuntimeState.cs" Link="DesktopRuntimeState.cs" />
+    <Compile Include="../../../src-windows/Services/PageNoticeState.cs" Link="PageNoticeState.cs" />
+    <Compile Include="../../../src-windows/Services/RuntimeConfigReader.cs" Link="RuntimeConfigReader.cs" />
     <Compile Include="../../../src-windows/Services/DesktopStatusOrder.cs" Link="DesktopStatusOrder.cs" />
     <Compile Include="../../../src-windows/Services/TunDeviceState.cs" Link="TunDeviceState.cs" />
     <Compile Include="../../../src-windows/Services/CoreUpdateState.cs" Link="CoreUpdateState.cs" />

@@ -43,11 +43,11 @@ use windows_sys::Win32::{
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 const RESPONSE_RESERVE: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 fn operation_timeout(request: &Request) -> Result<Duration> {
     match request {
-        Request::Start { config } | Request::Reload { config } => {
+        Request::Start { config, .. } | Request::Reload { config, .. } => {
             config::resource_bootstrap_timeout(config)?
                 .checked_add(RESPONSE_RESERVE)
                 .ok_or_else(|| AppError::new("config_invalid", "服务操作时限超出系统支持范围"))
@@ -77,9 +77,9 @@ fn time_left(deadline: Instant) -> Result<Duration> {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    Start { config: String },
+    Start { config: String, tun: bool },
     Stop,
-    Reload { config: String },
+    Reload { config: String, tun: bool },
     Status,
     Reconcile { generation: u64 },
     Heartbeat,
@@ -135,6 +135,26 @@ pub struct Envelope {
 }
 
 impl Envelope {
+    fn validate(&self, bulk: bool) -> Result<()> {
+        if self.protocol_version != PROTOCOL_VERSION
+            || self.request.bulk() != bulk
+            || self.owner_session.len() != 32
+            || !self.owner_session.bytes().all(|c| c.is_ascii_hexdigit())
+            || self.request_id.is_empty()
+            || self.request_id.len() > 80
+            || !self
+                .request_id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        {
+            return Err(AppError::new(
+                "service_protocol",
+                "服务请求版本、会话或编号无效",
+            ));
+        }
+        Ok(())
+    }
+
     /// Only protocol identities and a fixed command category cross into logs.
     /// Configurations and authenticated payloads are deliberately not serialized.
     pub(crate) fn diagnostic_fields(&self) -> serde_json::Value {
@@ -326,7 +346,29 @@ impl Client {
             "service_call_started",
             envelope.diagnostic_fields(),
         );
-        let result = self.call_envelope(&envelope, cancellation, deadline);
+        let mut submitted = false;
+        let result = self.call_envelope(&envelope, cancellation, deadline, &mut submitted);
+        let result = if submitted
+            && matches!(
+                envelope.request,
+                Request::Start { .. } | Request::Reload { .. }
+            )
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.code == "operation_cancelled")
+        {
+            match self.cancel_submitted_lifecycle(envelope.intent_revision) {
+                Ok(()) => result,
+                Err(error) if error.code == "operation_cancelled" => result,
+                Err(error) => Err(AppError::new(
+                    "core_termination_unconfirmed",
+                    format!("操作已取消，但服务内核停止尚未确认：{}", error.message),
+                )),
+            }
+        } else {
+            result
+        };
         crate::diagnostics::record(
             &self.diagnostic_directory,
             "service_call_finished",
@@ -344,6 +386,7 @@ impl Client {
         envelope: &Envelope,
         cancellation: &Cancellation,
         deadline: Instant,
+        submitted: &mut bool,
     ) -> Result<CoreStatus> {
         // A lost accepted response is retried with the same request ID. The
         // service records it before dispatch, so retries cannot spawn twice.
@@ -351,6 +394,9 @@ impl Client {
         let reply = loop {
             cancellation.check()?;
             time_left(deadline)?;
+            // Once transmission is attempted, a lost response cannot prove
+            // that the service did not accept this lifecycle operation.
+            *submitted = true;
             match self.exchange(envelope, deadline) {
                 Ok(reply)
                     if reply
@@ -421,6 +467,50 @@ impl Client {
                 .operation
                 .ok_or_else(|| AppError::new("service_protocol", "服务响应缺少操作进度"))?;
         }
+    }
+
+    fn cancel_submitted_lifecycle(&self, intent_revision: u64) -> Result<()> {
+        let deadline = deadline_after(Duration::from_secs(18))?;
+        // Never borrow the newer UI generation. The service rejects this Stop
+        // if a newer intent already owns the runtime.
+        self.accept_stop(intent_revision)?;
+        loop {
+            time_left(deadline)?;
+            let operation = self.cancelled_stop_operation(intent_revision, deadline)?;
+            if cancelled_stop_completed(&operation)? {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub(crate) fn confirmed_cancelled_stop(&self, intent_revision: u64) -> Result<CoreStatus> {
+        let operation =
+            self.cancelled_stop_operation(intent_revision, deadline_after(CONTROL_TIMEOUT)?)?;
+        if cancelled_stop_completed(&operation)? {
+            Ok(operation.status)
+        } else {
+            Err(AppError::new(
+                "core_termination_unconfirmed",
+                "已取消操作的停止尚未完成",
+            ))
+        }
+    }
+
+    fn cancelled_stop_operation(
+        &self,
+        intent_revision: u64,
+        deadline: Instant,
+    ) -> Result<RuntimeOperation> {
+        let id = format!("{}:stop-{intent_revision}", self.owner_session);
+        let probe = self.envelope(Request::Operation { id }, intent_revision)?;
+        let reply = self.exchange(&probe, deadline)?;
+        if let Some(error) = reply.error {
+            return Err(error);
+        }
+        reply
+            .operation
+            .ok_or_else(|| AppError::new("service_protocol", "服务响应缺少停止操作进度"))
     }
 
     pub fn status(&self) -> Result<CoreStatus> {
@@ -602,6 +692,25 @@ impl Client {
     }
 }
 
+fn cancelled_stop_completed(operation: &RuntimeOperation) -> Result<bool> {
+    match operation.phase.as_str() {
+        "queued" | "running" => Ok(false),
+        "cancelled" => Err(AppError::new(
+            "operation_cancelled",
+            "更新的用户指令已接管内核",
+        )),
+        "succeeded"
+            if operation.status.pid.is_none() && operation.status.process_state == "exited" =>
+        {
+            Ok(true)
+        }
+        _ => Err(AppError::new(
+            "core_termination_unconfirmed",
+            "服务尚未确认自有内核已退出",
+        )),
+    }
+}
+
 pub struct Server {
     handle: OwnedHandle,
     owner_sid: String,
@@ -709,25 +818,7 @@ impl Server {
             let envelope = serde_json::from_slice::<Envelope>(&bytes).map_err(|_| {
                 AppError::new("service_version_required", "服务要求配套新版桌面控制协议")
             })?;
-            if envelope.protocol_version != PROTOCOL_VERSION
-                || envelope.request.bulk() != self.bulk
-                || envelope.owner_session.len() != 32
-                || !envelope
-                    .owner_session
-                    .bytes()
-                    .all(|c| c.is_ascii_hexdigit())
-                || envelope.request_id.is_empty()
-                || envelope.request_id.len() > 80
-                || !envelope
-                    .request_id
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
-            {
-                return Err(AppError::new(
-                    "service_protocol",
-                    "服务请求版本、会话或编号无效",
-                ));
-            }
+            envelope.validate(self.bulk)?;
             Ok(AuthenticatedRequest { envelope, owner })
         })();
         match validated {
@@ -891,6 +982,72 @@ mod timeout_tests {
     use super::*;
 
     #[test]
+    fn cancelled_stop_needs_its_completed_operation_not_an_empty_cached_pid() {
+        let mut operation = RuntimeOperation {
+            id: "owner:stop-7".into(),
+            phase: "queued".into(),
+            intent_revision: 7,
+            status: CoreStatus {
+                process_state: "exited".into(),
+                ..CoreStatus::default()
+            },
+            error: None,
+        };
+        for phase in ["queued", "running"] {
+            operation.phase = phase.into();
+            assert!(!cancelled_stop_completed(&operation).unwrap());
+        }
+        operation.phase = "succeeded".into();
+        assert!(cancelled_stop_completed(&operation).unwrap());
+        operation.status.pid = Some(111);
+        assert_eq!(
+            cancelled_stop_completed(&operation).unwrap_err().code,
+            "core_termination_unconfirmed"
+        );
+        operation.phase = "cancelled".into();
+        assert_eq!(
+            cancelled_stop_completed(&operation).unwrap_err().code,
+            "operation_cancelled"
+        );
+        operation.phase = "failed".into();
+        assert_eq!(
+            cancelled_stop_completed(&operation).unwrap_err().code,
+            "core_termination_unconfirmed"
+        );
+    }
+
+    #[test]
+    fn lifecycle_protocol_requires_an_explicit_tun_mode_and_version_four() {
+        for command in ["start", "reload"] {
+            let missing = serde_json::json!({"command":command, "config":"mixed-port: 7890"});
+            assert!(serde_json::from_value::<Request>(missing).is_err());
+            for tun in [false, true] {
+                let request: Request = serde_json::from_value(serde_json::json!({
+                    "command":command, "config":"mixed-port: 7890", "tun":tun,
+                }))
+                .unwrap();
+                assert_eq!(serde_json::to_value(&request).unwrap()["tun"], tun);
+                let mut envelope = Envelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    owner_session: "00000000000000000000000000000001".into(),
+                    request_id: "mode-switch".into(),
+                    intent_revision: 1,
+                    request_sequence: 1,
+                    request,
+                };
+                assert!(envelope.validate(true).is_ok());
+                assert!(envelope.validate(false).is_err());
+                envelope.protocol_version = 3;
+                assert_eq!(
+                    envelope.validate(true).unwrap_err().code,
+                    "service_protocol"
+                );
+            }
+        }
+        assert_eq!(PROTOCOL_VERSION, 4);
+    }
+
+    #[test]
     fn core_update_ipc_does_not_accept_paths_urls_or_digests() {
         for payload in [
             r#"{"command":"prepare_core_update","proxy_port":7890,"url":"https://attacker.invalid/core.zip"}"#,
@@ -922,6 +1079,7 @@ mod timeout_tests {
             request_sequence: 17,
             request: Request::Start {
                 config: "secret: must-not-be-logged".into(),
+                tun: true,
             },
         };
         let fields = envelope.diagnostic_fields();
@@ -968,7 +1126,8 @@ mod timeout_tests {
         );
         assert_eq!(
             operation_timeout(&Request::Start {
-                config: "resource-bootstrap:\n  timeout: 300\n".into()
+                config: "resource-bootstrap:\n  timeout: 300\n".into(),
+                tun: true,
             })
             .unwrap(),
             Duration::from_secs(360)
