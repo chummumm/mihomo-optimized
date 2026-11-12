@@ -1,7 +1,8 @@
 # Pinned sing-tun patches
 
-This directory contains `github.com/metacubex/sing-tun` **v0.4.28**, copied from
-the Go module verified by the repository's `go.sum`. Upstream licenses and
+This directory contains `github.com/metacubex/sing-tun` **v0.4.29**, plus the
+patches below. `UPSTREAM_VERSION` records this baseline and must match the root
+`go.mod` requirement. Upstream licenses and
 embedded Wintun binaries are retained unchanged. The root `go.mod` replacement
 makes the patch reproducible for every build; it does not modify a module cache.
 

@@ -12,7 +12,7 @@ case "${1:-test}" in
     python3 scripts/test-upstream-sync.py
     python3 scripts/test-release-build.py
     CGO_ENABLED=0 go test -tags with_gvisor -count=1 -timeout=5m \
-      ./adapter ./common/arc/... ./common/lru/... ./common/net/... ./common/singleflight/... ./component/trie/... ./component/easytier/... ./component/fakeip/... ./component/dnsmessage/... ./component/dnsstats/... ./component/process/... ./component/resolver/... ./component/http/... ./component/resource/... ./component/geodata/... ./component/mmdb/... ./component/updater/... ./context/... ./dns/... ./listener/sing_tun/... ./transport/socks4/... ./transport/socks5/... \
+      ./adapter ./adapter/inbound ./common/convert ./listener/inbound ./transport/snell ./common/arc/... ./common/lru/... ./common/net/... ./common/singleflight/... ./component/trie/... ./component/easytier/... ./component/fakeip/... ./component/dnsmessage/... ./component/dnsstats/... ./component/process/... ./component/resolver/... ./component/http/... ./component/resource/... ./component/geodata/... ./component/mmdb/... ./component/updater/... ./context/... ./dns/... ./listener/sing_tun/... ./transport/socks4/... ./transport/socks5/... \
       ./tunnel/... ./listener/socks/... ./listener/sing/... ./listener/anytls/... ./component/lanpreconnect/... ./rules/logic/... ./rules/provider/... ./adapter/provider/... ./config/... \
       ./hub/route/... ./hub/executor/... ./component/desktop/...
     CGO_ENABLED=0 go test -tags with_gvisor -count=1 -timeout=5m \

@@ -3,6 +3,7 @@
 
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -38,6 +39,19 @@ def commit(repo, message):
     return git(repo, "rev-parse", "HEAD")
 
 
+class LocalPatchBaselineTests(unittest.TestCase):
+    def test_sing_tun_requirement_matches_local_patch_baseline(self):
+        module = (SOURCE_ROOT / "go.mod").read_text()
+        baseline = (SOURCE_ROOT / "third_party/sing-tun/UPSTREAM_VERSION").read_text().strip()
+        self.assertRegex(baseline, r"\Av[0-9]+\.[0-9]+\.[0-9]+\Z")
+        required = re.findall(r"(?m)^\s*github\.com/metacubex/sing-tun\s+(\S+)[ \t]*$", module)
+        self.assertEqual(required, [baseline],
+                         "Refresh the local sing-tun source and reapply its fork patches before syncing a new dependency version.")
+        self.assertRegex(module,
+                         r"(?m)^replace github\.com/metacubex/sing-tun => \./third_party/sing-tun[ \t]*$",
+                         "The Windows ownership and TCP handshake patches require the local sing-tun replacement.")
+
+
 class StableSyncTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="mihomo-sync-test-")
@@ -51,6 +65,7 @@ class StableSyncTests(unittest.TestCase):
             git(repo, "config", "user.email", "test@example.invalid")
             git(repo, "config", "commit.gpgsign", "false")
         write(self.upstream, "code.txt", "upstream base\n")
+        write(self.upstream, "adapter/outbound/easytier.go", "base instance accessor\n")
         write(self.upstream, ".github/workflows/build.yml", "upstream automation\n")
         self.initial = commit(self.upstream, "initial upstream")
         git(self.upstream, "tag", "v1.0.0")
@@ -149,6 +164,19 @@ class StableSyncTests(unittest.TestCase):
         self.assert_clean_base()
         self.assertEqual((self.fork / "PROJECT_VERSION").read_text(), "1.0.7\n")
         self.assertEqual(len(git(self.fork, "worktree", "list", "--porcelain").split("worktree ")) - 1, 1)
+
+    def test_easytier_resolution_does_not_accept_unreviewed_inputs(self):
+        write(self.fork, "adapter/outbound/easytier.go", "fork route readiness\n")
+        base = commit(self.fork, "unreviewed fork EasyTier change")
+        write(self.upstream, "adapter/outbound/easytier.go", "upstream packet drain\n")
+        commit(self.upstream, "unreviewed upstream EasyTier change")
+        git(self.upstream, "tag", "v1.19.34")
+        result = self.sync("v1.19.34", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manual conflict resolution", result.stdout)
+        self.assertNotIn("Applied reviewed EasyTier", result.stdout)
+        self.assert_clean_base(base)
+        self.assertEqual((self.fork / "adapter/outbound/easytier.go").read_text(), "fork route readiness\n")
 
     def test_document_commits_do_not_consume_project_versions(self):
         write(self.fork, "README.md", "fork documentation\n")
