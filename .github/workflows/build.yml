@@ -274,7 +274,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest, macos-26-intel]
     env:
       CGO_ENABLED: "0"
     steps:
@@ -379,7 +379,9 @@ jobs:
               printf '%s\n\n' '## 本次更新：1.0.33
 
           - 修复 Windows SOCKS UDP 回归测试将 TCP 随机端口直接用于 UDP 的假设：UDP relay 独立申请可用端口，SOCKS UDP ASSOCIATE 响应返回实际 relay 地址，保留全部原有目标地址和收发断言。
-          - 本次仅修复测试夹具，不改变生产网络行为或发布验证要求。
+          - 资源启动与运行期隔离测试通过真实 HTTP 请求等待客户端取消并检查 DeadlineExceeded，避免短延时响应与取消计时器竞争；保留首次慢响应、10 毫秒运行期预算以及临时路由和缓存隔离断言。
+          - 本次仅调整测试夹具与 CI 运行环境，不改变生产网络行为。
+          - macOS 原生验收因 ARM64 runner 容量不足改用标准 macos-26-intel，保留全部测试命令、断言和发布依赖；更新、回滚及 codesign 仍在真实 macOS 上执行。原生运行架构由 ARM64 改为 Intel，Darwin ARM64 发布目标仍接受交叉编译检查，不将其宣称为 ARM64 原生运行验证。
           - 包含 1.0.32 的健康采样修复：受管内核启动及成功重载后立即启动后台 TUN 健康采样，避免第一次桌面健康查询才开始采样而先返回 pending。
           - TUN 配置未变化的重载保留已有真实健康观察和原始时间戳；实际设备变更仍立即使旧快照失效，过期观察不会被伪装成新鲜结果。
           - 健康接口继续直接读取快照，不等待原生设备检查，复用单一采样线程和有界请求合并。配套桌面的提示清理与操作加速由桌面版本交付。
