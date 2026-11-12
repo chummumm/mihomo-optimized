@@ -387,7 +387,8 @@ func TestProxyTargetSOCKSUDPWireAndReplies(t *testing.T) {
 			}
 			defer listener.Close()
 			port := listener.Addr().(*net.TCPAddr).Port
-			relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+			// TCP and UDP have separate port reservations; let the OS choose each.
+			relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -401,9 +402,12 @@ func TestProxyTargetSOCKSUDPWireAndReplies(t *testing.T) {
 				}
 				defer conn.Close()
 				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-				_, command, _, err := socks5.ServerHandshake(conn, nil)
+				_, command, _, err := socks5.ServerRequest(conn, nil)
 				if err == nil && command != socks5.CmdUDPAssociate {
 					err = fmt.Errorf("unexpected command %d", command)
+				}
+				if err == nil {
+					err = socks5.WriteResponse(conn, 0, relay.LocalAddr())
 				}
 				if err == nil {
 					_, err = io.Copy(io.Discard, conn)

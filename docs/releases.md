@@ -2,6 +2,12 @@
 
 项目使用独立版本 **`mihomo-optimized-vX.Y.Z`**，首版为 `mihomo-optimized-v1.0.0`。`main` 的源码、依赖或构建配置变更在全部测试和完整编译成功后生成固定提交的 GitHub Release。Latest 仅在该构建仍对应当前 `main` 时更新；PR 只做合并前检查，不生成正式发布包。纯文档变更不消耗版本号，也不触发自动发布。
 
+## 1.0.33：Windows SOCKS UDP 回归测试端口分配
+
+修复 SOCKS UDP 目标地址回归测试将 TCP 随机端口直接用于 UDP、在 Windows 上可能被端口保留规则拒绝的问题。测试现在让系统独立分配 UDP relay 端口，并在 SOCKS UDP ASSOCIATE 响应中返回实际 relay 地址；原有 IPv4 / IPv6 目标地址、收发数据和响应来源断言全部保留。
+
+本版仅修复测试夹具，不改变生产网络行为或发布验证要求。
+
 ## 1.0.32：桌面 TUN 健康采样时机
 
 受管内核在成功启动和应用配置后立即提交后台健康采样，复用原有单一观察线程，不再等待桌面首次请求 `/desktop/health` 才启动采样。健康接口仍直接读取带时间戳的快照，不等待 Windows 网卡、地址或路由枚举；真实原生检查延迟时继续返回 pending / stale。
