@@ -376,14 +376,16 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.32
+              printf '%s\n\n' '## 本次更新：1.0.33
 
-          - 受管内核启动及成功重载后立即启动后台 TUN 健康采样，避免第一次桌面健康查询才开始采样而先返回 pending。
+          - 修复 Windows SOCKS UDP 回归测试将 TCP 随机端口直接用于 UDP 的假设：UDP relay 独立申请可用端口，SOCKS UDP ASSOCIATE 响应返回实际 relay 地址，保留全部原有目标地址和收发断言。
+          - 本次仅修复测试夹具，不改变生产网络行为或发布验证要求。
+          - 包含 1.0.32 的健康采样修复：受管内核启动及成功重载后立即启动后台 TUN 健康采样，避免第一次桌面健康查询才开始采样而先返回 pending。
           - TUN 配置未变化的重载保留已有真实健康观察和原始时间戳；实际设备变更仍立即使旧快照失效，过期观察不会被伪装成新鲜结果。
           - 健康接口继续直接读取快照，不等待原生设备检查，复用单一采样线程和有界请求合并。配套桌面的提示清理与操作加速由桌面版本交付。
           - 保留 1.0.31 已合入的上游 v1.19.34 和本地 sing-tun v0.4.29 基线。
 
-          [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.32/docs/releases.md)
+          [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.33/docs/releases.md)
 
           ## 1.0.29
 
