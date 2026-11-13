@@ -1,4 +1,4 @@
-name: Inspect saved core update rejection
+name: Inspect saved automatic update restoration
 on:
   push:
     branches: [diagnostics/windows-tun-ci-43368503742]
@@ -13,11 +13,11 @@ jobs:
       - name: Download existing failed-run evidence
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: '14017082034'
+          artifact-ids: '14018855631'
           path: evidence
           merge-multiple: true
           repository: chummumm/mihomo-optimized
-          run-id: '43380485216'
+          run-id: '43383468432'
           github-token: ${{ github.token }}
       - name: Read bounded saved rejection state
         shell: python
