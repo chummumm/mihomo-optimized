@@ -156,7 +156,10 @@ jobs:
           MIHOMO_LAN_INTEGRATION: '1'
         run: go test -p 1 -tags with_gvisor -count=1 -v -timeout=90s ./adapter/outbound -run '^TestLANWireGuardNativePreparationBeforeBusiness$'
       - name: Install pinned Rust compiler
-        run: rustup toolchain install 1.99.1 --profile minimal
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt
+      - name: Check pinned Rust source format
+        working-directory: src-tauri
+        run: cargo +1.99.1 fmt --all -- --check
       - name: Cache Rust dependencies
         id: rust-cache
         uses: actions/cache/restore@v4

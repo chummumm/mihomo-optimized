@@ -4622,7 +4622,16 @@ mod tests {
         // exercises spawn_with_budget's real cleanup, without a test-only
         // launch implementation or a second process ownership model.
         let error = core.start("mixed-port: 0\n".into(), false).err().unwrap();
-        assert_eq!(error.code, "core_start_failed");
+        // This deliberately short-lived child may enter Windows termination
+        // before job assignment. Only that exact native assignment failure is
+        // another valid cause; both paths must reap the actual spawned child.
+        let assignment_denied = cfg!(windows)
+            && error.code == "io_error"
+            && error.message == "无法接管内核进程（系统错误：5）";
+        assert!(
+            error.code == "core_start_failed" || assignment_denied,
+            "unexpected startup cause: {error}"
+        );
         assert!(started.elapsed() < Duration::from_secs(10));
         let status = core.status();
         assert!(!status.running && !status.desired_running);
@@ -4633,7 +4642,23 @@ mod tests {
                 .unwrap();
         assert_eq!(runtime["external-controller"].as_str(), Some("127.0.0.1:0"));
         drop(core);
-        assert!(crate::diagnostics::flush(Duration::from_secs(2)));
+        // diagnostic_events asserts the existing writer ACK before reading.
+        let events = diagnostic_events(&directory.join("logs"));
+        let spawned_pid = events
+            .iter()
+            .find(|event| event["event"] == "core_spawned")
+            .and_then(|event| event["data"]["corePid"].as_u64())
+            .filter(|pid| *pid != 0)
+            .expect("the fixture must have started a real owned process");
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "core_force_stop_result"
+                    && event["data"]["role"] == "main"
+                    && event["data"]["corePid"].as_u64() == Some(spawned_pid)
+                    && event["data"]["exitConfirmed"].as_bool() == Some(true)
+            }),
+            "the spawned process must have a matching confirmed exit"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
