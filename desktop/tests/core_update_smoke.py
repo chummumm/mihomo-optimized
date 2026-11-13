@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """Exercise independent automatic core replacement in the installed Windows app.
 
-The elevated fixture seeds a checksum-pinned, published 1.0.28 executable only
-while the GUI, host, core and service are all absent. The real medium-integrity
-GUI then owns its ordinary host, whose installed service downloads the official
-latest core. No update command, source override or replacement test hook is used.
-Running, real TUN and stopped scenarios must retain their configuration and user
-intent. This script only runs on a disposable elevated GitHub Windows runner.
+The elevated fixture seeds a clearly identified CI-only low-version executable
+built from the exact clean bundled core source. The real medium-integrity GUI
+owns its ordinary host, whose installed service downloads the official latest
+core. A separate checksum-pinned published 1.0.28 negative case proves that its
+unsupported controller protocol is rejected and completely cleaned up. No
+update command, source override or replacement test hook is used. Running, real
+TUN and stopped updates must retain configuration and user intent. This script
+only runs on a disposable elevated GitHub Windows runner.
 """
 
 from __future__ import annotations
 
 import ctypes
+from datetime import datetime
 import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -26,6 +30,7 @@ import tempfile
 import time
 import zipfile
 
+from upgrade_tun_native import NativeTunIdentity
 from windows_smoke import (
     Acceptance, RestrictedDesktop, SmokeFailure, SocksFixture, TUN_BODY,
     TUN_TARGET, child_environment, free_port, listening, profile, require,
@@ -33,13 +38,16 @@ from windows_smoke import (
 )
 
 
-BASELINE_VERSION = "mihomo-optimized-v1.0.28"
-BASELINE_SOURCE = "e348a0f888b1ae497fb45c87a769bb479ca37e1c"
-BASELINE_ARCHIVE = BASELINE_VERSION + "-windows-amd64.zip"
-BASELINE_SHA256 = "6c213cc5ff1755900956711225dfefd55109339e9b6aa170167b6198054e4f49"
+BASELINE_VERSION = "mihomo-optimized-v0.0.0-desktop"
+BASELINE_KIND = "source-built-managed-discovery-baseline"
+BASELINE_DIRECTORY = Path("artifacts/core-update-fixture")
+LEGACY_VERSION = "mihomo-optimized-v1.0.28"
+LEGACY_SOURCE = "e348a0f888b1ae497fb45c87a769bb479ca37e1c"
+LEGACY_ARCHIVE = LEGACY_VERSION + "-windows-amd64.zip"
+LEGACY_SHA256 = "6c213cc5ff1755900956711225dfefd55109339e9b6aa170167b6198054e4f49"
 RELEASE_ROOT = "https://github.com/chummumm/mihomo-optimized/releases/download/"
 ARCHIVE_MEMBER = "mihomo-optimized-windows-amd64.exe"
-MINIMUM_UPDATED_VERSION = (1, 0, 29)
+MINIMUM_UPDATED_VERSION = (1, 0, 35)
 INTERVAL_HOURS = 24
 UPDATE_TIMEOUT = 660
 
@@ -61,11 +69,11 @@ def executable_version(path: Path) -> str:
     return match[1]
 
 
-def download_fixture(name: str, destination: Path, limit: int) -> None:
+def download_legacy_fixture(name: str, destination: Path, limit: int) -> None:
     # Both the release and asset name are fixed in this file. Credentials and
     # ambient proxy overrides never reach curl or the actual application.
-    require(name in (BASELINE_ARCHIVE, "SHA256SUMS"), "core_fixture_asset_invalid")
-    url = RELEASE_ROOT + BASELINE_VERSION + "/" + name
+    require(name in (LEGACY_ARCHIVE, "SHA256SUMS"), "core_fixture_asset_invalid")
+    url = RELEASE_ROOT + LEGACY_VERSION + "/" + name
     result = subprocess.run(["curl.exe", "--fail", "--location", "--silent", "--show-error",
         "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "20",
         "--max-time", "120", "--retry", "2", "--retry-delay", "2", "--retry-all-errors",
@@ -76,6 +84,40 @@ def download_fixture(name: str, destination: Path, limit: int) -> None:
             and 0 < destination.stat().st_size <= limit, "core_fixture_download_failed")
 
 
+def validate_baseline_metadata(metadata: dict, installed: dict, pin: dict) -> dict:
+    require(isinstance(metadata, dict) and isinstance(installed, dict) and isinstance(pin, dict),
+            "core_fixture_baseline_metadata_invalid")
+    source = metadata.get("source")
+    require(metadata.get("kind") == BASELINE_KIND and metadata.get("version") == BASELINE_VERSION
+            and metadata.get("coreDirty") is False and installed.get("coreDirty") is False
+            and isinstance(source, str) and re.fullmatch(r"[0-9a-f]{40}", source)
+            and source == installed.get("coreCommit") == pin.get("commit")
+            and installed.get("repository") == pin.get("repository") == "chummumm/mihomo-optimized",
+            "core_fixture_baseline_source_mismatch")
+    require(isinstance(metadata.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]),
+            "core_fixture_baseline_checksum_invalid")
+    require(isinstance(metadata.get("goToolchain"), str)
+            and metadata["goToolchain"].startswith("go version ")
+            and metadata["goToolchain"] == installed.get("goToolchain"),
+            "core_fixture_baseline_toolchain_mismatch")
+    source_time = metadata.get("sourceTime")
+    require(isinstance(source_time, str) and 20 <= len(source_time) <= 40,
+            "core_fixture_baseline_source_time_invalid")
+    try:
+        parsed_time = datetime.fromisoformat(source_time.replace("Z", "+00:00"))
+    except ValueError:
+        raise SmokeFailure("core_fixture_baseline_source_time_invalid") from None
+    require(parsed_time.tzinfo is not None, "core_fixture_baseline_source_time_invalid")
+    flags = ("-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=" + BASELINE_VERSION
+             + " -X github.com/metacubex/mihomo/constant.BuildTime=" + source_time)
+    require(metadata.get("buildFlags") == ["-tags", "with_gvisor", "-trimpath", "-ldflags", flags],
+            "core_fixture_baseline_build_flags_mismatch")
+    # Only reviewed build facts enter the report; this executable is never
+    # represented as a published old release or as the official update target.
+    return {key: metadata[key] for key in (
+        "kind", "source", "version", "sha256", "coreDirty", "goToolchain", "sourceTime", "buildFlags")}
+
+
 class CoreUpdateAcceptance(Acceptance):
     def __init__(self, app: Path, artifacts: Path) -> None:
         super().__init__(app, artifacts)
@@ -84,11 +126,14 @@ class CoreUpdateAcceptance(Acceptance):
         self.original_core_hash: str | None = None
         self.baseline_core: Path | None = None
         self.baseline_core_hash: str | None = None
+        self.legacy_core: Path | None = None
+        self.legacy_core_hash: str | None = None
         self.core_replaced = False
         self.report_path = artifacts.parent / "core-update.json"
-        self.report["baseline"] = {"version": BASELINE_VERSION, "source": BASELINE_SOURCE,
-            "url": RELEASE_ROOT + BASELINE_VERSION + "/" + BASELINE_ARCHIVE,
-            "archiveSha256": BASELINE_SHA256}
+        self.report["baseline"] = {"kind": BASELINE_KIND, "version": BASELINE_VERSION, "published": False}
+        self.report["unsupportedPublishedCore"] = {"version": LEGACY_VERSION, "source": LEGACY_SOURCE,
+            "url": RELEASE_ROOT + LEGACY_VERSION + "/" + LEGACY_ARCHIVE,
+            "archiveSha256": LEGACY_SHA256}
         self.report["scenarios"] = {}
 
     def checkpoint(self) -> None:
@@ -113,21 +158,44 @@ class CoreUpdateAcceptance(Acceptance):
                 "core_fixture_process_still_running")
 
     def prepare_baseline(self) -> None:
-        self.stage = "baseline_download"
+        self.stage = "source_built_baseline"
         self.temporary = tempfile.TemporaryDirectory(prefix="mihomo-core-update-smoke-")
         directory = Path(self.temporary.name)
         self.original_core = directory / "original-core.exe"
         shutil.copyfile(self.core, self.original_core)
         self.original_core_hash = file_hash(self.original_core)
-        archive = directory / BASELINE_ARCHIVE
-        manifest = directory / "SHA256SUMS"
-        download_fixture("SHA256SUMS", manifest, 1024 * 1024)
-        entries = [match[1].lower() for line in manifest.read_text(encoding="utf-8").splitlines()
-                   if (match := re.fullmatch(r"([0-9a-fA-F]{64}) [ *]" + re.escape(BASELINE_ARCHIVE), line))]
-        require(entries == [BASELINE_SHA256], "core_fixture_published_checksum_changed")
-        download_fixture(BASELINE_ARCHIVE, archive, 64 * 1024 * 1024)
-        require(file_hash(archive) == BASELINE_SHA256, "core_fixture_archive_checksum_mismatch")
+        installed = json.loads((self.app.parent / "resources" / "build-info.json").read_text(encoding="utf-8-sig"))
+        pin = json.loads(Path(__file__).resolve().parents[1].joinpath("core.json").read_text(encoding="utf-8"))
+        manifest = BASELINE_DIRECTORY / "build-info.json"
+        require(manifest.is_file() and 0 < manifest.stat().st_size <= 65536,
+                "core_fixture_baseline_manifest_missing")
+        metadata = validate_baseline_metadata(json.loads(manifest.read_text(encoding="utf-8")), installed, pin)
+        require(installed.get("runtimeFiles", {}).get(self.core.name) == self.original_core_hash,
+                "core_fixture_installed_manifest_hash_mismatch")
+        prepared = BASELINE_DIRECTORY / "baseline-core.exe"
+        require(prepared.is_file() and 0 < prepared.stat().st_size <= 256 * 1024 * 1024
+                and file_hash(prepared) == metadata["sha256"],
+                "core_fixture_prepared_baseline_checksum_mismatch")
         self.baseline_core = directory / "baseline-core.exe"
+        shutil.copyfile(prepared, self.baseline_core)
+        self.baseline_core_hash = file_hash(self.baseline_core)
+        require(self.baseline_core_hash == metadata["sha256"]
+                and executable_version(self.baseline_core) == BASELINE_VERSION,
+                "core_fixture_baseline_copy_or_version_mismatch")
+        self.report["baseline"].update({**metadata, "executableSha256": self.baseline_core_hash,
+                                       "minimumOfficialTarget": "mihomo-optimized-v1.0.35"})
+        self.mark("source_built_baseline_verified")
+
+        self.stage = "published_legacy_download"
+        archive = directory / LEGACY_ARCHIVE
+        published_manifest = directory / "SHA256SUMS"
+        download_legacy_fixture("SHA256SUMS", published_manifest, 1024 * 1024)
+        entries = [match[1].lower() for line in published_manifest.read_text(encoding="utf-8").splitlines()
+                   if (match := re.fullmatch(r"([0-9a-fA-F]{64}) [ *]" + re.escape(LEGACY_ARCHIVE), line))]
+        require(entries == [LEGACY_SHA256], "core_fixture_published_checksum_changed")
+        download_legacy_fixture(LEGACY_ARCHIVE, archive, 64 * 1024 * 1024)
+        require(file_hash(archive) == LEGACY_SHA256, "core_fixture_archive_checksum_mismatch")
+        self.legacy_core = directory / "published-legacy-core.exe"
         with zipfile.ZipFile(archive) as package:
             entries = package.infolist()
             require(len(entries) == 1, "core_fixture_archive_members_invalid")
@@ -136,15 +204,15 @@ class CoreUpdateAcceptance(Acceptance):
                     and not stat.S_ISLNK(entry.external_attr >> 16)
                     and 0 < entry.file_size <= 256 * 1024 * 1024,
                     "core_fixture_archive_executable_invalid")
-            with package.open(entry) as source, self.baseline_core.open("xb") as destination:
+            with package.open(entry) as source, self.legacy_core.open("xb") as destination:
                 shutil.copyfileobj(source, destination, 1024 * 1024)
-            require(self.baseline_core.stat().st_size == entry.file_size,
+            require(self.legacy_core.stat().st_size == entry.file_size,
                     "core_fixture_archive_size_mismatch")
-        require(executable_version(self.baseline_core) == BASELINE_VERSION,
-                "core_fixture_baseline_version_mismatch")
-        self.baseline_core_hash = file_hash(self.baseline_core)
-        self.report["baseline"]["executableSha256"] = self.baseline_core_hash
-        self.mark("published_baseline_verified")
+        require(executable_version(self.legacy_core) == LEGACY_VERSION,
+                "core_fixture_published_legacy_version_mismatch")
+        self.legacy_core_hash = file_hash(self.legacy_core)
+        self.report["unsupportedPublishedCore"]["executableSha256"] = self.legacy_core_hash
+        self.mark("published_legacy_fixture_verified")
 
     def verify_protected_installation(self) -> None:
         import pywintypes
@@ -194,6 +262,62 @@ class CoreUpdateAcceptance(Acceptance):
         require(all(not path.exists() for path in self.update_files()),
                 "core_update_transaction_not_cleaned")
 
+    def unsupported_published_core(self) -> None:
+        self.stage = "published_legacy_discovery_rejected"
+        self.require_idle_installation()
+        require(all(not path.exists() for path in self.update_files()), "core_fixture_update_already_pending")
+        device = "MihomoCoreUpdateLegacy" + secrets.token_hex(6)
+        native = NativeTunIdentity()
+        native.require_unused(device)
+        self.core_replaced = True
+        shutil.copyfile(self.legacy_core, self.core)
+        require(file_hash(self.core) == self.legacy_core_hash and executable_version(self.core) == LEGACY_VERSION,
+                "core_fixture_published_legacy_seed_failed")
+        self.verify_protected_installation()
+        content = profile(0, self.socks.server_address[1]).replace("MihomoSmokeTun", device)
+        content = content.replace("nameserver: [1.1.1.1]", "nameserver: [system]")
+        content += f"core-auto-update: false\ncore-update-interval: {INTERVAL_HOURS}\n"
+        configuration = self.directory / "config.yaml"
+        configuration.write_text(content, encoding="utf-8", newline="")
+        (self.directory / "preferences.json").write_text(json.dumps({
+            "desiredRunning": False, "systemProxy": False, "tun": True}), encoding="utf-8")
+        row = self.report["unsupportedPublishedCore"]
+        row.update({"requestedTun": True, "configuredDevice": device, "automaticUpdateEnabled": False,
+                    "expectedErrorCode": "core_controller_incompatible"})
+        self.service_owned = True
+        self.service_action("install")
+        wait_until(service_installed, "core_update_service_install_timeout", 15)
+        row["service"] = self.service_process_access()
+        row["guiToken"] = self.launch_gui(self.artifacts / "unsupported-published-core")
+        self.phase("stopped")
+        started = time.monotonic()
+        self.driver.invoke("desktop_start", expected_error="core_controller_incompatible")
+        row["rejectionMilliseconds"] = round((time.monotonic() - started) * 1000)
+        status = self.status()
+        row["statusAfterRejection"] = {key: status.get(key) for key in
+            ("phase", "errorCode", "desiredRunning", "pid", "operation", "processState", "controlState")}
+        self.checkpoint()
+        require(status.get("phase") in ("failed", "error") and status.get("errorCode") == "core_controller_incompatible"
+                and status.get("desiredRunning") is False and status.get("controller") is None
+                and status.get("pid") is None and status.get("operation") is None,
+                "core_fixture_legacy_rejection_not_terminal")
+        # Rejection returns only after startup cleanup confirms the child has
+        # exited. Do not turn an unconfirmed owner into an eventual-pass wait.
+        require(not self.processes.at_paths([self.core]), "core_fixture_legacy_core_survived_rejection")
+        native.require_unused(device)
+        task = self.driver.invoke("desktop_core_update_status")
+        require(task.get("auto_update") is False and not task.get("request_id"),
+                "core_fixture_legacy_negative_case_started_update")
+        require(configuration.read_bytes() == content.encode("utf-8")
+                and file_hash(self.core) == self.legacy_core_hash,
+                "core_fixture_legacy_rejection_changed_source_or_binary")
+        row.update({"ownedCoreExitConfirmed": True, "controllerWithdrawn": True,
+                    "noTunAdapterCreated": True, "yamlUnchanged": True, "publishedBinaryUnchanged": True})
+        self.close_scenario()
+        native.require_unused(device)
+        row["installationAndServiceIdleAfterCleanup"] = True
+        self.mark("published_legacy_discovery_rejected")
+
     def seed_scenario(self, name: str, *, running: bool, tun: bool) -> tuple[dict, int, str]:
         self.stage = name + "_prepare"
         self.require_idle_installation()
@@ -217,6 +341,7 @@ class CoreUpdateAcceptance(Acceptance):
         (self.directory / "preferences.json").write_text(json.dumps({
             "desiredRunning": running, "systemProxy": False, "tun": tun}), encoding="utf-8")
         row = {"runningIntent": running, "tunIntent": tun, "baselineVersion": BASELINE_VERSION,
+               "baselineKind": BASELINE_KIND, "baselineSource": self.report["baseline"]["source"],
                "baselineSha256": self.baseline_core_hash, "observations": [],
                "manualUpdateCommands": 0, "trigger": "applied_yaml" if running else "startup_yaml"}
         self.report["scenarios"][name] = row
@@ -337,7 +462,12 @@ class CoreUpdateAcceptance(Acceptance):
         if running:
             before = self.phase("running")
             self.observe_intent(running=True, tun=tun)
-            previous_pid = self.managed_core(before)["pid"]
+            identity = self.managed_core(before)
+            previous_pid = identity["pid"]
+            require(identity.get("api_version") == 1 and isinstance(identity.get("core_instance"), str)
+                    and identity["core_instance"], "core_fixture_baseline_managed_protocol_invalid")
+            row["baselineController"] = {"managedApiVersion": identity["api_version"],
+                                         "pid": previous_pid, "coreInstance": identity["core_instance"]}
             row["baselineCoreAccount"] = self.service_core_account(before)
             require(self.runtime_json("version").get("version") == BASELINE_VERSION,
                     "core_update_baseline_not_running")
@@ -391,6 +521,8 @@ class CoreUpdateAcceptance(Acceptance):
             row["stayedStopped"] = True
         row["yamlSha256"] = hashlib.sha256(source).hexdigest()
         row["updatedSha256"] = updated_hash
+        row["target"] = {"kind": "official_latest_release", "version": item["current_version"],
+                         "executableSha256": updated_hash}
         row["yamlUnchanged"] = True
         row["intentPreserved"] = True
         self.verify_core_row(row)
@@ -447,6 +579,7 @@ class CoreUpdateAcceptance(Acceptance):
         self.socks = SocksFixture()
         sidecars = {path: file_hash(path) for path in (self.app, self.host, self.helper)}
         self.prepare_baseline()
+        self.unsupported_published_core()
         self.scenario("running_auto_update", running=True, tun=False)
         self.scenario("tun_auto_update", running=True, tun=True)
         self.scenario("stopped_auto_update", running=False, tun=True)
@@ -519,7 +652,8 @@ def main() -> int:
                 acceptance.cleanup()
             except Exception as error:
                 acceptance.report["diagnostics"].append({"stage": "cleanup", "code": "unexpected_" + type(error).__name__})
-            required = {"published_baseline_verified", "running_auto_update", "tun_auto_update",
+            required = {"source_built_baseline_verified", "published_legacy_fixture_verified",
+                        "published_legacy_discovery_rejected", "running_auto_update", "tun_auto_update",
                         "stopped_auto_update", "desktop_application_unchanged", "final_cleanup", "original_bundle_restored"}
             acceptance.report["passed"] = all(acceptance.report["tests"].get(name) is True for name in required) and not acceptance.report["diagnostics"]
             acceptance.checkpoint()
