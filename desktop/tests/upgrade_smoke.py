@@ -724,6 +724,7 @@ def main() -> int:
                         "same_product_tun_active_owner_preserved",
                         "same_product_tun_close_immediate_recreate",
                         "same_product_tun_forced_exit_recreate",
+                        "desktop_tun_repeated_restart",
                         "tun_failure_lifecycle_and_fast_toggle",
                         "configured_tun_name_upgrade_and_rollback",
                         "candidate_reinstalled_for_gui", "final_cleanup"}

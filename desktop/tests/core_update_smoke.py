@@ -47,7 +47,7 @@ LEGACY_ARCHIVE = LEGACY_VERSION + "-windows-amd64.zip"
 LEGACY_SHA256 = "6c213cc5ff1755900956711225dfefd55109339e9b6aa170167b6198054e4f49"
 RELEASE_ROOT = "https://github.com/chummumm/mihomo-optimized/releases/download/"
 ARCHIVE_MEMBER = "mihomo-optimized-windows-amd64.exe"
-MINIMUM_UPDATED_VERSION = (1, 0, 35)
+MINIMUM_UPDATED_VERSION = (1, 0, 36)
 INTERVAL_HOURS = 24
 UPDATE_TIMEOUT = 660
 
@@ -199,7 +199,7 @@ class CoreUpdateAcceptance(Acceptance):
                 and executable_version(self.baseline_core) == BASELINE_VERSION,
                 "core_fixture_baseline_copy_or_version_mismatch")
         self.report["baseline"].update({**metadata, "executableSha256": self.baseline_core_hash,
-                                       "minimumOfficialTarget": "mihomo-optimized-v1.0.35"})
+                                       "minimumOfficialTarget": "mihomo-optimized-v1.0.36"})
         self.mark("source_built_baseline_verified")
 
         self.stage = "published_legacy_download"
