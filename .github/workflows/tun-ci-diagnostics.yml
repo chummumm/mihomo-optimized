@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 2b3626c07d39cba53a129d8472e1a9c9bf037908
+          ref: 88913fb12efcdbfbc74eb5840d477744b1fbca9f
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -29,8 +29,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
-          python -m pyflakes scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
+          python -m py_compile scripts/desktop-release-notes.py scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
+          python -m pyflakes scripts/desktop-release-notes.py scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
           python desktop/tests/upgrade_tun_http_test.py
           python desktop/tests/core_update_fixture_test.py
       - name: Install pinned Rust compiler and formatter
