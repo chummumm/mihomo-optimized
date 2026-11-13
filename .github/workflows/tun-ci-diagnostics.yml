@@ -1,53 +1,47 @@
-name: Validate controller discovery integration
+name: Inspect saved core update rejection
 on:
   push:
     branches: [diagnostics/windows-tun-ci-43368503742]
 permissions:
   contents: read
+  actions: read
 jobs:
-  contracts:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-2022]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    env:
-      CARGO_INCREMENTAL: '0'
-      RUSTFLAGS: ${{ matrix.os == 'windows-2022' && '-C target-feature=+crt-static' || '' }}
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Download existing failed-run evidence
+        uses: actions/download-artifact@v4
         with:
-          ref: f9b0c045973529f4e17d8caaba5bd71dbe851e19
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install Python static checker
-        run: python -m pip install pyflakes==3.4.0
-      - name: Validate source and fixture contracts
-        shell: bash
+          artifact-ids: '14017082034'
+          path: evidence
+          merge-multiple: true
+          repository: chummumm/mihomo-optimized
+          run-id: '43380485216'
+          github-token: ${{ github.token }}
+      - name: Read bounded saved rejection state
+        shell: python
         run: |
-          set -euo pipefail
-          python -m py_compile scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
-          python -m pyflakes scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
-          python desktop/tests/upgrade_tun_http_test.py
-          python desktop/tests/core_update_fixture_test.py
-      - name: Install pinned Rust compiler and formatter
-        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt
-      - name: Reuse existing Windows compilation cache
-        if: runner.os == 'Windows'
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: desktop-native-windows-msvc-v2-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: desktop-native-windows-msvc-v2-
-      - name: Check Rust source format
-        working-directory: src-tauri
-        run: cargo +1.99.1 fmt --all -- --check
-      - name: Exercise portable and native library contracts
-        working-directory: src-tauri
-        run: cargo +1.99.1 test --locked --lib
+          import json, re
+          from pathlib import Path
+          root = Path('evidence')
+          files = [p for p in root.rglob('*') if p.is_file()]
+          print('ARTIFACT_FILES', json.dumps([{'name': str(p.relative_to(root)), 'bytes': p.stat().st_size} for p in files]))
+          path = next(root.rglob('core-update.json'))
+          assert 0 < path.stat().st_size <= 1024 * 1024
+          data = json.loads(path.read_text(encoding='utf-8-sig'))
+          def clean(value):
+              if isinstance(value, dict):
+                  return {key: ('<redacted>' if key.lower() in ('secret', 'token', 'password', 'authorization') else clean(item)) for key, item in value.items()}
+              if isinstance(value, list):
+                  return [clean(item) for item in value]
+              if isinstance(value, str):
+                  value = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', value)
+                  value = re.sub(r'https?://[^\s\"<>]+', '<url>', value)
+                  value = re.sub(r'(?i)(authorization|secret|token|password)(\s*[=:]\s*)[^\s,;]+', r'\1\2<redacted>', value)
+                  return value[-20000:]
+              return value
+          out = {key: data.get(key) for key in ('stage', 'passed', 'tests', 'diagnostics', 'unsupportedPublishedCore', 'baseline', 'scenarios')}
+          print('CORE_UPDATE_SAVED_EVIDENCE_BEGIN')
+          print(json.dumps(clean(out), ensure_ascii=True, indent=2))
+          print('CORE_UPDATE_SAVED_EVIDENCE_END')
