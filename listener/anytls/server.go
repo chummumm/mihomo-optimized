@@ -1,6 +1,7 @@
 package anytls
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/common/buf"
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
 	C "github.com/metacubex/mihomo/constant"
@@ -24,7 +26,6 @@ import (
 	"github.com/metacubex/mihomo/transport/anytls/session"
 
 	"github.com/metacubex/sing/common/auth"
-	"github.com/metacubex/sing/common/bufio"
 	M "github.com/metacubex/sing/common/metadata"
 	"github.com/metacubex/tls"
 )
@@ -214,8 +215,6 @@ func (l *Listener) HandleConn(conn net.Conn, h *sing.ListenerHandler) {
 	if err != nil {
 		return
 	}
-	conn = bufio.NewCachedConn(conn, b)
-
 	by, err := b.ReadBytes(32)
 	if err != nil {
 		return
@@ -238,6 +237,12 @@ func (l *Listener) HandleConn(conn net.Conn, h *sing.ListenerHandler) {
 			return
 		}
 	}
+
+	// Session callbacks can close the connection while its receive loop reads.
+	// Keep the remaining first-packet bytes independent of the pooled buffer:
+	// this cache only reads the prefix, and Close touches the transport alone.
+	conn = N.NewCachedConn(conn, bytes.Clone(b.Bytes()))
+	b.Release()
 
 	session := session.NewServerSession(conn, func(stream *session.Stream) {
 		defer stream.Close()
