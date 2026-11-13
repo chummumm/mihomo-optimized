@@ -130,6 +130,131 @@ func TestDesktopNativeExclusiveAdapterLifecycle(t *testing.T) {
 	}
 }
 
+func TestDesktopNativeExclusiveAdapterIPHelperResidue(t *testing.T) {
+	requireDesktopNativeIntegration(t)
+	if runDesktopNativeHarness(t) {
+		return
+	}
+
+	var nonce [12]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("MihomoIPHelper-%x", nonce)
+	options := desktopNativeFixtureOptions(name)
+	owned, err := NewExclusive(options)
+	if err != nil {
+		t.Fatalf("create product interface fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		if owned != nil {
+			_ = owned.Close()
+		}
+	})
+	native, ok := owned.(*NativeTun)
+	if !ok || native.InterfaceLUID() == 0 {
+		t.Fatal("product interface fixture has no native adapter")
+	}
+	row, err := winipcfg.LUID(native.InterfaceLUID()).Interface()
+	if err != nil {
+		t.Fatalf("read actual product IP Helper row: %v", err)
+	}
+	expectedGUID := *generateExclusiveGUIDByDeviceName(name)
+	if row.InterfaceLUID != winipcfg.LUID(native.InterfaceLUID()) || row.InterfaceGUID != expectedGUID ||
+		row.Alias() != name || row.InterfaceIndex == 0 || row.Type != winipcfg.IfTypePropVirtual {
+		t.Fatalf("native product row does not carry the required identity: luid=%d index=%d guid=%s alias=%q description=%q type=%d",
+			row.InterfaceLUID, row.InterfaceIndex, row.InterfaceGUID, row.Alias(), row.Description(), row.Type)
+	}
+	identity, err := queryWindowsAdapter(name, expectedGUID)
+	if err != nil || !identity.matchesProduct(name, expectedGUID) || identity.Phantom {
+		t.Fatalf("product fixture has invalid native identity: identity=%+v err=%v", identity, err)
+	}
+	assertDesktopNativeSession(t, native)
+	snapshot := windowsInterfaceIdentity{
+		Alias: row.Alias(), Description: row.Description(), GUID: row.InterfaceGUID,
+		LUID: uint64(row.InterfaceLUID), Index: row.InterfaceIndex, Type: uint32(row.Type),
+		OperStatus: uint32(row.OperStatus), AdminState: uint32(row.AdminStatus),
+		Flags: uint8(row.InterfaceAndOperStatusFlags),
+	}
+	t.Logf("actual product IP Helper identity: %v; native instance=%q", snapshot, identity.InstanceID)
+
+	// Capture real OS metadata, then deterministically expose the split snapshot
+	// seen during removal: the IP Helper row remains while PnP no longer finds it.
+	// Only observation is substituted; both owner checks and recreation use the
+	// production constructor and the actual Wintun/SwDeviceCreate implementation.
+	originalInspect, originalCreate := inspectExclusiveWindowsAdapter, createExclusiveWindowsAdapter
+	t.Cleanup(func() {
+		inspectExclusiveWindowsAdapter, createExclusiveWindowsAdapter = originalInspect, originalCreate
+	})
+	inspections, creates := 0, 0
+	inspectExclusiveWindowsAdapter = func(requested string) (windowsAdapterInspection, error) {
+		inspections++
+		if requested != name {
+			t.Fatalf("unexpected fixture alias %q", requested)
+		}
+		return inspectWindowsAdapterInterfaces(requested, []windowsInterfaceIdentity{snapshot}, func(string, windows.GUID) (windowsAdapterIdentity, error) {
+			return windowsAdapterIdentity{}, os.ErrNotExist
+		})
+	}
+	createExclusiveWindowsAdapter = func(requested Options) (windowsAdapter, error) {
+		creates++
+		return originalCreate(requested)
+	}
+
+	// Missing PnP observation must never weaken native creator exclusivity, even
+	// when every captured IP Helper product field matches the requested device.
+	conflicting, conflictErr := NewExclusive(options)
+	if conflicting != nil {
+		t.Cleanup(func() { _ = conflicting.Close() })
+	}
+	if conflicting != nil || !errors.Is(conflictErr, windows.ERROR_ALREADY_EXISTS) || inspections != 1 || creates != 1 ||
+		!strings.Contains(conflictErr.Error(), "stage=create reason=native_busy") {
+		t.Fatalf("IP Helper fallback bypassed native live ownership: adapter=%v err=%v inspections=%d creates=%d",
+			conflicting, conflictErr, inspections, creates)
+	}
+	heldRow, err := winipcfg.LUID(snapshot.LUID).Interface()
+	if err != nil || heldRow.InterfaceGUID != snapshot.GUID || heldRow.InterfaceLUID != winipcfg.LUID(snapshot.LUID) ||
+		heldRow.Alias() != name || heldRow.Type != winipcfg.IfTypePropVirtual {
+		t.Fatalf("live product interface changed after native contention: row=%+v err=%v", heldRow, err)
+	}
+	heldIdentity, err := queryWindowsAdapter(name, expectedGUID)
+	if err != nil || !heldIdentity.matchesProduct(name, expectedGUID) || heldIdentity.InstanceID != identity.InstanceID || heldIdentity.Phantom {
+		t.Fatalf("live native identity changed after contention: before=%+v after=%+v err=%v", identity, heldIdentity, err)
+	}
+	assertDesktopNativeSession(t, native)
+
+	// Do not wait for removal and do not retry NewExclusive. Keep the captured row
+	// for the entire call even if the real IP Helper table has already caught up.
+	// This makes the reported split-enumeration regression deterministic on CI.
+	if err := owned.Close(); err != nil {
+		t.Fatalf("close owned product fixture: %v", err)
+	}
+	owned = nil
+	inspections, creates = 0, 0
+	started := time.Now()
+	owned, err = NewExclusive(options)
+	if err != nil || inspections != 1 || creates != 1 {
+		t.Fatalf("single recreate through captured IP Helper residue failed after %s: err=%v inspections=%d creates=%d",
+			time.Since(started), err, inspections, creates)
+	}
+	native, ok = owned.(*NativeTun)
+	if !ok || native.InterfaceLUID() == 0 {
+		t.Fatal("IP Helper residue recovery has no native adapter")
+	}
+	recoveredRow, err := winipcfg.LUID(native.InterfaceLUID()).Interface()
+	if err != nil || recoveredRow.InterfaceGUID != expectedGUID || recoveredRow.Alias() != name ||
+		recoveredRow.InterfaceIndex == 0 || recoveredRow.Type != winipcfg.IfTypePropVirtual {
+		t.Fatalf("IP Helper residue recreation has the wrong actual interface: row=%+v err=%v", recoveredRow, err)
+	}
+	recoveredIdentity, err := queryWindowsAdapter(name, expectedGUID)
+	if err != nil || !recoveredIdentity.matchesProduct(name, expectedGUID) || recoveredIdentity.Phantom {
+		t.Fatalf("IP Helper residue recreation has no verified native identity: identity=%+v err=%v", recoveredIdentity, err)
+	}
+	assertDesktopNativeSession(t, native)
+	t.Logf("single IP Helper residue recreate completed in %s: previousLUID=%d currentLUID=%d instance=%q description=%q",
+		time.Since(started), snapshot.LUID, native.InterfaceLUID(), recoveredIdentity.InstanceID, recoveredRow.Description())
+}
+
 func requireDesktopNativeIntegration(t *testing.T) {
 	t.Helper()
 	if os.Getenv("MIHOMO_TUN_INTEGRATION") != "1" {

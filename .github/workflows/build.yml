@@ -403,7 +403,15 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.35
+              printf '%s\n\n' '## 本次更新：1.0.36
+
+          - 修复重启内核时 PnP 设备已移除、网络接口表仍残留旧记录导致的 native_identity_missing。单一产品专属 GUID、名称、虚拟接口类型和有效 LUID/索引匹配时，由 Windows 原生创建协调移除时序。
+          - 保留 utun 名称、原生活跃拥有者排他和创建后句柄校验；同名不同 GUID、身份冲突及查询错误继续拒绝。不扩大 500 毫秒等待、不循环重启、不按名称接管已有网卡。
+          - 增加固定残留快照的 Windows 原生回归，验证活跃拥有者保护及关闭后单次重建。配套桌面 0.2.12 增加连续 20 次完整重启与真实 TUN 转发验收。
+
+          [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.36/docs/releases.md)
+
+          ## 1.0.35
 
           - 受管内核自身原子绑定系统分配的控制端口，通过固定位置的有界启动记录交接实际地址；新版桌面核验本次启动标识、PID 与核心实例，再执行原有认证和就绪检查。
           - 控制端口绑定或记录发布失败会立即作为启动失败返回，并清理已创建资源；相同实例重载保留控制监听器。

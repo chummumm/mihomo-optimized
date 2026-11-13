@@ -204,22 +204,27 @@ deadline; the published failure does not release its ownership or permit a secon
 constructor. Process shutdown is the supervisor's escalation boundary, and exit
 must be confirmed before another core starts.
 
-From core 1.0.28, exclusive Windows creation uses a stable product-specific
-requested GUID namespace and the creation-time `Mihomo Optimized` tunnel marker.
-A forced process exit can leave a registered, non-present software device even
-after all process handles are gone. An existing alias permits re-enumeration only
-when its actual GUID, name, exact `SWD\Wintun` instance, network class and native
-properties match, and Configuration Manager definitively reports a phantom
-instance. A down, disabled or problem-state device is not sufficient. The normal
-Wintun create API then requests the same instance; Windows permits only one
-software-device handle per instance and arbitrates a concurrent live owner.
-This is native exclusivity, not an inference from an old PID. The guard never
-opens an existing adapter, removes or renames it, or calls global orphan cleanup.
-Uncertain identity and active/foreign aliases remain conflicts. Legacy shared
-`Meta`/GUID residue cannot prove this identity: stop the original owner before
-upgrading, or choose an unused `tun.device` name. Normal shutdown retains the
-explicit owned-device uninstall path. Native lifecycle references and the
-forced-exit regression are documented in the [dependency patch](../third_party/sing-tun/MIHOMO_PATCH.md).
+Exclusive Windows creation uses a stable product-specific requested GUID
+namespace and the creation-time `Mihomo Optimized` tunnel marker. Core 1.0.34
+admits an existing PnP instance when its actual GUID, name, network class and
+native product properties match, without requiring it to be phantom first.
+Core 1.0.36 also handles normal removal when the PnP query finds no matching
+device but IP Helper still returns exactly one product-GUID/name interface row
+with a nonzero LUID/index and Wintun's virtual interface type. Its description
+is diagnostic only: NetCfg can decorate descriptions, and link state does not
+prove ownership. A native query error or a known PnP mismatch cannot take this path.
+
+Both paths request the same software-device instance through ordinary Create.
+Windows arbitrates an outstanding creator handle and queues creation while
+previous removal completes; a missing PnP observation alone does not prove an
+owner exited. The constructor checks the returned handle's actual GUID before
+assigning addresses/routes. The supervisor still confirms its old process exit.
+The guard never opens an existing adapter, removes or renames it, or explicitly
+calls global orphan cleanup. Different-GUID aliases and ambiguous/unverified
+identities remain protected. Legacy shared `Meta`/GUID residue does not match
+this product namespace. Normal shutdown retains the explicit owned-device
+uninstall path. Native lifecycle references and deterministic residual-snapshot
+tests are documented in the [dependency patch](../third_party/sing-tun/MIHOMO_PATCH.md).
 
 Legacy `POST /desktop/recover` retains the empty body/query contract and the old
 result schema (`pid`, `tun`, `status`, optional `error`). It starts/coalesces the

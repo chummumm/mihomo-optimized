@@ -17,27 +17,28 @@ The Windows ownership changes are limited to `tun_windows.go`,
   Wintun supplies the name, device description and friendly name as initial
   software-device properties, so the identity exists before a later controller
   health publication. Generic upstream `New` retains its original namespace.
-- Before calling Wintun, a read-only interface-table check rejects a conflicting
-  alias, including a down or hidden interface, with a fixed 500 ms grace for
-  asynchronous removal. There is one narrow exception: the actual interface
-  GUID, alias, exact `SWD\Wintun` instance, network class, Wintun hardware ID and
-  product properties must all match, and `CM_Get_DevNode_Status` must return
-  exactly `CR_NO_SUCH_DEVINST` for that enumerated instance. Only then may normal
-  creation request the same non-present software-device instance. A down,
-  disabled or problem-state device is still present and cannot qualify. Native
-  query errors prevent creation; foreign and unverified aliases remain conflicts.
+- Before calling Wintun, a read-only interface-table check rejects a different
+  GUID using the same alias, including a down or hidden interface. Unverified
+  conflicting names retain the fixed 500 ms removal grace. A matching PnP
+  instance is admitted using its actual NetCfgInstanceId, name, network class,
+  Wintun hardware ID and product properties. Its real instance ID is read from
+  Windows, and its present/phantom state does not decide creator ownership.
+- Normal close can remove the PnP record before IP Helper withdraws its row.
+  If the native query returns its exact no-match sentinel, a single row with
+  the product GUID, requested alias, nonzero LUID/index and Wintun interface
+  type 53 can enter Create immediately. Description is recorded for diagnostics
+  but is not a fixed marker: NetCfg makes ifDescr unique and drivers may change
+  it. Neither a query error nor a known PnP mismatch can use this path. The
+  no-match result is an observation, not proof of creator death or a complete
+  historical ownership record.
+- These paths use ordinary Create with the exact requested instance, never
+  Open, explicit removal or an explicit global orphan-cleanup call. Windows
+  allows only one software-device handle per instance and queues same-instance
+  creation behind previous removal. The actual returned handle GUID is checked
+  before addresses/routes are assigned. The caller still confirms its old
+  process exit. Generic legacy `Meta`/shared-GUID interfaces remain protected.
   The read-only guard does not atomically reserve aliases against another
   application's simultaneous creation of a different instance.
-- The exception repairs forced-process-exit residue. Normal Wintun close
-  explicitly removes its device; process termination can leave the non-present
-  registration and its alias behind. The old guard prevented all Wintun calls,
-  leaving this residue indefinitely. Re-enumeration uses ordinary Create with
-  the exact requested instance, never Open, explicit removal or an explicit
-  global orphan-cleanup call. Windows allows only one software-device handle per
-  instance and arbitrates a competing live owner. This is native exclusivity,
-  not proof of prior PID death. The caller still confirms its old process exit.
-  Unknown legacy `Meta`/shared-GUID residue remains a conflict: stop its original
-  owner normally before upgrading or select an unused `tun.device` name.
 - `NewExclusive` also refuses to open a pre-existing adapter after a failed
   create. Mihomo uses this entry point; upstream `New` retains its original
   semantics.
@@ -55,16 +56,22 @@ The Windows ownership changes are limited to `tun_windows.go`,
 `tun_ownership_windows_test.go` verifies with a fake clock that persistent alias
 conflicts and lookup failures never reach the adapter factory, alias removal
 within the fixed grace period permits exactly one create, and an absent alias
-permits immediate creation. It rejects every mismatched identity and all present
-devices, including down/problem state; only an exact verified phantom is admitted.
+permits immediate creation. Verified product PnP instances and the qualified
+IP Helper-only residual row reach exactly one native creation without waiting.
+Every mismatched native identity, incomplete residual row and query error remains
+rejected; display descriptions cannot change the decision.
 It also verifies failed creation never opens an existing adapter, deterministic
 adapter cleanup and early route failure, without configuring a real interface.
 `tun_ownership_integration_windows_test.go`, gated by
 `MIHOMO_TUN_INTEGRATION=1` on an elevated Windows runner, uses separate short-lived
 test processes so Wintun's asynchronous cleanup from a prior scenario cannot
 hide the crash defect. It preserves an independent foreign adapter, verifies
-Close-to-immediate-Create, then rejects a live product owner before any native
-creation call. After forcibly killing and waiting for that exact owner process,
+Close-to-immediate-Create, and confirms native refusal of a live product owner.
+A deterministic residual-window test captures a real interface row, supplies
+that old read-only snapshot with a no-match PnP observation, and verifies both
+live-owner protection and single-call recreation after close. The Wintun calls
+and sessions are real; only the two enumeration views are controlled. After
+forcibly killing and waiting for that exact owner process,
 one production constructor must regain the same product instance/GUID/alias
 with a usable native session. The test counts actual factory invocations and
 does not call native Open or dummy Create before the recovery under test.
@@ -81,6 +88,7 @@ embedded DLL version) and Microsoft's documentation:
   the device registration; immediate same-instance creation is serialized.
 - [SwDeviceSetLifetime](https://learn.microsoft.com/en-us/windows/win32/api/swdevice/nf-swdevice-swdevicesetlifetime): handle lifetime and at most one software-device
   handle per instance.
+- [Network interfaces](https://learn.microsoft.com/en-us/windows/win32/network-interfaces): GUID-based interface identity and mutable/decorated descriptions.
 - [Determining whether a device is plugged in](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/determining-whether-a-device-is-plugged-in):
   definitive phantom detection through `CM_Get_DevNode_Status`.
 
