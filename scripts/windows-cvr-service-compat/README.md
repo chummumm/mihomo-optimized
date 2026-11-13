@@ -53,6 +53,32 @@ Relevant fixed source contracts:
 - [`src/core/runtime_generation/assets.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/core/runtime_generation/assets.rs): the request's absolute source path is mapped by filename to the installer-approved copy in the protected `cores` directory. The harness verifies the actual process runs that copy.
 - [`src/core/manager.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/core/manager.rs) and [`src/core/paths.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/core/paths.rs): the service supplies `-d`, `-f`, `-ext-ctl-pipe` and `LISTEN_NAMEDPIPE_SDDL`. The core pipe is `\\.\pipe\verge-mihomo-production-<SHA256(owner SID)>`; it supplies no `-desktop-managed`.
 
+### GitHub runner file-owner prerequisite
+
+The first actual production-service run reached the official `2.7.7` version
+handshake, but `POST /clash/start` returned HTTP 422 / code 1003 before spawning
+the core: the newly installed core file's owner was outside SYSTEM,
+Administrators and TrustedInstaller. The official installer's `stage_binary`
+creates files with `create_new`, without assigning a Windows file owner; its
+explicit protected owner/DACL setup applies to the directories. The service's
+[`trusted_core_location.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/core/trusted_core_location.rs)
+checks the file owner as well as its access rules and protected parent chain.
+
+The harness now records and, when needed, normalizes **only the freshly installed
+test core's owner** before its first start request. It requires the exact unique
+approved path and SHA-256, rejects every reparse-point ancestor, and checks the
+official service/core directories have trusted owners and protected DACLs. The
+file and those directories must grant full access only to SYSTEM and
+Administrators. The file may inherit these rules from its protected parent.
+
+An already trusted file owner is left unchanged. Only an owner equal to the
+current installer user SID may be changed to Builtin Administrators; other
+owners are rejected. The access-only SDDL must remain identical and the file
+hash must remain unchanged. The report records the actual before/after SIDs,
+access SDDL, hashes and reason. This is a disposable-runner prerequisite, not a
+change to the official service or an exemption from its trust checks. Existing
+installations, other files and the service executable are never normalized.
+
 ## Assertions and cleanup
 
 Two service-managed start/stop cycles run against the same isolated random TUN

@@ -252,6 +252,11 @@ class Acceptance:
         require(info["build_version"] == SERVICE_VERSION and info["protocol"] == {"epoch": 2, "revision": 6},
                 "the installed service is not the pinned production protocol")
         self.report["officialService"]["versionResponse"] = info
+        # The runner's elevated installer token can create a file owned by the
+        # runner user. Meet the official service's owner requirement on only
+        # this fresh approved core, preserving its DACL and attested bytes.
+        self.report["core"]["installationSecurity"] = self.powershell(
+            "NormalizeCoreOwner", CorePath=self.installed_core, CoreSHA256=self.core_digest)
         self.checkpoint()
 
     def cycle(self, number: int) -> None:
