@@ -81,8 +81,9 @@ installations, other files and the service executable are never normalized.
 
 ## Assertions and cleanup
 
-Two service-managed start/stop cycles run against the same isolated random TUN
-name. Each cycle verifies:
+Two service-managed compatibility cycles run against the same isolated random
+TUN name. A separate generation deliberately releases the test's native
+resources after both compatibility cycles pass. Each compatibility cycle verifies:
 
 1. The official service commits the correct owner session and reports a core PID.
 2. The process's executable, digest, parent service PID and actual argument list
@@ -99,7 +100,26 @@ name. Each cycle verifies:
 
 The official Windows service implements this normal **service API stop** using
 `Child.kill`/`TerminateProcess`; the report does not call it graceful in-core
-shutdown. The separate compatibility test covers clean native resource closure.
+shutdown. The observed service can leave its stopped TUN's down IP Helper row.
+The report preserves the snapshot immediately after the second stop, and neither
+compatibility cycle disables TUN before stopping. There is no cleanup between the
+first stop and second start.
+
+Only after both cycles finish successfully, the harness runs one separately
+recorded `harness_resource_release` generation. The same official service starts
+the same approved core and TUN name. The harness checks the file checksum, held
+process identity, parent service, arguments, core version and generic TUN identity
+again. It then sends one `PATCH /configs {"tun":{"enable":false}}` to that core's
+pipe, checking the server PID before the mutation. A subsequent `GET /configs`
+must confirm TUN is disabled, the still-running core must release the interface
+within a bounded read-only wait, and only then does the harness request the final
+official service stop. Its log and report entry are separate from the two
+compatibility cycles. A failure in either compatibility cycle prevents this
+additional start; it is not a retry or recovery of a failed acceptance cycle.
+
+This deliberate resource-release request is test cleanup. The two earlier
+service stop results retain their actual `TerminateProcess` behavior, and the
+separate compatibility test also covers clean native resource closure.
 
 In `finally`, the harness rechecks the registered executable/account, official
 executable checksum and the exact approved test-core set before using the

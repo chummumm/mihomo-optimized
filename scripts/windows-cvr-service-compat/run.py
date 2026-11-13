@@ -259,9 +259,15 @@ class Acceptance:
             "NormalizeCoreOwner", CorePath=self.installed_core, CoreSHA256=self.core_digest)
         self.checkpoint()
 
-    def cycle(self, number: int) -> None:
-        record = {"cycle": number, "startedAt": compat.timestamp()}
-        self.report["cycles"].append(record)
+    def cycle(self, number: int, *, release_resources: bool = False) -> None:
+        if release_resources:
+            record = {"purpose": "harness_resource_release", "startedAt": compat.timestamp()}
+            self.report["harness_resource_release"] = record
+            require(compat.file_hash(self.installed_core) == self.core_digest,
+                    "approved core changed before test resource release")
+        else:
+            record = {"cycle": number, "startedAt": compat.timestamp()}
+            self.report["cycles"].append(record)
         token = secrets.token_hex(32)
         self.tokens.append(token)
         result = self.service_call("POST", "/clash/start", start_payload(self.requested_core, self.config, token))
@@ -298,10 +304,38 @@ class Acceptance:
             else:
                 require(response["status"] == 404, "official service unexpectedly enabled desktop-managed mode")
         record["identity"] = self.windows.generic(self.name)
-        record["forwarding"] = compat.verify_tun_forwarding(
-            self.socks, alive=lambda: not self.windows.process_state(held)["exited"])
+        if release_resources:
+            require(not self.windows.process_state(held)["exited"],
+                    "resource-release core exited before TUN shutdown")
+            release = {"method": "PATCH /configs tun.enable=false", "expectedPid": held["pid"],
+                       "requestedAt": compat.timestamp()}
+            record["tunRelease"] = release
+            self.checkpoint()
+            response = compat.pipe_request(self.pipe, "PATCH", "/configs", {"tun": {"enable": False}},
+                                           expected_pid=held["pid"])
+            require(response["status"] == 204, "test resource release could not disable TUN")
+            response = compat.pipe_request(self.pipe, "GET", "/configs", expected_pid=held["pid"])
+            tun = response["body"].get("tun", {})
+            require(response["status"] == 200 and tun.get("enable") is False,
+                    "test resource release did not confirm disabled TUN")
+            release["confirmedTunConfig"] = tun
+            deadline = time.monotonic() + 10
+            rows = self.windows.interfaces(self.name)
+            while rows and time.monotonic() < deadline:
+                time.sleep(0.1)
+                rows = self.windows.interfaces(self.name)
+            release["remainingInterfaces"] = rows
+            self.checkpoint()
+            require(not rows, "test TUN remained after the explicit resource-release request")
+            require(not self.windows.process_state(held)["exited"],
+                    "resource-release core exited before TUN shutdown was confirmed")
+            release["confirmedAt"] = compat.timestamp()
+        else:
+            record["forwarding"] = compat.verify_tun_forwarding(
+                self.socks, alive=lambda: not self.windows.process_state(held)["exited"])
         log = self.service_call("GET", "/clash/log-snapshot")
-        (self.evidence / f"core-cycle-{number}.log").write_text(self.redact(log), encoding="utf-8")
+        log_name = "core-resource-release.log" if release_resources else f"core-cycle-{number}.log"
+        (self.evidence / log_name).write_text(self.redact(log), encoding="utf-8")
         self.checkpoint()
 
         proof = self.session
@@ -415,6 +449,11 @@ class Acceptance:
             self.prepare()
             self.cycle(1)
             self.cycle(2)
+            # Both compatibility cycles must finish before any deliberate TUN
+            # shutdown. Preserve what the second official forced stop left.
+            self.report["cycles"][-1]["interfacesAfterStop"] = self.windows.interfaces(self.name)
+            self.checkpoint()
+            self.cycle(3, release_resources=True)
             self.report["status"] = "passed"
         except Exception as error:
             self.report.update({"status": "failed", "error": self.redact(str(error))})
