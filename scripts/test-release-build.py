@@ -7,10 +7,13 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 import zipfile
@@ -24,6 +27,110 @@ VERSION = 'mihomo-optimized-v1.0.0'
 LEGACY_VERSION = 'v1.19.32-dns-optimized-8'
 COMMIT = '123456789abcdef0123456789abcdef0123456789'
 TIME = '2026-10-09T02:00:00+00:00'
+
+
+def run_package_fixture(*args, phase, env=None, cwd=None, binary=False, timeout=30):
+    """Bound a real package command and all helpers in its private process group."""
+    label = f'[package fixture: {phase}]'
+    command = shlex.join(os.fspath(arg) for arg in args)
+    print(f'\n{label} start: {command}', file=sys.stderr, flush=True)
+    timed_out = False
+    # dpkg --root still loads host status loggers (for example needrestart).
+    # They can outlive dpkg/fakeroot and keep stderr open. PIPE/communicate()
+    # would wait for their EOF even after the package command itself exited.
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        process = subprocess.Popen(args, cwd=cwd or release.ROOT, env=env,
+                                   stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                   start_new_session=True)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            # Let wrappers finish their own cleanup before the hard stop.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=1)
+        finally:
+            # Also reclaim asynchronous loggers after a successful command.
+            # This group belongs only to this fixture, never to the CI shell.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=4)
+        stdout.seek(0)
+        stderr.seek(0)
+        output, errors = stdout.read(), stderr.read()
+    if timed_out or process.returncode:
+        reason = f'timed out after {timeout}s' if timed_out else f'exited with {process.returncode}'
+        raise AssertionError(f'{label} {reason}: {command}\n'
+                             f'stdout:\n{output[-8192:].decode(errors="replace")}\n'
+                             f'stderr:\n{errors[-8192:].decode(errors="replace")}')
+    print(f'{label} complete', file=sys.stderr, flush=True)
+    return output if binary else output.decode()
+
+
+class PackageCommandTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='mihomo-package-command-test-')
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def test_finished_command_does_not_wait_for_status_logger(self):
+        root = self.root / 'dpkg-root'
+        (root / 'var/lib/dpkg').mkdir(parents=True)
+        (root / 'var/lib/dpkg/status').touch()
+        ready = self.root / 'ready'
+        os.mkfifo(ready)
+        pid_file = self.root / 'logger.pid'
+        logger = self.root / 'logger.py'
+        logger.write_text('''import os, pathlib, signal, sys
+pathlib.Path(sys.argv[2]).write_text(str(os.getpid()))
+with open(sys.argv[1], 'w') as ready:
+    ready.write('ready')
+sys.stdin.read()
+# Reproduce a host logger that survives dpkg while holding inherited stderr.
+while True:
+    signal.pause()
+''')
+        logger_command = 'exec ' + shlex.join([sys.executable, str(logger), str(ready), str(pid_file)])
+        # A post-invoke handshake makes the inherited-descriptor regression
+        # deterministic: dpkg cannot exit before its logger is attached.
+        handshake = shlex.join([sys.executable, '-c',
+                               'import sys; open(sys.argv[1]).read()', str(ready)])
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stderr(diagnostics):
+            run_package_fixture('dpkg', '--root=' + str(root), '--log=' + str(self.root / 'dpkg.log'),
+                                '--force-not-root', '--force-bad-path',
+                                '--status-logger=' + logger_command, '--post-invoke=' + handshake,
+                                '--configure', '--pending', phase='inherited stderr logger')
+        self.assertIn('[package fixture: inherited stderr logger] complete', diagnostics.getvalue())
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                state = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()[0]
+            except FileNotFoundError:
+                return
+            if state == 'Z':  # Exited; awaiting the system reaper, no open descriptors.
+                return
+            time.sleep(0.01)
+        self.fail(f'fixture status logger {pid} survived process-group cleanup')
+
+    def test_timeout_still_fails_and_reports_stage(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(
+                AssertionError, r'\[package fixture: blocked install\] timed out after 1s'):
+            run_package_fixture(sys.executable, '-c', 'import signal; signal.pause()',
+                                phase='blocked install', timeout=1)
+
+    def test_failed_command_preserves_exit_status_and_diagnostics(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(AssertionError) as error:
+            run_package_fixture(sys.executable, '-c',
+                                'import sys; print("fixture output"); '
+                                'print("fixture error", file=sys.stderr); sys.exit(7)',
+                                phase='rejected install')
+        self.assertIn('[package fixture: rejected install] exited with 7', str(error.exception))
+        self.assertIn('fixture output', str(error.exception))
+        self.assertIn('fixture error', str(error.exception))
 
 
 class AccountFixture:
@@ -393,30 +500,39 @@ class ReleaseTests(unittest.TestCase):
             'Architecture: amd64\nMaintainer: Test <test@example.invalid>\nDescription: migration fixture\n')
         (stage / 'DEBIAN/conffiles').write_text('/etc/mihomo/config.yaml\n')
         old_package = self.root / 'previous.deb'
-        release.run('dpkg-deb', '--root-owner-group', '--build', str(stage), str(old_package))
+        run_package_fixture('dpkg-deb', '--root-owner-group', '--build', str(stage), str(old_package),
+                            phase='build previous Debian package')
         root = self.root / 'installed-root'
         (root / 'var/lib/dpkg').mkdir(parents=True)
         (root / 'var/lib/dpkg/status').touch()
         fixture = AccountFixture(self.root / 'account')
+        fixture.env['DEBIAN_FRONTEND'] = 'noninteractive'
         command = ['dpkg', '--root=' + str(root), '--force-not-root', '--force-bad-path',
-                   '--force-architecture', '--force-confold', '--force-script-chrootless', '--force-depends']
+                   '--force-architecture', '--force-confold', '--force-script-chrootless', '--force-depends',
+                   '--log=' + str(self.root / 'dpkg.log')]
         if os.geteuid() != 0:
             self.assertIsNotNone(shutil.which('fakeroot'), 'Install fakeroot for the isolated dpkg migration test')
             command.insert(0, 'fakeroot')
-        release.run(*command, '--install', str(old_package), env=fixture.env)
+        run_package_fixture(*command, '--install', str(old_package), env=fixture.env,
+                            phase='install previous Debian package')
         config = root / 'etc/mihomo/config.yaml'
         local_config = 'mixed-port: 8990\ncore-auto-update: true\n'
         config.write_text(local_config)
         row = dict(release.target('linux-amd64'), packages={'deb': 'amd64'})
-        package, = release.package_binary(self.binary, row, VERSION, self.out, TIME, COMMIT, 'v1.19.32')
-        release.run(*command, '--install', str(package), env=fixture.env)
+        with mock.patch.object(release, 'run', side_effect=lambda *args, **kwargs: run_package_fixture(
+                *args, phase='build and inspect replacement Debian package', **kwargs)):
+            package, = release.package_binary(self.binary, row, VERSION, self.out, TIME, COMMIT, 'v1.19.32')
+        run_package_fixture(*command, '--install', str(package), env=fixture.env,
+                            phase='upgrade renamed Debian package')
         self.assertIsNotNone(fixture.read()['passwd'])
         self.assertEqual(config.read_text(), local_config)
         self.assertEqual((root / 'usr/bin/mihomo').read_bytes(), self.binary.read_bytes())
-        status = release.run('dpkg-query', '--admindir=' + str(root / 'var/lib/dpkg'), '-W',
-                             '-f=${Status} ${Version}', 'mihomo-optimized')
+        status = run_package_fixture('dpkg-query', '--admindir=' + str(root / 'var/lib/dpkg'), '-W',
+                                     '-f=${Status} ${Version}', 'mihomo-optimized',
+                                     phase='verify installed Debian status')
         self.assertEqual(status.strip(), 'install ok installed 1:1.0.0')
-        owner = release.run('dpkg-query', '--admindir=' + str(root / 'var/lib/dpkg'), '-S', '/usr/bin/mihomo')
+        owner = run_package_fixture('dpkg-query', '--admindir=' + str(root / 'var/lib/dpkg'),
+                                    '-S', '/usr/bin/mihomo', phase='verify Debian binary ownership')
         self.assertEqual(owner.strip(), 'mihomo-optimized: /usr/bin/mihomo')
 
     def test_release_versions_reject_malformed_or_mismatched_values(self):

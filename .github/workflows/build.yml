@@ -180,6 +180,14 @@ jobs:
           python3 scripts/test-resource-bootstrap.py --core "$stop_test_binary" --report "$RUNNER_TEMP/resource-bootstrap-verification.json"
       - name: Test fork changes and sync safeguards
         run: bash scripts/ci-check.sh test
+      - name: Repeat real Debian upgrades with locally modified configuration
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          # Fresh fixtures on each run; any failure stops the release gate.
+          for iteration in 1 2 3; do
+            python3 scripts/test-release-build.py ReleaseTests.test_debian_rename_preserves_locally_modified_configuration
+          done
       - name: Test configuration permissions with an unprivileged service user
         run: |
           set -euo pipefail
@@ -290,6 +298,11 @@ jobs:
           cache: true
       - name: Verify native core replacement, rollback and macOS signing
         run: go test -tags with_gvisor -count=1 -timeout=5m ./component/updater ./component/resource ./component/mmdb ./component/geodata ./rules/provider
+      - name: Repeat Windows startup routing and cancellation across scheduler settings
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        # Every iteration must pass. This is a stability gate, not a retry loop.
+        run: go test -v -tags with_gvisor -count=25 -cpu=1,4 -shuffle=on -timeout=2m ./component/resource -run '^TestResourceBootstrap'
       - name: Verify native configuration editing and private UI staging
         run: go test -tags with_gvisor -count=1 -timeout=5m ./hub/route -run 'ConfigFile|UIUpdater|UnifiedUpgrade|UpgradeSchedule'
       - name: Verify desktop supervisor authentication, confinement and lifecycle contracts
@@ -382,6 +395,7 @@ jobs:
           - 按实际 NetCfgInstanceId 关联 PnP 身份并读取真实实例 ID；不同 GUID 的同名设备和身份不符继续受保护，不按名称打开接管。失败携带阶段与本次设备查询结果。
           - 修正 Wintun GC 清理的原生参数和无返回值 Close API 的处理；保留部分创建失败后的确定性清理与原有网络切换行为。
           - 配套桌面 0.2.11 修正固定备用名恢复、历史失败提示与 TUN 局部切换，需使用完整桌面安装包取得客户端改动。
+          - 修正资源路由测试的计时边界与 Debian 迁移测试的子进程输出隔离；生产超时策略不变。新增 Windows 两种调度设置各 25 次验证和三次真实 Debian 配置迁移，任何一次失败均阻止发布。
 
           [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.34/docs/releases.md)
 
