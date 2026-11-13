@@ -43,7 +43,7 @@ use windows_sys::Win32::{
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 const RESPONSE_RESERVE: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 fn operation_timeout(request: &Request) -> Result<Duration> {
     match request {
@@ -77,16 +77,31 @@ fn time_left(deadline: Instant) -> Result<Duration> {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    Start { config: String, tun: bool },
+    Start {
+        config: String,
+        tun: bool,
+    },
     Stop,
-    Reload { config: String, tun: bool },
+    Reload {
+        config: String,
+        tun: bool,
+        tun_change: bool,
+    },
     Status,
-    Reconcile { generation: u64 },
+    Reconcile {
+        generation: u64,
+    },
     Heartbeat,
-    Operation { id: String },
-    PrepareCoreUpdate { proxy_port: Option<u16> },
+    Operation {
+        id: String,
+    },
+    PrepareCoreUpdate {
+        proxy_port: Option<u16>,
+    },
     CommitCoreUpdate {},
-    CompleteCoreUpdate { accept: bool },
+    CompleteCoreUpdate {
+        accept: bool,
+    },
 }
 
 impl Request {
@@ -678,7 +693,7 @@ impl Client {
         if reply.protocol_version != PROTOCOL_VERSION {
             return Err(AppError::new(
                 "service_version_required",
-                "桌面与 TUN 服务版本不匹配，请修复安装",
+                "桌面与 TUN 服务协议不兼容，请安装完整新版桌面程序",
             ));
         }
         if let Ok(remaining) = time_left(deadline) {
@@ -1017,15 +1032,19 @@ mod timeout_tests {
     }
 
     #[test]
-    fn lifecycle_protocol_requires_an_explicit_tun_mode_and_version_four() {
+    fn lifecycle_protocol_requires_explicit_tun_intent_and_version_five() {
         for command in ["start", "reload"] {
             let missing = serde_json::json!({"command":command, "config":"mixed-port: 7890"});
             assert!(serde_json::from_value::<Request>(missing).is_err());
             for tun in [false, true] {
-                let request: Request = serde_json::from_value(serde_json::json!({
+                let mut payload = serde_json::json!({
                     "command":command, "config":"mixed-port: 7890", "tun":tun,
-                }))
-                .unwrap();
+                });
+                if command == "reload" {
+                    assert!(serde_json::from_value::<Request>(payload.clone()).is_err());
+                    payload["tun_change"] = serde_json::json!(true);
+                }
+                let request: Request = serde_json::from_value(payload).unwrap();
                 assert_eq!(serde_json::to_value(&request).unwrap()["tun"], tun);
                 let mut envelope = Envelope {
                     protocol_version: PROTOCOL_VERSION,
@@ -1037,14 +1056,14 @@ mod timeout_tests {
                 };
                 assert!(envelope.validate(true).is_ok());
                 assert!(envelope.validate(false).is_err());
-                envelope.protocol_version = 3;
+                envelope.protocol_version = 4;
                 assert_eq!(
                     envelope.validate(true).unwrap_err().code,
                     "service_protocol"
                 );
             }
         }
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]

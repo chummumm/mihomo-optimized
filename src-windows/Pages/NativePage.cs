@@ -53,6 +53,7 @@ public abstract class NativePage : UserControl
     private bool reservePageGutter = true;
     private readonly TextBlock notice = Ui.Text("");
     private readonly TextBlock runtimeNotice = Ui.Text("");
+    private readonly TextBlock lastOperationNotice = Ui.Text("");
     private readonly PageNoticeState noticeState = new();
     private CancellationTokenSource? lifetime;
     private string controllerIdentity = "";
@@ -101,7 +102,9 @@ public abstract class NativePage : UserControl
         notice.Id(key + "Notice");
         runtimeNotice.Margin = notice.Margin; runtimeNotice.Visibility = Visibility.Collapsed;
         runtimeNotice.Id(key + "RuntimeNotice");
-        var notices = new StackPanel(); notices.Children.Add(runtimeNotice); notices.Children.Add(notice);
+        lastOperationNotice.Margin = notice.Margin; lastOperationNotice.Visibility = Visibility.Collapsed;
+        lastOperationNotice.Id(key + "LastOperationFailure");
+        var notices = new StackPanel(); notices.Children.Add(runtimeNotice); notices.Children.Add(lastOperationNotice); notices.Children.Add(notice);
         Grid.SetRow(notices, 1); layout.Children.Add(notices);
         Grid.SetRow(Body, 2); layout.Children.Add(Body);
         pagePresenter.Content = pageBox; viewport.Children.Add(pagePresenter); Content = viewport;
@@ -138,6 +141,7 @@ public abstract class NativePage : UserControl
         header.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
         RenderNotice(notice, noticeState.Operation);
         RenderNotice(runtimeNotice, noticeState.Runtime);
+        RenderNotice(lastOperationNotice, noticeState.LastOperation);
     }
     protected void SetPagePadding(Thickness? padding) { pagePadding = padding; UpdatePageMetrics(); }
     protected void SetPageMaxWidth(double width) { pageMaxWidth = width; UpdatePageMetrics(); }
@@ -245,10 +249,21 @@ public abstract class NativePage : UserControl
     {
         noticeState.ObserveRuntime(Session.Status, Session.Runtime);
         RenderNotice(runtimeNotice, noticeState.Runtime);
+        RenderNotice(lastOperationNotice, noticeState.LastOperation);
+    }
+    protected void UpdateOperationFailureNotice()
+    {
+        noticeState.ObserveLastOperation(Session.Runtime);
+        RenderNotice(lastOperationNotice, noticeState.LastOperation);
     }
     private void RenderNotice(TextBlock target, PageNotice message)
     {
-        L.Bind(target, TextBlock.TextProperty, message.Text);
+        if (message.Arguments is { } arguments)
+        {
+            target.ClearValue(TextBlock.TextProperty);
+            target.Text = L.F(message.Text, arguments);
+        }
+        else L.Bind(target, TextBlock.TextProperty, message.Text);
         target.Visibility = message.IsVisible && header.Visibility == Visibility.Visible ? Visibility.Visible : Visibility.Collapsed;
         target.SetResourceReference(TextBlock.ForegroundProperty, message.Kind switch
         {

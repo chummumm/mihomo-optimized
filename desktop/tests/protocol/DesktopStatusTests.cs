@@ -140,6 +140,15 @@ internal static class DesktopStatusTests
         Equal(DesktopRuntimePhase.Uncertain, DesktopRuntimeState.Read(Status(stale: true, errorCode: "tun_device_conflict")).Phase);
 
         Equal(DesktopRuntimePhase.Stopping, DesktopRuntimeState.Read(Status(errorCode: "tun_device_conflict"), "desktop_stop").Phase);
+
+        var rolledBack = DesktopRuntimeState.Read(Status(tun: false, tunHealth: "disabled", errorCode: "tun_device_conflict"));
+        Equal(DesktopRuntimePhase.Running, rolledBack.Phase);
+        Check(rolledBack.RuntimeAvailable && !rolledBack.IsProblem && rolledBack.RuntimeError.Length == 0,
+            "An old enable conflict replaced the current healthy proxy state after TUN rollback");
+        Equal(DesktopRuntimePhase.TunDeviceConflict, DesktopRuntimeState.Read(Status(
+            phase: "error", tun: false, tunHealth: "unavailable", errorCode: "tun_device_conflict")).Phase);
+        Equal(DesktopRuntimePhase.Uncertain, DesktopRuntimeState.Read(Status(
+            tun: false, tunHealth: "disabled", stale: true, errorCode: "tun_device_conflict")).Phase);
     }
 
     private static void ObserveAutomaticTunDeviceRecovery()

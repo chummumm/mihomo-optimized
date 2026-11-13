@@ -22,8 +22,8 @@ internal sealed record TunDeviceState
         bool available = device.ValueKind == JsonValueKind.Object
             && configured.ValueKind is JsonValueKind.String or JsonValueKind.Null
             && effective.ValueKind is JsonValueKind.String or JsonValueKind.Null
-            && Get(device, "managed").ValueKind is JsonValueKind.True or JsonValueKind.False
-            && !string.IsNullOrWhiteSpace(managedName);
+            && Get(device, "managed").ValueKind is JsonValueKind.Undefined or JsonValueKind.True or JsonValueKind.False
+            && !string.IsNullOrWhiteSpace(revision);
         if (!available) return new TunDeviceState();
         string? configuredName = configured.ValueKind == JsonValueKind.String ? configured.GetString() : null;
         string? effectiveName = effective.ValueKind == JsonValueKind.String ? effective.GetString() : null;

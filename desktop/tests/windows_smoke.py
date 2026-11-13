@@ -2524,22 +2524,50 @@ class Acceptance:
         require(cache.is_file() and b"bootstrap-fixture.invalid" in cache.read_bytes(), "resource_cache_not_persisted")
         self.save_configuration(self.resources.configuration(base, failing=True))
         failed_at = time.monotonic()
+        reload_errors = ("resource_bootstrap_timeout", "reload_invalid", "reload_failed")
         self.driver.invoke("desktop_reload_config", {"force": True},
-                           expected_error=("resource_bootstrap_timeout", "reload_invalid", "reload_failed"))
+                           expected_error=reload_errors)
         failure_seconds = time.monotonic() - failed_at
-        # Background native status polling must not erase this actionable error.
-        time.sleep(2.2)
-        after = self.status()
+        failed = self.status()
+        failure = failed.get("lastOperationFailure")
+        require(isinstance(failure, dict) and failure.get("operation") == "config_reload"
+                and failure.get("code") in reload_errors
+                and failure.get("requestedTun") is False and failure.get("appliedTun") is False
+                and type(failure.get("occurredAt")) is int
+                and 0 < failure["occurredAt"] <= time.time() * 1000 + 1000
+                and type(failure.get("intentRevision")) is int
+                and running.get("intentRevision", -1) < failure["intentRevision"]
+                <= failed.get("intentRevision", -1), "resource_operation_failure_contract_invalid")
+        message = failure.get("message")
+        require(isinstance(message, str) and message and self.resources.token not in message
+                and "http://" not in message and len(message) < 1024, "resource_error_diagnostic_unsafe")
+        observed_at = failed.get("observedAt")
+        require(type(observed_at) is int and observed_at > 0, "resource_failure_observation_missing")
+
+        # A rejected reload must survive a real later observation without
+        # becoming a current fault in the still healthy, unchanged runtime.
+        def next_observation():
+            current = self.status(timeout=3)
+            require(current.get("lastOperationFailure") == failure
+                    and current.get("intentRevision") == failed.get("intentRevision"),
+                    "resource_health_poll_erased_operation_failure")
+            require(current.get("phase") == "running" and current.get("processState") == "alive"
+                    and current.get("controlState") == "ready" and current.get("tun") is False
+                    and current.get("tunHealth") == "disabled" and current.get("statusStale") is not True
+                    and current.get("lastError") is None and current.get("errorCode") is None,
+                    "resource_historical_failure_overrode_current_health")
+            return current if current.get("observedAt", 0) > observed_at else None
+
+        after = wait_until(next_observation, "resource_failure_observation_did_not_advance", 8)
         require(after.get("phase") == "running" and after.get("controller") == running.get("controller")
                 and self.managed_core(after)["pid"] == identity["pid"], "resource_failure_did_not_restore_active_core")
         require(failure_seconds < 10 and self.resources.count("/timeout.yaml") >= 1,
                 "short_resource_budget_not_enforced")
-        message = after.get("lastError", "")
-        require(isinstance(message, str) and message and self.resources.token not in message
-                and "http://" not in message and len(message) < 1024, "resource_error_diagnostic_unsafe")
         self.save_configuration(source)
         self.driver.invoke("desktop_reload_config", {"force": True})
-        require(self.status().get("lastError") is None, "successful_reload_kept_resource_error")
+        restored = self.status()
+        require(restored.get("lastError") is None and restored.get("errorCode") is None
+                and restored.get("lastOperationFailure") is None, "successful_reload_kept_resource_error")
         self.resources.offline = True
         self.report["resourceBootstrap"] = {"delaySeconds": self.resources.delay,
                                              "startupSeconds": round(elapsed, 3),

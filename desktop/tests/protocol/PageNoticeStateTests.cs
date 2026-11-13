@@ -8,7 +8,9 @@ internal static class PageNoticeStateTests
         ClearRecoveredRuntimeNotice();
         PreserveOperationFailures();
         DistinguishInitialTunObservation();
-        Console.WriteLine("Page notices: recovered runtime errors clear, command failures survive background observations, and initial TUN checks remain distinct from unavailable/stale health.");
+        KeepTunFailureSeparateFromLiveHealth();
+        RejectInvalidOperationFailures();
+        Console.WriteLine("Page notices: current health, timestamped operation failures, unfulfilled TUN intent, and ordered clearing remain independent.");
     }
 
     private static void ClearRecoveredRuntimeNotice()
@@ -102,14 +104,92 @@ internal static class PageNoticeStateTests
             "A genuinely disabled requested TUN was silently reclassified as checking");
     }
 
+    private static void KeepTunFailureSeparateFromLiveHealth()
+    {
+        var order = new DesktopStatusOrder();
+        var notices = new PageNoticeState();
+        var failure = OperationFailure();
+        void Observe(JsonElement status)
+        {
+            if (order.TryAccept(status)) notices.ObserveRuntime(status, DesktopRuntimeState.Read(status));
+        }
+        var rejectedEnable = Status(10, health: "disabled", tun: false, failure: failure);
+        var runtime = DesktopRuntimeState.Read(rejectedEnable);
+        Check(runtime.Phase == DesktopRuntimePhase.Running && runtime.RuntimeAvailable && !runtime.IsProblem,
+            "A rejected TUN enable marked the confirmed healthy proxy as failed");
+        Check(runtime.TunEnableUnfulfilled && !runtime.TunRequested
+            && runtime.TunDescription == "已关闭 · 上次开启失败"
+            && runtime.LastOperationFailure?.OccurredAt.ToUnixTimeMilliseconds() == 1760000000123,
+            "The failed request or its original time was lost, or TUN was shown as enabled");
+        Observe(rejectedEnable);
+        Check(!notices.Runtime.IsVisible && notices.LastOperation.IsVisible
+            && notices.LastOperation.Kind == PageNoticeKind.Warning
+            && notices.LastOperation.Arguments is { Length: 2 } arguments
+            && arguments[1].Equals("fixture native owner is busy"),
+            "The historical failure was hidden or presented as current runtime health");
+
+        // Neither an ordinary health observation nor an unrelated scalar write
+        // acknowledges the rejected enable request.
+        Observe(Status(11, health: "disabled", tun: false, failure: failure));
+        notices.ShowOperation("", false);
+        Observe(Status(12, health: "disabled", tun: false, failure: failure, intentRevision: 2));
+        Check(notices.LastOperation.IsVisible && !notices.Runtime.IsVisible && !notices.Operation.IsVisible,
+            "A poll or unrelated successful operation acknowledged the failed TUN request");
+
+        // A later successful TUN action explicitly clears the host failure.
+        Observe(Status(13, intentRevision: 3));
+        Check(!notices.LastOperation.IsVisible, "A successful TUN retry retained the old failure");
+        Observe(Status(14, health: "disabled", tun: false, failure: failure));
+        Observe(rejectedEnable);
+        Check(!notices.LastOperation.IsVisible, "A delayed failed operation replaced the newer successful intent");
+
+        var unresolved = Status(15, health: "unavailable", phase: "error", control: "unknown", tun: false,
+            failure: failure, errorCode: "tun_rollback_unconfirmed", message: "rollback not confirmed", intentRevision: 4);
+        Observe(unresolved);
+        var uncertain = DesktopRuntimeState.Read(unresolved);
+        Check(notices.Runtime.IsVisible && notices.LastOperation.IsVisible
+            && uncertain.NeedsAttention && uncertain.TunDescription == "状态待确认"
+            && notices.LastOperation.Text == "上次开启 TUN 失败（{0}）。{1}",
+            "Historical failure concealed an unconfirmed current runtime state");
+    }
+
+    private static void RejectInvalidOperationFailures()
+    {
+        foreach (var change in new Action<Dictionary<string, object?>>[]
+        {
+            value => value["occurredAt"] = "yesterday",
+            value => value["occurredAt"] = long.MaxValue,
+            value => value["occurredAt"] = 0,
+            value => value["requestedTun"] = "true",
+            value => value.Remove("appliedTun"),
+            value => value["intentRevision"] = "1",
+            value => value["intentRevision"] = 2,
+            value => value["operation"] = "unknown",
+            value => value["message"] = ""
+        })
+        {
+            var failure = OperationFailure(); change(failure);
+            var runtime = DesktopRuntimeState.Read(Status(1, tun: false, health: "disabled", failure: failure));
+            Check(runtime.LastOperationFailure is null && !runtime.TunEnableUnfulfilled
+                && !PageNoticeState.FailureNotice(runtime).IsVisible,
+                "Malformed or not-yet-accepted operation data invented a failed TUN request");
+        }
+    }
+
+    private static Dictionary<string, object?> OperationFailure() => new()
+    {
+        ["operation"] = "tun_change", ["code"] = "tun_device_busy", ["message"] = "fixture native owner is busy",
+        ["occurredAt"] = 1760000000123L, ["requestedTun"] = true, ["appliedTun"] = false, ["intentRevision"] = 1UL
+    };
+
     private static JsonElement Status(int sequence, string health = "healthy", string phase = "running",
         string process = "alive", string control = "ready", bool tun = true, bool stale = false,
-        string? errorCode = null, string? message = null) => JsonSerializer.SerializeToElement(new
+        string? errorCode = null, string? message = null, object? failure = null, ulong intentRevision = 1) => JsonSerializer.SerializeToElement(new
         {
-            statusInstance = "host-fixture", statusSequence = sequence, intentRevision = 1,
+            statusInstance = "host-fixture", statusSequence = sequence, intentRevision,
             phase, processState = process, controlState = control, tunHealth = health, tun,
             desiredRunning = phase != "stopped", pid = process == "alive" ? 5740 : (int?)null,
-            errorCode, lastError = message, statusStale = stale,
+            errorCode, lastError = message, statusStale = stale, lastOperationFailure = failure,
             controller = process == "alive" ? new { url = "http://127.0.0.1:1234" } : null
         });
 

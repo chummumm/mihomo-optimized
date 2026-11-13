@@ -43,6 +43,10 @@ jobs:
           python-version: '3.12'
       - name: Verify Windows PowerShell UIA result contract
         run: python desktop/tests/windows_smoke.py --uia-json-contract
+      - name: Verify upgrade controller read and shutdown response contracts
+        run: python desktop/tests/upgrade_tun_http_test.py
+      - name: Verify core update baseline provenance and legacy rejection contracts
+        run: python desktop/tests/core_update_fixture_test.py
       - name: Read pinned core source
         id: core
         shell: pwsh
@@ -94,7 +98,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311 pyflakes==3.4.0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pyflakes desktop/tests/windows_smoke.py desktop/tests/upgrade_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_smoke.py desktop/tests/core_update_smoke.py desktop/tests/port_fixture.py desktop/tests/core_smoke.py
+          python -m pyflakes desktop/tests/windows_smoke.py desktop/tests/upgrade_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_http_test.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/port_fixture.py desktop/tests/core_smoke.py
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
       - name: Verify the unchanged web dashboard
@@ -120,9 +124,13 @@ jobs:
           } finally { Pop-Location }
       - name: Exercise managed core and resource bootstrap on Windows
         working-directory: core-src
-        # Reduce contention around the pinned tests' short wall-clock deadlines.
-        # Keep every package, assertion, deadline and uncached execution intact.
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./component/desktop ./component/resource ./component/http ./component/dialer ./component/resolver ./component/profile/cachefile ./adapter/provider ./adapter/outboundgroup ./config ./hub/executor ./hub/route . -run 'Desktop|ResourceBootstrap|ReadSelectedSnapshot'
+      - name: Repeat startup routing and cancellation across scheduler settings
+        working-directory: core-src
+        shell: bash
+        timeout-minutes: 3
+        # Every iteration must pass. This is a stability gate, not a retry loop.
+        run: go test -v -tags with_gvisor -count=25 -cpu=1,4 -shuffle=on -timeout=2m ./component/resource -run '^TestResourceBootstrap'
       - name: Verify EasyTier LAN preparation and ordinary TCP deadlines
         working-directory: core-src
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./component/easytier ./context ./adapter/outbound ./tunnel -run 'EasyTier|DialBudget|TCPDial|TCPFirst|LAN'
@@ -133,7 +141,7 @@ jobs:
         working-directory: core-src
         env:
           MIHOMO_TUN_INTEGRATION: '1'
-        run: go test -v -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun -run Desktop
+        run: go test -v -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun github.com/metacubex/sing-tun/internal/wintun -run Desktop
       - name: Verify proxy IP destinations and DNS address-family output
         working-directory: core-src
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./adapter ./adapter/provider ./dns ./config ./tunnel -run 'ProxyTarget|ProxyForceIP|TargetIPFamily|AnswerIPFamily|ProviderTargetFamily'
@@ -148,7 +156,10 @@ jobs:
           MIHOMO_LAN_INTEGRATION: '1'
         run: go test -p 1 -tags with_gvisor -count=1 -v -timeout=90s ./adapter/outbound -run '^TestLANWireGuardNativePreparationBeforeBusiness$'
       - name: Install pinned Rust compiler
-        run: rustup toolchain install 1.99.1 --profile minimal
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt
+      - name: Check pinned Rust source format
+        working-directory: src-tauri
+        run: cargo +1.99.1 fmt --all -- --check
       - name: Cache Rust dependencies
         id: rust-cache
         uses: actions/cache/restore@v4
@@ -161,6 +172,10 @@ jobs:
           restore-keys: desktop-native-windows-msvc-v2-
       - name: Build and stage fixed companion programs
         run: python scripts/prepare-desktop.py --core-dir core-src
+      - name: Verify actual managed controller discovery and startup cleanup
+        run: python core-src/scripts/test-desktop-controller.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe --require-tun
+      - name: Build explicit discovery-compatible core update baseline
+        run: python scripts/prepare-core-update-baseline.py --core-dir core-src
       - name: Exercise native settings and update policies
         working-directory: src-tauri
         run: cargo test --locked --target x86_64-pc-windows-msvc --lib
@@ -192,7 +207,7 @@ jobs:
         run: python desktop/tests/core_smoke.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe
       - name: Test real Windows bootstrap groups, offline cache and cancellation
         run: python core-src/scripts/test-resource-bootstrap.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe --report artifacts/verification/resource-bootstrap-core.json
-      - name: Test legacy installer upgrade and automatic TUN recovery
+      - name: Test legacy installer upgrade and native TUN lifecycle
         run: ./desktop/tests/setup-windows.ps1
       - name: Test independent automatic core updates while running, in TUN and stopped
         timeout-minutes: 35

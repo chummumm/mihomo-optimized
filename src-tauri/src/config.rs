@@ -353,15 +353,36 @@ pub fn runtime_config(content: &str, tun: bool, port: u16) -> Result<String> {
     }
     let tun_mapping = tun_config.as_mapping_mut().expect("mapping created above");
     tun_mapping.insert(key("enable"), Value::Bool(tun));
-    if tun {
-        tun_mapping.insert(key("auto-route"), Value::Bool(true));
-        tun_mapping.insert(key("auto-detect-interface"), Value::Bool(true));
-        tun_mapping.entry(key("stack")).or_insert(key("mixed"));
-        tun_mapping.entry(key("dns-hijack")).or_insert(
-            serde_yaml::to_value(["any:53"])
-                .map_err(|_| AppError::new("config_invalid", "无法设置 TUN DNS"))?,
-        );
+    // Keep the effective TUN parameters stable while disabled. A later switch
+    // can then apply the core's complete, already parsed TUN block without
+    // rebuilding DNS, providers or unrelated listeners.
+    tun_mapping.insert(key("auto-route"), Value::Bool(true));
+    tun_mapping.insert(key("auto-detect-interface"), Value::Bool(true));
+    tun_mapping.entry(key("stack")).or_insert(key("mixed"));
+    // sing_tun.New materializes this listener default. Keep the requested
+    // runtime block stable too, so an applied snapshot used for a later switch
+    // does not make an unchanged YAML reload look like a different TUN.
+    if tun_mapping.get(key("gso-max-size")).is_none_or(|value| {
+        // Go's uint32 YAML decoder accepts null and numeric values whose
+        // truncation is zero (including fractional +/-0.x). Strings and
+        // negative integers remain untouched for the core to reject.
+        value.is_null() || value.as_f64().is_some_and(|number| number.trunc() == 0.0)
+    }) {
+        tun_mapping.insert(key("gso-max-size"), Value::Number(65_536u64.into()));
     }
+    #[cfg(not(target_os = "linux"))]
+    if tun_mapping.get(key("auto-redirect")).is_none()
+        || tun_mapping
+            .get(key("auto-redirect"))
+            .is_some_and(Value::is_bool)
+    {
+        // The core disables auto-redirect on every non-Linux platform.
+        tun_mapping.insert(key("auto-redirect"), Value::Bool(false));
+    }
+    tun_mapping.entry(key("dns-hijack")).or_insert(
+        serde_yaml::to_value(["any:53"])
+            .map_err(|_| AppError::new("config_invalid", "无法设置 TUN DNS"))?,
+    );
     serde_yaml::to_string(&document)
         .map_err(|_| AppError::new("config_invalid", "无法生成运行配置"))
 }
@@ -609,6 +630,59 @@ mod tests {
         );
         assert!(runtime_config(source, false, 9090).is_ok());
         assert!(runtime_config(INITIAL_CONFIG, true, 9090).is_ok());
+    }
+
+    #[test]
+    fn disabled_tun_has_the_same_effective_parameters_as_enabled_tun() {
+        for source in [
+            "mixed-port: 7890\ndns:\n  enable: true\n",
+            "mixed-port: 7890\ndns:\n  enable: true\ntun:\n  device: utun\n  stack: gvisor\n  dns-hijack: [tcp://any:53, udp://any:53]\n  auto-route: false\n  include-interface: [Wi-Fi, Ethernet]\n",
+        ] {
+            let before = parse(source).unwrap();
+            let disabled = parse(&runtime_config(source, false, 9090).unwrap()).unwrap();
+            let mut enabled = parse(&runtime_config(source, true, 9090).unwrap()).unwrap();
+            assert_eq!(disabled["tun"]["enable"].as_bool(), Some(false));
+            assert_eq!(enabled["tun"]["enable"].as_bool(), Some(true));
+            enabled["tun"]["enable"] = Value::Bool(false);
+            assert_eq!(disabled, enabled, "a mode-only switch must not alter any other parsed input");
+            assert_eq!(parse(source).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn runtime_tun_gso_materializes_only_go_zero_defaults_without_changing_source() {
+        for scalar in [
+            None,
+            Some("null"),
+            Some("~"),
+            Some("0"),
+            Some("0.0"),
+            Some("-0.0"),
+            Some("0.5"),
+            Some("-0.5"),
+        ] {
+            let suffix = scalar
+                .map(|value| format!("tun:\n  gso-max-size: {value}\n"))
+                .unwrap_or_default();
+            let source = format!("dns:\n  enable: true\n{suffix}");
+            let original = parse(&source).unwrap();
+            for enabled in [false, true, false, true] {
+                let runtime = parse(&runtime_config(&source, enabled, 9090).unwrap()).unwrap();
+                assert_eq!(runtime["tun"]["gso-max-size"].as_u64(), Some(65536));
+            }
+            assert_eq!(parse(&source).unwrap(), original);
+        }
+        for scalar in [
+            "32768", "65536", "1.5", "-1", "-1.5", "'0'", "invalid", "false",
+        ] {
+            let source = format!("dns:\n  enable: true\ntun:\n  gso-max-size: {scalar}\n");
+            let original = parse(&source).unwrap();
+            let runtime = parse(&runtime_config(&source, true, 9090).unwrap()).unwrap();
+            assert_eq!(
+                runtime["tun"]["gso-max-size"], original["tun"]["gso-max-size"],
+                "{scalar}"
+            );
+        }
     }
     #[test]
     fn overwrite_is_atomic_and_stale_revision_is_rejected() {

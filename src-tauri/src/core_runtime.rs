@@ -30,12 +30,23 @@ pub struct RuntimeOperation {
 
 #[derive(Clone)]
 pub enum RuntimeRequest {
-    Start { config: String, tun: bool },
-    Reload { config: String, tun: bool },
+    Start {
+        config: String,
+        tun: bool,
+    },
+    Reload {
+        config: String,
+        tun: bool,
+        tun_change: bool,
+    },
     Stop(StopReason),
-    PrepareCoreUpdate { proxy_port: Option<u16> },
+    PrepareCoreUpdate {
+        proxy_port: Option<u16>,
+    },
     CommitCoreUpdate,
-    CompleteCoreUpdate { accept: bool },
+    CompleteCoreUpdate {
+        accept: bool,
+    },
 }
 
 impl RuntimeRequest {
@@ -54,8 +65,16 @@ impl RuntimeRequest {
         let mut digest = Sha256::new();
         digest.update(self.name());
         match self {
-            Self::Start { config, tun } | Self::Reload { config, tun } => {
+            Self::Start { config, tun } => {
                 digest.update([u8::from(*tun)]);
+                digest.update(config);
+            }
+            Self::Reload {
+                config,
+                tun,
+                tun_change,
+            } => {
+                digest.update([u8::from(*tun), u8::from(*tun_change)]);
                 digest.update(config);
             }
             Self::Stop(reason) => digest.update(format!("{reason:?}")),
@@ -340,13 +359,20 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
                 "runtime_operation_begin",
                 serde_json::json!({"corePid":core.status().pid}),
             );
-            core.set_cancellation(Cancellation::new(shared.revision.clone(), work.revision));
+            core.set_cancellation_for_intent(
+                Cancellation::new(shared.revision.clone(), work.revision),
+                work.intent_revision,
+            );
             let result = if work.revision != shared.revision.load(Ordering::Acquire) {
                 Err(cancelled())
             } else {
                 match work.request {
                     RuntimeRequest::Start { config, tun } => core.start(config, tun),
-                    RuntimeRequest::Reload { config, tun } => {
+                    RuntimeRequest::Reload {
+                        config,
+                        tun,
+                        tun_change,
+                    } => {
                         // A superseded update may have stopped the old process
                         // before the new Reload arrived. Resume only under this
                         // newly admitted running intent; Stop remains final.
@@ -357,7 +383,7 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
                         {
                             core.start(config, tun)
                         } else {
-                            core.reconfigure(config, tun)
+                            core.reconfigure_request(config, tun, tun_change)
                         }
                     }
                     RuntimeRequest::Stop(reason) => core.stop_for(reason).map(|_| core.status()),
@@ -407,7 +433,10 @@ fn run_worker(shared: Arc<Shared>, mut core: CoreSupervisor) {
                 "source":if reconcile.is_some() { "resume_reconcile" } else { "background_health_poll" },
                 "intentRevision":intent_revision,"workerRevision":revision,
             }));
-            core.set_cancellation(Cancellation::new(shared.revision.clone(), revision));
+            core.set_cancellation_for_intent(
+                Cancellation::new(shared.revision.clone(), revision),
+                intent_revision,
+            );
             if let Some(generation) = reconcile {
                 let _ = core.request_reconcile(generation);
             }
@@ -591,6 +620,7 @@ mod tests {
                     RuntimeRequest::Reload {
                         config: "mixed-port: 7890".into(),
                         tun,
+                        tun_change: true,
                     }
                 }
             };
@@ -612,6 +642,29 @@ mod tests {
             );
             assert_eq!(runtime.shared.revision.load(Ordering::Acquire), revision);
         }
+    }
+
+    #[test]
+    fn reload_replay_cannot_turn_ordinary_apply_into_tun_acknowledgement() {
+        let runtime = queued_runtime();
+        let request = |tun_change| RuntimeRequest::Reload {
+            config: "mixed-port: 7890".into(),
+            tun: false,
+            tun_change,
+        };
+        runtime
+            .submit("session:reload".into(), 3, request(false))
+            .unwrap();
+        let revision = runtime.shared.revision.load(Ordering::Acquire);
+        assert_eq!(
+            runtime
+                .submit("session:reload".into(), 3, request(true))
+                .err()
+                .unwrap()
+                .code,
+            "service_request_conflict"
+        );
+        assert_eq!(runtime.shared.revision.load(Ordering::Acquire), revision);
     }
 
     #[test]
@@ -722,6 +775,7 @@ mod tests {
                 RuntimeRequest::Reload {
                     config: crate::config::INITIAL_CONFIG.into(),
                     tun: true,
+                    tun_change: true,
                 },
             )
             .unwrap();

@@ -1,6 +1,6 @@
 [package]
 name = "mihomo-desktop"
-version = "0.2.10"
+version = "0.2.11"
 description = "Windows desktop host for Mihomo Optimized"
 edition = "2021"
 rust-version = "1.88"
@@ -36,6 +36,9 @@ getrandom = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt", "time", "net"] }
 zip = { version = "=9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.1"

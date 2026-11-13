@@ -34,8 +34,12 @@ internal sealed record DesktopRuntimeState
     public bool ProcessAlive { get; init; }
     public bool RuntimeAvailable { get; init; }
     public bool StopRequired { get; init; }
+    // The host's "tun" field is the last confirmed applied mode.
     public bool TunRequested { get; init; }
     public bool TunDeviceRecoveryPending { get; init; }
+    public string RuntimeError { get; init; } = "";
+    public DesktopOperationFailure? LastOperationFailure { get; init; }
+    public bool TunEnableUnfulfilled => !TunRequested && LastOperationFailure is { RequestedTun: true };
 
     public bool IsWorking => Phase is DesktopRuntimePhase.Connecting or DesktopRuntimePhase.Starting
         or DesktopRuntimePhase.Reloading or DesktopRuntimePhase.Restarting or DesktopRuntimePhase.Recovering
@@ -83,7 +87,7 @@ internal sealed record DesktopRuntimeState
             : "暂时无法确认内核状态，正在等待本机服务的最新结果。",
         DesktopRuntimePhase.TunDegraded => "内核进程仍在运行，TUN 设备需要处理。请查看详细信息或日志。",
         DesktopRuntimePhase.TunFailed => "TUN 恢复未完成。请查看详细信息或日志；可停止内核后重试。",
-        DesktopRuntimePhase.TunDeviceConflict => "TUN 接口未能启动。已有同名网卡，暂时无法确认其归属；可查看详细信息或日志。",
+        DesktopRuntimePhase.TunDeviceConflict => "TUN 接口未能启动：此名称已被另一张网卡使用。请查看详细信息或日志。",
         DesktopRuntimePhase.Stopping => "正在停止代理连接并恢复系统设置，请稍候。",
         DesktopRuntimePhase.StopUnconfirmed => "尚未确认旧内核退出，暂不启动新内核。请查看详细信息或日志。",
         DesktopRuntimePhase.Exited => "已确认内核进程退出。请查看错误信息或日志，再重试启动。",
@@ -92,7 +96,10 @@ internal sealed record DesktopRuntimeState
         _ => "已有配置时，可从顶部启动内核；首次使用请在设置中导入完整配置。"
     };
 
-    public string TunDescription => !TunRequested ? "已关闭" : Phase switch
+    public string TunDescription => !TunRequested
+        ? Phase is DesktopRuntimePhase.Uncertain or DesktopRuntimePhase.StopUnconfirmed ? "状态待确认"
+            : TunEnableUnfulfilled ? "已关闭 · 上次开启失败" : "已关闭"
+        : Phase switch
     {
         DesktopRuntimePhase.RepairingTun => "正在恢复 TUN",
         DesktopRuntimePhase.RecoveringTunDevice => "正在自动恢复 TUN",
@@ -123,6 +130,11 @@ internal sealed record DesktopRuntimeState
         // that observation would disable Start after sitting idle for 30s.
         bool confirmedStopped = phase == "stopped" && process == "exited" && !ownsProcess && !desired && operation.Length == 0;
         bool stale = Boolean(status, "statusStale") && !confirmedStopped;
+        // A rejected enable is an operation result, not a fault in an otherwise
+        // confirmed healthy proxy. Older snapshots could retain its error code.
+        bool disabledProxyReady = alive && !tunRequested && phase == "running" && control == "ready"
+            && tunHealth == "disabled" && !stale && operation.Length == 0;
+        bool historicalTunConflict = disabledProxyReady && error == "tun_device_conflict";
         bool stopPending = command == "desktop_stop";
         bool starting = command is "desktop_start" or "desktop_restart";
         bool recoveringTunDevice = operation == "recovering_tun_device";
@@ -145,7 +157,7 @@ internal sealed record DesktopRuntimeState
         else if (stale) state = DesktopRuntimePhase.Uncertain;
         else if (operation == "recovering_tun") state = DesktopRuntimePhase.RepairingTun;
         else if (command == "desktop_reload_config" || operation == "reloading") state = DesktopRuntimePhase.Reloading;
-        else if (error == "tun_device_conflict" && phase != "recovering" && (alive || process == "exited")) state = DesktopRuntimePhase.TunDeviceConflict;
+        else if (error == "tun_device_conflict" && !historicalTunConflict && phase != "recovering" && (alive || process == "exited")) state = DesktopRuntimePhase.TunDeviceConflict;
         else if (alive && tunRequested && (error is "tun_recovery_failed" or "tun_recovery_needs_restart" or "tun_restart_required" || tunHealth == "failed")) state = DesktopRuntimePhase.TunFailed;
         else if (alive && tunRequested && (tunHealth is "degraded" or "conflict" or "disabled" || error is "tun_not_repairable" or "tun_ownership_conflict")) state = DesktopRuntimePhase.TunDegraded;
         else if (alive && (tunRequested && (tunHealth == "unavailable" || error == "tun_health_unavailable") || control is "unknown" or "unreachable" or "busy")) state = DesktopRuntimePhase.Uncertain;
@@ -179,7 +191,9 @@ internal sealed record DesktopRuntimeState
             RuntimeAvailable = runtimeAvailable,
             StopRequired = stopRequired,
             TunRequested = tunRequested,
-            TunDeviceRecoveryPending = recoveringTunDevice
+            TunDeviceRecoveryPending = recoveringTunDevice,
+            RuntimeError = historicalTunConflict ? "" : Text(status, "lastError"),
+            LastOperationFailure = DesktopOperationFailure.Read(status)
         };
     }
 
@@ -189,4 +203,29 @@ internal sealed record DesktopRuntimeState
         && value.TryGetProperty(key, out var item) && item.ValueKind == JsonValueKind.True;
     private static string Text(JsonElement value, string key, string fallback = "") => value.ValueKind == JsonValueKind.Object
         && value.TryGetProperty(key, out var item) && item.ValueKind == JsonValueKind.String ? item.GetString() ?? fallback : fallback;
+}
+
+/// <summary>An accepted operation result, independent of the latest health observation.</summary>
+internal sealed record DesktopOperationFailure(string Operation, string Code, string Message,
+    DateTimeOffset OccurredAt, bool RequestedTun, bool AppliedTun, ulong IntentRevision)
+{
+    internal static DesktopOperationFailure? Read(JsonElement status)
+    {
+        if (status.ValueKind != JsonValueKind.Object
+            || !status.TryGetProperty("lastOperationFailure", out var failure) || failure.ValueKind != JsonValueKind.Object
+            || !status.TryGetProperty("intentRevision", out var current) || current.ValueKind != JsonValueKind.Number || !current.TryGetUInt64(out ulong currentRevision)
+            || !failure.TryGetProperty("intentRevision", out var intent) || intent.ValueKind != JsonValueKind.Number || !intent.TryGetUInt64(out ulong revision)
+            || revision > currentRevision
+            || !failure.TryGetProperty("operation", out var operation) || operation.ValueKind != JsonValueKind.String
+            || operation.GetString() is not ("tun_change" or "config_reload" or "config_patch" or "start")
+            || !failure.TryGetProperty("code", out var code) || code.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(code.GetString())
+            || !failure.TryGetProperty("message", out var message) || message.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(message.GetString())
+            || !failure.TryGetProperty("occurredAt", out var timestamp) || timestamp.ValueKind != JsonValueKind.Number || !timestamp.TryGetInt64(out long milliseconds)
+            || milliseconds <= 0 || milliseconds > DateTimeOffset.MaxValue.ToUnixTimeMilliseconds()
+            || !failure.TryGetProperty("requestedTun", out var requested) || requested.ValueKind is not (JsonValueKind.True or JsonValueKind.False)
+            || !failure.TryGetProperty("appliedTun", out var applied) || applied.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            return null;
+        return new(operation.GetString()!, code.GetString()!, message.GetString()!,
+            DateTimeOffset.FromUnixTimeMilliseconds(milliseconds), requested.GetBoolean(), applied.GetBoolean(), revision);
+    }
 }

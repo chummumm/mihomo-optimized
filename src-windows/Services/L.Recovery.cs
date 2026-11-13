@@ -52,13 +52,21 @@ public static partial class L
         catalog["正在自动恢复 TUN 接口，可随时停止。原配置文件保持不变。"] = "Automatically recovering the TUN interface. You can stop at any time. The configuration file is unchanged.";
         catalog["TUN 网卡名称冲突"] = "TUN adapter name conflict";
         catalog["网卡名称冲突"] = "Adapter name conflict";
-        catalog["TUN 接口未能启动。已有同名网卡，暂时无法确认其归属；可查看详细信息或日志。"] = "The TUN interface could not start. An adapter with this name already exists, and its ownership could not be verified. Review the details or logs.";
+        catalog["TUN 接口未能启动：此名称已被另一张网卡使用。请查看详细信息或日志。"] = "The TUN interface could not start: another adapter uses this name. Review the details or logs.";
         catalog["TUN 网卡名称"] = "TUN adapter name";
         catalog["配置名称：{0}"] = "Configured name: {0}";
         catalog["使用名称：{0}"] = "Effective name: {0}";
         catalog["准备使用名称：{0}"] = "Preparing to use: {0}";
         catalog["内核默认名称"] = "Core default";
         catalog["尚未确定"] = "Not yet known";
-        catalog["发生网卡名称冲突时，软件会自动尝试恢复。原配置文件保持不变。"] = "The app automatically attempts recovery if an adapter name conflicts. The configuration file is unchanged.";
+        catalog["使用配置中的网卡名称。若开启失败，保留失败详情，并显示当前实际状态。"] = "Uses the configured adapter name. If enabling fails, the failure details remain available alongside the current state.";
+        catalog["已关闭 · 上次开启失败"] = "Off · last enable failed";
+        catalog["上次开启 TUN 失败（{0}），当前 TUN 已关闭。{1}"] = "Last TUN enable failed ({0}). TUN is currently off. {1}";
+        catalog["上次关闭 TUN 失败（{0}），当前 TUN 仍开启。{1}"] = "Last TUN disable failed ({0}). TUN is still on. {1}";
+        catalog["上次开启 TUN 失败（{0}）。{1}"] = "Last TUN enable failed ({0}). {1}";
+        catalog["上次关闭 TUN 失败（{0}）。{1}"] = "Last TUN disable failed ({0}). {1}";
+        catalog["上次配置重载失败（{0}）。{1}"] = "Last configuration reload failed ({0}). {1}";
+        catalog["上次配置修改失败（{0}）。{1}"] = "Last configuration change failed ({0}). {1}";
+        catalog["上次启动失败（{0}）。{1}"] = "Last start failed ({0}). {1}";
     }
 }

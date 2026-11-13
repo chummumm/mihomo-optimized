@@ -490,7 +490,7 @@ public sealed class SettingsPage : NativePage
         tunDeviceConfiguredName.Text = L.F("配置名称：{0}", string.IsNullOrWhiteSpace(device.ConfiguredName) ? L.T("内核默认名称") : device.ConfiguredName);
         bool preparingDevice = Session.Runtime.Phase == DesktopRuntimePhase.RecoveringTunDevice && device.Managed;
         tunDeviceEffectiveName.Text = L.F(preparingDevice ? "准备使用名称：{0}" : "使用名称：{0}", string.IsNullOrWhiteSpace(device.EffectiveName) ? L.T("尚未确定") : device.EffectiveName);
-        tunDeviceHint.Text = L.T("发生网卡名称冲突时，软件会自动尝试恢复。原配置文件保持不变。");
+        tunDeviceHint.Text = L.T("使用配置中的网卡名称。若开启失败，保留失败详情，并显示当前实际状态。");
         configPath.Text = status.Text("configPath", fallback: L.T("主配置、备份和资源缓存"));
         logsPath.Text = L.T("内核与桌面程序的日志，按天轮转");
         applying = true;
