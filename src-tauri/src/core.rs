@@ -1620,9 +1620,8 @@ impl CoreSupervisor {
         self.termination_unconfirmed = false;
         #[cfg(windows)]
         {
-            match crate::windows::create_kill_job(
-                self.child.as_ref().expect("child stored above"),
-            ) {
+            match crate::windows::create_kill_job(self.child.as_ref().expect("child stored above"))
+            {
                 Ok(job) => self.job = Some(job),
                 Err(error) => {
                     // A policy-incompatible child can exit before job assignment.
@@ -1759,10 +1758,7 @@ impl CoreSupervisor {
     fn startup_exit_error(&self, exit: ExitStatus) -> AppError {
         let diagnostic = self.recent_diagnostic();
         if controller_discovery::legacy_incompatible_diagnostic(&diagnostic).is_some() {
-            return AppError::new(
-                "core_controller_incompatible",
-                LEGACY_CONTROLLER_MESSAGE,
-            );
+            return AppError::new("core_controller_incompatible", LEGACY_CONTROLLER_MESSAGE);
         }
         if let Some(error) = tun_device_error(&diagnostic) {
             return error;
@@ -1873,7 +1869,9 @@ impl CoreSupervisor {
                     )));
                 }
                 if let Some(instance) = expected_instance {
-                    if info.get("core_instance").and_then(serde_json::Value::as_str)
+                    if info
+                        .get("core_instance")
+                        .and_then(serde_json::Value::as_str)
                         != Some(instance)
                         || info.get("controller").and_then(serde_json::Value::as_str)
                             != Some(controller.url.trim_start_matches("http://"))
@@ -4561,7 +4559,11 @@ mod tests {
                 true,
                 "desktop-managed controller port must be 1..65535 unrelated-data",
             ),
-            (AppError::new("operation_cancelled", "cancelled"), true, legacy),
+            (
+                AppError::new("operation_cancelled", "cancelled"),
+                true,
+                legacy,
+            ),
             (
                 AppError::new("core_termination_unconfirmed", "still owned"),
                 true,
@@ -4624,11 +4626,9 @@ mod tests {
         assert!(status.pid.is_none() && status.controller.is_none());
         assert!(!core.termination_unconfirmed);
         let runtime: serde_yaml::Value =
-            serde_yaml::from_str(&fs::read_to_string(core.home.join("config.yaml")).unwrap()).unwrap();
-        assert_eq!(
-            runtime["external-controller"].as_str(),
-            Some("127.0.0.1:0")
-        );
+            serde_yaml::from_str(&fs::read_to_string(core.home.join("config.yaml")).unwrap())
+                .unwrap();
+        assert_eq!(runtime["external-controller"].as_str(), Some("127.0.0.1:0"));
         drop(core);
         fs::remove_dir_all(directory).unwrap();
     }
