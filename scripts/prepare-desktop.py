@@ -77,6 +77,19 @@ def download_cli():
     return spec["version"]
 
 
+def build_core(core, binary, version, source_time):
+    if not re.fullmatch(r"mihomo-optimized-v\d+\.\d+\.\d+(?:-desktop)?", version):
+        raise ValueError("Invalid core build version")
+    flags = f"-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version={version} -X github.com/metacubex/mihomo/constant.BuildTime={source_time}"
+    environment = {**os.environ, "CGO_ENABLED": "0", "GOOS": "windows", "GOARCH": "amd64", "GOAMD64": "v1", "GOTOOLCHAIN": "local", "GOFLAGS": "-mod=readonly"}
+    subprocess.run(["go", "build", "-tags", "with_gvisor", "-trimpath", "-ldflags", flags, "-o", str(binary), "."], cwd=core, env=environment, check=True)
+    ensure_pe(binary)
+    metadata = run("go", "version", "-m", str(binary), env=environment)
+    for expected in ["GOOS=windows", "GOARCH=amd64", "GOAMD64=v1", "CGO_ENABLED=0", "-tags=with_gvisor"]:
+        if expected not in metadata:
+            raise ValueError(f"Missing core build property: {expected}")
+    return ["-tags", "with_gvisor", "-trimpath", "-ldflags", flags]
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--core-dir", type=Path, required=True)
@@ -105,15 +118,8 @@ def main():
     if not re.fullmatch(r"\d+\.\d+\.\d+", core_version):
         raise ValueError("Invalid core version")
     source_time = run("git", "show", "-s", "--format=%cI", "HEAD", cwd=core)
-    flags = f"-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=mihomo-optimized-v{core_version}-desktop -X github.com/metacubex/mihomo/constant.BuildTime={source_time}"
-    environment = {**os.environ, "CGO_ENABLED": "0", "GOOS": "windows", "GOARCH": "amd64", "GOAMD64": "v1", "GOTOOLCHAIN": "local", "GOFLAGS": "-mod=readonly"}
     binary = BINARIES / f"mihomo-core-{TARGET}.exe"
-    subprocess.run(["go", "build", "-tags", "with_gvisor", "-trimpath", "-ldflags", flags, "-o", str(binary), "."], cwd=core, env=environment, check=True)
-    ensure_pe(binary)
-    metadata = run("go", "version", "-m", str(binary), env=environment)
-    for expected in ["GOOS=windows", "GOARCH=amd64", "GOAMD64=v1", "CGO_ENABLED=0", "-tags=with_gvisor"]:
-        if expected not in metadata:
-            raise ValueError(f"Missing core build property: {expected}")
+    build_core(core, binary, f"mihomo-optimized-v{core_version}-desktop", source_time)
     if args.service:
         service = args.service.resolve()
     else:

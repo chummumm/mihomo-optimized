@@ -167,6 +167,10 @@ jobs:
           restore-keys: desktop-native-windows-msvc-v2-
       - name: Build and stage fixed companion programs
         run: python scripts/prepare-desktop.py --core-dir core-src
+      - name: Verify actual managed controller discovery and startup cleanup
+        run: python core-src/scripts/test-desktop-controller.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe --require-tun
+      - name: Build explicit discovery-compatible core update baseline
+        run: python scripts/prepare-core-update-baseline.py --core-dir core-src
       - name: Exercise native settings and update policies
         working-directory: src-tauri
         run: cargo test --locked --target x86_64-pc-windows-msvc --lib
