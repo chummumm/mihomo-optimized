@@ -360,6 +360,24 @@ fn tun_device_error(diagnostic: &str) -> Option<AppError> {
         .map(|cause| AppError::new("tun_device_conflict", format!("TUN 网卡名称冲突：{cause}")))
 }
 
+const LEGACY_CONTROLLER_MESSAGE: &str =
+    "配套内核不支持安全的控制端口发现，请安装完整新版客户端或升级配套内核";
+
+/// Only call after the existing owned-process cleanup has confirmed exit.
+/// A child may finish logging its policy rejection between a failed Windows
+/// job assignment and that exit barrier. Never reinterpret unrelated I/O or
+/// a preparation failure using a previous launch's diagnostic.
+fn confirmed_startup_error(cause: &AppError, spawned: bool, diagnostic: &str) -> AppError {
+    if spawned
+        && cause.code == "io_error"
+        && controller_discovery::legacy_incompatible_diagnostic(diagnostic).is_some()
+    {
+        AppError::new("core_controller_incompatible", LEGACY_CONTROLLER_MESSAGE)
+    } else {
+        cause.clone()
+    }
+}
+
 pub(crate) fn startup_cleanup_error(cause: &AppError, cleanup: &AppError) -> AppError {
     if cleanup.code == "operation_cancelled" {
         return cleanup.clone();
@@ -1523,10 +1541,18 @@ impl CoreSupervisor {
                 // the unresolved handle. Do not silently grant another budget.
                 return result;
             }
+            let spawned = self.child.is_some();
             let cleanup = self.terminate_child_until(self.operation_cleanup_deadline(budget));
             self.controller = None;
             if let Err(cleanup) = cleanup {
                 return Err(startup_cleanup_error(cause, &cleanup));
+            }
+            if spawned && cause.code == "io_error" && self.check_cancelled().is_ok() {
+                return Err(confirmed_startup_error(
+                    cause,
+                    spawned,
+                    &self.recent_diagnostic(),
+                ));
             }
         }
         result
@@ -1735,7 +1761,7 @@ impl CoreSupervisor {
         if controller_discovery::legacy_incompatible_diagnostic(&diagnostic).is_some() {
             return AppError::new(
                 "core_controller_incompatible",
-                "配套内核不支持安全的控制端口发现，请安装完整新版客户端或升级配套内核",
+                LEGACY_CONTROLLER_MESSAGE,
             );
         }
         if let Some(error) = tun_device_error(&diagnostic) {
@@ -4519,6 +4545,63 @@ mod tests {
             drop(core);
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn confirmed_exit_requires_an_owned_launch_and_exact_legacy_diagnostic() {
+        let legacy = "desktop-managed controller port must be 1..65535";
+        let job_error = AppError::new("io_error", "无法接管内核进程（系统错误：5）");
+        let classified = confirmed_startup_error(&job_error, true, legacy);
+        assert_eq!(classified.code, "core_controller_incompatible");
+        for (cause, spawned, diagnostic) in [
+            (job_error.clone(), false, legacy),
+            (job_error.clone(), true, ""),
+            (
+                job_error.clone(),
+                true,
+                "desktop-managed controller port must be 1..65535 unrelated-data",
+            ),
+            (AppError::new("operation_cancelled", "cancelled"), true, legacy),
+            (
+                AppError::new("core_termination_unconfirmed", "still owned"),
+                true,
+                legacy,
+            ),
+            (
+                AppError::new("core_start_failed", "different failure"),
+                true,
+                legacy,
+            ),
+        ] {
+            let preserved = confirmed_startup_error(&cause, spawned, diagnostic);
+            assert_eq!(preserved.code, cause.code);
+            assert_eq!(preserved.message, cause.message);
+        }
+        let cleanup = AppError::new("io_error", "cannot confirm exit");
+        let unresolved = startup_cleanup_error(&job_error, &cleanup);
+        assert_eq!(unresolved.code, "core_termination_unconfirmed");
+
+        let directory = diagnostic_test_directory("discovery-old-diagnostic");
+        fs::create_dir_all(&directory).unwrap();
+        let old = format!("{legacy}\n");
+        fs::write(
+            directory.join("core.log"),
+            format!("{old}a different current launch failure\n"),
+        )
+        .unwrap();
+        let mut core = CoreSupervisor::new(PathBuf::new(), directory.clone(), directory.clone());
+        core.log_start = old.len() as u64;
+        let current = core.recent_diagnostic();
+        assert!(
+            current.is_empty(),
+            "old launch policy errors must not be reused"
+        );
+        assert_eq!(
+            confirmed_startup_error(&job_error, true, &current).code,
+            "io_error"
+        );
+        drop(core);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
