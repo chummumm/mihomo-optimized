@@ -25,27 +25,42 @@ var (
 	windowsWintunName   = windows.DEVPROPKEY{FmtID: windows.DEVPROPGUID{Data1: 0x3361c968, Data2: 0x2f2e, Data3: 0x4660, Data4: [8]byte{0xb4, 0x7e, 0x69, 0x9c, 0xdc, 0x4c, 0x32, 0xb9}}, PID: 3}
 
 	createExclusiveWindowsAdapter = func(options Options) (windowsAdapter, error) {
-		expected := generateExclusiveGUIDByDeviceName(options.Name)
-		adapter, err := wintun.CreateAdapter(options.Name, exclusiveWindowsTunnelType, expected)
-		if err != nil {
-			return nil, err
-		}
-		// Check the handle returned by Create before assigning addresses or routes.
-		// RequestedGUID is a request to Windows, not a substitute for this identity.
-		luid := adapter.LUID()
-		actual, err := winipcfg.LUID(luid).GUID()
-		if err != nil {
-			adapter.Close()
-			return nil, fmt.Errorf("read created Wintun identity (luid=%d): %w", luid, err)
-		}
-		if luid == 0 || *actual != *expected {
-			adapter.Close()
-			return nil, fmt.Errorf("created Wintun identity differs from requested product (luid=%d guid=%s expected_guid=%s)", luid, actual, expected)
-		}
-		return adapter, nil
+		return createWindowsProductAdapter(options.Name, *generateExclusiveGUIDByDeviceName(options.Name))
 	}
 	inspectExclusiveWindowsAdapter = inspectWindowsAdapter
 )
+
+// The migration path can claim the original product GUID under its current
+// native alias, which Wintun may have changed after a namespace switch.
+func createWindowsProductAdapter(name string, expected windows.GUID) (windowsAdapter, error) {
+	adapter, err := wintun.CreateAdapter(name, exclusiveWindowsTunnelType, &expected)
+	if err != nil {
+		return nil, err
+	}
+	return verifyCreatedWindowsProductAdapter(adapter, expected, func(luid uint64) (windows.GUID, error) {
+		actual, err := winipcfg.LUID(luid).GUID()
+		if err != nil {
+			return windows.GUID{}, err
+		}
+		return *actual, nil
+	})
+}
+
+// RequestedGUID is a request to Windows, not a substitute for checking the
+// returned handle. Only this newly created handle is closed on failure.
+func verifyCreatedWindowsProductAdapter(adapter windowsAdapter, expected windows.GUID, readGUID func(uint64) (windows.GUID, error)) (windowsAdapter, error) {
+	luid := adapter.LUID()
+	actual, err := readGUID(luid)
+	if err != nil {
+		adapter.Close()
+		return nil, fmt.Errorf("read created Wintun identity (luid=%d): %w", luid, err)
+	}
+	if luid == 0 || actual != expected {
+		adapter.Close()
+		return nil, fmt.Errorf("created Wintun identity differs from requested product (luid=%d guid=%s expected_guid=%s)", luid, actual, expected)
+	}
+	return adapter, nil
+}
 
 func generateExclusiveGUIDByDeviceName(name string) *windows.GUID {
 	sum := md5.Sum([]byte("mihomo-optimized/wintun-exclusive/v1\x00" + name))
@@ -158,9 +173,17 @@ func (inspection windowsAdapterInspection) mayDisappear() bool {
 }
 
 func inspectWindowsAdapter(name string) (windowsAdapterInspection, error) {
-	interfaces, err := winipcfg.GetIfTable2Ex(winipcfg.MibIfEntryNormal)
+	rows, err := readWindowsInterfaceIdentities()
 	if err != nil {
 		return windowsAdapterInspection{ExpectedGUID: *generateExclusiveGUIDByDeviceName(name), Reason: "interface_query_failed"}, err
+	}
+	return inspectWindowsAdapterInterfaces(name, rows, queryWindowsAdapter)
+}
+
+func readWindowsInterfaceIdentities() ([]windowsInterfaceIdentity, error) {
+	interfaces, err := winipcfg.GetIfTable2Ex(winipcfg.MibIfEntryNormal)
+	if err != nil {
+		return nil, err
 	}
 	rows := make([]windowsInterfaceIdentity, 0, len(interfaces))
 	for _, entry := range interfaces {
@@ -170,7 +193,7 @@ func inspectWindowsAdapter(name string) (windowsAdapterInspection, error) {
 			AdminState: uint32(entry.AdminStatus), Flags: uint8(entry.InterfaceAndOperStatusFlags),
 		})
 	}
-	return inspectWindowsAdapterInterfaces(name, rows, queryWindowsAdapter)
+	return rows, nil
 }
 
 func inspectWindowsAdapterInterfaces(name string, interfaces []windowsInterfaceIdentity, query func(string, windows.GUID) (windowsAdapterIdentity, error)) (windowsAdapterInspection, error) {

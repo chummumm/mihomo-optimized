@@ -279,7 +279,7 @@ jobs:
   updater-platforms:
     name: Core updater (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -308,27 +308,69 @@ jobs:
         run: go test -tags with_gvisor -count=1 -timeout=5m ./hub/route -run 'ConfigFile|UIUpdater|UnifiedUpgrade|UpgradeSchedule'
       - name: Verify desktop supervisor authentication, confinement and lifecycle contracts
         run: go test -tags with_gvisor -count=1 -timeout=3m ./component/desktop ./hub/route . -run Desktop
-      - name: Verify actual OS-assigned managed controllers and startup cleanup
+      - name: Set up Python for native Windows compatibility tests
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Verify standalone Windows legacy product migration contracts
+        if: runner.os == 'Windows'
+        run: go test -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun -run StandaloneWindows
+      - name: Build the actual core for native acceptance
+        id: acceptance_core
         shell: bash
         run: |
           set -euo pipefail
           controller_test_binary="$RUNNER_TEMP/mihomo-controller-test"
           if [[ "$RUNNER_OS" == "Windows" ]]; then controller_test_binary="$controller_test_binary.exe"; fi
-          trap 'rm -f "$controller_test_binary"' EXIT
           CGO_ENABLED=0 go build -tags with_gvisor -o "$controller_test_binary" .
+          printf 'binary=%s\n' "$controller_test_binary" >> "$GITHUB_OUTPUT"
+      - name: Verify actual managed controllers and startup cleanup
+        timeout-minutes: 5
+        env:
+          CONTROLLER_TEST_BINARY: ${{ steps.acceptance_core.outputs.binary }}
+        run: |
+          set -euo pipefail
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            python scripts/test-desktop-controller.py --core "$controller_test_binary" --require-tun
+            python scripts/test-desktop-controller.py --core "$CONTROLLER_TEST_BINARY" --require-tun
           else
-            python3 scripts/test-desktop-controller.py --core "$controller_test_binary"
+            python3 scripts/test-desktop-controller.py --core "$CONTROLLER_TEST_BINARY"
           fi
+      - name: Verify standalone Windows TUN compatibility and product migration
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.acceptance_core.outcome == 'success' }}
+        timeout-minutes: 8
+        env:
+          CONTROLLER_TEST_BINARY: ${{ steps.acceptance_core.outputs.binary }}
+        run: |
+          set -euo pipefail
+          compat_fixture_binary="$RUNNER_TEMP/mihomo-tun-compat-fixture.test.exe"
+          trap 'rm -f "$compat_fixture_binary"' EXIT
+          CGO_ENABLED=0 go test -tags with_gvisor -c -o "$compat_fixture_binary" github.com/metacubex/sing-tun
+          python scripts/test-windows-tun-compat.py --core "$CONTROLLER_TEST_BINARY" --fixture "$compat_fixture_binary" --report "$RUNNER_TEMP/windows-tun-compat/report.json"
+      - name: Verify the official CVR service with the actual core
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.acceptance_core.outcome == 'success' }}
+        timeout-minutes: 6
+        env:
+          CONTROLLER_TEST_BINARY: ${{ steps.acceptance_core.outputs.binary }}
+        run: python scripts/windows-cvr-service-compat/run.py --core "$CONTROLLER_TEST_BINARY" --report "$RUNNER_TEMP/windows-tun-compat/cvr-service/report.json"
+      - name: Preserve Windows compatibility evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: windows-tun-compat-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-tun-compat/
+          if-no-files-found: warn
+          retention-days: 30
       - name: Verify TUN snapshots, recovery operations and native Windows resource repair
-        run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./listener ./listener/sing_tun ./hub/executor ./hub/route -run 'Desktop|TunHealth|TunRecovery'
+        if: ${{ !cancelled() && steps.acceptance_core.outcome == 'success' }}
+        run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./listener ./listener/sing_tun ./hub/executor ./hub/route -run 'Desktop|StandaloneWindowsTun|TunHealth|TunRecovery'
       - name: Verify exclusive Windows adapter creation and deterministic cleanup
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.acceptance_core.outcome == 'success' }}
         env:
           MIHOMO_TUN_INTEGRATION: '1'
         run: go test -v -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun github.com/metacubex/sing-tun/internal/wintun -run Desktop
       - name: Verify native startup resource routing, cache isolation and cancellation
+        if: ${{ !cancelled() && steps.acceptance_core.outcome == 'success' }}
         run: go test -tags with_gvisor -count=1 -timeout=5m ./adapter/provider ./adapter/outboundgroup ./component/profile/cachefile ./component/dialer ./component/http ./component/resolver ./config ./hub/executor ./hub/route . -run 'ResourceBootstrap|ReadSelectedSnapshot'
 
   release:
@@ -403,7 +445,17 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.36
+              printf '%s\n\n' '## 本次更新：1.0.37
+
+          - 修复 Windows 普通核心替换时，上游通用 GUID 的同名网卡被产品独占预检查拒绝的问题（issue #92）。普通核心恢复上游通用 GUID、Create / Open / StartSession 和 Windows 重试流程，支持第三方宿主使用 -d、-f、-ext-ctl-pipe 启动。
+          - 只有显式 desktop-managed 的自家桌面保留专属身份与独占创建；管理员权限、Windows 服务和开启 TUN 本身不会切换模式。无需新增 YAML 配置。
+          - 处理旧 optimized 核心崩溃后遗留的产品 GUID：严格确认本产品身份，取得同一实例的原生创建者句柄并正常关闭，再创建通用网卡。仍有创建者持有时明确拒绝，避免跨 GUID 换核留下断开接口。
+          - 保留会话及部分配置失败的确定性清理、Wintun Close 修复、实际句柄身份检查和路由错误处理。替换前先由原宿主停止旧核心；普通模式采用上游原生同名处理，受管模式继续保护外部同名设备。
+          - 新增真实 Wintun 创建者与实际核心命名管道启动验收，验证通用身份复用、活动会话保护和身份切换；另使用固定 SHA-256 的 Clash Verge Service IPC 2.7.7 正式服务验证核心启动、TUN 实际转发和停止。受管原生生命周期回归继续执行。
+
+          [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.37/docs/releases.md) · [Windows 模式边界](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.37/docs/desktop-managed.md#windows-tun-ownership-boundary)
+
+          ## 1.0.36
 
           - 修复重启内核时 PnP 设备已移除、网络接口表仍残留旧记录导致的 native_identity_missing。单一产品专属 GUID、名称、虚拟接口类型和有效 LUID/索引匹配时，由 Windows 原生创建协调移除时序。
           - 保留 utun 名称、原生活跃拥有者排他和创建后句柄校验；同名不同 GUID、身份冲突及查询错误继续拒绝。不扩大 500 毫秒等待、不循环重启、不按名称接管已有网卡。
