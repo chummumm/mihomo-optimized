@@ -635,8 +635,17 @@ class Core:
         result = pipe_request(self.pipe, method, path, body, expected_pid=self.current["pid"])
         require(result["pid"] == self.current["pid"],
                 "controller response came from a different process")
-        self.record["controllerResponses"].append({"method": method, "path": path,
-            "pid": result["pid"], "status": result["status"], "bytes": result["bytes"]})
+        observed = {"method": method, "path": path,
+                    "pid": result["pid"], "status": result["status"], "bytes": result["bytes"]}
+        if path == "/configs" and isinstance(result["body"], dict):
+            configuration = result["body"]
+            tun = configuration.get("tun")
+            observed["configuration"] = {"mode": configuration.get("mode"),
+                "log-level": configuration.get("log-level"),
+                "tun": {key: tun.get(key) for key in ("enable", "device", "stack", "auto-route",
+                    "auto-detect-interface", "route-address", "inet4-address", "dns-mode")}
+                    if isinstance(tun, dict) else tun}
+        self.record["controllerResponses"].append(observed)
         return result
 
     def ready(self, *, previous_pid: int | None = None) -> dict:
@@ -669,8 +678,9 @@ class Core:
         require(response["status"] == 200 and isinstance(response["body"], dict), "cannot read ordinary /configs")
         tun = response["body"].get("tun", {})
         require(tun.get("enable") is True and tun.get("device") == self.case.name
-                and tun.get("stack") == "system" and tun.get("auto-route") is True,
-                "ordinary runtime did not apply its original TUN configuration")
+                and tun.get("stack") == "System" and tun.get("auto-route") is True,
+                "ordinary runtime did not apply its original TUN configuration: "
+                + json.dumps({"expectedDevice": self.case.name, "actualTun": tun}, sort_keys=True))
         require(self.request("GET", "/desktop")["status"] == 404
                 and not (self.home / "desktop-controller.json").exists(),
                 "ordinary startup/reload/restart unexpectedly entered managed mode")
@@ -703,8 +713,8 @@ class Core:
         require(self.current["pid"] == old_pid
                 and all(after[key] == before[key] for key in ("guid", "luid", "index", "alias", "if_type")),
                 "an unchanged ordinary TUN was replaced or changed identity during hot reload")
-        require(self.request("GET", "/configs")["body"].get("log-level") == "warning",
-                "hot reload did not apply the changed configuration")
+        actual_level = self.request("GET", "/configs")["body"].get("log-level")
+        require(actual_level == "warning", f"hot reload did not apply log-level warning: actual={actual_level!r}")
         self.record["hotReload"] = {"pid": old_pid, "sameIdentity": True, "modeRemainedOrdinary": True}
         self.forwarding("after_hot_reload")
 
