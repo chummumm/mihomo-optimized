@@ -127,10 +127,7 @@ impl LaunchDiscovery {
         if record.protocol_version != 1 {
             return Err(incompatible("配套内核不支持当前控制端口发现协议"));
         }
-        if expected_pid == 0
-            || record.pid != expected_pid
-            || record.launch_nonce != self.nonce
-        {
+        if expected_pid == 0 || record.pid != expected_pid || record.launch_nonce != self.nonce {
             return Err(AppError::new(
                 "core_controller_identity",
                 "本地控制就绪记录不属于本次自有内核启动",
@@ -182,7 +179,9 @@ pub(super) fn legacy_incompatible_diagnostic(line: &str) -> Option<&'static str>
     } else {
         line
     };
-    let message = message.strip_prefix("parse config error: ").unwrap_or(message);
+    let message = message
+        .strip_prefix("parse config error: ")
+        .unwrap_or(message);
     (message == LEGACY).then_some(LEGACY)
 }
 
@@ -230,7 +229,11 @@ mod tests {
     #[test]
     fn ready_record_requires_exact_launch_process_and_loopback_address() {
         let fixture = Fixture::new();
-        assert!(fixture.discovery.read(1234, "test-secret").unwrap().is_none());
+        assert!(fixture
+            .discovery
+            .read(1234, "test-secret")
+            .unwrap()
+            .is_none());
         let valid = fixture.record();
         fixture.write(&valid);
         let discovered = fixture
@@ -285,7 +288,12 @@ mod tests {
             record["controller"] = serde_json::json!(address);
             fixture.write(&record);
             assert_eq!(
-                fixture.discovery.read(1234, "test-secret").err().unwrap().code,
+                fixture
+                    .discovery
+                    .read(1234, "test-secret")
+                    .err()
+                    .unwrap()
+                    .code,
                 "core_controller_incompatible"
             );
         }
