@@ -2035,7 +2035,10 @@ mod cleanup_observation_tests {
             let error = fixture
                 .manager
                 .apply_core_update_completion(
-                    Err(AppError::new("core_update_accept_failed", "fixture failure")),
+                    Err(AppError::new(
+                        "core_update_accept_failed",
+                        "fixture failure",
+                    )),
                     installer_only,
                 )
                 .unwrap_err();
