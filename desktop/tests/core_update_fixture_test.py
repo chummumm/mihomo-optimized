@@ -5,7 +5,9 @@ from __future__ import annotations
 import copy
 import unittest
 
-from core_update_smoke import BASELINE_KIND, BASELINE_VERSION, validate_baseline_metadata
+from core_update_smoke import (
+    BASELINE_KIND, BASELINE_VERSION, validate_baseline_metadata, validate_legacy_rejection_status,
+)
 from windows_smoke import SmokeFailure
 
 
@@ -77,6 +79,44 @@ class BaselineProvenanceTests(unittest.TestCase):
             with self.subTest(source_time=source_time):
                 with self.assertRaisesRegex(SmokeFailure, "^core_fixture_baseline_source_time_invalid$"):
                     self.validate({**self.metadata, "sourceTime": source_time})
+
+
+class LegacyRejectionStateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.status = {
+            "phase": "error", "errorCode": "core_controller_incompatible",
+            "desiredRunning": True, "controller": None, "pid": None, "operation": None,
+            "processState": "exited", "controlState": "unknown", "listenersReady": None,
+        }
+
+    def test_user_start_intent_is_preserved_after_confirmed_resource_exit(self) -> None:
+        before = copy.deepcopy(self.status)
+        validate_legacy_rejection_status(self.status)
+        self.assertEqual(self.status, before)
+        validate_legacy_rejection_status({**self.status, "listenersReady": False})
+
+    def test_lost_user_intent_is_not_accepted_as_successful_cleanup(self) -> None:
+        for intent in (False, None, 0, 1):
+            with self.subTest(intent=intent):
+                with self.assertRaisesRegex(SmokeFailure, "^core_fixture_legacy_start_intent_lost$"):
+                    validate_legacy_rejection_status({**self.status, "desiredRunning": intent})
+
+    def test_residual_or_unconfirmed_resources_and_missing_fields_fail(self) -> None:
+        for key, value in (
+            ("phase", "starting"), ("errorCode", "core_termination_unconfirmed"),
+            ("controller", {"url": "http://127.0.0.1:45678", "secret": "fixture-only"}),
+            ("pid", 42), ("operation", "stopping"), ("processState", "unknown"),
+            ("controlState", "ready"), ("listenersReady", True), ("listenersReady", 0),
+        ):
+            with self.subTest(key=key, value=value):
+                with self.assertRaisesRegex(SmokeFailure, "^core_fixture_legacy_rejection_not_terminal$"):
+                    validate_legacy_rejection_status({**self.status, key: value})
+        for key in self.status:
+            with self.subTest(missing=key):
+                status = dict(self.status)
+                del status[key]
+                with self.assertRaisesRegex(SmokeFailure, "^core_fixture_legacy_rejection_status_incomplete$"):
+                    validate_legacy_rejection_status(status)
 
 
 if __name__ == "__main__":

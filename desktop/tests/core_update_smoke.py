@@ -118,6 +118,22 @@ def validate_baseline_metadata(metadata: dict, installed: dict, pin: dict) -> di
         "kind", "source", "version", "sha256", "coreDirty", "goToolchain", "sourceTime", "buildFlags")}
 
 
+def validate_legacy_rejection_status(status: dict) -> None:
+    fields = {"phase", "errorCode", "desiredRunning", "controller", "pid", "operation",
+              "processState", "controlState", "listenersReady"}
+    require(isinstance(status, dict) and fields.issubset(status),
+            "core_fixture_legacy_rejection_status_incomplete")
+    # This is the desktop user's explicit Start intent, not the core's
+    # automatic recovery intent. A failed Start preserves it until Stop.
+    require(status["desiredRunning"] is True, "core_fixture_legacy_start_intent_lost")
+    require(status["phase"] == "error" and status["errorCode"] == "core_controller_incompatible"
+            and status["controller"] is None and status["pid"] is None
+            and status["operation"] is None and status["processState"] == "exited"
+            and status["controlState"] == "unknown"
+            and (status["listenersReady"] is None or status["listenersReady"] is False),
+            "core_fixture_legacy_rejection_not_terminal")
+
+
 class CoreUpdateAcceptance(Acceptance):
     def __init__(self, app: Path, artifacts: Path) -> None:
         super().__init__(app, artifacts)
@@ -295,12 +311,11 @@ class CoreUpdateAcceptance(Acceptance):
         row["rejectionMilliseconds"] = round((time.monotonic() - started) * 1000)
         status = self.status()
         row["statusAfterRejection"] = {key: status.get(key) for key in
-            ("phase", "errorCode", "desiredRunning", "pid", "operation", "processState", "controlState")}
+            ("phase", "errorCode", "desiredRunning", "pid", "operation", "processState",
+             "controlState", "listenersReady")}
+        row["controllerWithdrawn"] = "controller" in status and status["controller"] is None
         self.checkpoint()
-        require(status.get("phase") in ("failed", "error") and status.get("errorCode") == "core_controller_incompatible"
-                and status.get("desiredRunning") is False and status.get("controller") is None
-                and status.get("pid") is None and status.get("operation") is None,
-                "core_fixture_legacy_rejection_not_terminal")
+        validate_legacy_rejection_status(status)
         # Rejection returns only after startup cleanup confirms the child has
         # exited. Do not turn an unconfirmed owner into an eventual-pass wait.
         require(not self.processes.at_paths([self.core]), "core_fixture_legacy_core_survived_rejection")
@@ -312,7 +327,8 @@ class CoreUpdateAcceptance(Acceptance):
                 and file_hash(self.core) == self.legacy_core_hash,
                 "core_fixture_legacy_rejection_changed_source_or_binary")
         row.update({"ownedCoreExitConfirmed": True, "controllerWithdrawn": True,
-                    "noTunAdapterCreated": True, "yamlUnchanged": True, "publishedBinaryUnchanged": True})
+                    "userStartIntentPreserved": True, "noTunAdapterCreated": True,
+                    "yamlUnchanged": True, "publishedBinaryUnchanged": True})
         self.close_scenario()
         native.require_unused(device)
         row["installationAndServiceIdleAfterCleanup"] = True
