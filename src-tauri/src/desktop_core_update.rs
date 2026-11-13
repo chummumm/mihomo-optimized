@@ -33,8 +33,6 @@ impl DesktopManager {
             && self.app.stop_pending.load(Ordering::Acquire) == 0
             && matches!(self.phase, Phase::Stopped | Phase::Running | Phase::Error)
             && self.core_status.error_code.as_deref() != Some("core_termination_unconfirmed")
-            && !self.tun_device_recovery.active
-            && !self.can_recover_tun_device()
             && (self.phase != Phase::Error || self.core_status.process_state == "exited")
     }
 

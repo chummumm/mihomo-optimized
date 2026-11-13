@@ -9,7 +9,7 @@ internal static class TunDeviceStateTests
         KeepsSelectionSeparateFromReadiness();
         RejectsIncompleteMetadata();
         KeepsTheConfigurationRevisionBound();
-        Console.WriteLine("TUN device status: read-only host names, automatic recovery without manual eligibility, separate readiness, and ordered source revisions passed.");
+        Console.WriteLine("TUN device status: configured names without a fixed fallback, separate readiness, and ordered source revisions passed.");
     }
 
     private static void ReadsNamesWithoutManualEligibility()
@@ -32,6 +32,13 @@ internal static class TunDeviceStateTests
 
         var legacyEligibility = Read(Snapshot(device: values => values["canUseManaged"] = true));
         Check(legacyEligibility == state, "A retired action eligibility field changed read-only device information");
+        var withoutFallback = Read(Snapshot(device: values =>
+        {
+            values.Remove("managed"); values.Remove("managedName");
+        }));
+        Check(withoutFallback.Available && !withoutFallback.Managed && withoutFallback.ConfiguredName == "utun"
+            && withoutFallback.EffectiveName == "utun" && withoutFallback.ManagedName.Length == 0,
+            "Configured-name information still required the retired fixed-name fallback");
     }
 
     private static void KeepsSelectionSeparateFromReadiness()
@@ -69,13 +76,13 @@ internal static class TunDeviceStateTests
     {
         foreach (var change in new Action<Dictionary<string, object?>>[]
         {
-            values => values.Remove("managed"),
             values => values["managed"] = "false",
             values => values.Remove("configuredName"),
             values => values["configuredName"] = 1,
             values => values.Remove("effectiveName"),
             values => values["effectiveName"] = new { invalid = true },
-            values => values["managedName"] = " "
+            values => values.Remove("configRevision"),
+            values => values["configRevision"] = " "
         }) Check(!Read(Snapshot(device: change)).Available, "Malformed metadata exposed invented device information");
         Check(!Read(Snapshot(status: values => values.Remove("tunDevice"))).Available,
             "A host without device metadata exposed new device information");

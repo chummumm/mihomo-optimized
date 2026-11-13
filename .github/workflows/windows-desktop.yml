@@ -133,7 +133,7 @@ jobs:
         working-directory: core-src
         env:
           MIHOMO_TUN_INTEGRATION: '1'
-        run: go test -v -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun -run Desktop
+        run: go test -v -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun github.com/metacubex/sing-tun/internal/wintun -run Desktop
       - name: Verify proxy IP destinations and DNS address-family output
         working-directory: core-src
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./adapter ./adapter/provider ./dns ./config ./tunnel -run 'ProxyTarget|ProxyForceIP|TargetIPFamily|AnswerIPFamily|ProviderTargetFamily'
@@ -192,7 +192,7 @@ jobs:
         run: python desktop/tests/core_smoke.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe
       - name: Test real Windows bootstrap groups, offline cache and cancellation
         run: python core-src/scripts/test-resource-bootstrap.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe --report artifacts/verification/resource-bootstrap-core.json
-      - name: Test legacy installer upgrade and automatic TUN recovery
+      - name: Test legacy installer upgrade and native TUN lifecycle
         run: ./desktop/tests/setup-windows.ps1
       - name: Test independent automatic core updates while running, in TUN and stopped
         timeout-minutes: 35

@@ -1,10 +1,10 @@
-"""Actual 0.2.5 TUN upgrade and automatic desktop-name recovery acceptance.
+"""Actual Windows TUN ownership, lifecycle and published-version acceptance.
 
 The hot upgrade uses the installed published GUI, host, service and core. The
-crash/foreign cases use a verified copy of that same old core as an isolated
-child, so an old supervisor cannot restart Wintun and erase the evidence before
-the candidate sees it. Each startup makes at most one ordinary Start request;
-the fixture never invokes a repair command or a repair button.
+crash/foreign cases use verified private copies of the published and candidate
+cores. No supervisor can restart those owners between exit and the candidate's
+next operation. Tests preserve the configured name, never invoke a repair
+command and never create/open a Wintun adapter just to inspect its identity.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import http.client
-import ipaddress
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -24,15 +24,14 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
-from upgrade_tun_native import MANAGED_NAME, NativeTunIdentity, expected_guid, same_identity
+from upgrade_tun_native import NativeTunIdentity, expected_guid, same_identity
 from windows_smoke import (
-    NativeDriver, RestrictedDesktop, SmokeFailure, SocksFixture, child_environment,
+    NativeDriver, RestrictedDesktop, SmokeFailure, SocksFixture, TUN_BODY, TUN_TARGET, child_environment,
     free_port, profile, require, safe_code, wait_until,
 )
 
 
 OLD_CORE_SOURCE = "96c428bce6b1e7d68327910dad5f426ad29d2d98"
-CURRENT_CORE_SOURCE = "79bbcad5ef3151fc2be4a9f8256d5afc838bde43"
 START_TIMEOUT = 60.0
 AUTO_RECOVERY_EVENTS = ("tun_device_auto_recovery", "tun_device_auto_recovery_succeeded")
 
@@ -66,7 +65,7 @@ class TunUpgradeAcceptance:
         # actual private directory spelling before copying or launching files.
         self.directory = Path(self.temp.name).resolve(strict=True)
         self.evidence = {"oldDesktopVersion": version, "oldDesktopSource": source,
-                         "oldCoreSource": OLD_CORE_SOURCE, "candidateCoreSource": CURRENT_CORE_SOURCE,
+                         "oldCoreSource": OLD_CORE_SOURCE, "candidateCoreSource": owner.info["coreCommit"],
                          "scenarios": {}, "cleanup": []}
         owner.report["nativeTunUpgrade"] = self.evidence
 
@@ -78,10 +77,10 @@ class TunUpgradeAcceptance:
                 + profile(free_port(), self.socks.server_address[1]).replace(
                     "  device: MihomoSmokeTun\n", "  device: " + name + "\n")).encode("utf-8")
 
-    def configure(self, content: bytes) -> None:
+    def configure(self, content: bytes, *, tun: bool = True) -> None:
         require(self.driver is None, "upgrade_configure_requires_stopped_gui")
         self.owner.config.write_bytes(content)
-        self.preferences.write_text(json.dumps({"desiredRunning": False, "systemProxy": False, "tun": True}),
+        self.preferences.write_text(json.dumps({"desiredRunning": False, "systemProxy": False, "tun": tun}),
                                     encoding="utf-8")
         self.config_hash = file_hash(self.owner.config)
 
@@ -116,7 +115,8 @@ class TunUpgradeAcceptance:
         if isinstance(secret, str) and secret:
             self.secrets.add(secret)
         self.evidence["lastStatus"] = {key: status.get(key) for key in
-            ("phase", "errorCode", "desiredRunning", "tun", "tunDevice", "operation", "pid")}
+            ("phase", "errorCode", "desiredRunning", "tun", "tunHealth", "tunDevice", "operation", "pid",
+             "processState", "controlState", "observedAt", "intentRevision", "statusSequence", "lastOperationFailure")}
         return status
 
     def recovery_cursor(self) -> dict:
@@ -156,41 +156,6 @@ class TunUpgradeAcceptance:
         evidence.setdefault("automaticRecoveryEventCounts", {})[stage] = len(actual)
         self.checkpoint()
         require(actual == expected, "upgrade_unexpected_additional_automatic_recovery")
-
-    def require_auto_recovery(self, cursor: dict, original_name: str, status: dict,
-                              process, evidence: dict, deadline: float) -> list[dict]:
-        def complete():
-            events = self.recovery_events(cursor)
-            evidence["automaticRecoveryEvents"] = events
-            require(len(events) <= 2, "upgrade_automatic_recovery_repeated")
-            return events if len(events) == 2 else None
-
-        events = wait_until(complete, "upgrade_automatic_recovery_evidence_missing", self.remaining(deadline))
-        require([event["event"] for event in events] == list(AUTO_RECOVERY_EVENTS),
-                "upgrade_automatic_recovery_event_order_invalid")
-        initial, success = [event.get("data", {}) for event in events]
-        for data in (initial, success):
-            require(data.get("causeCode") == "tun_device_conflict"
-                    and data.get("configRevision") == self.config_hash
-                    and data.get("configuredName") == original_name
-                    and data.get("effectiveName") == MANAGED_NAME
-                    and type(data.get("attempt")) is int and data["attempt"] == 1
-                    and data.get("previousExitConfirmed") is True
-                    and type(data.get("generation")) is int and data["generation"] >= 0
-                    and type(status.get("intentRevision")) is int
-                    and data["generation"] == status["intentRevision"]
-                    and data.get("desktopVersion") == self.owner.info["desktopVersion"]
-                    and "coreVersion" in data, "upgrade_automatic_recovery_event_invalid")
-        require(success["generation"] == initial["generation"] and success.get("corePid") == process.pid
-                and isinstance(success["coreVersion"], str) and success["coreVersion"]
-                and success["coreVersion"] == status.get("coreVersion")
-                and type(events[0].get("processId")) is int and events[0]["processId"] > 0
-                and events[0].get("processId") == events[1].get("processId")
-                and events[0].get("timeMs", 0) > 0 and events[1].get("timeMs", 0) >= events[0]["timeMs"],
-                "upgrade_automatic_recovery_success_identity_mismatch")
-        evidence["automaticRecoveryEventCounts"] = {"after_start": len(events)}
-        self.checkpoint()
-        return events
 
     @staticmethod
     def remaining(deadline: float) -> float:
@@ -270,11 +235,11 @@ class TunUpgradeAcceptance:
             record["elapsedMilliseconds"] = round((time.monotonic() - started) * 1000)
             self.checkpoint()
 
-    def running(self, name: str) -> tuple[dict, object]:
+    def running(self, name: str, *, tun: bool = True) -> tuple[dict, object]:
         status = self.status()
         require(status.get("phase") == "running" and status.get("statusStale") is not True,
                 "upgrade_tun_not_running")
-        require(status.get("tun") is True and status.get("systemProxy") is False
+        require(status.get("tun") is tun and status.get("systemProxy") is False
                 and status.get("service", {}).get("running") is True, "upgrade_tun_not_service_owned")
         identity = self.request(status["controller"], "/desktop")
         require(identity.get("managed") is True and identity.get("state") == "running", "upgrade_core_not_managed")
@@ -282,7 +247,7 @@ class TunUpgradeAcceptance:
         require(process and process.path == os.path.normcase(str(self.owner.core.resolve())), "upgrade_core_image_mismatch")
         self.retain_process(process)
         configuration = self.request(status["controller"], "/configs")
-        require(configuration.get("tun", {}).get("enable") is True
+        require(configuration.get("tun", {}).get("enable") is tun
                 and configuration["tun"].get("device") == name, "upgrade_actual_tun_name_mismatch")
         return status, process
 
@@ -327,10 +292,10 @@ class TunUpgradeAcceptance:
                 and evidence["forwarding"][label]["lastFixtureError"] is None,
                 "upgrade_tun_forwarding_fixture_error")
 
-    def assert_legacy(self, before: dict, evidence: dict, stage: str, *,
+    def assert_adapter_unchanged(self, before: dict, evidence: dict, stage: str, *,
                       phantom: bool | None, allow_removed: bool = False) -> str:
         actual = self.native.query(before["name"], before["guid"])
-        evidence.setdefault("legacyObservations", {})[stage] = actual
+        evidence.setdefault("adapterObservations", {})[stage] = actual
         self.checkpoint()
         if actual is None:
             require(allow_removed, "upgrade_legacy_adapter_disappeared_before_recovery")
@@ -340,18 +305,6 @@ class TunUpgradeAcceptance:
         if phantom is False:
             require(actual["interface"] == before["interface"], "upgrade_live_foreign_interface_changed")
         return "same_exact_identity"
-
-    def verify_managed(self, original_name: str, evidence: dict) -> tuple[dict, object]:
-        status, process = self.running(MANAGED_NAME)
-        self.require_mapping(status, original_name)
-        self.unchanged_source(evidence, "after_automatic_start")
-        adapter = self.capture(MANAGED_NAME, True, process)
-        require(adapter["guid"] != expected_guid(original_name, exclusive=False), "upgrade_legacy_adapter_was_adopted")
-        evidence["managedAdapter"] = adapter
-        evidence["initialTunDevice"] = status["tunDevice"]
-        evidence["persistedOverride"] = json.loads(self.preferences.read_text(encoding="utf-8"))["tunDeviceOverride"]
-        evidence["sourceYamlSha256"] = self.config_hash
-        return status, process
 
     def assert_no_repair_controls(self, evidence: dict, *, offline: bool = False) -> None:
         controls = evidence.setdefault("removedRepairControls", {})
@@ -378,20 +331,10 @@ class TunUpgradeAcceptance:
         self.checkpoint()
         require(all(value is False for value in controls.values()), "upgrade_manual_tun_repair_control_remains")
 
-    def require_mapping(self, status: dict, original_name: str) -> None:
-        device = status.get("tunDevice", {})
-        require(device.get("configuredName") == original_name and device.get("effectiveName") == MANAGED_NAME
-                and device.get("managed") is True and device.get("managedName") == MANAGED_NAME
-                and device.get("configRevision") == self.config_hash,
-                "upgrade_managed_tun_mapping_incorrect")
-        preference = json.loads(self.preferences.read_text(encoding="utf-8"))
-        require(preference.get("tunDeviceOverride") == {"configuredName": original_name, "effectiveName": MANAGED_NAME},
-                "upgrade_managed_tun_mapping_not_persisted")
-
     def require_configured_name(self, status: dict, name: str) -> None:
         device = status.get("tunDevice", {})
         require(device.get("configuredName") == name and device.get("effectiveName") == name
-                and device.get("managed") is False and device.get("managedName") == MANAGED_NAME
+                and device.get("managed") is not True
                 and device.get("configRevision") == self.config_hash,
                 "upgrade_unexpected_tun_name_override")
         preference = json.loads(self.preferences.read_text(encoding="utf-8"))
@@ -447,7 +390,6 @@ class TunUpgradeAcceptance:
             self.owner.processes.api.CloseHandle(handle)
         self.child_handles.clear()
         self.children.clear()
-        self.native.require_unused(MANAGED_NAME)
 
     def verify_old_installation(self) -> None:
         self.owner.assert_registration(self.old_version)
@@ -514,35 +456,69 @@ class TunUpgradeAcceptance:
         deadline = time.monotonic() + START_TIMEOUT
         self.launch_gui("candidate-hot")
         status = self.start_gui(evidence, "candidate", resume_running_intent=True, deadline=deadline)
-        evidence["automaticMappingUsed"] = status.get("tunDevice", {}).get("managed") is True
-        if evidence["automaticMappingUsed"]:
-            require(observed is not None, "upgrade_hot_conflict_without_legacy_identity")
-            status, current_core = self.verify_managed(name, evidence)
-            events = self.require_auto_recovery(cursor, name, status, current_core, evidence, deadline)
-        else:
-            status, current_core = self.running(name)
-            self.require_configured_name(status, name)
-            evidence["candidateAdapter"] = self.capture(name, True, current_core)
-            require(evidence["candidateAdapter"]["guid"] != legacy["guid"], "upgrade_hot_adopted_legacy_adapter")
-            self.assert_recovery_events(cursor, [], evidence, "after_start")
-            events = []
+        status, current_core = self.running(name)
+        self.require_configured_name(status, name)
+        evidence["candidateAdapter"] = self.capture(name, True, current_core)
+        require(evidence["candidateAdapter"]["guid"] != legacy["guid"], "upgrade_hot_adopted_legacy_adapter")
+        self.assert_recovery_events(cursor, [], evidence, "after_start")
         evidence["candidateTunDevice"] = status["tunDevice"]
-        evidence["legacyAfterCreate"] = self.assert_legacy(legacy, evidence, "after_automatic_start",
+        evidence["legacyAfterCreate"] = self.assert_adapter_unchanged(legacy, evidence, "after_automatic_start",
                                                           phantom=None, allow_removed=True)
         self.forwarding(evidence, "after_upgrade")
         self.unchanged_source(evidence, "after_upgrade_forwarding")
         self.assert_no_repair_controls(evidence)
-        self.assert_recovery_events(cursor, events, evidence, "after_upgrade_forwarding")
+        self.assert_recovery_events(cursor, [], evidence, "after_upgrade_forwarding")
         evidence.update({"sourceYamlSha256": self.config_hash, "servicePidBefore": before_service.pid,
                          "servicePidAfter": after_service.pid, "ownerSidPreserved": True})
         self.capture_logs("candidate_after_live_upgrade")
         self.owner.mark("published_0_2_5_live_tun_upgrade")
+
+        # Roll back the actual installed application after its owner confirms
+        # Stop. Neither direction changes the user's configured adapter name.
+        self.close_gui()
+        require(self.exited(current_core), "upgrade_candidate_core_survived_stop_before_rollback")
+        require(self.owner.command("tun_same_name_rollback", self.baseline, ["/S"], 180)["exitCode"] == 0,
+                "upgrade_same_name_rollback_install_failed")
+        self.verify_old_installation()
+        self.unchanged_source(evidence, "after_rollback_installer")
+        self.launch_gui("same-name-rollback")
+        self.start_gui(evidence, "rollback")
+        _, rollback_core = self.running(name)
+        evidence["rollbackAdapter"] = self.capture(name, False, rollback_core)
+        require(evidence["rollbackAdapter"]["guid"] == legacy["guid"], "upgrade_rollback_changed_configured_identity")
+        self.forwarding(evidence, "after_rollback")
+        self.close_gui()
+        require(self.exited(rollback_core), "upgrade_rollback_core_survived_stop")
+        require(self.owner.command("tun_same_name_upgrade_again", self.owner.candidate, ["/S"], 180)["exitCode"] == 0,
+                "upgrade_same_name_reinstall_failed")
+        self.owner.assert_candidate_files(configuration_hash=self.config_hash)
+        cursor = self.recovery_cursor()
+        self.launch_gui("same-name-reupgrade")
+        self.start_gui(evidence, "reupgrade")
+        status, creator = self.running(name)
+        self.require_configured_name(status, name)
+        evidence["reupgradeAdapter"] = self.capture(name, True, creator)
+        require(evidence["reupgradeAdapter"]["guid"] == evidence["candidateAdapter"]["guid"],
+                "upgrade_reinstall_changed_product_identity")
+        self.forwarding(evidence, "after_reupgrade")
+        self.unchanged_source(evidence, "after_reupgrade")
+        self.assert_recovery_events(cursor, [], evidence, "after_reupgrade")
+        self.owner.mark("configured_tun_name_upgrade_and_rollback")
         self.finish_case()
 
-    def isolated_old_core(self, name: str, *, auto_route: bool) -> dict:
-        require(file_hash(self.old_core) == self.evidence["oldCoreSha256"], "upgrade_old_core_copy_changed")
+    def isolated_core(self, name: str, *, candidate: bool, auto_route: bool) -> dict:
+        require(self.child is None, "upgrade_isolated_owner_already_running")
+        if candidate:
+            core = self.directory / "candidate-core.exe"
+            expected_hash = self.owner.info["runtimeFiles"][self.owner.core.name]
+            require(file_hash(self.owner.core) == expected_hash, "upgrade_candidate_runtime_hash_changed")
+            if not core.exists():
+                shutil.copyfile(self.owner.core, core)
+        else:
+            core, expected_hash = self.old_core, self.evidence["oldCoreSha256"]
+        require(file_hash(core) == expected_hash, "upgrade_isolated_core_copy_changed")
         self.native.require_unused(name)
-        home = self.directory / name
+        home = self.directory / (name + "-" + uuid.uuid4().hex[:8])
         home.mkdir()
         content = self.source(name).decode("utf-8").replace(
             "tun:\n  enable: false\n", "tun:\n  enable: true\n  auto-route: "
@@ -560,7 +536,7 @@ class TunUpgradeAcceptance:
         self.child_identity = None
         self.child_record = None
         self.child_output = tempfile.TemporaryFile()
-        self.child = subprocess.Popen([str(self.old_core), "-desktop-managed", "-d", str(home),
+        self.child = subprocess.Popen([str(core), "-desktop-managed", "-d", str(home),
             "-f", str(home / "config.yaml"), "-ext-ctl", self.child_controller["url"].removeprefix("http://")],
             cwd=home, env=environment, stdin=subprocess.DEVNULL,
             stdout=self.child_output, stderr=self.child_output, close_fds=True,
@@ -569,12 +545,13 @@ class TunUpgradeAcceptance:
         # lookup. Preserve its raw ProcessIdentity for the later kill guard;
         # only the comparison to the verified file needs path normalization.
         self.child_identity = self.owner.processes.from_handle(int(self.child._handle), self.child.pid)
-        expected = os.path.normcase(str(self.old_core.resolve(strict=True)))
+        expected = os.path.normcase(str(core.resolve(strict=True)))
         self.child_record = {"pid": self.child.pid, "expectedPath": expected,
             "actualPath": self.child_identity.path if self.child_identity else None,
             "canonicalPath": None, "sameFile": False,
             "creationTime": str(self.child_identity.created) if self.child_identity else None,
-            "exitCodeAtInspection": self.child.poll(), "exitCode": None}
+            "exitCodeAtInspection": self.child.poll(), "exitCode": None, "candidate": candidate,
+            "verifiedSha256": expected_hash}
         self.evidence.setdefault("isolatedProcesses", []).append(self.child_record)
         if self.child_identity:
             try:
@@ -582,203 +559,291 @@ class TunUpgradeAcceptance:
                     Path(self.child_identity.path).resolve(strict=True)))
                 # samefile checks the volume/file ID on Windows. Different
                 # textual paths never authorize a different executable.
-                self.child_record["sameFile"] = os.path.samefile(self.child_identity.path, self.old_core)
+                self.child_record["sameFile"] = os.path.samefile(self.child_identity.path, core)
             except OSError as error:
                 self.child_record["pathQueryError"] = {"type": type(error).__name__,
                     "winerror": getattr(error, "winerror", None)}
         self.checkpoint()
         require(self.child_identity and self.child_record["canonicalPath"] == expected
                 and self.child_record["sameFile"] is True,
-                "upgrade_isolated_old_core_identity_mismatch")
+                "upgrade_isolated_core_identity_mismatch")
         self.retain_process(self.child_identity)
 
         def ready():
-            require(self.child.poll() is None, "upgrade_isolated_old_core_exited")
+            require(self.child.poll() is None, "upgrade_isolated_core_exited")
             try:
                 value = self.request(self.child_controller, "/desktop")
             except (OSError, http.client.HTTPException):
                 return None
             require(value.get("pid") == self.child.pid and value.get("managed") is True,
-                    "upgrade_isolated_old_core_controller_mismatch")
+                    "upgrade_isolated_core_controller_mismatch")
             return value if value.get("state") == "running" else None
 
-        wait_until(ready, "upgrade_isolated_old_core_start_timeout", 45)
+        wait_until(ready, "upgrade_isolated_core_start_timeout", 45)
         configuration = self.request(self.child_controller, "/configs")
         require(configuration.get("tun", {}).get("enable") is True
-                and configuration["tun"].get("device") == name, "upgrade_isolated_old_tun_not_enabled")
+                and configuration["tun"].get("device") == name, "upgrade_isolated_tun_not_enabled")
         if not auto_route:
             tun = configuration["tun"]
             require(tun.get("auto-route") is False and tun.get("inet4-address") == ["198.19.0.1/30"]
                     and tun.get("route-address") == ["198.19.77.77/32"], "upgrade_foreign_tun_addresses_not_isolated")
-        return self.capture(name, False, self.child_identity)
+        return self.capture(name, candidate, self.child_identity)
 
-    @staticmethod
-    def foreign_routes(adapter: dict) -> list[str]:
-        index = adapter["interface"]["index"]
-        require(type(index) is int and index > 0, "upgrade_foreign_interface_index_invalid")
-        script = ("$ErrorActionPreference='Stop'; @((Get-NetRoute -AddressFamily IPv4 -InterfaceIndex "
-                  + str(index) + ").DestinationPrefix) | ConvertTo-Json -Compress")
-        result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, text=True, encoding="utf-8", errors="strict", timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW)
-        require(result.returncode == 0 and len(result.stdout) < 65536, "upgrade_foreign_routes_query_failed")
-        value = json.loads(result.stdout.lstrip("\ufeff"))
-        routes = value if isinstance(value, list) else [value]
-        target = ipaddress.ip_address("198.18.77.77")
-        require(routes and all(isinstance(prefix, str) and target not in ipaddress.ip_network(prefix)
-                               for prefix in routes), "upgrade_foreign_route_claims_candidate_target")
-        return routes
+    def require_tun_failure(self, status: dict, code: str) -> dict:
+        failure = status.get("lastOperationFailure")
+        require(isinstance(failure, dict) and failure.get("operation") == "tun_change"
+                and failure.get("code") == code and isinstance(failure.get("message"), str)
+                and failure["message"] and failure.get("requestedTun") is True
+                and failure.get("appliedTun") is False
+                and type(failure.get("occurredAt")) is int and 0 < failure["occurredAt"] <= time.time() * 1000 + 1000
+                and type(failure.get("intentRevision")) is int
+                and failure["intentRevision"] <= status.get("intentRevision", -1),
+                "upgrade_tun_operation_failure_contract_invalid")
+        require(status.get("phase") == "running" and status.get("processState") == "alive"
+                and status.get("controlState") == "ready" and status.get("tun") is False
+                and status.get("tunHealth") == "disabled" and not status.get("lastError")
+                and not status.get("errorCode") and status.get("statusStale") is not True,
+                "upgrade_historical_tun_failure_overrode_current_proxy_health")
+        return failure
 
-    def conflict_recovery(self, *, phantom: bool) -> None:
-        label = "legacyPhantom" if phantom else "liveForeign"
-        self.owner.stage = "upgrade_tun_" + label
+    def proxy_forwarding(self, status: dict, evidence: dict, label: str) -> None:
+        configuration = self.request(status["controller"], "/configs")
+        port = configuration.get("mixed-port")
+        require(type(port) is int and 0 < port < 65536 and configuration.get("tun", {}).get("enable") is False,
+                "upgrade_proxy_forwarding_requires_confirmed_tun_disabled")
+        before = self.socks.diagnostics()["forwarded"]
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            connection.request("GET", "http://" + TUN_TARGET + "/mihomo-tun-smoke",
+                               headers={"Host": TUN_TARGET, "Connection": "close"})
+            response = connection.getresponse()
+            require(response.status == 200 and response.read(4096) == TUN_BODY,
+                    "upgrade_ordinary_proxy_not_forwarding_after_rejected_tun")
+        finally:
+            connection.close()
+        wait_until(lambda: self.socks.diagnostics()["forwarded"] > before,
+                   "upgrade_proxy_forwarding_counter_did_not_advance", 3)
+        evidence.setdefault("proxyForwarding", {})[label] = {"forwardedBefore": before, **self.socks.diagnostics()}
+        require(self.socks.diagnostics()["unexpectedTargets"] == 0
+                and self.socks.diagnostics()["lastFixtureError"] is None, "upgrade_proxy_forwarding_fixture_error")
+        self.checkpoint()
+
+    def failure_ui(self, evidence: dict, failure: dict | None) -> None:
+        self.driver.navigate("home")
+        phase = self.driver.ui("CorePhase")
+        require(phase.get("found") is True and phase.get("name") in ("运行中", "Running"),
+                "upgrade_live_sidebar_still_reports_historical_tun_failure")
+        self.driver.navigate("settings")
+        for page, identifier in (("settings", "settingsLastOperationFailure"), ("home", "homeLastOperationFailure")):
+            self.driver.navigate(page)
+            notice = self.driver.ui(identifier)
+            evidence.setdefault("operationFailureUi", {}).setdefault(page, []).append(notice)
+            if failure is None:
+                require(not notice.get("found") or not notice.get("name"), "upgrade_cleared_failure_still_visible")
+            else:
+                stamp = datetime.fromtimestamp(failure["occurredAt"] / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                require(notice.get("found") is True and stamp in notice.get("name", "")
+                        and failure["message"] in notice["name"]
+                        and ("当前 TUN 已关闭" in notice["name"] or "TUN is currently off" in notice["name"]),
+                        "upgrade_failed_tun_request_or_timestamp_hidden")
+        self.checkpoint()
+
+    def owned_active_collision(self) -> None:
+        self.owner.stage = "same_product_tun_active_owner"
         name = "MihomoUpgrade-" + uuid.uuid4().hex[:12]
-        self.configure(self.source(name))
-        evidence = self.evidence["scenarios"][label] = {"configuredName": name, "sourceYamlSha256": self.config_hash}
-        self.unchanged_source(evidence, "before_fixture_start")
-        legacy = evidence["legacyAdapter"] = self.isolated_old_core(name, auto_route=phantom)
-        evidence["oldCorePid"] = self.child.pid
-        if phantom:
-            self.forwarding(evidence, "before_forced_exit")
-            self.owner.processes.kill(self.child_identity)
-            require(self.child.wait(timeout=10) != 0, "upgrade_legacy_owner_not_force_killed")
-            require(self.exited(self.child_identity),
-                    "upgrade_legacy_owner_exit_unconfirmed")
-
-            def residual():
-                actual = self.native.query(name, legacy["guid"])
-                return actual if actual and actual["phantom"] and actual["interface"] else None
-
-            witnessed = wait_until(residual, "upgrade_legacy_crash_did_not_leave_real_alias_phantom", 10)
-            require(same_identity(legacy, witnessed), "upgrade_legacy_crash_identity_changed")
-            evidence["witnessedPhantom"] = witnessed
-            evidence["oldProcessExitConfirmed"] = True
-            # No other Wintun call occurs between this read-only witness and
-            # the candidate's first start. In particular, no Open/dummy
-            # Create is used to inspect or manufacture the crash residue.
-            self.checkpoint()
-        else:
-            evidence["foreignRoutes"] = self.foreign_routes(legacy)
-        evidence["beforeAutomaticStart"] = self.assert_legacy(legacy, evidence, "before_automatic_start",
-                                                             phantom=phantom)
-        self.native.require_unused(MANAGED_NAME)
+        self.configure(self.source(name), tun=False)
+        evidence = self.evidence["scenarios"]["sameProductActiveOwner"] = {
+            "configuredName": name, "sourceYamlSha256": self.config_hash}
         cursor = self.recovery_cursor()
-        deadline = time.monotonic() + START_TIMEOUT
-        self.launch_gui(label)
-        self.start_gui(evidence, "initial", deadline=deadline)
-        status, process = self.verify_managed(name, evidence)
-        events = self.require_auto_recovery(cursor, name, status, process, evidence, deadline)
-        if not phantom:
-            require(self.child.poll() is None, "upgrade_live_foreign_owner_exited")
-        evidence["afterAutomaticStart"] = self.assert_legacy(legacy, evidence, "after_automatic_start",
-                                                            phantom=phantom, allow_removed=phantom)
-        self.forwarding(evidence, "after_automatic_start")
-        self.assert_no_repair_controls(evidence)
-        if phantom:
-            self.driver.invoke("desktop_reload_config", {"force": True}, timeout=95)
-            status, creator = self.running(MANAGED_NAME)
-            self.capture(MANAGED_NAME, True, creator)
-            self.require_mapping(status, name)
-            evidence["tunDeviceAfterReload"] = status["tunDevice"]
-            self.unchanged_source(evidence, "after_reload")
-            self.forwarding(evidence, "after_reload")
-            self.assert_recovery_events(cursor, events, evidence, "after_reload")
-            self.close_gui()
-            self.unchanged_source(evidence, "after_stop")
-            self.launch_gui("persisted-mapping")
-            self.start_gui(evidence, "relaunch")
-            status, creator = self.running(MANAGED_NAME)
-            self.require_mapping(status, name)
-            evidence["tunDeviceAfterRelaunch"] = status["tunDevice"]
-            self.capture(MANAGED_NAME, True, creator)
-            self.unchanged_source(evidence, "after_relaunch")
-            self.forwarding(evidence, "after_relaunch")
-            self.assert_recovery_events(cursor, events, evidence, "after_relaunch")
-            evidence["mappingSurvivedReloadAndRelaunch"] = True
-            self.owner.mark("managed_tun_mapping_persists_without_yaml_rewrite")
-        else:
-            require(self.child.poll() is None, "upgrade_live_foreign_owner_not_preserved")
-            evidence["afterForwarding"] = self.assert_legacy(legacy, evidence, "after_forwarding", phantom=False)
-            self.unchanged_source(evidence, "after_forwarding")
-            self.assert_recovery_events(cursor, events, evidence, "after_forwarding")
-        self.capture_logs(label)
-        self.owner.mark("legacy_tun_phantom_automatic_recovery" if phantom else "live_foreign_tun_preserved")
+        self.launch_gui("owned-active")
+        self.start_gui(evidence, "ordinary_proxy")
+        _, proxy_core = self.running(name, tun=False)
+        owner = evidence["activeOwnerAdapter"] = self.isolated_core(name, candidate=True, auto_route=True)
+        evidence["activeOwnerPid"] = self.child_identity.pid
+        self.forwarding(evidence, "active_owner_before_collision")
+        self.driver.invoke("desktop_set_tun", {"enabled": True}, expected_error="tun_device_busy", timeout=45)
+        status, proxy_after = self.running(name, tun=False)
+        failure = self.require_tun_failure(status, "tun_device_busy")
+        require(proxy_after == proxy_core and self.child.poll() is None, "upgrade_rejected_tun_replaced_an_active_owner")
+        self.require_configured_name(status, name)
+        self.assert_adapter_unchanged(owner, evidence, "after_rejected_enable", phantom=False)
+        self.forwarding(evidence, "active_owner_after_collision")
+        self.proxy_forwarding(status, evidence, "after_rejected_enable")
+        self.unchanged_source(evidence, "after_rejected_enable")
+        self.owner.mark("same_product_tun_active_owner_preserved")
+
+        # Wait for an actual newer health observation, not a fixed-duration
+        # sleep or a new status envelope that may still contain cached health.
+        observed_at = status.get("observedAt", 0)
+        def next_health():
+            current = self.status()
+            require(self.require_tun_failure(current, "tun_device_busy") == failure,
+                    "upgrade_health_poll_acknowledged_failed_enable")
+            return current if current.get("observedAt", 0) > observed_at else None
+        wait_until(next_health, "upgrade_health_observation_did_not_advance", 15)
+        self.driver.invoke("desktop_patch_config", {"patch": {"log-level": "debug"}}, timeout=30)
+        self.config_hash = file_hash(self.owner.config)  # Explicit fixture scalar edit, not an automatic name rewrite.
+        status, unchanged_core = self.running(name, tun=False)
+        require(unchanged_core == proxy_core and self.require_tun_failure(status, "tun_device_busy") == failure,
+                "upgrade_scalar_change_cleared_failed_tun_intent")
+        self.require_configured_name(status, name)
+        evidence["sourceSha256AfterExplicitScalarEdit"] = self.config_hash
+        self.driver.invoke("desktop_reload_config", {"force": True}, timeout=95)
+        status, unchanged_core = self.running(name, tun=False)
+        require(unchanged_core == proxy_core and self.require_tun_failure(status, "tun_device_busy") == failure,
+                "upgrade_unchanged_reload_acknowledged_failed_tun_enable")
+        self.proxy_forwarding(status, evidence, "after_scalar_and_unchanged_reload")
+        self.unchanged_source(evidence, "after_unchanged_reload")
+        self.failure_ui(evidence, failure)
+
+        # Explicitly choosing Off acknowledges the failed request even though
+        # the confirmed applied value is already false. A fresh failure has a
+        # later host intent; an unrelated poll must not resurrect the first one.
+        self.driver.invoke("desktop_set_tun", {"enabled": False}, timeout=30)
+        require(self.status().get("lastOperationFailure") is None, "upgrade_manual_off_did_not_acknowledge_failure")
+        self.failure_ui(evidence, None)
+        self.driver.invoke("desktop_set_tun", {"enabled": True}, expected_error="tun_device_busy", timeout=45)
+        latest = self.require_tun_failure(self.status(), "tun_device_busy")
+        require(latest["intentRevision"] > failure["intentRevision"] and latest["occurredAt"] >= failure["occurredAt"],
+                "upgrade_repeated_failure_reused_stale_operation_identity")
+        evidence["failedOperations"] = [failure, latest]
+        self.assert_adapter_unchanged(owner, evidence, "after_repeated_enable", phantom=False)
+        self.forwarding(evidence, "active_owner_after_repeated_collision")
+
+        # Synchronize on the exact owner's process handle. The very next
+        # operation is Create through the ordinary TUN switch: no alias wait,
+        # PnP manipulation, native inspection or retry manufactures success.
+        self.request(self.child_controller, "/desktop/shutdown", "POST")
+        require(self.child.wait(timeout=10) == 0 and self.exited(self.child_identity),
+                "upgrade_owned_graceful_exit_unconfirmed")
+        started = time.monotonic()
+        self.driver.invoke("desktop_set_tun", {"enabled": True}, timeout=45)
+        evidence["closeToCreateMilliseconds"] = round((time.monotonic() - started) * 1000)
+        self.stop_child()
+        status, current = self.running(name)
+        require(current == proxy_core and status.get("lastOperationFailure") is None,
+                "upgrade_successful_tun_retry_replaced_core_or_retained_failure")
+        adapter = evidence["adapterAfterClose"] = self.capture(name, True, current)
+        require(adapter["guid"] == owner["guid"], "upgrade_close_recreate_changed_product_identity")
+        self.forwarding(evidence, "after_immediate_recreate")
+        self.owner.mark("same_product_tun_close_immediate_recreate")
+
+        evidence["rapidToggles"] = []
+        for cycle in range(3):
+            started = time.monotonic()
+            self.driver.invoke("desktop_set_tun", {"enabled": False}, timeout=30)
+            self.driver.invoke("desktop_set_tun", {"enabled": True}, timeout=45)
+            elapsed = round((time.monotonic() - started) * 1000)
+            status, current = self.running(name)
+            current_adapter = self.capture(name, True, current)
+            require(current == proxy_core and current_adapter["guid"] == owner["guid"]
+                    and status.get("lastOperationFailure") is None,
+                    "upgrade_rapid_tun_toggle_replaced_owner_identity_or_restored_old_error")
+            self.require_configured_name(status, name)
+            self.forwarding(evidence, "rapid_toggle_" + str(cycle))
+            evidence["rapidToggles"].append({"cycle": cycle, "milliseconds": elapsed, "pid": current.pid,
+                                             "guid": current_adapter["guid"], "interface": current_adapter["interface"]})
+        self.failure_ui(evidence, None)
+        self.driver.invoke("desktop_reload_config", {"force": True}, timeout=95)
+        status, current = self.running(name)
+        require(current == proxy_core and status.get("lastOperationFailure") is None,
+                "upgrade_reload_replaced_owner_or_restored_old_error")
+        self.capture(name, True, current)
+        self.require_configured_name(status, name)
+        self.forwarding(evidence, "after_config_reload")
+        self.unchanged_source(evidence, "after_rapid_toggle_and_reload")
+        self.assert_recovery_events(cursor, [], evidence, "after_rapid_toggle_and_reload")
+        self.owner.mark("tun_failure_lifecycle_and_fast_toggle")
+        self.capture_logs("same-product-active-owner")
         self.finish_case()
 
-    def managed_name_collision(self) -> None:
-        self.owner.stage = "upgrade_managed_tun_collision_bounded"
-        self.configure(self.source(MANAGED_NAME))
-        evidence = self.evidence["scenarios"]["managedNameCollision"] = {
-            "configuredName": MANAGED_NAME, "sourceYamlSha256": self.config_hash}
-        self.unchanged_source(evidence, "before_fixture_start")
-        legacy = evidence["legacyAdapter"] = self.isolated_old_core(MANAGED_NAME, auto_route=False)
-        evidence["oldCorePid"] = self.child.pid
-        evidence["foreignRoutes"] = self.foreign_routes(legacy)
-
-        def name_family() -> list[dict]:
-            return sorted((row for row in self.native.interfaces()
-                           if row["name"].casefold().startswith(MANAGED_NAME.casefold())),
-                          key=lambda row: (row["name"], row["guid"], row["luid"]))
-
-        before = evidence["nameFamilyBefore"] = name_family()
-        require(before == [legacy["interface"]], "upgrade_managed_name_fixture_not_isolated")
-        require(self.native.query(MANAGED_NAME, expected_guid(MANAGED_NAME, exclusive=True)) is None,
-                "upgrade_managed_product_instance_already_exists")
+    def owned_forced_exit(self) -> None:
+        self.owner.stage = "same_product_tun_forced_exit"
+        name = "MihomoUpgrade-" + uuid.uuid4().hex[:12]
+        self.configure(self.source(name), tun=False)
+        evidence = self.evidence["scenarios"]["sameProductForcedExit"] = {
+            "configuredName": name, "sourceYamlSha256": self.config_hash}
         cursor = self.recovery_cursor()
-        deadline = time.monotonic() + START_TIMEOUT
-        self.launch_gui("managed-name-collision")
-        status = self.start_gui(evidence, "initial", expect_conflict=True, deadline=deadline)
-        self.require_configured_name(status, MANAGED_NAME)
-        evidence["tunDeviceAtConflict"] = status["tunDevice"]
+        self.launch_gui("owned-forced-exit")
+        self.start_gui(evidence, "ordinary_proxy")
+        _, proxy_core = self.running(name, tun=False)
+        owner = evidence["previousAdapter"] = self.isolated_core(name, candidate=True, auto_route=True)
+        evidence["previousOwnerPid"] = self.child_identity.pid
+        self.forwarding(evidence, "before_forced_exit")
+        self.owner.processes.kill(self.child_identity)
+        require(self.child.wait(timeout=10) != 0 and self.exited(self.child_identity),
+                "upgrade_same_product_forced_exit_unconfirmed")
+        started = time.monotonic()
+        self.driver.invoke("desktop_set_tun", {"enabled": True}, timeout=45)
+        evidence["exitToCreateMilliseconds"] = round((time.monotonic() - started) * 1000)
+        self.stop_child()
+        status, current = self.running(name)
+        require(current == proxy_core and status.get("lastOperationFailure") is None,
+                "upgrade_forced_exit_recovery_replaced_proxy_core_or_failed")
+        adapter = evidence["currentAdapter"] = self.capture(name, True, current)
+        require(adapter["guid"] == owner["guid"], "upgrade_forced_exit_recovery_changed_product_identity")
+        self.require_configured_name(status, name)
+        self.forwarding(evidence, "after_forced_exit_recreate")
+        self.unchanged_source(evidence, "after_forced_exit_recreate")
+        self.assert_recovery_events(cursor, [], evidence, "after_forced_exit_recreate")
+        self.owner.mark("same_product_tun_forced_exit_recreate")
+        self.capture_logs("same-product-forced-exit")
+        self.finish_case()
+
+    def foreign_name_collision(self) -> None:
+        self.owner.stage = "live_foreign_tun_preserved"
+        name = "MihomoUpgrade-" + uuid.uuid4().hex[:12]
+        self.configure(self.source(name))
+        evidence = self.evidence["scenarios"]["liveForeign"] = {
+            "configuredName": name, "sourceYamlSha256": self.config_hash}
+        legacy = evidence["foreignAdapter"] = self.isolated_core(name, candidate=False, auto_route=True)
+        evidence["foreignCorePid"] = self.child_identity.pid
+        before = [row for row in self.native.interfaces() if row["name"].casefold().startswith(name.casefold())]
+        require(before == [legacy["interface"]]
+                and self.native.query(name, expected_guid(name, exclusive=True)) is None,
+                "upgrade_foreign_name_fixture_not_isolated")
+        self.forwarding(evidence, "foreign_owner_before_collision")
+        cursor = self.recovery_cursor()
+        self.launch_gui("foreign-name-collision")
+        status = self.start_gui(evidence, "rejected_start", expect_conflict=True)
+        self.require_configured_name(status, name)
+        self.assert_adapter_unchanged(legacy, evidence, "after_rejected_start", phantom=False)
+        self.forwarding(evidence, "foreign_owner_after_collision")
+        for _ in range(3):
+            status = self.status()
+            require(status.get("phase") in ("failed", "error") and status.get("errorCode") == "tun_device_conflict"
+                    and status.get("pid") is None and status.get("controller") is None
+                    and status.get("operation") is None and self.child.poll() is None,
+                    "upgrade_foreign_collision_not_terminal_or_owner_exited")
+            require(not self.owner.processes.at_paths([self.owner.core]), "upgrade_foreign_collision_core_respawned")
+        after = [row for row in self.native.interfaces() if row["name"].casefold().startswith(name.casefold())]
+        require(after == before and self.native.query(name, expected_guid(name, exclusive=True)) is None,
+                "upgrade_foreign_collision_created_suffix_or_product_adapter")
+        evidence.update({"interfacesBefore": before, "interfacesAfter": after})
         self.unchanged_source(evidence, "after_rejected_start")
         self.assert_recovery_events(cursor, [], evidence, "after_rejected_start")
-        evidence["afterRejectedStart"] = self.assert_legacy(legacy, evidence, "after_rejected_start", phantom=False)
-
-        # Cover multiple normal service poll ticks under the original total
-        # deadline. A failed fixed-name start must stay stopped; neither a new
-        # suffixed interface nor another core generation is allowed to appear.
-        observation_started = time.monotonic()
-        observation_end = observation_started + 6
-        require(observation_end < deadline, "upgrade_conflict_left_no_stability_budget")
-        evidence["terminalObservations"] = []
-        while time.monotonic() < observation_end:
-            status = self.status(timeout=min(5, self.remaining(deadline)))
-            record = {key: status.get(key) for key in
-                      ("phase", "errorCode", "operation", "pid", "recoveryGeneration", "statusStale")}
-            evidence["terminalObservations"].append(record)
-            require(status.get("phase") in ("failed", "error") and status.get("errorCode") == "tun_device_conflict"
-                    and status.get("operation") is None and status.get("pid") is None
-                    and status.get("controller") is None and status.get("statusStale") is not True,
-                    "upgrade_managed_collision_restarted_or_not_terminal")
-            require(self.child.poll() is None and not self.exited(self.child_identity),
-                    "upgrade_managed_collision_foreign_owner_exited")
-            require(not self.owner.processes.at_paths([self.owner.core]), "upgrade_managed_collision_core_respawned")
-            require(name_family() == before, "upgrade_managed_collision_created_suffix_or_changed_owner")
-            time.sleep(min(.15, max(0, observation_end - time.monotonic()), self.remaining(deadline)))
-        evidence["terminalObservationMilliseconds"] = round((time.monotonic() - observation_started) * 1000)
-        evidence["nameFamilyAfter"] = name_family()
-        require(self.native.query(MANAGED_NAME, expected_guid(MANAGED_NAME, exclusive=True)) is None,
-                "upgrade_managed_collision_created_product_instance")
-        self.require_configured_name(status, MANAGED_NAME)
-        self.assert_recovery_events(cursor, [], evidence, "after_stability_observation")
-        self.unchanged_source(evidence, "after_stability_observation")
-        evidence["afterObservation"] = self.assert_legacy(legacy, evidence, "after_stability_observation", phantom=False)
         self.assert_no_repair_controls(evidence, offline=True)
-        self.capture_logs("managed-name-collision")
-        self.owner.mark("managed_tun_collision_bounded")
+        self.driver.invoke("desktop_stop", timeout=25)
+        require(self.status().get("lastOperationFailure") is None, "upgrade_stop_retained_old_operation_failure")
+        self.assert_adapter_unchanged(legacy, evidence, "after_candidate_stop", phantom=False)
+        self.forwarding(evidence, "foreign_owner_after_candidate_stop")
+        self.capture_logs("foreign-name-collision")
+        self.owner.mark("live_foreign_tun_preserved")
         self.finish_case()
 
     def run(self) -> None:
         try:
-            require(self.owner.info.get("coreCommit") == CURRENT_CORE_SOURCE, "upgrade_candidate_core_pin_changed")
-            self.native.require_unused(MANAGED_NAME)
+            core_pin = json.loads(Path(__file__).resolve().parents[1].joinpath("core.json").read_text(encoding="utf-8"))
+            require(self.owner.info.get("coreCommit") == core_pin.get("commit")
+                    and self.owner.info.get("repository") == core_pin.get("repository"),
+                    "upgrade_candidate_core_pin_changed")
             self.desktop = RestrictedDesktop()
             require(self.desktop.sid == self.owner.sid, "upgrade_gui_owner_sid_changed")
             self.socks = SocksFixture()
             self.hot_upgrade()
-            self.conflict_recovery(phantom=True)
-            self.conflict_recovery(phantom=False)
-            self.managed_name_collision()
+            self.owned_active_collision()
+            self.owned_forced_exit()
+            self.foreign_name_collision()
             require(self.owner.command("tun_upgrade_service_remove", self.owner.helper, ["--uninstall"])["exitCode"] == 0,
                     "upgrade_tun_service_remove_failed")
             self.owner.assert_no_service()
@@ -798,7 +863,7 @@ class TunUpgradeAcceptance:
         if self.driver is not None:
             attempt("gui_exact_handle_close", self.driver.close)
             self.driver = None
-        attempt("isolated_old_child_stop", self.stop_child)
+        attempt("isolated_child_stop", self.stop_child)
         attempt("owned_service_stop", self.owner.remove_owned_service)
         for identity in self.children:
             attempt("owned_core_stop", lambda identity=identity: self.owner.processes.kill(identity))

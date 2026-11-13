@@ -720,9 +720,12 @@ def main() -> int:
                         "published_old_helper_failure_reproduced", "candidate_repairs_uninstall_residue",
                         "overwrite_restarts_existing_service", "candidate_application_fully_uninstalled",
                         "published_0_1_7_direct_upgrade", "published_0_2_5_paired_upgrade",
-                        "published_0_2_5_live_tun_upgrade", "legacy_tun_phantom_automatic_recovery",
-                        "live_foreign_tun_preserved", "managed_tun_mapping_persists_without_yaml_rewrite",
-                        "managed_tun_collision_bounded",
+                        "published_0_2_5_live_tun_upgrade", "live_foreign_tun_preserved",
+                        "same_product_tun_active_owner_preserved",
+                        "same_product_tun_close_immediate_recreate",
+                        "same_product_tun_forced_exit_recreate",
+                        "tun_failure_lifecycle_and_fast_toggle",
+                        "configured_tun_name_upgrade_and_rollback",
                         "candidate_reinstalled_for_gui", "final_cleanup"}
             acceptance.report["passed"] = (all(acceptance.report["tests"].get(name) is True for name in required)
                                            and not acceptance.report["diagnostics"])

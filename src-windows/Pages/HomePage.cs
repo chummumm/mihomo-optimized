@@ -256,8 +256,9 @@ public sealed class HomePage : NativePage
         coreVersion.Text = ShortVersion(version); coreVersion.ToolTip = version;
         coreVersion.TextTrimming = TextTrimming.CharacterEllipsis; coreVersion.MaxWidth = 180; coreVersion.TextWrapping = TextWrapping.NoWrap;
         proxyAddress.Text = port > 0 ? "127.0.0.1:" + port : "—";
-        coreError.Text = status.Text("lastError"); coreError.Visibility = coreError.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        coreError.Text = runtime.RuntimeError; coreError.Visibility = coreError.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
         coreError.SetResourceReference(TextBlock.ForegroundProperty, runtime.IsProblem ? "DangerBrush" : "TextSecondaryBrush");
+        UpdateOperationFailureNotice();
         var device = Session.TunDevice;
         bool preparingDevice = runtime.Phase == DesktopRuntimePhase.RecoveringTunDevice && device.Managed;
         tunDeviceName.Visibility = device.Available && runtime.TunRequested && !string.IsNullOrWhiteSpace(device.EffectiveName)
@@ -273,7 +274,7 @@ public sealed class HomePage : NativePage
         restart.IsEnabled = interactive && runtime.ProcessAlive;
         modes.IsEnabled = interactive && running && runtimeReady;
         proxy.SetState(status.Bool("systemProxy"), !running && status.Bool("systemProxy") ? L.T("内核启动后生效") : status.Bool("systemProxy") ? L.F("端口 {0}", port > 0 ? port.ToString(CultureInfo.CurrentCulture) : "—") : L.T("已关闭"), interactive && status.Get("capabilities").Bool("systemProxy"), pending == "proxy");
-        tun.SetState(status.Bool("tun"), status.Bool("tun") ? L.T(runtime.TunDescription) : !status.Get("service").Bool("installed") ? L.T("需要安装系统服务") : L.T("已关闭"), interactive && status.Get("capabilities").Bool("tun"), pending == "tun");
+        tun.SetState(status.Bool("tun"), !status.Get("service").Bool("installed") && !status.Bool("tun") ? L.T("需要安装系统服务") : L.T(runtime.TunDescription), interactive && status.Get("capabilities").Bool("tun"), pending == "tun");
         lan.SetState(allowLan, allowLan ? L.F("局域网可用 :{0}", port > 0 ? port.ToString(CultureInfo.CurrentCulture) : "—") : L.T("仅本机"), interactive && running && runtimeReady, pending == "lan");
         autostart.SetState(status.Bool("autostart"), L.T(status.Bool("autostart") ? "登录时启动" : "已关闭"), interactive && status.Get("capabilities").Bool("autostart"), pending == "autostart");
         throughputHint.Text = L.T(running ? "最近 60 秒 · 每秒采样" : runtime.StopRequired ? "等待本机状态更新" : "内核未运行");

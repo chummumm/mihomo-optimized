@@ -842,7 +842,15 @@ fn handle_session_request(
             }
             let operation = match request {
                 Request::Start { config, tun } => RuntimeRequest::Start { config, tun },
-                Request::Reload { config, tun } => RuntimeRequest::Reload { config, tun },
+                Request::Reload {
+                    config,
+                    tun,
+                    tun_change,
+                } => RuntimeRequest::Reload {
+                    config,
+                    tun,
+                    tun_change,
+                },
                 Request::Stop => RuntimeRequest::Stop(StopReason::UserStop),
                 Request::PrepareCoreUpdate { proxy_port } => {
                     if proxy_port == Some(0) {
@@ -1066,6 +1074,7 @@ mod control_tests {
             let reload = |tun| Request::Reload {
                 config: "mixed-port: 7890".into(),
                 tun,
+                tun_change: true,
             };
             let unowned = handle_request(&runtime, &session, request("unowned", 1, 1, reload(tun)));
             assert_eq!(unowned.error.unwrap().code, "service_owner_required");
@@ -1145,7 +1154,8 @@ mod control_tests {
                     2,
                     Request::Reload {
                         config: "mixed-port: 7890".into(),
-                        tun: true
+                        tun: true,
+                        tun_change: true,
                     }
                 )
             )
@@ -1186,6 +1196,7 @@ mod control_tests {
                         Request::Reload {
                             config: "mixed-port: 7890".into(),
                             tun: true,
+                            tun_change: true,
                         },
                     ),
                 );

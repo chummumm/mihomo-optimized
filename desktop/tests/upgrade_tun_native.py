@@ -21,7 +21,6 @@ from windows_smoke import require, wait_until
 
 DWORD = ctypes.c_uint32
 NETWORK_CLASS = "{4D36E972-E325-11CE-BFC1-08002BE10318}"
-MANAGED_NAME = "MihomoDesktop"
 
 
 class GUID(ctypes.Structure):
@@ -140,42 +139,65 @@ class NativeTunIdentity:
                 "upgrade_device_property_invalid")
         return kind.value, bytes(buffer[:needed.value]).decode("utf-16-le").rstrip("\0").split("\0")
 
+    def wintun_name(self, devices, device, *, required: bool) -> str | None:
+        key = PropertyKey(GUID.parse("{3361C968-2F2E-4660-B47E-699CDC4C32B9}"), 3)
+        raw = (ctypes.c_ubyte * 4096)()
+        kind, needed = DWORD(), DWORD()
+        result = self.setup.SetupDiGetDevicePropertyW(devices, ctypes.byref(device), ctypes.byref(key),
+            ctypes.byref(kind), raw, len(raw), ctypes.byref(needed), 0)
+        if not result and not required:
+            return None
+        self.check(result, "upgrade_wintun_name_failed")
+        valid = kind.value == 0x12 and 0 < needed.value <= len(raw) and needed.value % 2 == 0
+        if not valid and not required:
+            return None
+        require(valid, "upgrade_wintun_name_invalid")
+        return bytes(raw[:needed.value]).decode("utf-16-le").rstrip("\0")
+
     def query(self, name: str, guid: str) -> dict | None:
         import winreg
 
         guid = GUID.parse(guid).text()
-        instance_id = "SWD\\Wintun\\" + guid
         network_class = GUID.parse(NETWORK_CLASS)
-        devices = self.setup.SetupDiGetClassDevsW(ctypes.byref(network_class), "SWD\\Wintun", None, 0)
+        devices = self.setup.SetupDiGetClassDevsW(ctypes.byref(network_class), None, None, 0)
         require(devices not in (None, ctypes.c_void_p(-1).value), "upgrade_device_list_failed")
+        found = None
         try:
             for index in range(16384):
                 device = DeviceInfo(size=ctypes.sizeof(DeviceInfo))
                 if not self.setup.SetupDiEnumDeviceInfo(devices, index, ctypes.byref(device)):
                     self.check(ctypes.get_last_error() == 259, "upgrade_device_enumeration_failed")
-                    return None
+                    return found
+                handle = self.setup.SetupDiOpenDevRegKey(devices, ctypes.byref(device), 1, 0, 2, winreg.KEY_QUERY_VALUE)
+                actual_guid = None
+                if handle in (None, ctypes.c_void_p(-1).value):
+                    registry_error = ctypes.get_last_error()
+                else:
+                    registry_error = None
+                    try:
+                        value, kind = winreg.QueryValueEx(handle, "NetCfgInstanceId")
+                        if kind == winreg.REG_SZ and isinstance(value, str):
+                            actual_guid = GUID.parse(value).text()
+                    except (OSError, ValueError) as error:
+                        registry_error = getattr(error, "winerror", None)
+                    finally:
+                        winreg.CloseKey(handle)
+                if actual_guid is None:
+                    # Unrelated, uninstalled network devices can have no driver
+                    # key. A named Wintun candidate with unreadable identity is
+                    # an error, never evidence that this fixture name is free.
+                    candidate_name = self.wintun_name(devices, device, required=False)
+                    require(candidate_name is None or candidate_name.casefold() != name.casefold(),
+                            "upgrade_named_device_registry_unreadable_" + str(registry_error))
+                    continue
+                if actual_guid != guid:
+                    continue
+                require(found is None, "upgrade_duplicate_device_network_guid")
                 buffer = ctypes.create_unicode_buffer(1024)
                 needed = DWORD()
                 self.check(self.setup.SetupDiGetDeviceInstanceIdW(devices, ctypes.byref(device), buffer,
                     len(buffer), ctypes.byref(needed)), "upgrade_instance_id_failed")
-                if buffer.value.casefold() != instance_id.casefold():
-                    continue
-                handle = self.setup.SetupDiOpenDevRegKey(devices, ctypes.byref(device), 1, 0, 2, winreg.KEY_QUERY_VALUE)
-                require(handle not in (None, ctypes.c_void_p(-1).value), "upgrade_device_registry_failed")
-                try:
-                    actual_guid, kind = winreg.QueryValueEx(handle, "NetCfgInstanceId")
-                finally:
-                    winreg.CloseKey(handle)
-                require(kind == winreg.REG_SZ and GUID.parse(actual_guid).text() == guid,
-                        "upgrade_device_registry_identity_mismatch")
-                key = PropertyKey(GUID.parse("{3361C968-2F2E-4660-B47E-699CDC4C32B9}"), 3)
-                raw = (ctypes.c_ubyte * 4096)()
-                kind, needed = DWORD(), DWORD()
-                self.check(self.setup.SetupDiGetDevicePropertyW(devices, ctypes.byref(device), ctypes.byref(key),
-                    ctypes.byref(kind), raw, len(raw), ctypes.byref(needed), 0), "upgrade_wintun_name_failed")
-                require(kind.value == 0x12 and 0 < needed.value <= len(raw) and needed.value % 2 == 0,
-                        "upgrade_wintun_name_invalid")
-                actual_name = bytes(raw[:needed.value]).decode("utf-16-le").rstrip("\0")
+                actual_name = self.wintun_name(devices, device, required=True)
                 description_kind, description = self.property(devices, device, 0)
                 friendly_kind, friendly = self.property(devices, device, 12)
                 hardware_kind, hardware = self.property(devices, device, 1)
@@ -189,7 +211,7 @@ class NativeTunIdentity:
                 # rename cannot appear to be an absent IPHelper row.
                 rows = [row for row in self.interfaces() if row["guid"] == guid]
                 require(len(rows) <= 1, "upgrade_interface_identity_ambiguous")
-                return {"name": actual_name, "guid": guid, "instanceId": buffer.value.upper(),
+                found = {"name": actual_name, "guid": guid, "instanceId": buffer.value.upper(),
                     "classGuid": device.class_guid.text(), "tunnelType": description[0][:-len(" Tunnel")],
                     "friendlyName": friendly[0], "hardwareIds": hardware,
                     "phantom": result == 13, "cmResult": result, "cmStatus": status.value,

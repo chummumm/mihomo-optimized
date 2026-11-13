@@ -28,6 +28,7 @@ const MAX_RESTARTS: usize = 3;
 const RECOVERY_RESERVE: Duration = Duration::from_secs(30);
 const CLEANUP_RESERVE: Duration = STOP_TIMEOUT;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+const TUN_PATCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_DIAGNOSTIC_BYTES: usize = 4096;
 
 /// Reload validation and application share one resource deadline. A fresh
@@ -247,11 +248,110 @@ fn safe_tun_device_conflict(line: &str) -> Option<String> {
     ))
 }
 
-fn safe_core_diagnostic(line: &str) -> Option<String> {
-    safe_tun_device_conflict(line).or_else(|| safe_resource_diagnostic(line))
+fn structured_tun_diagnostic(line: &str) -> Option<(&'static str, String)> {
+    let line = line.trim();
+    let decoded;
+    let message = if (line.starts_with("time=") || line.starts_with("level="))
+        && (line.contains("level=fatal msg=") || line.contains("level=error msg="))
+    {
+        decoded = serde_json::Deserializer::from_str(line.split_once("msg=")?.1)
+            .into_iter::<String>()
+            .next()?
+            .ok()?;
+        decoded.as_str()
+    } else {
+        line
+    };
+    let message = message
+        .strip_prefix("parse config error: ")
+        .or_else(|| message.strip_prefix("Start TUN listening error: "))
+        .unwrap_or(message);
+    let value = message.strip_prefix("configure tun interface: adapter ")?;
+    let mut quoted = serde_json::Deserializer::from_str(value).into_iter::<String>();
+    let name = quoted.next()?.ok()?;
+    let details = value
+        .get(quoted.byte_offset()..)?
+        .strip_prefix(": [wintun ")?;
+    let header = details.split_once(']')?.0;
+    if header.len() > 512 {
+        return None;
+    }
+    let field = |prefix: &str| {
+        header
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(prefix))
+    };
+    let stage = field("stage=")?;
+    let reason = field("reason=")?;
+    let code = match (stage, reason) {
+        ("inspect", "foreign_alias") => "tun_device_conflict",
+        ("inspect", "ambiguous_alias" | "native_identity_missing" | "identity_mismatch") => {
+            "tun_device_identity_unverified"
+        }
+        ("inspect", "native_query_failed" | "interface_query_failed") => {
+            "tun_device_inspection_failed"
+        }
+        ("create", "native_busy") => "tun_device_busy",
+        ("create", "native_create_failed") => "tun_device_create_failed",
+        ("initialize", "native_initialization_failed") => "tun_device_initialization_failed",
+        _ => return None,
+    };
+    let name = config::diagnostic_tun_device(Some(&name))?;
+    let mut safe = format!(
+        "configure tun interface: adapter {}: [wintun stage={stage} reason={reason}",
+        serde_json::to_string(&name).ok()?
+    );
+    for key in ["expected_guid", "actual_guid"] {
+        if let Some(guid) = field(&format!("{key}=")).filter(|guid| {
+            let value = guid
+                .strip_prefix('{')
+                .and_then(|guid| guid.strip_suffix('}'))
+                .unwrap_or(guid);
+            value.len() == 36
+                && value.bytes().enumerate().all(|(index, byte)| {
+                    if [8, 13, 18, 23].contains(&index) {
+                        byte == b'-'
+                    } else {
+                        byte.is_ascii_hexdigit()
+                    }
+                })
+        }) {
+            safe.push_str(&format!(" {key}={guid}"));
+        }
+    }
+    for key in ["native_code", "win32_code", "luid", "index", "cfgmgr_code"] {
+        if let Some(value) = field(&format!("{key}=")).filter(|value| {
+            let parsed = if let Some(hex) = value.strip_prefix("0x") {
+                !hex.is_empty()
+                    && hex.len() <= 16
+                    && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && u64::from_str_radix(hex, 16).is_ok()
+            } else {
+                !value.is_empty()
+                    && value.len() <= 20
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && value.parse::<u64>().is_ok()
+            };
+            parsed
+        }) {
+            safe.push_str(&format!(" {key}={value}"));
+        }
+    }
+    safe.push(']');
+    Some((code, safe))
 }
 
-fn tun_device_conflict_error(diagnostic: &str) -> Option<AppError> {
+fn safe_core_diagnostic(line: &str) -> Option<String> {
+    structured_tun_diagnostic(line)
+        .map(|(_, diagnostic)| diagnostic)
+        .or_else(|| safe_tun_device_conflict(line))
+        .or_else(|| safe_resource_diagnostic(line))
+}
+
+fn tun_device_error(diagnostic: &str) -> Option<AppError> {
+    if let Some((code, cause)) = diagnostic.lines().find_map(structured_tun_diagnostic) {
+        return Some(AppError::new(code, format!("TUN 接口操作失败：{cause}")));
+    }
     diagnostic
         .lines()
         .find_map(safe_tun_device_conflict)
@@ -333,6 +433,8 @@ pub struct CoreStatus {
     pub controller: Option<Controller>,
     pub version: Option<String>,
     pub error: Option<String>,
+    /// A rejected request is distinct from the health of the restored runtime.
+    pub last_operation_failure: Option<OperationFailure>,
     pub restart_count: usize,
     pub lifecycle_api: u32,
     pub desired_running: bool,
@@ -352,6 +454,38 @@ pub struct CoreStatus {
     pub status_sequence: u64,
     pub intent_revision: u64,
     pub core_update: Option<CoreUpdateStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationFailure {
+    pub operation: String,
+    pub code: String,
+    pub message: String,
+    pub occurred_at: u64,
+    pub requested_tun: bool,
+    pub applied_tun: bool,
+    pub intent_revision: u64,
+}
+
+impl OperationFailure {
+    pub fn new(
+        operation: &str,
+        error: &AppError,
+        requested_tun: bool,
+        applied_tun: bool,
+        intent_revision: u64,
+    ) -> Self {
+        Self {
+            operation: operation.into(),
+            code: error.code.clone(),
+            message: error.message.clone(),
+            occurred_at: observed_now(),
+            requested_tun,
+            applied_tun,
+            intent_revision,
+        }
+    }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -531,6 +665,7 @@ pub struct CoreSupervisor {
     tun: bool,
     desired_running: bool,
     error: Option<String>,
+    last_operation_failure: Option<OperationFailure>,
     log_start: u64,
     restarts: VecDeque<Instant>,
     failed_recoveries: usize,
@@ -550,6 +685,7 @@ pub struct CoreSupervisor {
     listeners_ready: Option<bool>,
     observed_at: u64,
     cancellation: Option<Cancellation>,
+    operation_intent_revision: u64,
     tun_recovery: Option<TunRecovery>,
     diagnostic_health: Option<serde_json::Value>,
     diagnostic_health_at: Option<u64>,
@@ -799,6 +935,7 @@ impl CoreSupervisor {
             tun: false,
             desired_running: false,
             error: None,
+            last_operation_failure: None,
             log_start: 0,
             restarts: VecDeque::new(),
             failed_recoveries: 0,
@@ -818,6 +955,7 @@ impl CoreSupervisor {
             listeners_ready: None,
             observed_at: observed_now(),
             cancellation: None,
+            operation_intent_revision: 0,
             tun_recovery: None,
             diagnostic_health: None,
             diagnostic_health_at: None,
@@ -827,7 +965,19 @@ impl CoreSupervisor {
     }
 
     pub fn set_cancellation(&mut self, cancellation: Cancellation) {
+        self.operation_intent_revision = cancellation.revision();
         self.cancellation = Some(cancellation);
+    }
+
+    pub fn set_cancellation_for_intent(
+        &mut self,
+        cancellation: Cancellation,
+        intent_revision: u64,
+    ) {
+        self.set_cancellation(cancellation);
+        // The service worker's cancellation revision is local to that worker;
+        // UI-facing operation outcomes belong to the authenticated host intent.
+        self.operation_intent_revision = intent_revision;
     }
 
     pub(crate) fn record_lifecycle(&self, event: &str, fields: serde_json::Value) {
@@ -851,6 +1001,11 @@ impl CoreSupervisor {
             controller: self.controller.clone(),
             version: self.version.clone(),
             error: self.error.clone(),
+            last_operation_failure: self.last_operation_failure.as_ref().map(|failure| {
+                let mut failure = failure.clone();
+                failure.applied_tun = self.tun;
+                failure
+            }),
             restart_count: self.restarts.len(),
             lifecycle_api: 2,
             desired_running: self.desired_running,
@@ -1190,10 +1345,23 @@ impl CoreSupervisor {
                 self.job = None;
             }
             self.desired_running = false;
+            if self.child.is_none() && !self.termination_unconfirmed {
+                self.tun = false;
+            }
             self.error = Some(error.message.clone());
             self.error_code = Some(error.code.clone());
+            if self.check_cancelled().is_ok() && error.code != "operation_cancelled" {
+                self.last_operation_failure = Some(OperationFailure::new(
+                    "start",
+                    &error,
+                    tun,
+                    self.tun,
+                    self.operation_intent_revision,
+                ));
+            }
             return Err(error);
         }
+        self.last_operation_failure = None;
         Ok(self.status())
     }
 
@@ -1427,7 +1595,7 @@ impl CoreSupervisor {
                 .map_err(|e| AppError::io("无法读取内核状态", e))?
             {
                 let diagnostic = self.recent_diagnostic();
-                if let Some(error) = tun_device_conflict_error(&diagnostic) {
+                if let Some(error) = tun_device_error(&diagnostic) {
                     return Err(error);
                 }
                 return Err(AppError::new(
@@ -1591,7 +1759,7 @@ impl CoreSupervisor {
         self.log_diagnostic(&summary);
         result.map_err(|mut error| {
             if error.code == "reload_invalid" {
-                if let Some(conflict) = tun_device_conflict_error(&summary) {
+                if let Some(conflict) = tun_device_error(&summary) {
                     return conflict;
                 }
             }
@@ -1763,7 +1931,7 @@ impl CoreSupervisor {
                         .and_then(|message| message.as_str())
                         .and_then(safe_core_diagnostic)
                 });
-            if let Some(conflict) = diagnostic.as_deref().and_then(tun_device_conflict_error) {
+            if let Some(conflict) = diagnostic.as_deref().and_then(tun_device_error) {
                 self.log_diagnostic(diagnostic.as_deref().unwrap_or_default());
                 return Err(conflict);
             }
@@ -1790,6 +1958,7 @@ impl CoreSupervisor {
         deadline: Instant,
     ) -> Result<serde_json::Value> {
         let mutation = method == reqwest::Method::PATCH;
+        let tun_mutation = mutation && body.as_ref().is_some_and(|body| body.get("tun").is_some());
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -1797,7 +1966,11 @@ impl CoreSupervisor {
         let request = client
             .request(method, format!("{}{endpoint}", controller.url))
             .bearer_auth(&controller.secret)
-            .timeout(remaining(deadline)?.min(CONTROL_TIMEOUT));
+            .timeout(remaining(deadline)?.min(if tun_mutation {
+                TUN_PATCH_TIMEOUT
+            } else {
+                CONTROL_TIMEOUT
+            }));
         let request = if let Some(body) = body {
             request.json(&body)
         } else {
@@ -1816,6 +1989,25 @@ impl CoreSupervisor {
             };
             let mut response = request.send().await.map_err(|_| transport_error())?;
             if !response.status().is_success() {
+                if tun_mutation {
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = response.chunk().await.map_err(|_| transport_error())? {
+                        if bytes.len().saturating_add(chunk.len()) > 16 * 1024 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if let Some(error) = body
+                            .get("message")
+                            .or_else(|| body.get("error"))
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(tun_device_error)
+                        {
+                            return Err(error);
+                        }
+                    }
+                }
                 return Err(AppError::new(
                     if mutation {
                         "config_patch_failed"
@@ -1855,6 +2047,7 @@ impl CoreSupervisor {
         controller: &Controller,
         patch: &serde_json::Map<String, serde_json::Value>,
         source: &str,
+        tun: bool,
         deadline: Instant,
     ) -> Result<()> {
         let identity =
@@ -1870,7 +2063,7 @@ impl CoreSupervisor {
         if patch
             .iter()
             .any(|(key, value)| actual.get(key) != Some(value))
-            || actual["tun"]["enable"].as_bool() != Some(self.tun)
+            || actual["tun"]["enable"].as_bool() != Some(tun)
         {
             return Err(AppError::new(
                 "config_patch_readback_mismatch",
@@ -1879,11 +2072,11 @@ impl CoreSupervisor {
         }
         // PATCH can return 204 even when a native listener bind failed. Verify
         // all actual listener ports, including those a LAN change recreated.
-        Self::verify_listener_snapshot(&actual, &config::parse(source)?, self.tun).map_err(
-            |error| match error {
+        Self::verify_listener_snapshot(&actual, &config::parse(source)?, tun).map_err(|error| {
+            match error {
                 ReadinessFailure::Temporary(error) | ReadinessFailure::Fatal(error) => error,
-            },
-        )
+            }
+        })
     }
 
     fn apply_config_patch(
@@ -1901,11 +2094,11 @@ impl CoreSupervisor {
             deadline,
         );
         match patched {
-            Ok(_) => self.verify_config_patch(controller, patch, source, deadline),
+            Ok(_) => self.verify_config_patch(controller, patch, source, self.tun, deadline),
             Err(error) if error.code == "config_patch_unconfirmed" => {
                 // The reply may have been lost after application. A readback of
                 // the desired scalar is safe: any late identical PATCH agrees.
-                self.verify_config_patch(controller, patch, source, deadline)
+                self.verify_config_patch(controller, patch, source, self.tun, deadline)
                     .map_err(|readback| {
                         if readback.code == "operation_cancelled" {
                             readback
@@ -1980,8 +2173,10 @@ impl CoreSupervisor {
                     "配置已保存，设置更新或回滚未能确认；自有内核已停止"
                 },
             );
-            self.error_code = Some(failure.code.clone());
-            self.error = Some(failure.message.clone());
+            if !restored {
+                self.error_code = Some(failure.code.clone());
+                self.error = Some(failure.message.clone());
+            }
             return Err(failure);
         }
         self.source = Some(source);
@@ -1993,6 +2188,138 @@ impl CoreSupervisor {
         Ok(self.status())
     }
 
+    fn apply_tun_patch(
+        &self,
+        controller: &Controller,
+        parameters: &serde_json::Value,
+        source: &str,
+        tun: bool,
+        deadline: Instant,
+    ) -> Result<()> {
+        let patch = serde_json::Map::from_iter([("tun".into(), parameters.clone())]);
+        self.runtime_json(
+            controller,
+            reqwest::Method::PATCH,
+            "/configs",
+            Some(serde_json::Value::Object(patch.clone())),
+            deadline,
+        )?;
+        // Unlike scalar changes, an early disabled readback can be published
+        // while native Close is still running. A lost PATCH acknowledgement is
+        // therefore never recovered by reading that value; confirmed exit is
+        // the only safe barrier before a successor operation.
+        self.verify_config_patch(controller, &patch, source, tun, deadline)
+    }
+
+    fn reconfigure_tun(
+        &mut self,
+        controller: &Controller,
+        source: String,
+        port: u16,
+        tun: bool,
+    ) -> Result<CoreStatus> {
+        let started = Instant::now();
+        let deadline = started + TUN_PATCH_TIMEOUT + CONTROL_TIMEOUT * 3;
+        let identity =
+            self.runtime_json(controller, reqwest::Method::GET, "/desktop", None, deadline)?;
+        verify_managed_identity(&identity, self.child.as_ref().map(Child::id)).map_err(
+            |failure| match failure {
+                ReadinessFailure::Temporary(error) | ReadinessFailure::Fatal(error) => error,
+            },
+        )?;
+        let actual =
+            self.runtime_json(controller, reqwest::Method::GET, "/configs", None, deadline)?;
+        Self::verify_listener_snapshot(&actual, &config::parse(&source)?, self.tun).map_err(
+            |failure| match failure {
+                ReadinessFailure::Temporary(error) | ReadinessFailure::Fatal(error) => error,
+            },
+        )?;
+        let before = actual
+            .get("tun")
+            .filter(|value| {
+                value.is_object()
+                    && value["enable"].as_bool() == Some(self.tun)
+                    && value["device"].is_string()
+                    && value["stack"].is_string()
+                    && value["auto-route"].is_boolean()
+                    && value["auto-detect-interface"].is_boolean()
+            })
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    "core_controller_incompatible",
+                    "内核缺少完整的 TUN 运行参数",
+                )
+            })?;
+        // The source is semantically unchanged, so the core's parsed block also
+        // retains derived addresses, sorted lists and defaults that YAML omits.
+        let mut after = before.clone();
+        after["enable"] = serde_json::json!(tun);
+        let path = self.home.join("config.yaml");
+        let old_runtime = config::runtime_config(&source, self.tun, port)?;
+        let runtime = config::runtime_config(&source, tun, port)?;
+        self.check_cancelled()?;
+        config::atomic_write(&path, runtime.as_bytes())?;
+        let result = self.apply_tun_patch(controller, &after, &source, tun, deadline);
+        self.record_lifecycle("core_tun_patch_result", serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"requestedTun":tun,"durationMs":started.elapsed().as_millis(),"success":result.is_ok(),"errorCode":result.as_ref().err().map(|error| &error.code)}));
+        if let Err(error) = result {
+            let restored_file = config::atomic_write(&path, old_runtime.as_bytes());
+            let uncertain = matches!(
+                error.code.as_str(),
+                "operation_cancelled" | "config_patch_unconfirmed"
+            );
+            let restored = !uncertain
+                && restored_file.is_ok()
+                && self
+                    .apply_tun_patch(
+                        controller,
+                        &before,
+                        &source,
+                        self.tun,
+                        Instant::now() + TUN_PATCH_TIMEOUT + CONTROL_TIMEOUT * 3,
+                    )
+                    .is_ok();
+            let cancelled = self.check_cancelled().err();
+            if !restored || cancelled.is_some() {
+                self.stop_for(StopReason::UserStop)?;
+            }
+            restored_file?;
+            if let Some(cancelled) = cancelled {
+                return Err(cancelled);
+            }
+            let failure = AppError::new(
+                if uncertain {
+                    "tun_patch_unconfirmed"
+                } else {
+                    error.code.as_str()
+                },
+                if restored {
+                    format!("TUN 切换未能应用：{}。已恢复先前运行模式", error.message)
+                } else {
+                    format!("TUN 切换或回滚未能确认；自有内核已停止。{}", error.message)
+                },
+            );
+            if restored {
+                self.begin_health_observation();
+            } else {
+                self.error_code = Some(failure.code.clone());
+                self.error = Some(failure.message.clone());
+            }
+            return Err(failure);
+        }
+        self.source = Some(source);
+        self.tun = tun;
+        self.recovery = None;
+        self.health_blocked = false;
+        self.health_deferred = false;
+        self.tun_recovery = None;
+        self.begin_health_observation();
+        self.error = None;
+        self.error_code = None;
+        self.observed_at = observed_now();
+        Ok(self.status())
+    }
+
     pub fn reload(&mut self, source: String) -> Result<CoreStatus> {
         self.reconfigure(source, self.tun)
     }
@@ -2000,17 +2327,62 @@ impl CoreSupervisor {
     /// Apply a configuration and runtime mode as one owned operation. The
     /// previous source/mode remains authoritative until readback succeeds.
     pub fn reconfigure(&mut self, source: String, tun: bool) -> Result<CoreStatus> {
+        self.reconfigure_request(source, tun, false)
+    }
+
+    /// `tun_change` records an explicit mode request, including acknowledgement
+    /// of an already disabled TUN after a failed enable. An ordinary reload of
+    /// the same source must never acknowledge an unmet user request.
+    pub fn reconfigure_request(
+        &mut self,
+        source: String,
+        tun: bool,
+        tun_change: bool,
+    ) -> Result<CoreStatus> {
         let started = Instant::now();
+        let tun_operation = tun_change || tun != self.tun;
         self.record_lifecycle(
             "core_reload",
             serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"tun":self.tun,"requestedTun":tun}),
         );
-        let result = self.reconfigure_inner(source, tun);
+        let result = self.reconfigure_inner(source, tun, tun_change);
+        if self.check_cancelled().is_ok() {
+            match &result {
+                Err(error) if error.code != "operation_cancelled" => {
+                    self.last_operation_failure = Some(OperationFailure::new(
+                        if tun_operation {
+                            "tun_change"
+                        } else {
+                            "config_reload"
+                        },
+                        error,
+                        tun,
+                        self.tun,
+                        self.operation_intent_revision,
+                    ));
+                }
+                Ok(_)
+                    if tun_operation
+                        || self
+                            .last_operation_failure
+                            .as_ref()
+                            .is_some_and(|failure| failure.operation != "tun_change") =>
+                {
+                    self.last_operation_failure = None
+                }
+                _ => (),
+            }
+        }
         self.record_lifecycle("core_reload_result", serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"durationMs":started.elapsed().as_millis(),"success":result.is_ok(),"errorCode":result.as_ref().err().map(|error|&error.code)}));
-        result
+        result.map(|_| self.status())
     }
 
-    fn reconfigure_inner(&mut self, source: String, tun: bool) -> Result<CoreStatus> {
+    fn reconfigure_inner(
+        &mut self,
+        source: String,
+        tun: bool,
+        tun_change: bool,
+    ) -> Result<CoreStatus> {
         self.check_cancelled()?;
         self.abort_core_update(true)?;
         let budget = OperationBudget::new(&source)?;
@@ -2031,6 +2403,23 @@ impl CoreSupervisor {
             .and_then(|v| v.parse::<u16>().ok())
             .ok_or_else(|| AppError::new("controller_invalid", "本地控制接口无效"))?;
         let previous = self.source.clone().unwrap_or_default();
+        if config::parse(&previous)? == config::parse(&source)? {
+            if tun != self.tun {
+                return self.reconfigure_tun(&controller, source, port, tun);
+            }
+            if tun_change {
+                // Explicitly confirming the already applied mode acknowledges
+                // the previous failed switch without reloading resources.
+                self.verify_config_patch(
+                    &controller,
+                    &serde_json::Map::new(),
+                    &source,
+                    tun,
+                    Instant::now() + CONTROL_TIMEOUT * 3,
+                )?;
+                return Ok(self.status());
+            }
+        }
         if tun == self.tun {
             if let Some(patch) = scalar_config_change(&previous, &source)? {
                 return self.reconfigure_scalars(&controller, source, &previous, port, patch);
@@ -2048,8 +2437,6 @@ impl CoreSupervisor {
             }
             let old = config::runtime_config(&previous, self.tun, port)?;
             config::atomic_write(&self.home.join("config.yaml"), old.as_bytes())?;
-            self.error = Some(error.message.clone());
-            self.error_code = Some(error.code.clone());
             return Err(error);
         }
         if let Err(error) = self.apply_runtime_for(
@@ -2088,8 +2475,8 @@ impl CoreSupervisor {
             }
             if rollback.is_ok() {
                 let restored = AppError::new(
-                    if error.code == "tun_device_conflict" {
-                        "tun_device_conflict"
+                    if error.code.starts_with("tun_device_") {
+                        error.code.as_str()
                     } else {
                         "reload_failed"
                     },
@@ -2098,8 +2485,7 @@ impl CoreSupervisor {
                         error.message
                     ),
                 );
-                self.error = Some(restored.message.clone());
-                self.error_code = Some(restored.code.clone());
+                self.begin_health_observation();
                 return Err(restored);
             }
             // A timed-out ApplyConfig may still be running. Only confirmed process
@@ -2111,8 +2497,8 @@ impl CoreSupervisor {
             self.version = None;
             let code = if self.termination_unconfirmed {
                 "core_termination_unconfirmed"
-            } else if error.code == "tun_device_conflict" {
-                "tun_device_conflict"
+            } else if error.code.starts_with("tun_device_") {
+                error.code.as_str()
             } else {
                 "reload_restore_failed"
             };
@@ -2788,7 +3174,11 @@ impl CoreSupervisor {
             StopReason::HealthFailure => "health_failure",
             StopReason::Shutdown => "shutdown",
         };
-        self.stop_for_cause(reason, cause)
+        self.stop_for_cause(reason, cause)?;
+        if reason == StopReason::UserStop {
+            self.last_operation_failure = None;
+        }
+        Ok(())
     }
 
     fn stop_for_cause(&mut self, reason: StopReason, cause: &'static str) -> Result<()> {
@@ -3638,12 +4028,15 @@ mod tests {
         HoldRollback,
         RejectFirstPut,
         BindFailure,
+        TunNativeBusy,
+        LateTunPatch,
     }
 
     struct ConfigurationFixture {
         core: CoreSupervisor,
         directory: PathBuf,
         requests: Arc<std::sync::Mutex<Vec<String>>>,
+        patches: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         patch_seen: Arc<AtomicBool>,
         release_patch: Arc<AtomicBool>,
         finished: Arc<AtomicBool>,
@@ -3685,6 +4078,8 @@ mod tests {
             .unwrap();
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let mutations = requests.clone();
+            let patches = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let patch_bodies = patches.clone();
             let patch_seen = Arc::new(AtomicBool::new(false));
             let seen = patch_seen.clone();
             let release_patch = Arc::new(AtomicBool::new(false));
@@ -3692,7 +4087,7 @@ mod tests {
             let finished = Arc::new(AtomicBool::new(false));
             let stop = finished.clone();
             let server = thread::spawn(move || {
-                let mut actual = serde_json::json!({"port":0,"socks-port":0,"mixed-port":7890,"mode":"rule","allow-lan":false,"log-level":"info","tun":{"enable":false}});
+                let mut actual = serde_json::json!({"port":0,"socks-port":0,"mixed-port":7890,"mode":"rule","allow-lan":false,"log-level":"info","tun":{"enable":false,"device":"","stack":"mixed","dns-mode":"","dns-hijack":["any:53"],"auto-route":true,"auto-detect-interface":true,"inet4-address":["198.18.0.1/30"],"inet6-address":["fdfe:dcba:9876::1/126"],"file-descriptor":0,"include-interface":["Ethernet","Wi-Fi"]}});
                 while !stop.load(Ordering::Acquire) {
                     let (mut stream, _) = match listener.accept() {
                         Ok(connection) => connection,
@@ -3730,8 +4125,11 @@ mod tests {
                     let (status, body) = if request.starts_with("get /desktop ") {
                         (200, serde_json::json!({"managed":true,"api_version":1,"state":"running","pid":pid}).to_string())
                     } else if request.starts_with("get /configs ") {
-                        if matches!(scenario, ConfigurationScenario::UnconfirmedPatch)
-                            && !mutations.lock().unwrap().is_empty()
+                        if matches!(
+                            scenario,
+                            ConfigurationScenario::UnconfirmedPatch
+                                | ConfigurationScenario::LateTunPatch
+                        ) && !mutations.lock().unwrap().is_empty()
                         {
                             (503, "{}".into())
                         } else {
@@ -3746,20 +4144,33 @@ mod tests {
                                 "log-level",
                                 "port",
                                 "socks-port",
-                                "mixed-port"
+                                "mixed-port",
+                                "tun"
                             ]
                             .contains(&key.as_str())),
-                            "scalar PATCH must not alter unrelated runtime fields"
+                            "PATCH must not alter unrelated runtime fields"
                         );
+                        patch_bodies.lock().unwrap().push(body.clone());
                         let attempt = {
                             let mut requests = mutations.lock().unwrap();
                             requests.push("PATCH".into());
                             requests.len()
                         };
+                        if matches!(scenario, ConfigurationScenario::LateTunPatch) && attempt == 1 {
+                            seen.store(true, Ordering::Release);
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            while !release.load(Ordering::Acquire)
+                                && !stop.load(Ordering::Acquire)
+                                && Instant::now() < deadline
+                            {
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                        }
                         if !matches!(
                             scenario,
                             ConfigurationScenario::IgnoreFirstPatch
                                 | ConfigurationScenario::HoldRollback
+                                | ConfigurationScenario::TunNativeBusy
                         ) || attempt != 1
                         {
                             for (key, value) in body.as_object().unwrap() {
@@ -3802,7 +4213,12 @@ mod tests {
                         {
                             continue;
                         }
-                        (204, String::new())
+                        if matches!(scenario, ConfigurationScenario::TunNativeBusy) && attempt == 1
+                        {
+                            (500, serde_json::json!({"message":"configure tun interface: adapter \"utun\": [wintun stage=create reason=native_busy expected_guid={3c3ae50c-e232-5514-9ea5-79082e75332a}] The object already exists"}).to_string())
+                        } else {
+                            (204, String::new())
+                        }
                     } else if request.starts_with("put /configs?") {
                         let attempt = {
                             let mut requests = mutations.lock().unwrap();
@@ -3844,6 +4260,7 @@ mod tests {
                 core,
                 directory,
                 requests,
+                patches,
                 patch_seen,
                 release_patch,
                 finished,
@@ -3853,6 +4270,33 @@ mod tests {
 
         fn runtime(&self) -> serde_yaml::Mapping {
             config::parse(&fs::read_to_string(self.core.home.join("config.yaml")).unwrap()).unwrap()
+        }
+
+        fn tun_source(&mut self) -> String {
+            let source = format!(
+                "{}dns:\n  enable: true\n",
+                self.core.source.as_deref().unwrap()
+            );
+            let port = self
+                .core
+                .controller
+                .as_ref()
+                .unwrap()
+                .url
+                .rsplit(':')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            config::atomic_write(
+                &self.core.home.join("config.yaml"),
+                config::runtime_config(&source, self.core.tun, port)
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+            self.core.source = Some(source.clone());
+            source
         }
 
         #[cfg(unix)]
@@ -4104,6 +4548,203 @@ mod tests {
     }
 
     #[test]
+    fn tun_only_patch_uses_complete_parsed_parameters_and_preserves_pid() {
+        let mut fixture = ConfigurationFixture::new(ConfigurationScenario::Healthy);
+        let source = fixture.tun_source();
+        let pid = fixture.core.status().pid;
+        for enabled in [true, false, true] {
+            let status = fixture.core.reconfigure(source.clone(), enabled).unwrap();
+            assert_eq!(status.pid, pid);
+            assert_eq!(status.tun, enabled);
+            assert!(
+                status.running && status.error.is_none() && status.last_operation_failure.is_none()
+            );
+            assert_eq!(fixture.runtime()["tun"]["enable"].as_bool(), Some(enabled));
+        }
+        assert_eq!(
+            *fixture.requests.lock().unwrap(),
+            ["PATCH", "PATCH", "PATCH"]
+        );
+        let patches = fixture.patches.lock().unwrap();
+        for patch in patches.iter() {
+            assert_eq!(patch.as_object().unwrap().len(), 1);
+            assert_eq!(patch["tun"]["device"], "");
+            assert_eq!(patch["tun"]["stack"], "mixed");
+            assert_eq!(patch["tun"]["auto-route"], true);
+            assert_eq!(patch["tun"]["auto-detect-interface"], true);
+            assert_eq!(patch["tun"]["dns-hijack"], serde_json::json!(["any:53"]));
+            assert_eq!(
+                patch["tun"]["inet4-address"],
+                serde_json::json!(["198.18.0.1/30"])
+            );
+            assert_eq!(
+                patch["tun"]["inet6-address"],
+                serde_json::json!(["fdfe:dcba:9876::1/126"])
+            );
+            assert_eq!(
+                patch["tun"]["include-interface"],
+                serde_json::json!(["Ethernet", "Wi-Fi"])
+            );
+        }
+    }
+
+    #[test]
+    fn failed_tun_patch_keeps_healthy_runtime_and_retains_the_unmet_request() {
+        let mut fixture = ConfigurationFixture::new(ConfigurationScenario::TunNativeBusy);
+        let source = fixture.tun_source();
+        let pid = fixture.core.status().pid;
+        fixture.core.set_cancellation_for_intent(
+            Cancellation::new(Arc::new(std::sync::atomic::AtomicU64::new(29)), 29),
+            4,
+        );
+        let error = fixture
+            .core
+            .reconfigure(source.clone(), true)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "tun_device_busy");
+        let status = fixture.core.status();
+        assert_eq!(status.pid, pid);
+        assert!(!status.tun && status.running);
+        assert!(status.error.is_none() && status.error_code.is_none());
+        let failure = status.last_operation_failure.unwrap();
+        assert_eq!(
+            failure.intent_revision, 4,
+            "worker cancellation revisions must not leak into host outcomes"
+        );
+        assert_eq!(failure.operation, "tun_change");
+        assert!(failure.requested_tun && !failure.applied_tun && failure.occurred_at > 0);
+        assert_eq!(fixture.runtime()["tun"]["enable"].as_bool(), Some(false));
+        assert_eq!(*fixture.requests.lock().unwrap(), ["PATCH", "PATCH"]);
+        fixture.core.poll().unwrap();
+        assert_eq!(
+            fixture.core.status().last_operation_failure,
+            Some(failure.clone())
+        );
+        let changed = source.replace("mode: rule", "mode: global");
+        let updated = fixture.core.reconfigure(changed.clone(), false).unwrap();
+        assert_eq!(updated.last_operation_failure, Some(failure));
+        let confirmed = fixture
+            .core
+            .reconfigure_request(changed.clone(), false, true)
+            .unwrap();
+        assert!(
+            confirmed.last_operation_failure.is_none(),
+            "explicitly confirming disabled acknowledges the failed switch"
+        );
+        assert_eq!(
+            *fixture.requests.lock().unwrap(),
+            ["PATCH", "PATCH", "PATCH"]
+        );
+        let enabled = fixture.core.reconfigure(changed, true).unwrap();
+        assert!(enabled.tun && enabled.last_operation_failure.is_none());
+        assert_eq!(enabled.pid, pid);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unchanged_config_reload_does_not_acknowledge_a_failed_tun_request() {
+        let mut fixture = ConfigurationFixture::new(ConfigurationScenario::TunNativeBusy);
+        fixture.allow_validation();
+        let source = fixture.tun_source();
+        assert_eq!(
+            fixture
+                .core
+                .reconfigure_request(source.clone(), true, true)
+                .err()
+                .unwrap()
+                .code,
+            "tun_device_busy"
+        );
+        let failure = fixture.core.status().last_operation_failure;
+        let unchanged = fixture.core.reload(source).unwrap();
+        assert_eq!(unchanged.last_operation_failure, failure);
+        assert!(unchanged.running && !unchanged.tun && unchanged.error_code.is_none());
+        assert_eq!(*fixture.requests.lock().unwrap(), ["PATCH", "PATCH", "PUT"]);
+    }
+
+    #[test]
+    fn mismatched_tun_readback_rolls_back_the_complete_old_block() {
+        let mut fixture = ConfigurationFixture::new(ConfigurationScenario::IgnoreFirstPatch);
+        let source = fixture.tun_source();
+        let pid = fixture.core.status().pid;
+        let error = fixture
+            .core
+            .reconfigure(source.clone(), true)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "config_patch_readback_mismatch");
+        assert_eq!(fixture.core.status().pid, pid);
+        assert!(fixture.core.status().running && !fixture.core.tun);
+        let patches = fixture.patches.lock().unwrap();
+        assert_eq!(patches.len(), 2);
+        let mut requested = patches[0].clone();
+        requested["tun"]["enable"] = serde_json::json!(false);
+        assert_eq!(patches[1], requested);
+        assert_eq!(fixture.runtime()["tun"]["enable"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn lost_tun_patch_reply_requires_exit_even_when_target_readback_would_match() {
+        let mut fixture = ConfigurationFixture::new(ConfigurationScenario::LostPatchReply);
+        let source = fixture.tun_source();
+        let error = fixture.core.reconfigure(source, true).err().unwrap();
+        assert_eq!(error.code, "tun_patch_unconfirmed");
+        assert!(fixture.core.child.is_none() && !fixture.core.desired_running);
+        assert_eq!(
+            *fixture.requests.lock().unwrap(),
+            ["PATCH"],
+            "an unacknowledged native operation must not race rollback"
+        );
+        assert_eq!(fixture.runtime()["tun"]["enable"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn cancelling_tun_patch_or_rollback_confirms_exit_before_a_successor() {
+        for scenario in [
+            ConfigurationScenario::LateTunPatch,
+            ConfigurationScenario::HoldRollback,
+        ] {
+            let mut fixture = ConfigurationFixture::new(scenario);
+            let source = fixture.tun_source();
+            let revision = Arc::new(std::sync::atomic::AtomicU64::new(1));
+            fixture
+                .core
+                .set_cancellation(Cancellation::new(revision.clone(), 1));
+            let seen = fixture.patch_seen.clone();
+            let release = fixture.release_patch.clone();
+            let canceller = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !seen.load(Ordering::Acquire) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert!(seen.load(Ordering::Acquire));
+                revision.store(2, Ordering::Release);
+                release.store(true, Ordering::Release);
+            });
+            let error = fixture
+                .core
+                .reconfigure(source.clone(), true)
+                .err()
+                .unwrap();
+            canceller.join().unwrap();
+            assert_eq!(error.code, "operation_cancelled");
+            assert!(fixture.core.child.is_none() && !fixture.core.desired_running);
+            assert!(!fixture.core.tun && fixture.core.status().last_operation_failure.is_none());
+            assert_eq!(fixture.core.source.as_deref(), Some(source.as_str()));
+            assert_eq!(fixture.runtime()["tun"]["enable"].as_bool(), Some(false));
+            assert_eq!(
+                fixture.requests.lock().unwrap().len(),
+                if matches!(scenario, ConfigurationScenario::HoldRollback) {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
+    }
+
+    #[test]
     fn unrelated_source_or_tun_changes_keep_the_full_validation_path() {
         for (source, tun) in [
             (
@@ -4135,7 +4776,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn tun_reconfiguration_uses_full_apply_and_keeps_pid_in_both_directions() {
+    fn source_changes_use_full_apply_then_tun_only_switch_uses_patch() {
         let mut fixture = ConfigurationFixture::new(ConfigurationScenario::Healthy);
         fixture.allow_validation();
         let pid = fixture.core.status().pid;
@@ -4155,13 +4796,13 @@ mod tests {
             fixture.runtime().get("tun").unwrap()["enable"].as_bool(),
             Some(false)
         );
-        assert_eq!(*fixture.requests.lock().unwrap(), ["PUT", "PUT"]);
+        assert_eq!(*fixture.requests.lock().unwrap(), ["PUT", "PATCH"]);
         assert_eq!(
             fs::read_to_string(fixture.core.home.join("validation-runs"))
                 .unwrap()
                 .lines()
                 .count(),
-            2
+            1
         );
     }
 
@@ -5006,6 +5647,64 @@ mod tests {
     }
 
     #[test]
+    fn wintun_diagnostics_keep_safe_native_identity_and_distinguish_failure_stages() {
+        for (stage, reason, expected) in [
+            ("inspect", "foreign_alias", "tun_device_conflict"),
+            (
+                "inspect",
+                "native_identity_missing",
+                "tun_device_identity_unverified",
+            ),
+            (
+                "inspect",
+                "native_query_failed",
+                "tun_device_inspection_failed",
+            ),
+            ("create", "native_busy", "tun_device_busy"),
+            ("create", "native_create_failed", "tun_device_create_failed"),
+            (
+                "initialize",
+                "native_initialization_failed",
+                "tun_device_initialization_failed",
+            ),
+        ] {
+            let header = format!("[wintun stage={stage} reason={reason} expected_guid={{3c3ae50c-e232-5514-9ea5-79082e75332a}} native_code=0x800700b7 win32_code=183 actual_guid={{11111111-2222-3333-4444-555555555555}} luid=123456 index=18 cfgmgr_code=0x00000000]");
+            let message = format!("configure tun interface: adapter \"utun\": {header} raw private output; snapshot={{token:never-echo,reason:foreign_alias}}");
+            let captured = safe_core_diagnostic(&message).unwrap();
+            let error = tun_device_error(&captured).unwrap();
+            assert_eq!(error.code, expected);
+            for field in [
+                "expected_guid={3c3ae50c-e232-5514-9ea5-79082e75332a}",
+                "native_code=0x800700b7",
+                "win32_code=183",
+                "actual_guid={11111111-2222-3333-4444-555555555555}",
+                "luid=123456",
+                "index=18",
+                "cfgmgr_code=0x00000000",
+            ] {
+                assert!(captured.contains(field), "missing {field} in {captured}");
+            }
+            assert!(!error.message.contains("never-echo"));
+            assert!(!error.message.contains("snapshot"));
+        }
+        let invalid_fields = "configure tun interface: adapter \"utun\": [wintun stage=inspect reason=native_query_failed expected_guid=bad-guid actual_guid={password} native_code=https://private win32_code=-1 luid=18446744073709551616 index=not-a-number cfgmgr_code=0xZZZZ] snapshot={reason:foreign_alias}";
+        let error = tun_device_error(invalid_fields).unwrap();
+        assert_eq!(error.code, "tun_device_inspection_failed");
+        for field in [
+            "expected_guid=",
+            "actual_guid=",
+            "native_code=",
+            "win32_code=",
+            "luid=",
+            "index=",
+            "cfgmgr_code=",
+        ] {
+            assert!(!error.message.contains(field));
+        }
+        assert!(tun_device_error("configure tun interface: adapter \"utun\": [wintun stage=inspect reason=unrecognized] snapshot={reason:foreign_alias}").is_none());
+    }
+
+    #[test]
     fn exact_native_tun_guard_becomes_typed_without_exposing_other_core_output() {
         let cause =
             format!("configure tun interface: adapter \"utun\"{TUN_DEVICE_CONFLICT_SUFFIX}");
@@ -5015,7 +5714,7 @@ mod tests {
         );
         let captured = collect_diagnostics(format!("secret: never-echo\n{line}\n").as_bytes());
         assert_eq!(captured, cause);
-        let error = tun_device_conflict_error(&captured).unwrap();
+        let error = tun_device_error(&captured).unwrap();
         assert_eq!(error.code, "tun_device_conflict");
         assert!(error.message.contains(&cause));
         assert!(!error.message.contains("never-echo"));
@@ -5025,13 +5724,10 @@ mod tests {
             "adapter utun: file already exists",
             "[resource-bootstrap] code=timeout kind=provider",
         ] {
-            assert!(
-                tun_device_conflict_error(unrelated).is_none(),
-                "{unrelated}"
-            );
+            assert!(tun_device_error(unrelated).is_none(), "{unrelated}");
         }
         let sensitive = format!("configure tun interface: adapter \"https://user:password@example.invalid/secret\"{TUN_DEVICE_CONFLICT_SUFFIX}");
-        let error = tun_device_conflict_error(&sensitive).unwrap();
+        let error = tun_device_error(&sensitive).unwrap();
         assert_eq!(error.code, "tun_device_conflict");
         assert!(!error.message.contains("password"));
         assert!(error

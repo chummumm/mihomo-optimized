@@ -353,15 +353,16 @@ pub fn runtime_config(content: &str, tun: bool, port: u16) -> Result<String> {
     }
     let tun_mapping = tun_config.as_mapping_mut().expect("mapping created above");
     tun_mapping.insert(key("enable"), Value::Bool(tun));
-    if tun {
-        tun_mapping.insert(key("auto-route"), Value::Bool(true));
-        tun_mapping.insert(key("auto-detect-interface"), Value::Bool(true));
-        tun_mapping.entry(key("stack")).or_insert(key("mixed"));
-        tun_mapping.entry(key("dns-hijack")).or_insert(
-            serde_yaml::to_value(["any:53"])
-                .map_err(|_| AppError::new("config_invalid", "无法设置 TUN DNS"))?,
-        );
-    }
+    // Keep the effective TUN parameters stable while disabled. A later switch
+    // can then apply the core's complete, already parsed TUN block without
+    // rebuilding DNS, providers or unrelated listeners.
+    tun_mapping.insert(key("auto-route"), Value::Bool(true));
+    tun_mapping.insert(key("auto-detect-interface"), Value::Bool(true));
+    tun_mapping.entry(key("stack")).or_insert(key("mixed"));
+    tun_mapping.entry(key("dns-hijack")).or_insert(
+        serde_yaml::to_value(["any:53"])
+            .map_err(|_| AppError::new("config_invalid", "无法设置 TUN DNS"))?,
+    );
     serde_yaml::to_string(&document)
         .map_err(|_| AppError::new("config_invalid", "无法生成运行配置"))
 }
@@ -609,6 +610,23 @@ mod tests {
         );
         assert!(runtime_config(source, false, 9090).is_ok());
         assert!(runtime_config(INITIAL_CONFIG, true, 9090).is_ok());
+    }
+
+    #[test]
+    fn disabled_tun_has_the_same_effective_parameters_as_enabled_tun() {
+        for source in [
+            "mixed-port: 7890\ndns:\n  enable: true\n",
+            "mixed-port: 7890\ndns:\n  enable: true\ntun:\n  device: utun\n  stack: gvisor\n  dns-hijack: [tcp://any:53, udp://any:53]\n  auto-route: false\n  include-interface: [Wi-Fi, Ethernet]\n",
+        ] {
+            let before = parse(source).unwrap();
+            let disabled = parse(&runtime_config(source, false, 9090).unwrap()).unwrap();
+            let mut enabled = parse(&runtime_config(source, true, 9090).unwrap()).unwrap();
+            assert_eq!(disabled["tun"]["enable"].as_bool(), Some(false));
+            assert_eq!(enabled["tun"]["enable"].as_bool(), Some(true));
+            enabled["tun"]["enable"] = Value::Bool(false);
+            assert_eq!(disabled, enabled, "a mode-only switch must not alter any other parsed input");
+            assert_eq!(parse(source).unwrap(), before);
+        }
     }
     #[test]
     fn overwrite_is_atomic_and_stale_revision_is_rejected() {

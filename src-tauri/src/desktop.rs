@@ -1,6 +1,6 @@
 use crate::{
     config::{self, ConfigDocument, Preferences},
-    core::{self, Controller, CoreStatus, CoreSupervisor},
+    core::{self, Controller, CoreStatus, CoreSupervisor, OperationFailure},
     error::{AppError, Result},
     host::HostContext,
     lifecycle::{self, Cancellation, RecoveryWindow, StopReason},
@@ -11,7 +11,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     path::PathBuf,
     sync::{atomic::Ordering, Arc, Mutex},
     time::{Duration, Instant},
@@ -22,44 +22,6 @@ mod core_update;
 
 #[derive(Clone)]
 pub struct HostState(pub Arc<Mutex<DesktopManager>>);
-
-const TUN_DEVICE_RECOVERY_OPERATION: &str = "recovering_tun_device";
-
-#[derive(Clone, Default)]
-pub(crate) enum TunDeviceRecoveryStatus {
-    #[default]
-    Idle,
-    Pending,
-    Succeeded,
-    Failed(AppError),
-}
-
-#[derive(Default)]
-struct TunDeviceRecovery {
-    active: bool,
-    generation: u64,
-    attempted_revisions: HashSet<String>,
-    outcome: Option<Result<()>>,
-}
-
-impl TunDeviceRecovery {
-    fn enter_generation(&mut self, generation: u64) {
-        if self.generation != generation {
-            self.generation = generation;
-            self.attempted_revisions.clear();
-            self.outcome = None;
-        }
-    }
-
-    fn claim(&mut self, generation: u64, revision: &str) -> bool {
-        self.enter_generation(generation);
-        let claimed = self.attempted_revisions.insert(revision.into());
-        if claimed {
-            self.outcome = None;
-        }
-        claimed
-    }
-}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -114,6 +76,7 @@ pub struct DesktopStatus {
     pub autostart: bool,
     pub controller: Option<Controller>,
     pub last_error: Option<String>,
+    pub last_operation_failure: Option<OperationFailure>,
     pub core_version: Option<String>,
     pub config_path: String,
     pub log_path: String,
@@ -138,14 +101,12 @@ pub struct DesktopStatus {
     pub service_instance: Option<String>,
     pub service_sequence: u64,
     pub tun_device: TunDeviceStatus,
-    // Raw service heartbeats share the host's admission policy, but this is
-    // internal sequencing state rather than a public UI capability.
-    #[serde(skip)]
-    pub(crate) auto_tun_recovery_eligible: bool,
-    #[serde(skip)]
-    pub(crate) tun_device_recovery: TunDeviceRecoveryStatus,
     #[serde(skip)]
     pub(crate) core_observation: Option<CoreStatus>,
+    // A switch from the unprivileged owner to the service spans two runtimes.
+    // Its rollback outcome belongs to the host transaction, not either child.
+    #[serde(skip)]
+    pub(crate) host_operation_failure: Option<OperationFailure>,
 }
 
 enum RunningCore {
@@ -188,6 +149,7 @@ struct TestRuntime {
     uninstalls: VecDeque<Result<()>>,
     actions: Vec<String>,
     tun_requests: Vec<bool>,
+    tun_change_requests: Vec<bool>,
     status_errors: VecDeque<AppError>,
     checkpoint: Option<RecoveryCheckpoint>,
 }
@@ -229,8 +191,9 @@ impl TestRuntime {
         result
     }
 
-    fn reload(&mut self, source: &str, tun: bool) -> Result<CoreStatus> {
+    fn reload(&mut self, source: &str, tun: bool, tun_change: bool) -> Result<CoreStatus> {
         self.tun_requests.push(tun);
+        self.tun_change_requests.push(tun_change);
         self.actions.push(format!(
             "reload:{}",
             config::configured_tun_device(source)?.unwrap_or_default()
@@ -242,6 +205,15 @@ impl TestRuntime {
             .expect("unexpected reload")
             .map(|mut status| {
                 status.tun = tun;
+                if !tun_change
+                    && self
+                        .status
+                        .last_operation_failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.operation == "tun_change")
+                {
+                    status.last_operation_failure = self.status.last_operation_failure.clone();
+                }
                 status
             });
         match &result {
@@ -256,8 +228,24 @@ impl TestRuntime {
                         ..CoreStatus::default()
                     };
                 }
-                self.status.error_code = Some(error.code.clone());
-                self.status.error = Some(error.message.clone());
+                if error.code == "operation_cancelled"
+                    || error.code == "core_termination_unconfirmed"
+                {
+                    self.status.error_code = Some(error.code.clone());
+                    self.status.error = Some(error.message.clone());
+                } else {
+                    self.status.last_operation_failure = Some(OperationFailure::new(
+                        if tun_change {
+                            "tun_change"
+                        } else {
+                            "config_reload"
+                        },
+                        error,
+                        tun,
+                        self.status.tun,
+                        0,
+                    ));
+                }
             }
         }
         self.checkpoint("reloaded");
@@ -306,6 +294,7 @@ pub struct DesktopManager {
     core_status: CoreStatus,
     applied_proxy_port: Option<u16>,
     last_error: Option<String>,
+    host_operation_failure: Option<OperationFailure>,
     pub dirty: bool,
     pub exiting: bool,
     updating: bool,
@@ -320,10 +309,6 @@ pub struct DesktopManager {
     applied_config_revision: Option<String>,
     cancellation: Cancellation,
     tun_device: TunDeviceStatus,
-    source_tun_valid: bool,
-    attempted_config_revision: Option<String>,
-    conflict_config_revision: Option<String>,
-    tun_device_recovery: TunDeviceRecovery,
     #[cfg(test)]
     test_runtime: Option<Arc<Mutex<TestRuntime>>>,
 }
@@ -360,6 +345,7 @@ impl DesktopManager {
             core_status: CoreStatus::default(),
             applied_proxy_port: None,
             last_error,
+            host_operation_failure: None,
             dirty: false,
             exiting: false,
             updating: false,
@@ -374,10 +360,6 @@ impl DesktopManager {
             applied_config_revision: None,
             cancellation,
             tun_device: TunDeviceStatus::default(),
-            source_tun_valid: false,
-            attempted_config_revision: None,
-            conflict_config_revision: None,
-            tun_device_recovery: TunDeviceRecovery::default(),
             #[cfg(test)]
             test_runtime: None,
         };
@@ -430,7 +412,6 @@ impl DesktopManager {
             }
         }
         self.cancellation = Cancellation::new(self.app.runtime_generation.clone(), generation);
-        self.tun_device_recovery.enter_generation(generation);
         if let Some(RunningCore::Direct(core)) = &mut self.running {
             core.set_cancellation(self.cancellation.clone());
         }
@@ -441,16 +422,19 @@ impl DesktopManager {
     }
 
     fn build_status(&self) -> DesktopStatus {
-        let recovering_device = (self.tun_device_recovery.active || self.can_recover_tun_device())
-            && self.core_status.error_code.as_deref() != Some("core_termination_unconfirmed");
-        let mut status = DesktopStatus {
-            phase: if recovering_device {
-                Phase::Recovering
-            } else {
-                self.phase
-            },
+        let failure = latest_operation_failure(
+            self.core_status.last_operation_failure.as_ref(),
+            self.host_operation_failure.as_ref(),
+        );
+        let tun = if self.core_status.pid.is_some() || failure.is_some() {
+            self.core_status.tun
+        } else {
+            self.preferences.tun
+        };
+        DesktopStatus {
+            phase: self.phase,
             system_proxy: self.proxy.owned().unwrap_or(false),
-            tun: self.preferences.tun,
+            tun,
             autostart: windows::autostart_enabled().unwrap_or(false),
             controller: if self.core_status.process_state == "alive"
                 && matches!(self.core_status.control_state.as_str(), "ready" | "busy")
@@ -460,6 +444,10 @@ impl DesktopManager {
                 None
             },
             last_error: self.last_error.clone(),
+            last_operation_failure: failure.map(|mut failure| {
+                failure.applied_tun = tun;
+                failure
+            }),
             core_version: self.core_status.version.clone(),
             config_path: self.config_path.display().to_string(),
             log_path: self.active_log_directory().display().to_string(),
@@ -492,14 +480,10 @@ impl DesktopManager {
             },
             listeners_ready: self.core_status.listeners_ready,
             pid: self.core_status.pid,
-            operation: if recovering_device {
-                Some(TUN_DEVICE_RECOVERY_OPERATION.into())
-            } else {
-                match self.phase {
-                    Phase::Starting => Some("starting".into()),
-                    Phase::Stopping => Some("stopping".into()),
-                    _ => self.core_status.operation.clone(),
-                }
+            operation: match self.phase {
+                Phase::Starting => Some("starting".into()),
+                Phase::Stopping => Some("stopping".into()),
+                _ => self.core_status.operation.clone(),
             },
             status_instance: self.app.instance.clone(),
             status_sequence: 0,
@@ -509,22 +493,9 @@ impl DesktopManager {
             service_instance: self.core_status.service_instance.clone(),
             service_sequence: self.core_status.status_sequence,
             tun_device: self.tun_device.clone(),
-            auto_tun_recovery_eligible: self.auto_tun_recovery_eligible(),
-            tun_device_recovery: if recovering_device {
-                TunDeviceRecoveryStatus::Pending
-            } else if self.tun_device_recovery.generation == self.cancellation.revision() {
-                match &self.tun_device_recovery.outcome {
-                    Some(Ok(())) => TunDeviceRecoveryStatus::Succeeded,
-                    Some(Err(error)) => TunDeviceRecoveryStatus::Failed(error.clone()),
-                    None => TunDeviceRecoveryStatus::Idle,
-                }
-            } else {
-                TunDeviceRecoveryStatus::Idle
-            },
             core_observation: Some(self.core_status.clone()),
-        };
-        status.project_tun_device_recovery();
-        status
+            host_operation_failure: self.host_operation_failure.clone(),
+        }
     }
 
     pub fn publish(&self) {
@@ -557,14 +528,12 @@ impl DesktopManager {
             Ok(name) => name,
             Err(_) => {
                 // The editor must still be able to read and repair invalid YAML.
-                self.source_tun_valid = false;
                 self.tun_device.configured_name = None;
                 self.tun_device.effective_name = None;
                 self.tun_device.managed = false;
                 return Ok(());
             }
         };
-        self.source_tun_valid = true;
         let retired =
             config::reconcile_tun_device_override(&mut self.preferences, &document.content)?;
         self.tun_device.configured_name = name.clone();
@@ -598,52 +567,35 @@ impl DesktopManager {
         Ok((source, document.revision))
     }
 
-    fn observe_tun_device_conflict(&mut self) {
-        if self.core_status.error_code.as_deref() == Some("tun_device_conflict") {
-            if self.conflict_config_revision.is_none() {
-                self.conflict_config_revision = self.attempted_config_revision.clone();
-            }
-        } else {
-            self.conflict_config_revision = None;
-            self.attempted_config_revision = self.applied_config_revision.clone();
+    /// Retire the old automatic alias only after this owner's observation proves
+    /// there is no active TUN to rename. Source edits still take the normal
+    /// serialized reconfiguration path; no new override is ever created.
+    fn retire_legacy_tun_device(&mut self) -> Result<bool> {
+        let no_process = self.core_status.process_state == "exited"
+            && self.core_status.pid.is_none()
+            && self.core_status.operation.is_none();
+        let disabled = self.core_status.process_state == "alive"
+            && self.core_status.control_state == "ready"
+            && !self.core_status.tun
+            && self.core_status.tun_health.as_deref() == Some("disabled")
+            && self.core_status.observed_at != 0
+            && core::observed_now().saturating_sub(self.core_status.observed_at) <= 30_000
+            && self.core_status.operation.is_none();
+        if (!no_process && !disabled) || self.preferences.tun_device_override.is_none() {
+            return Ok(false);
         }
-    }
-
-    fn auto_tun_recovery_eligible(&self) -> bool {
-        self.run_intent
-            && self.preferences.tun
-            && self.source_tun_valid
-            && !self.tun_device.managed
-            && !self
-                .tun_device
-                .configured_name
-                .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case(config::MANAGED_TUN_DEVICE))
-            && self
-                .attempted_config_revision
-                .as_ref()
-                .or(self.applied_config_revision.as_ref())
-                == Some(&self.tun_device.config_revision)
-            && !self.dirty
-            && !self.updating
-            && !self.exiting
-            && !self.tun_device_recovery.active
-            && (self.tun_device_recovery.generation != self.cancellation.revision()
-                || !self
-                    .tun_device_recovery
-                    .attempted_revisions
-                    .contains(&self.tun_device.config_revision))
-            && self.cancellation.check().is_ok()
-            && self.app.stop_pending.load(Ordering::Acquire) == 0
-    }
-
-    fn can_recover_tun_device(&self) -> bool {
-        self.auto_tun_recovery_eligible()
-            && self.core_status.error_code.as_deref() == Some("tun_device_conflict")
-            && self.conflict_config_revision.as_deref()
-                == Some(self.tun_device.config_revision.as_str())
-            && matches!(self.core_status.process_state.as_str(), "exited" | "alive")
-            && self.core_status.operation.is_none()
+        self.cancellation.check()?;
+        let previous = self.preferences.tun_device_override.take();
+        if let Err(error) = self.persist() {
+            self.preferences.tun_device_override = previous;
+            return Err(error);
+        }
+        self.remember_config(&config::read(&self.config_path)?)?;
+        self.record_lifecycle("tun_device_legacy_mapping_retired", serde_json::json!({
+            "configuredName":config::diagnostic_tun_device(self.tun_device.configured_name.as_deref()),
+            "noProcess":no_process,"tunDisabled":disabled,
+        }));
+        Ok(true)
     }
 
     fn require_idle_update(&self) -> Result<()> {
@@ -662,12 +614,7 @@ impl DesktopManager {
             "desktop_start_requested",
             serde_json::json!({"persistIntent":persist}),
         );
-        let mut result = self.start_once(persist, None);
-        if result.is_err() {
-            if let Some(recovery) = self.recover_tun_device(persist) {
-                result = recovery;
-            }
-        }
+        let result = self.start_once(persist, None);
         self.record_lifecycle(
             "desktop_start_finished",
             serde_json::json!({"code":result.as_ref().err().map(|error| &error.code)}),
@@ -704,12 +651,11 @@ impl DesktopManager {
         self.last_error = None;
         if self.core_status.error_code.as_deref() == Some("tun_device_conflict") {
             self.core_status.error_code = None;
-            self.conflict_config_revision = None;
         }
         self.publish();
         let mut confirmed_start = false;
         let mut result = (|| {
-            let (content, revision) = self.read_runtime_source(expected_revision)?;
+            let (mut content, mut revision) = self.read_runtime_source(expected_revision)?;
             let policy = crate::core_update::Policy::from_config(&content)?;
             if self.preferences.system_proxy {
                 config::mixed_port(&content)?;
@@ -725,12 +671,19 @@ impl DesktopManager {
             self.cancellation.check()?;
             self.recover_core_update_before_start()?;
             self.running = Some(self.new_running_core()?);
+            if self.preferences.tun_device_override.is_some() {
+                // A new service client must observe the authenticated runtime;
+                // absence of a local child does not establish service cleanup.
+                self.core_status =
+                    running_status(self.running.as_mut().expect("runtime set above"))?;
+                if self.retire_legacy_tun_device()? {
+                    (content, revision) = self.read_runtime_source(expected_revision)?;
+                }
+            }
             self.last_runtime_service = self
                 .running
                 .as_ref()
                 .is_some_and(RunningCore::service_owned);
-            self.attempted_config_revision = Some(revision.clone());
-            self.conflict_config_revision = None;
             self.publish();
             self.core_status = match self.running.as_mut().expect("runtime set above") {
                 RunningCore::Service(client) => client.call(
@@ -768,6 +721,7 @@ impl DesktopManager {
             }
             self.cancellation.check()?;
             self.phase = Phase::Running;
+            self.host_operation_failure = None;
             if persist {
                 self.preferences.desired_running = true;
                 self.persist()?;
@@ -816,7 +770,13 @@ impl DesktopManager {
                 };
                 self.last_error = Some(error.message.clone());
                 self.core_status.error_code = Some(error.code.clone());
-                self.observe_tun_device_conflict();
+                self.host_operation_failure = Some(OperationFailure::new(
+                    "start",
+                    &error,
+                    self.preferences.tun,
+                    self.core_status.tun,
+                    self.cancellation.revision(),
+                ));
                 result = Err(error);
             }
         }
@@ -832,9 +792,6 @@ impl DesktopManager {
             "desktop_stop_requested",
             serde_json::json!({"persistIntent":persist}),
         );
-        if !self.tun_device_recovery.active {
-            self.tun_device_recovery.outcome = None;
-        }
         self.resume_pending = None;
         self.lease_recovery_pending = None;
         self.communication_recovery = None;
@@ -880,7 +837,9 @@ impl DesktopManager {
         self.applied_config_revision = None;
         self.applied_proxy_port = None;
         self.phase = Phase::Stopped;
-        let error = persist_error.or(proxy_error);
+        self.host_operation_failure = None;
+        let migration_error = self.retire_legacy_tun_device().err();
+        let error = persist_error.or(proxy_error).or(migration_error);
         self.last_error = error.as_ref().map(|error| error.message.clone());
         self.publish();
         self.record_lifecycle("desktop_stop_finished", serde_json::json!({"code":error.as_ref().map(|error| &error.code),"elapsedMs":started.elapsed().as_millis(),"exitConfirmed":true}));
@@ -928,7 +887,13 @@ impl DesktopManager {
         );
         self.require_idle_update()?;
         self.cancellation.check()?;
-        if self.preferences.tun == enabled {
+        let failed_switch = latest_operation_failure(
+            self.core_status.last_operation_failure.as_ref(),
+            self.host_operation_failure.as_ref(),
+        )
+        .as_ref()
+        .is_some_and(|failure| matches!(failure.operation.as_str(), "tun_change" | "start"));
+        if self.preferences.tun == enabled && !failed_switch {
             return Ok(());
         }
         let service_owned = self
@@ -945,7 +910,7 @@ impl DesktopManager {
         let previous = self.preferences.tun;
         if was_running && service_owned && self.core_status.pid.is_some() {
             let (content, revision) = self.read_runtime_source(None)?;
-            let result = self.apply_runtime_config(content, revision, enabled);
+            let result = self.apply_runtime_config(content, revision, enabled, true);
             // Only confirmed application changes the stored mode. A failed
             // transaction retains the previous mode and its owned process.
             if self.cancellation.check().is_ok() {
@@ -968,192 +933,33 @@ impl DesktopManager {
                     };
                     return Err(error);
                 }
-                if error.code == "tun_device_conflict"
-                    || self.tun_device_recovery.generation == self.cancellation.revision()
-                        && self
-                            .tun_device_recovery
-                            .attempted_revisions
-                            .contains(&self.tun_device.config_revision)
-                {
-                    // An exhausted automatic TUN recovery remains a TUN
-                    // failure, not a silent fallback to the previous mode.
-                    self.persist()?;
-                    self.publish();
-                    return Err(error);
-                }
                 self.preferences.tun = previous;
                 let _rollback_scope = crate::diagnostics::scope(
                     serde_json::json!({"cause":"tun_mode_rollback","triggerCode":error.code}),
                 );
                 self.record_lifecycle("desktop_mode_rollback_requested", serde_json::json!({}));
                 let recovery = self.start(false);
-                self.last_error = Some(if recovery.is_ok() {
-                    format!("{}；已恢复先前模式", error.message)
+                self.cancellation.check()?;
+                self.host_operation_failure = Some(OperationFailure::new(
+                    "tun_change",
+                    &error,
+                    enabled,
+                    self.core_status.tun,
+                    self.cancellation.revision(),
+                ));
+                self.last_error = if recovery.is_ok() {
+                    self.core_status.error.clone()
                 } else {
-                    format!("{}；恢复先前模式失败，请检查配置", error.message)
-                });
+                    Some(format!("{}；恢复先前模式失败，请检查配置", error.message))
+                };
                 self.publish();
                 return Err(error);
             }
         }
+        self.host_operation_failure = None;
         self.persist()?;
         self.publish();
         Ok(())
-    }
-
-    /// Recover only an exact native ownership conflict. A selected fixed name
-    /// is retried once; normal starts and observations never rename interfaces.
-    fn recover_tun_device(&mut self, persist: bool) -> Option<Result<()>> {
-        if !self.can_recover_tun_device() {
-            return None;
-        }
-        let revision = self.tun_device.config_revision.clone();
-        let generation = self.cancellation.revision();
-        if !self.tun_device_recovery.claim(generation, &revision) {
-            return None;
-        }
-        let _scope = crate::diagnostics::scope(
-            serde_json::json!({"cause":"automatic_tun_device_recovery","triggerCode":"tun_device_conflict"}),
-        );
-        self.record_lifecycle("desktop_tun_recovery_started", serde_json::json!({}));
-        let original = AppError::new(
-            "tun_device_conflict",
-            self.last_error
-                .as_deref()
-                .or(self.core_status.error.as_deref())
-                .unwrap_or("TUN 网卡名称冲突"),
-        );
-        let previous = self.preferences.tun_device_override.clone();
-        let previous_core_version = self.core_status.version.clone();
-        let mut selected = false;
-        let mut source_check_failed = false;
-        self.tun_device_recovery.active = true;
-        self.phase = Phase::Recovering;
-        self.publish();
-        let mut result = (|| {
-            self.confirm_tun_recovery_revision(&revision)?;
-            // Reload may have rolled back to a live old process. Only this
-            // exact owner's successful Stop permits changing the runtime name.
-            if let Err(cleanup) = self.stop(false) {
-                return Err(if self.core_status.process_state == "unknown" {
-                    core::startup_cleanup_error(&original, &cleanup)
-                } else {
-                    cleanup
-                });
-            }
-            self.confirm_tun_recovery_revision(&revision)?;
-            self.preferences.tun_device_override = Some(config::TunDeviceOverride::managed(
-                self.tun_device.configured_name.clone(),
-            ));
-            if let Err(error) = self.persist() {
-                self.preferences.tun_device_override = previous.clone();
-                return Err(error);
-            }
-            selected = true;
-            #[cfg(test)]
-            self.tun_recovery_checkpoint("selected");
-            if let Err(error) = self.confirm_tun_recovery_revision(&revision) {
-                source_check_failed = true;
-                return Err(error);
-            }
-            self.record_tun_device_recovery(
-                "tun_device_auto_recovery",
-                &revision,
-                previous_core_version.as_deref(),
-            );
-            self.publish();
-            // This is the primitive start, deliberately not the automatic
-            // wrapper. A collision of MihomoDesktop is a terminal real error.
-            self.start_once(persist, Some(&revision))?;
-            #[cfg(test)]
-            self.tun_recovery_checkpoint("ready");
-            if let Err(error) = self.confirm_tun_recovery_revision(&revision) {
-                source_check_failed = true;
-                return Err(error);
-            }
-            Ok(())
-        })();
-        if let Err(mut error) = result {
-            if selected
-                && (source_check_failed
-                    || matches!(
-                        error.code.as_str(),
-                        "operation_cancelled" | "config_conflict"
-                    ))
-            {
-                // A file edit during startup must not leave the now-stale
-                // runtime alive. A newer Stop already owns cancellation cleanup.
-                if self.cancellation.check().is_ok() && self.running.is_some() {
-                    if let Err(cleanup) = self.stop(false) {
-                        error = core::startup_cleanup_error(&error, &cleanup);
-                    }
-                }
-                self.preferences.tun_device_override = previous;
-                if let Err(rollback) = self.persist() {
-                    error.message =
-                        format!("{}；恢复接口映射失败：{}", error.message, rollback.message);
-                }
-                if let Ok(document) = config::read(&self.config_path) {
-                    let _ = self.remember_config(&document);
-                }
-            }
-            if error.code != "operation_cancelled" && error.code != "core_termination_unconfirmed" {
-                error.message = format!(
-                    "{}；自动恢复 TUN 接口失败：{}",
-                    original.message, error.message
-                );
-            }
-            self.phase = if error.code == "core_termination_unconfirmed" {
-                Phase::Stopping
-            } else {
-                Phase::Error
-            };
-            self.last_error = Some(error.message.clone());
-            self.core_status.error = Some(error.message.clone());
-            self.core_status.error_code = Some(error.code.clone());
-            self.core_status.operation =
-                (error.code == "core_termination_unconfirmed").then(|| "stopping".into());
-            self.observe_tun_device_conflict();
-            result = Err(error);
-        } else {
-            self.record_tun_device_recovery(
-                "tun_device_auto_recovery_succeeded",
-                &revision,
-                self.core_status.version.as_deref(),
-            );
-        }
-        self.tun_device_recovery.active = false;
-        self.record_lifecycle(
-            "desktop_tun_recovery_finished",
-            serde_json::json!({"code":result.as_ref().err().map(|error| &error.code)}),
-        );
-        self.tun_device_recovery.outcome = Some(result.clone());
-        self.publish();
-        Some(result)
-    }
-
-    fn confirm_tun_recovery_revision(&mut self, expected: &str) -> Result<()> {
-        self.cancellation.check()?;
-        let document = config::read(&self.config_path)?;
-        self.remember_config(&document)?;
-        config::require_revision(&document.content, expected)?;
-        self.cancellation.check()
-    }
-
-    fn record_tun_device_recovery(&self, event: &str, revision: &str, core_version: Option<&str>) {
-        crate::diagnostics::record(
-            &self.logs,
-            event,
-            serde_json::json!({
-                "causeCode":"tun_device_conflict",
-                "configuredName":config::diagnostic_tun_device(self.tun_device.configured_name.as_deref()),
-                "effectiveName":config::diagnostic_tun_device(self.tun_device.effective_name.as_deref()),
-                "configRevision":revision,"generation":self.cancellation.revision(),
-                "attempt":1,"previousExitConfirmed":true,
-                "desktopVersion":env!("CARGO_PKG_VERSION"),"coreVersion":core_version,
-                "corePid":self.core_status.pid,
-            }),
-        );
     }
 
     fn ensure_service(&self) -> Result<()> {
@@ -1203,13 +1009,6 @@ impl DesktopManager {
             );
             supervisor.set_cancellation(self.cancellation.clone());
             Ok(RunningCore::Direct(Box::new(supervisor)))
-        }
-    }
-
-    #[cfg(test)]
-    fn tun_recovery_checkpoint(&self, stage: &str) {
-        if let Some(runtime) = &self.test_runtime {
-            runtime.lock().unwrap().checkpoint(stage);
         }
     }
 
@@ -1338,29 +1137,38 @@ impl DesktopManager {
                 .configure(crate::core_update::Policy::from_config(&content)?);
             return Ok(());
         }
-        self.apply_runtime_config(content, revision, self.preferences.tun)
+        self.apply_runtime_config(content, revision, self.preferences.tun, false)
     }
 
-    fn apply_runtime_config(&mut self, content: String, revision: String, tun: bool) -> Result<()> {
+    fn apply_runtime_config(
+        &mut self,
+        content: String,
+        revision: String,
+        tun: bool,
+        tun_change: bool,
+    ) -> Result<()> {
         self.cancellation.check()?;
         let policy = crate::core_update::Policy::from_config(&content)?;
         if self.preferences.system_proxy {
             config::mixed_port(&content)?;
         }
-        self.attempted_config_revision = Some(revision.clone());
-        self.conflict_config_revision = None;
         self.publish();
         let result = match self.running.as_mut() {
-            Some(RunningCore::Direct(core)) => core.reconfigure(content.clone(), tun),
+            Some(RunningCore::Direct(core)) => {
+                core.reconfigure_request(content.clone(), tun, tun_change)
+            }
             Some(RunningCore::Service(client)) => client.call(
                 Request::Reload {
                     config: content.clone(),
                     tun,
+                    tun_change,
                 },
                 &self.cancellation,
             ),
             #[cfg(test)]
-            Some(RunningCore::Fixture(runtime)) => runtime.lock().unwrap().reload(&content, tun),
+            Some(RunningCore::Fixture(runtime)) => {
+                runtime.lock().unwrap().reload(&content, tun, tun_change)
+            }
             None => return Ok(()),
         };
         let status = match result {
@@ -1380,31 +1188,18 @@ impl DesktopManager {
                     .and_then(|running| running_status(running).ok())
                     .unwrap_or_else(|| self.core_status.clone());
                 self.phase = phase_for_core(&self.core_status);
-                self.last_error = Some(error.message.clone());
-                self.core_status.error_code = Some(error.code.clone());
-                self.observe_tun_device_conflict();
+                if self.core_status.last_operation_failure.is_some() {
+                    self.last_error = self.core_status.error.clone();
+                } else {
+                    self.last_error = Some(error.message.clone());
+                    self.core_status.error_code = Some(error.code.clone());
+                }
                 if self.core_status.process_state == "exited"
                     || self.core_status.listeners_ready == Some(false)
                 {
                     let _ = self.proxy.restore();
                 }
                 self.publish();
-                // A newly enabled TUN can encounter the same guarded device
-                // conflict as startup. Keep the target intent only while the
-                // existing confirmed-stop recovery owns its one retry.
-                let previous_tun = self.preferences.tun;
-                if tun && error.code == "tun_device_conflict" {
-                    self.preferences.tun = true;
-                    if let Some(result) = self.recover_tun_device(false) {
-                        if result.is_err() {
-                            self.preferences.tun = previous_tun;
-                            self.persist()?;
-                            self.publish();
-                        }
-                        return result;
-                    }
-                    self.preferences.tun = previous_tun;
-                }
                 return Err(error);
             }
         };
@@ -1417,8 +1212,14 @@ impl DesktopManager {
         self.app.core_updates.configure(policy);
         self.phase = phase_for_core(&self.core_status);
         self.last_error = None;
+        if tun_change {
+            self.host_operation_failure = None;
+        }
         self.applied_proxy_port = config::mixed_port(&content).ok();
         self.cancellation.check()?;
+        if !self.core_status.tun {
+            self.retire_legacy_tun_device()?;
+        }
         if self.preferences.system_proxy {
             self.proxy.enable(config::mixed_port(&content)?)?;
         }
@@ -1539,13 +1340,7 @@ impl DesktopManager {
         }
         let generation = self.app.generation();
         self.begin_operation(generation);
-        let automatic_failure = match &self.tun_device_recovery.outcome {
-            Some(Err(error)) => Some(error.clone()),
-            _ => None,
-        };
-        if self.core_status.error_code.as_deref() == Some("core_termination_unconfirmed")
-            || automatic_failure.is_some()
-        {
+        if self.core_status.error_code.as_deref() == Some("core_termination_unconfirmed") {
             // An outstanding cleanup is an ownership barrier, not a health
             // recovery request. Keep observing until exit is confirmed.
             self.lease_recovery_pending = None;
@@ -1575,9 +1370,7 @@ impl DesktopManager {
             #[cfg(test)]
             Some(RunningCore::Fixture(runtime)) => runtime.lock().unwrap().poll(),
             None => {
-                if self.recover_tun_device(false).is_none() {
-                    self.publish();
-                }
+                self.publish();
                 return;
             }
         };
@@ -1603,20 +1396,16 @@ impl DesktopManager {
                 // withdraws the controller and restores our system proxy. The
                 // next confirmed Running observation must also restore the user's
                 // preference when that last process status was already running.
-                let recovered =
-                    automatic_failure.is_none() && self.phase != Phase::Running && status.running;
-                self.phase = if automatic_failure.is_none()
-                    && status.stop_reason == Some(StopReason::LeaseExpired)
-                    && self.run_intent
-                {
-                    self.lease_recovery_pending = Some(generation);
-                    Phase::Recovering
-                } else {
-                    phase_for_core(&status)
-                };
+                let recovered = self.phase != Phase::Running && status.running;
+                self.phase =
+                    if status.stop_reason == Some(StopReason::LeaseExpired) && self.run_intent {
+                        self.lease_recovery_pending = Some(generation);
+                        Phase::Recovering
+                    } else {
+                        phase_for_core(&status)
+                    };
                 self.last_error = status.error.clone();
                 self.core_status = status;
-                self.observe_tun_device_conflict();
                 if self.core_status.process_state == "exited"
                     || self.core_status.listeners_ready == Some(false)
                 {
@@ -1673,20 +1462,7 @@ impl DesktopManager {
             self.core_status.control_state = "unknown".into();
             self.core_status.controller = None;
             self.publish();
-        } else if let Some(error) = automatic_failure {
-            if error.code == "core_termination_unconfirmed"
-                && self.core_status.process_state == "exited"
-            {
-                self.tun_device_recovery.outcome = None;
-            } else {
-                self.phase = Phase::Error;
-                self.last_error = Some(error.message.clone());
-                self.core_status.error = Some(error.message);
-                self.core_status.error_code = Some(error.code);
-                self.core_status.operation = None;
-            }
-            self.publish();
-        } else if self.recover_tun_device(false).is_none() {
+        } else {
             self.publish();
         }
     }
@@ -1696,7 +1472,6 @@ impl DesktopManager {
             || self.updating
             || self.exiting
             || self.core_status.error_code.as_deref() == Some("core_termination_unconfirmed")
-            || matches!(self.tun_device_recovery.outcome, Some(Err(_)))
             || self.app.stop_pending.load(Ordering::Acquire) != 0
         {
             return;
@@ -1740,8 +1515,6 @@ impl DesktopManager {
                 )
             })?;
             self.lease_restarts.push_back(now);
-            self.attempted_config_revision = self.applied_config_revision.clone();
-            self.conflict_config_revision = None;
             self.publish();
             let status = match self.running.as_ref() {
                 Some(RunningCore::Service(client)) => client.call(
@@ -1795,7 +1568,6 @@ impl DesktopManager {
         if let Err(error) = result {
             self.phase = Phase::Error;
             self.core_status.error_code = Some(error.code.clone());
-            self.observe_tun_device_conflict();
             self.last_error = Some(error.message);
             crate::diagnostics::record(
                 &self.logs,
@@ -1803,9 +1575,7 @@ impl DesktopManager {
                 serde_json::json!({"generation":generation,"code":error.code}),
             );
         }
-        if self.recover_tun_device(false).is_none() {
-            self.publish();
-        }
+        self.publish();
     }
 
     pub fn request_exit(&mut self, force: bool) -> Result<bool> {
@@ -1894,21 +1664,19 @@ fn phase_for_core(status: &CoreStatus) -> Phase {
     }
 }
 
+fn latest_operation_failure(
+    core: Option<&OperationFailure>,
+    host: Option<&OperationFailure>,
+) -> Option<OperationFailure> {
+    [core, host]
+        .into_iter()
+        .flatten()
+        .max_by_key(|failure| (failure.intent_revision, failure.occurred_at))
+        .cloned()
+}
+
 impl DesktopStatus {
     pub fn preserve_core_observation(&mut self, current: &Self) {
-        // Only an owner outcome can finish a recovery. A metadata publication
-        // carrying an older native snapshot is not an operation completion.
-        if matches!(self.tun_device_recovery, TunDeviceRecoveryStatus::Idle)
-            && matches!(
-                current.tun_device_recovery,
-                TunDeviceRecoveryStatus::Pending
-            )
-            && self.auto_tun_recovery_eligible
-            && self.desired_running
-            && self.tun
-        {
-            self.tun_device_recovery = TunDeviceRecoveryStatus::Pending;
-        }
         let local_failure = self.control_state == "unreachable"
             && self
                 .error_code
@@ -1916,8 +1684,12 @@ impl DesktopStatus {
                 .is_some_and(|code| code.starts_with("service_") || code == "io_error");
         let precise_failure = matches!(
             self.error_code.as_deref(),
-            Some("tun_device_conflict" | "core_termination_unconfirmed")
-        );
+            Some("core_termination_unconfirmed")
+        ) || self.error_code.as_deref() == Some("tun_device_conflict")
+            && !current
+                .core_observation
+                .as_ref()
+                .is_some_and(|core| core.running && core.error_code.is_none());
         let failure = (local_failure || precise_failure).then(|| {
             (
                 self.phase,
@@ -1940,6 +1712,7 @@ impl DesktopStatus {
             self.stop_reason = current.stop_reason;
             self.error_code = current.error_code.clone();
             self.last_error = current.last_error.clone();
+            self.last_operation_failure = current.last_operation_failure.clone();
             self.tun_health = current.tun_health.clone();
             self.core_version = current.core_version.clone();
             self.recovery_generation = current.recovery_generation;
@@ -1959,7 +1732,9 @@ impl DesktopStatus {
                 }
             }
         }
-        self.project_tun_device_recovery();
+        if self.error_code.as_deref() == Some("core_termination_unconfirmed") {
+            self.retain_unconfirmed_cleanup();
+        }
     }
 
     pub fn apply_core_observation(&mut self, core: &CoreStatus) {
@@ -1969,20 +1744,8 @@ impl DesktopStatus {
         if let Some(message) = cleanup_failure {
             self.error_code = Some("core_termination_unconfirmed".into());
             self.last_error = message;
+            self.retain_unconfirmed_cleanup();
         }
-        if matches!(
-            self.tun_device_recovery,
-            TunDeviceRecoveryStatus::Idle | TunDeviceRecoveryStatus::Succeeded
-        ) && self.auto_tun_recovery_eligible
-            && self.desired_running
-            && self.tun
-            && self.error_code.as_deref() == Some("tun_device_conflict")
-            && matches!(self.process_state.as_str(), "alive" | "exited")
-            && self.operation.is_none()
-        {
-            self.tun_device_recovery = TunDeviceRecoveryStatus::Pending;
-        }
-        self.project_tun_device_recovery();
     }
 
     fn copy_core_observation(&mut self, core: &CoreStatus) {
@@ -1996,6 +1759,16 @@ impl DesktopStatus {
         self.stop_reason = core.stop_reason;
         self.error_code = core.error_code.clone();
         self.last_error = core.error.clone();
+        self.last_operation_failure = latest_operation_failure(
+            core.last_operation_failure.as_ref(),
+            self.host_operation_failure.as_ref(),
+        );
+        if core.pid.is_some() || self.last_operation_failure.is_some() {
+            self.tun = core.tun;
+        }
+        if let Some(failure) = &mut self.last_operation_failure {
+            failure.applied_tun = self.tun;
+        }
         self.tun_health = core.tun_health.clone();
         self.core_version = core.version.clone();
         self.recovery_generation = core.recovery_generation;
@@ -2009,31 +1782,6 @@ impl DesktopStatus {
             None
         };
         self.core_observation = Some(core.clone());
-    }
-
-    fn project_tun_device_recovery(&mut self) {
-        // Confirmed native uncertainty has precedence over the recovery UI.
-        if self.error_code.as_deref() == Some("core_termination_unconfirmed") {
-            self.retain_unconfirmed_cleanup();
-            return;
-        }
-        match &self.tun_device_recovery {
-            TunDeviceRecoveryStatus::Pending => {
-                self.phase = Phase::Recovering;
-                self.operation = Some(TUN_DEVICE_RECOVERY_OPERATION.into());
-            }
-            TunDeviceRecoveryStatus::Failed(error) => {
-                self.error_code = Some(error.code.clone());
-                self.last_error = Some(error.message.clone());
-                if error.code == "core_termination_unconfirmed" {
-                    self.retain_unconfirmed_cleanup();
-                } else {
-                    self.phase = Phase::Error;
-                    self.operation = None;
-                }
-            }
-            TunDeviceRecoveryStatus::Succeeded | TunDeviceRecoveryStatus::Idle => (),
-        }
     }
 
     fn retain_unconfirmed_cleanup(&mut self) {
@@ -2092,6 +1840,7 @@ mod cleanup_observation_tests {
                 },
                 applied_proxy_port: None,
                 last_error: None,
+                host_operation_failure: None,
                 dirty: false,
                 exiting: false,
                 updating: false,
@@ -2105,10 +1854,6 @@ mod cleanup_observation_tests {
                 applied_config: None,
                 applied_config_revision: None,
                 tun_device: TunDeviceStatus::default(),
-                source_tun_valid: false,
-                attempted_config_revision: None,
-                conflict_config_revision: None,
-                tun_device_recovery: TunDeviceRecovery::default(),
                 test_runtime: Some(runtime.clone()),
             };
             manager
@@ -2130,7 +1875,6 @@ mod cleanup_observation_tests {
                 Some(config::read(&self.manager.config_path).unwrap().content);
             self.manager.applied_config_revision =
                 Some(self.manager.tun_device.config_revision.clone());
-            self.manager.attempted_config_revision = self.manager.applied_config_revision.clone();
             self.manager.phase = phase_for_core(&status);
             self.manager.core_status = status.clone();
             self.runtime.lock().unwrap().status = status;
@@ -2145,66 +1889,6 @@ mod cleanup_observation_tests {
                 .lines()
                 .filter_map(|line| serde_json::from_str(line).ok())
                 .collect()
-        }
-
-        fn assert_recovered(&self) {
-            assert!(self.manager.phase == Phase::Running);
-            assert!(!self.manager.tun_device_recovery.active);
-            assert!(self.manager.tun_device.managed);
-            assert_eq!(
-                self.manager.tun_device.effective_name.as_deref(),
-                Some(config::MANAGED_TUN_DEVICE)
-            );
-            assert_eq!(
-                std::fs::read_to_string(&self.manager.config_path).unwrap(),
-                SOURCE
-            );
-            let stored = config::load_preferences(&self.directory).unwrap();
-            assert_eq!(
-                stored.tun_device_override,
-                Some(config::TunDeviceOverride::managed(Some("utun".into())))
-            );
-            let events = self.events();
-            let recovery = events
-                .iter()
-                .position(|event| event["event"] == "desktop_tun_recovery_started")
-                .unwrap();
-            let stop = events
-                .iter()
-                .position(|event| {
-                    event["event"] == "desktop_stop_requested"
-                        && event["context"]["cause"] == "automatic_tun_device_recovery"
-                })
-                .unwrap();
-            assert!(
-                recovery < stop,
-                "the automatic recovery cause must precede its Stop"
-            );
-            assert_eq!(
-                events[stop]["context"]["triggerCode"],
-                "tun_device_conflict"
-            );
-            assert_eq!(events[stop]["data"]["persistIntent"], false);
-            let attempts: Vec<_> = events
-                .iter()
-                .filter(|event| event["event"] == "tun_device_auto_recovery")
-                .collect();
-            let successes: Vec<_> = events
-                .iter()
-                .filter(|event| event["event"] == "tun_device_auto_recovery_succeeded")
-                .collect();
-            assert_eq!(attempts.len(), 1);
-            assert_eq!(successes.len(), 1);
-            assert_eq!(attempts[0]["data"]["attempt"], 1);
-            assert_eq!(attempts[0]["data"]["previousExitConfirmed"], true);
-            assert_eq!(
-                attempts[0]["data"]["configRevision"],
-                config::revision(SOURCE.as_bytes())
-            );
-            assert_eq!(
-                successes[0]["data"]["corePid"],
-                self.manager.core_status.pid.unwrap()
-            );
         }
     }
 
@@ -2264,6 +1948,231 @@ mod cleanup_observation_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn native_failure_never_creates_a_new_alias_or_restarts_a_healthy_runtime() {
+        for starting in [false, true] {
+            let mut fixture = Fixture::new(SOURCE);
+            if starting {
+                fixture
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .starts
+                    .push_back(Err(conflict("utun")));
+                assert_eq!(
+                    fixture.manager.start(false).unwrap_err().code,
+                    "tun_device_conflict"
+                );
+                assert_eq!(
+                    fixture.runtime.lock().unwrap().actions,
+                    ["start:utun", "stop"]
+                );
+            } else {
+                fixture.manager.preferences.tun = false;
+                fixture.installed_runtime(ready(111));
+                fixture
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .reloads
+                    .push_back(Err(conflict("utun")));
+                assert_eq!(
+                    fixture.manager.set_tun(true).unwrap_err().code,
+                    "tun_device_conflict"
+                );
+                let observed = fixture.manager.status();
+                assert!(observed.phase == Phase::Running && !observed.tun);
+                assert_eq!(observed.pid, Some(111));
+                assert!(observed.last_error.is_none() && observed.error_code.is_none());
+                assert_eq!(
+                    observed.last_operation_failure.unwrap().operation,
+                    "tun_change"
+                );
+                assert_eq!(fixture.runtime.lock().unwrap().actions, ["reload:utun"]);
+            }
+            assert!(fixture.manager.preferences.tun_device_override.is_none());
+            assert_eq!(
+                std::fs::read_to_string(&fixture.manager.config_path).unwrap(),
+                SOURCE
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_alias_waits_for_a_fresh_confirmed_disabled_boundary() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun_device_override =
+            Some(config::TunDeviceOverride::managed(Some("utun".into())));
+        fixture
+            .manager
+            .remember_config(&config::read(&fixture.manager.config_path).unwrap())
+            .unwrap();
+        fixture.manager.persist().unwrap();
+        fixture.installed_runtime(ready(111));
+        assert!(!fixture.manager.retire_legacy_tun_device().unwrap());
+        assert_eq!(
+            fixture.manager.tun_device.effective_name.as_deref(),
+            Some(config::MANAGED_TUN_DEVICE)
+        );
+        fixture.manager.core_status.tun = false;
+        fixture.manager.core_status.tun_health = Some("disabled".into());
+        fixture.manager.core_status.observed_at = core::observed_now().saturating_sub(30_001);
+        assert!(
+            !fixture.manager.retire_legacy_tun_device().unwrap(),
+            "a stale disabled snapshot cannot retire a live mapping"
+        );
+        fixture.manager.core_status.observed_at = core::observed_now();
+        fixture.manager.core_status.operation = Some("reloading".into());
+        assert!(
+            !fixture.manager.retire_legacy_tun_device().unwrap(),
+            "a pending operation may already be recreating the adapter"
+        );
+        fixture.manager.core_status.operation = None;
+        assert!(fixture.manager.retire_legacy_tun_device().unwrap());
+        assert!(config::load_preferences(&fixture.directory)
+            .unwrap()
+            .tun_device_override
+            .is_none());
+        assert_eq!(
+            fixture.manager.tun_device.effective_name.as_deref(),
+            Some("utun")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fixture.manager.config_path).unwrap(),
+            SOURCE
+        );
+        assert!(fixture.runtime.lock().unwrap().actions.is_empty());
+    }
+
+    #[test]
+    fn stopped_legacy_alias_is_retired_before_first_start_and_respects_utun() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun_device_override =
+            Some(config::TunDeviceOverride::managed(Some("utun".into())));
+        fixture
+            .manager
+            .remember_config(&config::read(&fixture.manager.config_path).unwrap())
+            .unwrap();
+        {
+            let mut runtime = fixture.runtime.lock().unwrap();
+            runtime.status = CoreStatus {
+                process_state: "exited".into(),
+                observed_at: core::observed_now(),
+                ..CoreStatus::default()
+            };
+            runtime.starts.push_back(Ok(ready(222)));
+        }
+        fixture.manager.start(false).unwrap();
+        assert!(fixture.manager.preferences.tun_device_override.is_none());
+        assert_eq!(
+            fixture.manager.tun_device.effective_name.as_deref(),
+            Some("utun")
+        );
+        assert_eq!(fixture.runtime.lock().unwrap().actions, ["start:utun"]);
+        assert_eq!(
+            std::fs::read_to_string(&fixture.manager.config_path).unwrap(),
+            SOURCE
+        );
+    }
+
+    #[test]
+    fn legacy_alias_retirement_keeps_the_choice_if_persistence_fails() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun_device_override =
+            Some(config::TunDeviceOverride::managed(Some("utun".into())));
+        fixture
+            .manager
+            .remember_config(&config::read(&fixture.manager.config_path).unwrap())
+            .unwrap();
+        let preferences = fixture.directory.join("preferences.json");
+        std::fs::remove_file(&preferences).unwrap();
+        std::fs::create_dir(&preferences).unwrap();
+        assert!(fixture.manager.retire_legacy_tun_device().is_err());
+        assert!(fixture.manager.preferences.tun_device_override.is_some());
+        assert_eq!(
+            fixture.manager.tun_device.effective_name.as_deref(),
+            Some(config::MANAGED_TUN_DEVICE)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fixture.manager.config_path).unwrap(),
+            SOURCE
+        );
+    }
+
+    #[test]
+    fn ordinary_reload_keeps_failed_tun_intent_and_explicit_disable_acknowledges_it() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun = false;
+        fixture.installed_runtime(ready(111));
+        fixture.runtime.lock().unwrap().reloads.extend([
+            Err(conflict("utun")),
+            Ok(ready(111)),
+            Ok(ready(111)),
+        ]);
+        assert!(fixture.manager.set_tun(true).is_err());
+        let failure = fixture.manager.status().last_operation_failure;
+        fixture.manager.reload_config(false).unwrap();
+        assert_eq!(fixture.manager.status().last_operation_failure, failure);
+        fixture.manager.set_tun(false).unwrap();
+        assert!(fixture.manager.status().last_operation_failure.is_none());
+        assert_eq!(
+            fixture.runtime.lock().unwrap().tun_change_requests,
+            [true, false, true]
+        );
+        assert_eq!(fixture.manager.status().pid, Some(111));
+    }
+
+    #[test]
+    fn direct_to_service_rollback_preserves_failed_request_through_healthy_polls() {
+        let mut fixture = Fixture::new(SOURCE);
+        fixture.manager.preferences.tun = false;
+        fixture.runtime.lock().unwrap().service_owned = false;
+        fixture.installed_runtime(ready(111));
+        fixture.runtime.lock().unwrap().starts.extend([
+            Err(AppError::new(
+                "tun_device_busy",
+                "owned adapter is still active",
+            )),
+            Ok(ready(222)),
+        ]);
+        assert_eq!(
+            fixture.manager.set_tun(true).unwrap_err().code,
+            "tun_device_busy"
+        );
+        let restored = fixture.manager.status();
+        assert!(restored.phase == Phase::Running && !restored.tun);
+        assert_eq!(restored.pid, Some(222));
+        assert!(restored.last_error.is_none() && restored.error_code.is_none());
+        let failure = restored.last_operation_failure.unwrap();
+        assert!(failure.requested_tun && !failure.applied_tun);
+        assert_eq!(failure.operation, "tun_change");
+        fixture.manager.poll();
+        assert_eq!(
+            fixture.manager.status().last_operation_failure,
+            Some(failure.clone())
+        );
+        fixture
+            .runtime
+            .lock()
+            .unwrap()
+            .reloads
+            .push_back(Ok(ready(222)));
+        fixture.manager.reload_config(false).unwrap();
+        assert_eq!(
+            fixture.manager.status().last_operation_failure,
+            Some(failure)
+        );
+        fixture
+            .runtime
+            .lock()
+            .unwrap()
+            .reloads
+            .push_back(Ok(ready(222)));
+        fixture.manager.set_tun(false).unwrap();
+        assert!(fixture.manager.status().last_operation_failure.is_none());
+        assert!(fixture.manager.status().last_error.is_none());
     }
 
     #[test]
@@ -2716,494 +2625,6 @@ mod cleanup_observation_tests {
             "operation_cancelled"
         );
         assert!(fixture.runtime.lock().unwrap().actions.is_empty());
-    }
-
-    #[test]
-    fn start_recovers_once_without_publishing_a_transient_terminal_conflict() {
-        let mut fixture = Fixture::new(SOURCE);
-        fixture
-            .runtime
-            .lock()
-            .unwrap()
-            .starts
-            .extend([Err(conflict("utun")), Ok(ready(222))]);
-        // Inspect the exact handoff point used by start's wrapper.
-        assert_eq!(
-            fixture.manager.start_once(true, None).unwrap_err().code,
-            "tun_device_conflict"
-        );
-        let pending = fixture.manager.status();
-        assert!(pending.phase == Phase::Recovering);
-        assert_eq!(
-            pending.operation.as_deref(),
-            Some(TUN_DEVICE_RECOVERY_OPERATION)
-        );
-        assert_eq!(pending.process_state, "exited");
-        fixture.manager.recover_tun_device(true).unwrap().unwrap();
-        fixture.assert_recovered();
-        assert_eq!(
-            fixture.runtime.lock().unwrap().actions,
-            ["start:utun", "stop", "start:MihomoDesktop"]
-        );
-    }
-
-    #[test]
-    fn ordinary_start_and_tun_enable_return_only_the_final_recovery_result() {
-        for enable in [false, true] {
-            let mut fixture = Fixture::new(SOURCE);
-            if enable {
-                fixture.manager.preferences.tun = false;
-                fixture.runtime.lock().unwrap().service_owned = false;
-                fixture.installed_runtime(ready(111));
-            }
-            fixture
-                .runtime
-                .lock()
-                .unwrap()
-                .starts
-                .extend([Err(conflict("utun")), Ok(ready(222))]);
-            if enable {
-                fixture.manager.set_tun(true).unwrap();
-            } else {
-                fixture.manager.start(true).unwrap();
-            }
-            fixture.assert_recovered();
-        }
-    }
-
-    #[test]
-    fn reload_poll_and_lease_recovery_share_the_same_confirmed_stop_barrier() {
-        for entry in ["reload", "poll", "lease"] {
-            let mut fixture = Fixture::new(SOURCE);
-            fixture.installed_runtime(ready(111));
-            {
-                let mut runtime = fixture.runtime.lock().unwrap();
-                match entry {
-                    "reload" => runtime.reloads.push_back(Err(conflict("utun"))),
-                    "poll" => runtime.observations.push_back(Ok(exited_conflict())),
-                    "lease" => runtime.starts.push_back(Err(conflict("utun"))),
-                    _ => unreachable!(),
-                }
-                runtime.starts.push_back(Ok(ready(222)));
-            }
-            match entry {
-                "reload" => fixture.manager.reload_config(true).unwrap(),
-                "poll" => fixture.manager.poll(),
-                "lease" => {
-                    fixture.manager.core_status = CoreStatus {
-                        process_state: "exited".into(),
-                        tun: true,
-                        stop_reason: Some(StopReason::LeaseExpired),
-                        ..CoreStatus::default()
-                    };
-                    fixture.manager.lease_recovery_pending = Some(fixture.manager.app.generation());
-                    fixture.manager.poll();
-                }
-                _ => unreachable!(),
-            }
-            fixture.assert_recovered();
-            let runtime = fixture.runtime.lock().unwrap();
-            let stop = runtime
-                .actions
-                .iter()
-                .position(|action| action == "stop")
-                .unwrap();
-            let restart = runtime
-                .actions
-                .iter()
-                .position(|action| action == "start:MihomoDesktop")
-                .unwrap();
-            assert!(
-                stop < restart,
-                "{entry} must stop its previous owner before the managed start"
-            );
-        }
-    }
-
-    #[test]
-    fn collision_of_fixed_name_is_terminal_without_a_suffix_or_second_attempt() {
-        for already_fixed in [false, true] {
-            let source = if already_fixed {
-                SOURCE.replace("utun", "mihomodesktop")
-            } else {
-                SOURCE.into()
-            };
-            let mut fixture = Fixture::new(&source);
-            fixture
-                .runtime
-                .lock()
-                .unwrap()
-                .starts
-                .push_back(Err(conflict(if already_fixed {
-                    "mihomodesktop"
-                } else {
-                    "utun"
-                })));
-            if !already_fixed {
-                fixture
-                    .runtime
-                    .lock()
-                    .unwrap()
-                    .starts
-                    .push_back(Err(conflict("MihomoDesktop")));
-            }
-            let error = fixture.manager.start(true).unwrap_err();
-            assert_eq!(error.code, "tun_device_conflict");
-            assert!(error.message.contains(if already_fixed {
-                "mihomodesktop"
-            } else {
-                "MihomoDesktop"
-            }));
-            assert!(fixture.manager.phase == Phase::Error);
-            assert!(!fixture.manager.tun_device_recovery.active);
-            let starts = fixture
-                .runtime
-                .lock()
-                .unwrap()
-                .actions
-                .iter()
-                .filter(|action| action.starts_with("start:"))
-                .count();
-            assert_eq!(starts, if already_fixed { 1 } else { 2 });
-            for _ in 0..3 {
-                fixture.manager.poll();
-            }
-            assert_eq!(
-                fixture
-                    .runtime
-                    .lock()
-                    .unwrap()
-                    .actions
-                    .iter()
-                    .filter(|action| action.starts_with("start:"))
-                    .count(),
-                starts
-            );
-            assert_eq!(
-                fixture
-                    .events()
-                    .iter()
-                    .filter(|event| event["event"] == "tun_device_auto_recovery")
-                    .count(),
-                usize::from(!already_fixed)
-            );
-        }
-    }
-
-    #[test]
-    fn stop_or_source_change_after_persist_rolls_back_without_late_start() {
-        for cancel in [true, false] {
-            let mut fixture = Fixture::new(SOURCE);
-            fixture
-                .runtime
-                .lock()
-                .unwrap()
-                .starts
-                .push_back(Err(conflict("utun")));
-            let context = fixture.manager.app.clone();
-            let path = fixture.manager.config_path.clone();
-            fixture.runtime.lock().unwrap().checkpoint = Some(Box::new(move |stage| {
-                if stage != "selected" {
-                    return;
-                }
-                if cancel {
-                    context.runtime_generation.fetch_add(1, Ordering::AcqRel);
-                } else {
-                    config::atomic_write(
-                        &path,
-                        SOURCE.replace("utun", "changed-device").as_bytes(),
-                    )
-                    .unwrap();
-                }
-            }));
-            let error = fixture.manager.start(true).unwrap_err();
-            assert_eq!(
-                error.code,
-                if cancel {
-                    "operation_cancelled"
-                } else {
-                    "config_conflict"
-                }
-            );
-            assert_eq!(
-                fixture
-                    .runtime
-                    .lock()
-                    .unwrap()
-                    .actions
-                    .iter()
-                    .filter(|action| action.starts_with("start:"))
-                    .count(),
-                1
-            );
-            assert!(fixture.manager.preferences.tun_device_override.is_none());
-            assert!(config::load_preferences(&fixture.directory)
-                .unwrap()
-                .tun_device_override
-                .is_none());
-            assert!(!fixture.manager.tun_device_recovery.active);
-            assert!(!fixture
-                .events()
-                .iter()
-                .any(|event| event["event"] == "tun_device_auto_recovery"));
-        }
-    }
-
-    #[test]
-    fn newer_poll_cleanup_uncertainty_outranks_an_earlier_auto_recovery_failure() {
-        let mut fixture = Fixture::new(SOURCE);
-        fixture.installed_runtime(ready(111));
-        let original = AppError::new("config_conflict", "source changed during recovery");
-        fixture.manager.tun_device_recovery.outcome = Some(Err(original.clone()));
-        fixture.manager.core_status.error_code = Some(original.code);
-        fixture.manager.last_error = Some(original.message);
-        fixture.manager.publish();
-        fixture
-            .runtime
-            .lock()
-            .unwrap()
-            .observations
-            .push_back(Ok(CoreStatus {
-                process_state: "unknown".into(),
-                error_code: Some("core_termination_unconfirmed".into()),
-                error: Some("later owned cleanup remains unconfirmed".into()),
-                operation: Some("stopping".into()),
-                ..ready(111)
-            }));
-        fixture.manager.poll();
-        let status = fixture.manager.status();
-        assert!(status.phase == Phase::Stopping);
-        assert_eq!(status.operation.as_deref(), Some("stopping"));
-        assert_eq!(
-            status.error_code.as_deref(),
-            Some("core_termination_unconfirmed")
-        );
-        assert_eq!(
-            status.last_error.as_deref(),
-            Some("later owned cleanup remains unconfirmed")
-        );
-        assert_eq!(status.process_state, "unknown");
-        assert_eq!(status.pid, Some(111));
-        assert!(status.controller.is_none());
-    }
-
-    #[test]
-    fn unreadable_source_after_ready_stops_the_new_owner_and_rolls_back() {
-        let mut fixture = Fixture::new(SOURCE);
-        fixture
-            .runtime
-            .lock()
-            .unwrap()
-            .starts
-            .extend([Err(conflict("utun")), Ok(ready(222))]);
-        let path = fixture.manager.config_path.clone();
-        fixture.runtime.lock().unwrap().checkpoint = Some(Box::new(move |stage| {
-            if stage == "ready" {
-                std::fs::remove_file(&path).unwrap();
-            }
-        }));
-        let error = fixture.manager.start(true).unwrap_err();
-        assert_eq!(error.code, "config_missing");
-        assert!(error.message.contains("utun"));
-        assert_eq!(
-            fixture.runtime.lock().unwrap().actions,
-            ["start:utun", "stop", "start:MihomoDesktop", "stop"]
-        );
-        assert!(fixture.manager.running.is_none());
-        assert!(fixture.manager.preferences.tun_device_override.is_none());
-        assert!(config::load_preferences(&fixture.directory)
-            .unwrap()
-            .tun_device_override
-            .is_none());
-        assert!(!fixture
-            .events()
-            .iter()
-            .any(|event| event["event"] == "tun_device_auto_recovery_succeeded"));
-        fixture.manager.poll();
-        assert!(fixture.manager.status().phase == Phase::Error);
-        assert_eq!(
-            fixture.manager.status().error_code.as_deref(),
-            Some("config_missing")
-        );
-    }
-
-    #[test]
-    fn stop_during_managed_start_retains_the_owner_and_never_retries_again() {
-        use std::sync::atomic::AtomicUsize;
-        let mut fixture = Fixture::new(SOURCE);
-        fixture
-            .runtime
-            .lock()
-            .unwrap()
-            .starts
-            .extend([Err(conflict("utun")), Ok(ready(222))]);
-        let context = fixture.manager.app.clone();
-        let starts = AtomicUsize::new(0);
-        fixture.runtime.lock().unwrap().checkpoint = Some(Box::new(move |stage| {
-            if stage == "start" && starts.fetch_add(1, Ordering::AcqRel) == 1 {
-                let revision = context.runtime_generation.fetch_add(1, Ordering::AcqRel) + 1;
-                let mut stopping = context.status().unwrap();
-                stopping.intent_revision = revision;
-                stopping.desired_running = false;
-                stopping.phase = Phase::Stopping;
-                stopping.operation = Some("stopping".into());
-                stopping.tun_device_recovery = TunDeviceRecoveryStatus::Idle;
-                stopping.auto_tun_recovery_eligible = false;
-                context.publish_status(stopping);
-            }
-        }));
-        assert_eq!(
-            fixture.manager.start(true).unwrap_err().code,
-            "operation_cancelled"
-        );
-        assert!(
-            fixture.manager.running.is_some(),
-            "the cancelled worker must retain its exact owner for Stop"
-        );
-        assert!(fixture.manager.preferences.tun_device_override.is_none());
-        assert!(fixture.manager.status().phase == Phase::Stopping);
-        fixture
-            .manager
-            .begin_operation(fixture.manager.app.generation());
-        fixture.manager.stop(true).unwrap();
-        assert!(fixture.manager.running.is_none());
-        assert!(fixture.manager.status().phase == Phase::Stopped);
-        assert_eq!(
-            fixture
-                .runtime
-                .lock()
-                .unwrap()
-                .actions
-                .iter()
-                .filter(|action| action.starts_with("start:"))
-                .count(),
-            2
-        );
-        assert!(!fixture
-            .events()
-            .iter()
-            .any(|event| event["event"] == "tun_device_auto_recovery_succeeded"));
-    }
-
-    #[test]
-    fn unknown_cleanup_dirty_state_and_disabled_tun_never_choose_another_device() {
-        for blocker in ["unknown", "dirty", "tun_disabled"] {
-            let mut fixture = Fixture::new(SOURCE);
-            fixture
-                .runtime
-                .lock()
-                .unwrap()
-                .starts
-                .push_back(Err(conflict("utun")));
-            match blocker {
-                "unknown" => fixture
-                    .runtime
-                    .lock()
-                    .unwrap()
-                    .stops
-                    .push_back(Err(AppError::new("service_timeout", "exit not confirmed"))),
-                "dirty" => fixture.manager.dirty = true,
-                "tun_disabled" => fixture.manager.preferences.tun = false,
-                _ => unreachable!(),
-            }
-            let error = fixture.manager.start(true).unwrap_err();
-            assert_eq!(
-                error.code,
-                if blocker == "unknown" {
-                    "core_termination_unconfirmed"
-                } else {
-                    "tun_device_conflict"
-                }
-            );
-            assert!(error.message.contains("utun"));
-            assert!(fixture.manager.preferences.tun_device_override.is_none());
-            assert!(fixture
-                .manager
-                .tun_device_recovery
-                .attempted_revisions
-                .is_empty());
-            assert_eq!(
-                fixture
-                    .runtime
-                    .lock()
-                    .unwrap()
-                    .actions
-                    .iter()
-                    .filter(|action| action.starts_with("start:"))
-                    .count(),
-                1
-            );
-        }
-    }
-
-    #[test]
-    fn normal_start_never_renames_and_failed_persistence_cannot_loop_in_poll() {
-        let mut ordinary = Fixture::new(SOURCE);
-        ordinary
-            .runtime
-            .lock()
-            .unwrap()
-            .starts
-            .push_back(Ok(ready(111)));
-        ordinary.manager.start(true).unwrap();
-        assert!(!ordinary.manager.tun_device.managed);
-        assert!(!ordinary
-            .events()
-            .iter()
-            .any(|event| event["event"] == "tun_device_auto_recovery"));
-        assert_eq!(
-            std::fs::read_to_string(&ordinary.manager.config_path).unwrap(),
-            SOURCE
-        );
-
-        let mut failed = Fixture::new(SOURCE);
-        let preferences = failed.directory.join("preferences.json");
-        std::fs::remove_file(&preferences).unwrap();
-        std::fs::create_dir(&preferences).unwrap();
-        failed
-            .runtime
-            .lock()
-            .unwrap()
-            .starts
-            .push_back(Err(conflict("utun")));
-        assert!(failed.manager.start(true).is_err());
-        assert_eq!(
-            failed.manager.tun_device_recovery.attempted_revisions.len(),
-            1
-        );
-        assert!(!failed.manager.tun_device_recovery.active);
-        failed.manager.core_status = exited_conflict();
-        failed.manager.attempted_config_revision =
-            Some(failed.manager.tun_device.config_revision.clone());
-        failed.manager.observe_tun_device_conflict();
-        for _ in 0..3 {
-            failed.manager.poll();
-        }
-        assert_eq!(
-            failed
-                .runtime
-                .lock()
-                .unwrap()
-                .actions
-                .iter()
-                .filter(|action| action.starts_with("start:"))
-                .count(),
-            1
-        );
-        assert!(!failed
-            .events()
-            .iter()
-            .any(|event| event["event"] == "tun_device_auto_recovery"));
-    }
-
-    #[test]
-    fn recovery_attempts_are_bound_to_both_intent_and_source_revision() {
-        let mut attempts = TunDeviceRecovery::default();
-        assert!(attempts.claim(7, "source-a"));
-        assert!(!attempts.claim(7, "source-a"));
-        assert!(attempts.claim(7, "source-b"));
-        assert!(!attempts.claim(7, "source-a"));
-        assert!(attempts.claim(8, "source-a"));
     }
 
     #[test]
