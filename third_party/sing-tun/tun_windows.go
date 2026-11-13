@@ -84,7 +84,8 @@ func New(options Options) (WinTun, error) {
 }
 
 // NewExclusive never adopts an adapter after a failed create. Native product
-// identity admits an existing instance; Windows decides whether its creator
+// identity admits an existing instance or its retiring IP Helper row; Windows
+// decides whether its creator
 // still owns it or its previous removal can finish before creation proceeds.
 // A different or unverified interface never authorizes a same-name Create.
 func NewExclusive(options Options) (WinTun, error) {
@@ -97,7 +98,8 @@ func newWindowsExclusive(options Options, now func() time.Time, wait func(time.D
 	}
 	// Wintun can rename a foreign interface when assigning a duplicate alias.
 	// Only unverified/conflicting names need this short, read-only removal grace.
-	// Verified product instances go straight to native Create even while present.
+	// Product instances and their retiring interface rows go straight to native
+	// Create, which arbitrates live owners and queues pending same-instance removal.
 	aliasDeadline := now().Add(500 * time.Millisecond)
 	var inspection windowsAdapterInspection
 	for {

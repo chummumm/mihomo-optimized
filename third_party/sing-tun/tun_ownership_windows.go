@@ -90,18 +90,29 @@ func (identity windowsAdapterIdentity) String() string {
 }
 
 type windowsInterfaceIdentity struct {
-	Alias      string
-	GUID       windows.GUID
-	LUID       uint64
-	Index      uint32
-	OperStatus uint32
-	AdminState uint32
-	Flags      uint8
+	Alias       string
+	Description string
+	GUID        windows.GUID
+	LUID        uint64
+	Index       uint32
+	Type        uint32
+	OperStatus  uint32
+	AdminState  uint32
+	Flags       uint8
+}
+
+func (identity windowsInterfaceIdentity) matchesProduct(name string, guid windows.GUID) bool {
+	// Interface GUID is the product-scoped native key, not a display name.
+	// NetCfg may decorate Description to make ifDescr unique, so do not use its
+	// spelling (or a down/disabled link state) as an ownership requirement.
+	return identity.GUID == guid && strings.EqualFold(identity.Alias, name) &&
+		identity.LUID != 0 && identity.Index != 0 && identity.Type == uint32(winipcfg.IfTypePropVirtual)
 }
 
 func (identity windowsInterfaceIdentity) String() string {
-	return fmt.Sprintf("alias=%q guid=%s luid=%d index=%d oper=%d admin=%d flags=0x%x",
-		identity.Alias, identity.GUID, identity.LUID, identity.Index, identity.OperStatus, identity.AdminState, identity.Flags)
+	return fmt.Sprintf("alias=%q description=%q guid=%s luid=%d index=%d type=%d oper=%d admin=%d flags=0x%x",
+		identity.Alias, identity.Description, identity.GUID, identity.LUID, identity.Index, identity.Type,
+		identity.OperStatus, identity.AdminState, identity.Flags)
 }
 
 type windowsAdapterInspection struct {
@@ -132,7 +143,7 @@ func (inspection windowsAdapterInspection) failure(stage, reason string, err err
 	}
 	if len(inspection.Interfaces) == 1 {
 		row := inspection.Interfaces[0]
-		header += fmt.Sprintf(" luid=%d index=%d", row.LUID, row.Index)
+		header += fmt.Sprintf(" luid=%d index=%d if_type=%d", row.LUID, row.Index, row.Type)
 	}
 	return fmt.Errorf("%s] %w; snapshot={interfaces=%v native={%v}}", header, err, inspection.Interfaces, inspection.Native)
 }
@@ -154,8 +165,8 @@ func inspectWindowsAdapter(name string) (windowsAdapterInspection, error) {
 	rows := make([]windowsInterfaceIdentity, 0, len(interfaces))
 	for _, entry := range interfaces {
 		rows = append(rows, windowsInterfaceIdentity{
-			Alias: entry.Alias(), GUID: entry.InterfaceGUID, LUID: uint64(entry.InterfaceLUID),
-			Index: entry.InterfaceIndex, OperStatus: uint32(entry.OperStatus),
+			Alias: entry.Alias(), Description: entry.Description(), GUID: entry.InterfaceGUID, LUID: uint64(entry.InterfaceLUID),
+			Index: entry.InterfaceIndex, Type: uint32(entry.Type), OperStatus: uint32(entry.OperStatus),
 			AdminState: uint32(entry.AdminStatus), Flags: uint8(entry.InterfaceAndOperStatusFlags),
 		})
 	}
@@ -191,6 +202,17 @@ func inspectWindowsAdapterInterfaces(name string, interfaces []windowsInterfaceI
 		if err == os.ErrNotExist {
 			if len(inspection.Interfaces) == 0 {
 				inspection.Reason = "adapter_absent"
+				return inspection, nil
+			}
+			if len(inspection.Interfaces) == 1 && inspection.Interfaces[0].matchesProduct(name, inspection.ExpectedGUID) {
+				// Wintun Close removes the PnP device before IP Helper necessarily
+				// withdraws its interface row. This product-scoped row can outlive
+				// the devnode; requiring both views to disappear in 500 ms prevents
+				// the native Create from coordinating that normal removal.
+				// Request the same software-device instance, never Open this row.
+				// A live creator still fails native exclusivity. The returned handle
+				// must have the expected GUID before any addresses/routes are set.
+				inspection.Reason = "product_interface_only"
 				return inspection, nil
 			}
 			inspection.Reason = "native_identity_missing"

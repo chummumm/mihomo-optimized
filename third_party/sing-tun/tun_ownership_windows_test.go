@@ -2,6 +2,7 @@ package tun
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/metacubex/sing-tun/internal/winipcfg"
 	"github.com/metacubex/sing-tun/internal/wintun"
 	"golang.org/x/sys/windows"
 )
@@ -95,6 +97,108 @@ func TestDesktopExclusiveAdapterUsesNativeOwnershipForVerifiedProduct(t *testing
 				}
 			})
 		}
+	}
+}
+
+func TestDesktopExclusiveAdapterUsesNativeOwnershipForRetiringInterface(t *testing.T) {
+	originalCreate, originalInspect := createExclusiveWindowsAdapter, inspectExclusiveWindowsAdapter
+	t.Cleanup(func() {
+		createExclusiveWindowsAdapter, inspectExclusiveWindowsAdapter = originalCreate, originalInspect
+	})
+	for _, name := range []string{"utun", "MihomoDesktop"} {
+		for _, description := range []string{"Mihomo Optimized Tunnel", "Mihomo Optimized Tunnel #2", "", "driver-assigned description"} {
+			t.Run(name+"/"+description, func(t *testing.T) {
+				row := windowsInterfaceIdentity{
+					Alias: strings.ToUpper(name), Description: description,
+					GUID: *generateExclusiveGUIDByDeviceName(name),
+					LUID: 14918723521478656, Index: 18, Type: uint32(winipcfg.IfTypePropVirtual),
+				}
+				inspections, creates := 0, 0
+				inspectExclusiveWindowsAdapter = func(requested string) (windowsAdapterInspection, error) {
+					inspections++
+					inspection, err := inspectWindowsAdapterInterfaces(requested, []windowsInterfaceIdentity{row}, func(string, windows.GUID) (windowsAdapterIdentity, error) {
+						return windowsAdapterIdentity{}, os.ErrNotExist
+					})
+					if err != nil || inspection.Reason != "product_interface_only" || inspection.Native != nil {
+						t.Fatalf("retiring interface blocked or claimed a verified PnP identity: inspection=%+v err=%v", inspection, err)
+					}
+					return inspection, err
+				}
+				createExclusiveWindowsAdapter = func(options Options) (windowsAdapter, error) {
+					creates++
+					if options.Name != name {
+						t.Fatalf("native creation changed the requested name: %q", options.Name)
+					}
+					// A missing PnP observation is not proof that a creator exited.
+					// The native ownership error must still reach the caller unchanged.
+					return nil, windows.ERROR_ALREADY_EXISTS
+				}
+				device, err := newWindowsExclusive(Options{Name: name}, time.Now, func(time.Duration) {
+					t.Fatal("a product interface awaiting removal must reach native creation without an alias grace wait")
+				})
+				if device != nil || !errors.Is(err, windows.ERROR_ALREADY_EXISTS) || inspections != 1 || creates != 1 {
+					t.Fatalf("retiring interface did not reach exactly one native attempt: device=%v err=%v inspections=%d creates=%d", device, err, inspections, creates)
+				}
+				for _, detail := range []string{"stage=create reason=native_busy", "actual_guid=" + row.GUID.String(), "if_type=53", "description="} {
+					if !strings.Contains(err.Error(), detail) {
+						t.Fatalf("native result lost interface evidence %q: %v", detail, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestDesktopExclusiveAdapterRetiringInterfaceRequiresExactNativeKey(t *testing.T) {
+	name := "utun"
+	row := windowsInterfaceIdentity{
+		Alias: name, GUID: *generateExclusiveGUIDByDeviceName(name),
+		LUID: 14918723521478656, Index: 18, Type: uint32(winipcfg.IfTypePropVirtual),
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*windowsInterfaceIdentity)
+	}{
+		{"different GUID", func(i *windowsInterfaceIdentity) { i.GUID = *generateGUIDByDeviceName(name) }},
+		{"different alias", func(i *windowsInterfaceIdentity) { i.Alias += "-other" }},
+		{"zero LUID", func(i *windowsInterfaceIdentity) { i.LUID = 0 }},
+		{"zero index", func(i *windowsInterfaceIdentity) { i.Index = 0 }},
+		{"missing interface type", func(i *windowsInterfaceIdentity) { i.Type = 0 }},
+		{"other interface type", func(i *windowsInterfaceIdentity) { i.Type = uint32(winipcfg.IfTypeEthernetCSMACD) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := row
+			test.change(&candidate)
+			inspection, err := inspectWindowsAdapterInterfaces(name, []windowsInterfaceIdentity{candidate}, func(string, windows.GUID) (windowsAdapterIdentity, error) {
+				return windowsAdapterIdentity{}, os.ErrNotExist
+			})
+			if err == nil || inspection.Reason == "product_interface_only" {
+				t.Fatalf("unverified residual interface admitted: inspection=%+v err=%v", inspection, err)
+			}
+		})
+	}
+	for _, queryErr := range []error{windows.ERROR_ACCESS_DENIED, windows.ERROR_FILE_NOT_FOUND, fmt.Errorf("candidate property: %w", os.ErrNotExist)} {
+		inspection, err := inspectWindowsAdapterInterfaces(name, []windowsInterfaceIdentity{row}, func(string, windows.GUID) (windowsAdapterIdentity, error) {
+			return windowsAdapterIdentity{}, queryErr
+		})
+		if !errors.Is(err, queryErr) || inspection.Reason != "native_query_failed" {
+			t.Fatalf("native query failure was treated as device removal: inspection=%+v err=%v", inspection, err)
+		}
+	}
+	inspection, err := inspectWindowsAdapterInterfaces(name, []windowsInterfaceIdentity{row, row}, func(string, windows.GUID) (windowsAdapterIdentity, error) {
+		t.Fatal("ambiguous aliases must fail before a native lookup")
+		return windowsAdapterIdentity{}, os.ErrNotExist
+	})
+	if err == nil || inspection.Reason != "ambiguous_alias" {
+		t.Fatalf("duplicate interface row admitted: inspection=%+v err=%v", inspection, err)
+	}
+	identity := desktopOwnedIdentity(name)
+	identity.HardwareIDs = []string{"other-device"}
+	inspection, err = inspectWindowsAdapterInterfaces(name, []windowsInterfaceIdentity{row}, func(string, windows.GUID) (windowsAdapterIdentity, error) {
+		return identity, nil
+	})
+	if err == nil || inspection.Reason != "identity_mismatch" {
+		t.Fatalf("interface-only path hid a known PnP mismatch: inspection=%+v err=%v", inspection, err)
 	}
 }
 
