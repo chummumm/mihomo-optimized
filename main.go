@@ -143,7 +143,7 @@ func main() {
 			log.Fatalln("desktop-managed requires a configuration file and does not allow post-up/post-down scripts")
 			return
 		}
-		if err := desktop.Enable(desktop.Options{Home: homeDir, Controller: externalController, Secret: secret}); err != nil {
+		if err := desktop.Enable(desktop.Options{Home: homeDir, Controller: externalController, Secret: secret, LaunchNonce: os.Getenv(desktop.LaunchNonceEnv)}); err != nil {
 			log.Fatalln("%s", err)
 			return
 		}
@@ -280,6 +280,9 @@ func runDaemon(options []hub.Option) error {
 	configured := false
 	defer func() {
 		shutdownUntilComplete(executor.Shutdown, stopRequests)
+		if err := hub.CloseManagedController(); err != nil {
+			log.Warnln("Close desktop controller: %s", err)
+		}
 		if configured && postDown != "" {
 			if _, err := cmd.ExecShell(postDown); err != nil {
 				log.Errorln("post-down script error: %s", err.Error())

@@ -44,7 +44,7 @@ func TestDesktopManagedContracts(t *testing.T) {
 
 	home := t.TempDir()
 	const secret = "desktop-contract-only-0123456789abcdefghijklmnopqrstuvwxyz"
-	if err := desktop.Enable(desktop.Options{Home: home, Controller: "127.0.0.1:19871", Secret: secret}); err != nil {
+	if err := desktop.Enable(desktop.Options{Home: home, Controller: "127.0.0.1:0", Secret: secret, LaunchNonce: strings.Repeat("a", 64)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := desktop.Enable(desktop.Options{Home: home, Controller: "127.0.0.1:19872", Secret: secret}); err == nil {
@@ -55,6 +55,9 @@ func TestDesktopManagedContracts(t *testing.T) {
 	defer func() {
 		if err := executor.Shutdown(); err != nil {
 			t.Errorf("managed contract shutdown failed: %v", err)
+		}
+		if err := CloseManagedController(); err != nil {
+			t.Errorf("managed controller close failed: %v", err)
 		}
 		// Unlike the daemon, this subprocess runs TempDir cleanup before it
 		// exits. Release the mapped cache file first, as Windows requires.
@@ -75,10 +78,16 @@ func TestDesktopManagedContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Controller.ExternalController != "127.0.0.1:19871" || cfg.Controller.Secret != secret || cfg.Controller.ExternalControllerTLS != "" || cfg.Controller.ExternalControllerUnix != "" || cfg.Controller.ExternalControllerPipe != "" {
+	if cfg.Controller.ExternalController != "127.0.0.1:0" || cfg.Controller.Secret != secret || cfg.Controller.ExternalControllerTLS != "" || cfg.Controller.ExternalControllerUnix != "" || cfg.Controller.ExternalControllerPipe != "" {
 		t.Fatal("YAML overrode managed controller policy")
 	}
 	if err := executor.ApplyConfig(cfg, true); err != nil {
+		t.Fatal(err)
+	}
+	if desktop.Ready() {
+		t.Fatal("managed core was ready before its controller was bound")
+	}
+	if err := ReCreateServer(&Config{}); err != nil {
 		t.Fatal(err)
 	}
 	// The supervisor waits on /desktop and may not ask for health for another

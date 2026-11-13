@@ -20,16 +20,19 @@ import (
 var ErrManaged = errors.New("desktop_managed: the desktop supervisor owns core and UI updates and process restart")
 
 type Options struct {
-	Home       string
-	Controller string
-	Secret     string
+	Home        string
+	Controller  string
+	Secret      string
+	LaunchNonce string
 }
 
 type policy struct {
 	Options
-	shutdown chan struct{}
-	once     sync.Once
-	ready    atomic.Bool
+	shutdown     chan struct{}
+	once         sync.Once
+	ready        atomic.Bool
+	controllerMu sync.Mutex
+	controller   atomic.Pointer[ControllerRecord]
 }
 
 var current atomic.Pointer[policy]
@@ -75,8 +78,17 @@ func validateOptions(options Options) (Options, error) {
 		return Options{}, errors.New("desktop-managed controller must use a loopback IP literal")
 	}
 	number, err := strconv.ParseUint(port, 10, 16)
-	if err != nil || number == 0 {
-		return Options{}, errors.New("desktop-managed controller port must be 1..65535")
+	if err != nil {
+		return Options{}, errors.New("desktop-managed controller port must be 0..65535")
+	}
+	if options.LaunchNonce != "" && !validLaunchNonce(options.LaunchNonce) {
+		return Options{}, errors.New("desktop-managed launch nonce must contain 64 lowercase hexadecimal characters")
+	}
+	if number == 0 && options.LaunchNonce == "" {
+		return Options{}, errors.New("desktop-managed controller port 0 requires MIHOMO_DESKTOP_LAUNCH_NONCE")
+	}
+	if options.LaunchNonce != "" && address.String() != "127.0.0.1" {
+		return Options{}, errors.New("desktop-managed controller discovery requires 127.0.0.1")
 	}
 	if len(options.Secret) < 32 || len(options.Secret) > 256 || strings.IndexFunc(options.Secret, func(r rune) bool {
 		return r > unicode.MaxASCII || unicode.IsSpace(r) || unicode.IsControl(r)
@@ -90,12 +102,13 @@ func validateOptions(options Options) (Options, error) {
 
 func Enabled() bool { return current.Load() != nil }
 
-// Ready is published only after a full configuration application succeeds.
+// Ready requires a successful full configuration application and a bound,
+// published process-owned controller.
 // The tunnel's traffic phase can become Running before listener errors are
 // collected, so it cannot establish supervisor readiness on its own.
 func Ready() bool {
 	p := current.Load()
-	return p != nil && p.ready.Load()
+	return p != nil && p.ready.Load() && p.controller.Load() != nil
 }
 
 // SetReady is called by the serialized configuration executor, after admission
@@ -120,7 +133,10 @@ func Home() string {
 
 func Controller() (address, secret string) {
 	if p := current.Load(); p != nil {
-		return p.Controller, p.Secret
+		if bound := p.controller.Load(); bound != nil {
+			return bound.Controller, p.Secret
+		}
+		return p.Options.Controller, p.Secret
 	}
 	return "", ""
 }
