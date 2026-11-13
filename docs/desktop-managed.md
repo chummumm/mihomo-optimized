@@ -9,16 +9,44 @@ parsed. This is an immutable process policy; it is not a YAML setting.
 Create a private, existing data directory first. Start the core with:
 
 ```text
-mihomo.exe -desktop-managed -d <absolute-home> -f <absolute-home/config.yaml> -ext-ctl 127.0.0.1:<reserved-port>
+mihomo.exe -desktop-managed -d <absolute-home> -f <absolute-home/config.yaml> -ext-ctl 127.0.0.1:0
 ```
 
 Generate at least 32 random bytes using the operating system CSPRNG and encode
 them as base64url. Pass the resulting secret only through `CLASH_OVERRIDE_SECRET`
 in the child environment, not the command line or YAML. The core rejects missing,
 short, non-ASCII or whitespace-containing secrets and non-loopback controller
-addresses. IP literals and explicit ports 1..65535 are required. The supervisor
-must reserve a distinct application instance and wait for the authenticated
-`GET /desktop` response from its child PID before considering it ready.
+addresses. Core 1.0.35 also accepts an OS-assigned port `0` when the supervisor
+passes a fresh, independent 32-byte random value encoded as 64 lowercase hex
+characters in `MIHOMO_DESKTOP_LAUNCH_NONCE`. The core itself binds the socket
+and holds that exact listener until shutdown. A temporary port probe followed
+by closing the probe is not a reservation and must not be used by new clients.
+
+After the actual bind succeeds, the core atomically publishes the fixed file
+`<absolute-home>/desktop-controller.json` (at most 4096 bytes):
+
+```json
+{
+  "protocolVersion": 1,
+  "pid": 1234,
+  "controller": "127.0.0.1:54321",
+  "coreInstance": "<core-lifetime-identity>",
+  "launchNonce": "<this-launch-64-lowercase-hex-value>"
+}
+```
+
+The supervisor removes its old record before spawning, accepts only a regular
+non-reparse file in its protected home, and checks the protocol, this launch
+nonce, exact child PID, expected loopback address and nonzero port. It then
+authenticates `GET /desktop` and confirms the same PID, core instance and running
+state. The record contains no controller secret and is not a readiness verdict.
+Cancellation still requires confirmed child exit before the next launch.
+
+Binding or publishing failures abort managed startup and clean up resources
+already created for that attempt. A configuration reload retains the actual
+bound controller listener and endpoint. Explicit nonzero ports remain supported
+for existing supervisors; without a launch nonce that legacy mode writes no
+discovery record. API 1 remains the authenticated runtime contract.
 
 The home must exist and cannot itself be a symbolic link or reparse point.
 The configuration file and managed provider/database/cache/state paths are
@@ -54,6 +82,7 @@ Allowed browser origins are `tauri://localhost`, `http://tauri.localhost`, and
   "api_version": 1,
   "state": "running",
   "pid": 1234,
+  "core_instance": "<core-lifetime-identity>",
   "platform": "windows",
   "arch": "amd64",
   "core_version": "<build-version>",

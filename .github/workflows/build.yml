@@ -178,6 +178,7 @@ jobs:
           CGO_ENABLED=0 go build -tags with_gvisor -o "$stop_test_binary" .
           sudo -n python3 scripts/test-transparent-stop.py --core "$stop_test_binary" --require-systemd
           python3 scripts/test-resource-bootstrap.py --core "$stop_test_binary" --report "$RUNNER_TEMP/resource-bootstrap-verification.json"
+          python3 scripts/test-desktop-controller.py --core "$stop_test_binary"
       - name: Test fork changes and sync safeguards
         run: bash scripts/ci-check.sh test
       - name: Repeat real Debian upgrades with locally modified configuration
@@ -307,6 +308,19 @@ jobs:
         run: go test -tags with_gvisor -count=1 -timeout=5m ./hub/route -run 'ConfigFile|UIUpdater|UnifiedUpgrade|UpgradeSchedule'
       - name: Verify desktop supervisor authentication, confinement and lifecycle contracts
         run: go test -tags with_gvisor -count=1 -timeout=3m ./component/desktop ./hub/route . -run Desktop
+      - name: Verify actual OS-assigned managed controllers and startup cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          controller_test_binary="$RUNNER_TEMP/mihomo-controller-test"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then controller_test_binary="$controller_test_binary.exe"; fi
+          trap 'rm -f "$controller_test_binary"' EXIT
+          CGO_ENABLED=0 go build -tags with_gvisor -o "$controller_test_binary" .
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python scripts/test-desktop-controller.py --core "$controller_test_binary" --require-tun
+          else
+            python3 scripts/test-desktop-controller.py --core "$controller_test_binary"
+          fi
       - name: Verify TUN snapshots, recovery operations and native Windows resource repair
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./listener ./listener/sing_tun ./hub/executor ./hub/route -run 'Desktop|TunHealth|TunRecovery'
       - name: Verify exclusive Windows adapter creation and deterministic cleanup
@@ -389,7 +403,16 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.34
+              printf '%s\n\n' '## 本次更新：1.0.35
+
+          - 受管内核自身原子绑定系统分配的控制端口，通过固定位置的有界启动记录交接实际地址；新版桌面核验本次启动标识、PID 与核心实例，再执行原有认证和就绪检查。
+          - 控制端口绑定或记录发布失败会立即作为启动失败返回，并清理已创建资源；相同实例重载保留控制监听器。
+          - 旧的明确非零控制端口模式继续兼容。完整消除桌面端口探测窗口需要安装配套桌面 0.2.11；旧客户端独立更新核心仍使用其原有启动方式。
+          - 增加真实多实例、监听器保留、发布失败和 Windows TUN 启动清理验收，保留资源稳定性与全部原生生命周期检查。
+
+          [启动交接协议](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.35/docs/desktop-managed.md) · [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.35/docs/releases.md)
+
+          ## 1.0.34
 
           - Windows TUN 对已核实的本产品设备直接进入 Wintun 原生创建流程，取消必须先观察到 phantom 的额外限制；关闭后的异步移除交由 Windows 协调，原生占用结果和错误码保留。
           - 按实际 NetCfgInstanceId 关联 PnP 身份并读取真实实例 ID；不同 GUID 的同名设备和身份不符继续受保护，不按名称打开接管。失败携带阶段与本次设备查询结果。

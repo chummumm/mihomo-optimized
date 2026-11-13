@@ -94,14 +94,14 @@ func (c Cors) Apply(r chi.Router) {
 	}).Handler)
 }
 
-func ReCreateServer(cfg *Config) {
+func ReCreateServer(cfg *Config) error {
 	if desktop.Enabled() {
 		owned := *cfg
 		owned.Addr, owned.Secret = desktop.Controller()
 		owned.TLSAddr, owned.UnixAddr, owned.PipeAddr, owned.DohServer = "", "", "", ""
 		owned.RoutingMark, owned.IsDebug = 0, false
 		owned.Cors = Cors{AllowOrigins: desktop.AllowedOrigins()}
-		cfg = &owned
+		return startManagedController(&owned)
 	}
 	go start(cfg)
 	go startTLS(cfg)
@@ -109,6 +109,7 @@ func ReCreateServer(cfg *Config) {
 	if inbound.SupportNamedPipe {
 		go startPipe(cfg)
 	}
+	return nil
 }
 
 // Retained for old integrations; the managed dashboard always lives in ui

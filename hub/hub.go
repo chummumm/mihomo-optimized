@@ -2,6 +2,8 @@ package hub
 
 import (
 	"context"
+
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/hub/route"
@@ -58,15 +60,21 @@ func ApplyConfig(cfg *config.Config) error {
 	if err := executor.ApplyConfig(cfg, true); err != nil {
 		return err
 	}
-	applyRoute(cfg)
+	if err := applyRoute(cfg); err != nil {
+		desktop.SetReady(false)
+		return err
+	}
 	return nil
 }
 
-func applyRoute(cfg *config.Config) {
+// CloseManagedController runs after owned traffic resources have stopped.
+func CloseManagedController() error { return route.CloseManagedController() }
+
+func applyRoute(cfg *config.Config) error {
 	if cfg.Controller.ExternalUI != "" {
 		route.SetUIPath(cfg.Controller.ExternalUI)
 	}
-	route.ReCreateServer(&route.Config{
+	return route.ReCreateServer(&route.Config{
 		Addr:           cfg.Controller.ExternalController,
 		TLSAddr:        cfg.Controller.ExternalControllerTLS,
 		UnixAddr:       cfg.Controller.ExternalControllerUnix,
