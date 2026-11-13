@@ -7,7 +7,7 @@ use crate::{
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     fs,
     io::{Read, Seek, SeekFrom, Write},
     net::TcpListener,
@@ -598,6 +598,139 @@ fn tun_reason_code(reason: Option<&str>) -> &'static str {
 struct ScalarConfigPatch {
     before: serde_json::Map<String, serde_json::Value>,
     after: serde_json::Map<String, serde_json::Value>,
+}
+
+/// GET /configs reports Listener.Config while TUN is active, and the last
+/// request while disabled. Only defaults actually written back by sing_tun.New
+/// belong here; MTU, timeouts and route defaults stay local to the core driver.
+/// This verification copy must never be used as a PATCH or rollback payload.
+fn expected_tun_readback(
+    request: &serde_json::Value,
+    automatic_device: Option<&str>,
+) -> serde_json::Value {
+    let mut expected = request.clone();
+    let Some(fields) = expected.as_object_mut() else {
+        return expected;
+    };
+    let enabled = fields.get("enable").and_then(serde_json::Value::as_bool) == Some(true);
+    let gso = fields.get("gso-max-size");
+    if enabled && (gso.is_none() || gso.and_then(serde_json::Value::as_u64) == Some(0)) {
+        fields.insert("gso-max-size".into(), serde_json::json!(65_536));
+    } else if !enabled && gso.and_then(serde_json::Value::as_u64) == Some(0) {
+        fields.remove("gso-max-size");
+    }
+    if fields
+        .get("auto-redirect")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+        || enabled && !cfg!(target_os = "linux")
+    {
+        fields.remove("auto-redirect");
+    }
+    if let Some(device) = automatic_device {
+        fields.insert("device".into(), serde_json::json!(device));
+    }
+    expected
+}
+
+fn safe_patch_field_path(parent: &str, field: &str) -> String {
+    // These names come from the fixed core schema, never from source values.
+    // Unknown additions are still mismatches, without echoing an arbitrary key.
+    let known = matches!(
+        field,
+        "mode"
+            | "allow-lan"
+            | "log-level"
+            | "port"
+            | "socks-port"
+            | "mixed-port"
+            | "enable"
+            | "device"
+            | "stack"
+            | "dns-mode"
+            | "dns-hijack"
+            | "auto-route"
+            | "auto-detect-interface"
+            | "mtu"
+            | "gso"
+            | "gso-max-size"
+            | "inet4-address"
+            | "inet6-address"
+            | "iproute2-table-index"
+            | "iproute2-rule-index"
+            | "auto-redirect"
+            | "auto-redirect-input-mark"
+            | "auto-redirect-output-mark"
+            | "auto-redirect-iproute2-fallback-rule-index"
+            | "loopback-address"
+            | "strict-route"
+            | "route-address"
+            | "route-address-set"
+            | "route-exclude-address"
+            | "route-exclude-address-set"
+            | "include-interface"
+            | "exclude-interface"
+            | "include-uid"
+            | "include-uid-range"
+            | "exclude-uid"
+            | "exclude-uid-range"
+            | "include-android-user"
+            | "include-package"
+            | "exclude-package"
+            | "include-mac-address"
+            | "exclude-mac-address"
+            | "endpoint-independent-nat"
+            | "udp-timeout"
+            | "icmp-timeout"
+            | "disable-icmp-forwarding"
+            | "congestion-controller"
+            | "file-descriptor"
+            | "inet4-route-address"
+            | "inet6-route-address"
+            | "inet4-route-exclude-address"
+            | "inet6-route-exclude-address"
+            | "exclude-src-port"
+            | "exclude-src-port-range"
+            | "exclude-dst-port"
+            | "exclude-dst-port-range"
+            | "recvmsgx"
+            | "sendmsgx"
+            | "processors-per-channel"
+    );
+    format!("{parent}{}", if known { field } else { "<unknown>" })
+}
+
+fn patch_readback_differences(
+    expected: &serde_json::Map<String, serde_json::Value>,
+    actual: &serde_json::Value,
+    tun: bool,
+) -> Vec<String> {
+    let mut differences = BTreeSet::new();
+    for (key, value) in expected {
+        if key == "tun" {
+            match (
+                value.as_object(),
+                actual.get(key).and_then(serde_json::Value::as_object),
+            ) {
+                (Some(wanted), Some(observed)) => {
+                    for field in wanted.keys().chain(observed.keys()) {
+                        if wanted.get(field) != observed.get(field) {
+                            differences.insert(safe_patch_field_path("tun.", field));
+                        }
+                    }
+                }
+                _ => {
+                    differences.insert("tun".into());
+                }
+            }
+        } else if actual.get(key) != Some(value) {
+            differences.insert(safe_patch_field_path("", key));
+        }
+    }
+    if actual["tun"]["enable"].as_bool() != Some(tun) {
+        differences.insert("tun.enable".into());
+    }
+    differences.into_iter().take(8).collect()
 }
 
 fn scalar_config_change(previous: &str, next: &str) -> Result<Option<ScalarConfigPatch>> {
@@ -2049,6 +2182,7 @@ impl CoreSupervisor {
         source: &str,
         tun: bool,
         deadline: Instant,
+        minimum_tun_generation: Option<u64>,
     ) -> Result<()> {
         let identity =
             self.runtime_json(controller, reqwest::Method::GET, "/desktop", None, deadline)?;
@@ -2060,14 +2194,78 @@ impl CoreSupervisor {
         let actual =
             self.runtime_json(controller, reqwest::Method::GET, "/configs", None, deadline)?;
         self.check_cancelled()?;
-        if patch
-            .iter()
-            .any(|(key, value)| actual.get(key) != Some(value))
-            || actual["tun"]["enable"].as_bool() != Some(tun)
-        {
+        let mut expected = patch.clone();
+        let mut unverified_automatic_device = false;
+        if let Some(parameters) = patch.get("tun") {
+            let automatic = tun
+                && parameters["device"].as_str() == Some("")
+                && parameters["file-descriptor"].as_i64().unwrap_or(0) == 0;
+            let automatic_device = if automatic {
+                // Automatic naming is a request to let this owned listener
+                // choose its interface. Bind that name to its creation facts,
+                // without waiting for the separate OS health observation.
+                let health = self.runtime_json(
+                    controller,
+                    reqwest::Method::GET,
+                    "/desktop/health",
+                    None,
+                    deadline,
+                )?;
+                verify_managed_identity(&health, self.child.as_ref().map(Child::id)).map_err(
+                    |error| match error {
+                        ReadinessFailure::Temporary(error) | ReadinessFailure::Fatal(error) => {
+                            error
+                        }
+                    },
+                )?;
+                let device = actual["tun"]["device"]
+                    .as_str()
+                    .filter(|device| !device.is_empty());
+                let bound = device.is_some()
+                    && diagnostic_identity(&identity["core_instance"]).is_some()
+                    && identity["core_instance"] == health["core_instance"]
+                    && health["tun"]["enabled"].as_bool() == Some(true)
+                    && health["tun"]["device"].as_str() == device
+                    && health["tun"]["index"]
+                        .as_u64()
+                        .is_some_and(|index| index > 0)
+                    && health["tun_generation"]
+                        .as_u64()
+                        .is_some_and(|generation| generation > 0)
+                    && health["tun_generation"].as_u64().is_some_and(|generation| {
+                        generation >= minimum_tun_generation.unwrap_or(1)
+                    })
+                    && (!cfg!(windows)
+                        || health["tun"]["identity"]
+                            .as_str()
+                            .and_then(|identity| u64::from_str_radix(identity, 16).ok())
+                            .is_some_and(|identity| identity > 0));
+                unverified_automatic_device = !bound;
+                bound.then_some(device).flatten()
+            } else {
+                None
+            };
+            expected.insert(
+                "tun".into(),
+                expected_tun_readback(parameters, automatic_device),
+            );
+        }
+        let mut differences = patch_readback_differences(&expected, &actual, tun);
+        if unverified_automatic_device && !differences.iter().any(|field| field == "tun.device") {
+            differences.truncate(7);
+            differences.push("tun.device".into());
+        }
+        if !differences.is_empty() {
+            self.record_lifecycle(
+                "core_config_patch_readback_mismatch",
+                serde_json::json!({"fields":differences}),
+            );
             return Err(AppError::new(
                 "config_patch_readback_mismatch",
-                "内核设置回读与请求不一致",
+                format!(
+                    "内核设置回读与请求不一致（字段：{}）",
+                    differences.join(", ")
+                ),
             ));
         }
         // PATCH can return 204 even when a native listener bind failed. Verify
@@ -2094,11 +2292,11 @@ impl CoreSupervisor {
             deadline,
         );
         match patched {
-            Ok(_) => self.verify_config_patch(controller, patch, source, self.tun, deadline),
+            Ok(_) => self.verify_config_patch(controller, patch, source, self.tun, deadline, None),
             Err(error) if error.code == "config_patch_unconfirmed" => {
                 // The reply may have been lost after application. A readback of
                 // the desired scalar is safe: any late identical PATCH agrees.
-                self.verify_config_patch(controller, patch, source, self.tun, deadline)
+                self.verify_config_patch(controller, patch, source, self.tun, deadline, None)
                     .map_err(|readback| {
                         if readback.code == "operation_cancelled" {
                             readback
@@ -2195,6 +2393,7 @@ impl CoreSupervisor {
         source: &str,
         tun: bool,
         deadline: Instant,
+        minimum_tun_generation: Option<u64>,
     ) -> Result<()> {
         let patch = serde_json::Map::from_iter([("tun".into(), parameters.clone())]);
         self.runtime_json(
@@ -2208,7 +2407,14 @@ impl CoreSupervisor {
         // while native Close is still running. A lost PATCH acknowledgement is
         // therefore never recovered by reading that value; confirmed exit is
         // the only safe barrier before a successor operation.
-        self.verify_config_patch(controller, &patch, source, tun, deadline)
+        self.verify_config_patch(
+            controller,
+            &patch,
+            source,
+            tun,
+            deadline,
+            minimum_tun_generation,
+        )
     }
 
     fn reconfigure_tun(
@@ -2234,7 +2440,7 @@ impl CoreSupervisor {
                 ReadinessFailure::Temporary(error) | ReadinessFailure::Fatal(error) => error,
             },
         )?;
-        let before = actual
+        let mut before = actual
             .get("tun")
             .filter(|value| {
                 value.is_object()
@@ -2251,6 +2457,49 @@ impl CoreSupervisor {
                     "内核缺少完整的 TUN 运行参数",
                 )
             })?;
+        // An active applied snapshot contains the selected automatic name.
+        // Preserve the source's naming request across disable/enable and a
+        // later full reload, rather than persisting that selected name as input.
+        let configured_device = config::configured_tun_device(&source)?;
+        if let Some(device) = configured_device.as_deref() {
+            if before["device"].as_str() != Some(device) {
+                return Err(AppError::new(
+                    "config_patch_readback_mismatch",
+                    "内核设置回读与请求不一致（字段：tun.device）",
+                ));
+            }
+        } else {
+            before["device"] = serde_json::json!("");
+        }
+        let previous_tun_generation = if configured_device.is_none()
+            && before["file-descriptor"].as_i64().unwrap_or(0) == 0
+        {
+            let health = self.runtime_json(
+                controller,
+                reqwest::Method::GET,
+                "/desktop/health",
+                None,
+                deadline,
+            )?;
+            verify_managed_identity(&health, self.child.as_ref().map(Child::id)).map_err(
+                |error| match error {
+                    ReadinessFailure::Temporary(error) | ReadinessFailure::Fatal(error) => error,
+                },
+            )?;
+            if diagnostic_identity(&identity["core_instance"]).is_none()
+                || identity["core_instance"] != health["core_instance"]
+            {
+                return Err(AppError::new(
+                    "core_controller_identity",
+                    "TUN 创建事实不属于当前内核实例",
+                ));
+            }
+            Some(health["tun_generation"].as_u64().ok_or_else(|| {
+                AppError::new("core_controller_incompatible", "内核缺少 TUN 实例代数")
+            })?)
+        } else {
+            None
+        };
         // The source is semantically unchanged, so the core's parsed block also
         // retains derived addresses, sorted lists and defaults that YAML omits.
         let mut after = before.clone();
@@ -2260,7 +2509,21 @@ impl CoreSupervisor {
         let runtime = config::runtime_config(&source, tun, port)?;
         self.check_cancelled()?;
         config::atomic_write(&path, runtime.as_bytes())?;
-        let result = self.apply_tun_patch(controller, &after, &source, tun, deadline);
+        let minimum_generation = previous_tun_generation.map(|generation| {
+            if tun && !self.tun {
+                generation.saturating_add(1)
+            } else {
+                generation
+            }
+        });
+        let result = self.apply_tun_patch(
+            controller,
+            &after,
+            &source,
+            tun,
+            deadline,
+            minimum_generation,
+        );
         self.record_lifecycle("core_tun_patch_result", serde_json::json!({"corePid":self.child.as_ref().map(Child::id),"requestedTun":tun,"durationMs":started.elapsed().as_millis(),"success":result.is_ok(),"errorCode":result.as_ref().err().map(|error| &error.code)}));
         if let Err(error) = result {
             let restored_file = config::atomic_write(&path, old_runtime.as_bytes());
@@ -2277,6 +2540,7 @@ impl CoreSupervisor {
                         &source,
                         self.tun,
                         Instant::now() + TUN_PATCH_TIMEOUT + CONTROL_TIMEOUT * 3,
+                        previous_tun_generation,
                     )
                     .is_ok();
             let cancelled = self.check_cancelled().err();
@@ -2416,6 +2680,7 @@ impl CoreSupervisor {
                     &source,
                     tun,
                     Instant::now() + CONTROL_TIMEOUT * 3,
+                    None,
                 )?;
                 return Ok(self.status());
             }
@@ -4030,6 +4295,15 @@ mod tests {
         BindFailure,
         TunNativeBusy,
         LateTunPatch,
+        TunWrongGso,
+        TunWrongRoute,
+        TunWrongDevice,
+        TunWrongAutomaticIdentity,
+        TunOldAutomaticGeneration,
+        TunWrongAutomaticInstance,
+        TunWrongAutomaticPid,
+        TunMissingAutomaticIndex,
+        TunMissingAutomaticIdentity,
     }
 
     struct ConfigurationFixture {
@@ -4088,6 +4362,16 @@ mod tests {
             let stop = finished.clone();
             let server = thread::spawn(move || {
                 let mut actual = serde_json::json!({"port":0,"socks-port":0,"mixed-port":7890,"mode":"rule","allow-lan":false,"log-level":"info","tun":{"enable":false,"device":"","stack":"mixed","dns-mode":"","dns-hijack":["any:53"],"auto-route":true,"auto-detect-interface":true,"inet4-address":["198.18.0.1/30"],"inet6-address":["fdfe:dcba:9876::1/126"],"file-descriptor":0,"include-interface":["Ethernet","Wi-Fi"]}});
+                if matches!(
+                    scenario,
+                    ConfigurationScenario::TunWrongGso
+                        | ConfigurationScenario::TunWrongRoute
+                        | ConfigurationScenario::TunWrongDevice
+                ) {
+                    actual["tun"]["device"] = serde_json::json!("utun");
+                    actual["tun"]["gso-max-size"] = serde_json::json!(32768);
+                }
+                let mut tun_generation = 7u64;
                 while !stop.load(Ordering::Acquire) {
                     let (mut stream, _) = match listener.accept() {
                         Ok(connection) => connection,
@@ -4123,7 +4407,21 @@ mod tests {
                     let mut bytes = vec![0u8; length];
                     stream.read_exact(&mut bytes).unwrap();
                     let (status, body) = if request.starts_with("get /desktop ") {
-                        (200, serde_json::json!({"managed":true,"api_version":1,"state":"running","pid":pid}).to_string())
+                        (200, serde_json::json!({"managed":true,"api_version":1,"state":"running","pid":pid,"core_instance":"fixture-core-instance"}).to_string())
+                    } else if request.starts_with("get /desktop/health ") {
+                        let active = actual["tun"]["enable"].as_bool() == Some(true);
+                        let wrong = |expected| {
+                            active
+                                && std::mem::discriminant(&scenario)
+                                    == std::mem::discriminant(&expected)
+                        };
+                        (200, serde_json::json!({"managed":true,"api_version":1,"state":"running", "pid":if wrong(ConfigurationScenario::TunWrongAutomaticPid) {pid+1} else {pid},
+                            "core_instance":if wrong(ConfigurationScenario::TunWrongAutomaticInstance) {"old-core-instance"} else {"fixture-core-instance"},
+                            "config_generation":2, "tun_generation":if wrong(ConfigurationScenario::TunOldAutomaticGeneration) {tun_generation-1} else {tun_generation},
+                            "stale":active,"observed_at":"", "tun":{"enabled":active,"state":if active {"unavailable"} else {"disabled"},
+                                "device":if wrong(ConfigurationScenario::TunWrongAutomaticIdentity) {"other-interface"} else {actual["tun"]["device"].as_str().unwrap_or("")},
+                                "index":if wrong(ConfigurationScenario::TunMissingAutomaticIndex) {0} else {42},
+                                "identity":if wrong(ConfigurationScenario::TunMissingAutomaticIdentity) {"0000000000000000"} else {"000000000000001a"}}}).to_string())
                     } else if request.starts_with("get /configs ") {
                         if matches!(
                             scenario,
@@ -4173,8 +4471,61 @@ mod tests {
                                 | ConfigurationScenario::TunNativeBusy
                         ) || attempt != 1
                         {
+                            let was_enabled = actual["tun"]["enable"].as_bool() == Some(true);
                             for (key, value) in body.as_object().unwrap() {
                                 actual[key] = value.clone();
+                            }
+                            if body.get("tun").is_some() {
+                                // Independently model the Go listener's active
+                                // Config snapshot, not an echo of PATCH input.
+                                let enabled = actual["tun"]["enable"].as_bool() == Some(true);
+                                if enabled {
+                                    if !was_enabled {
+                                        tun_generation += 1;
+                                    }
+                                    if actual["tun"]["gso-max-size"].as_u64().unwrap_or(0) == 0 {
+                                        actual["tun"]["gso-max-size"] = serde_json::json!(65536);
+                                    }
+                                    if actual["tun"]["device"].as_str() == Some("")
+                                        && actual["tun"]["file-descriptor"].as_i64().unwrap_or(0)
+                                            == 0
+                                    {
+                                        actual["tun"]["device"] =
+                                            serde_json::json!("fixture-automatic-tun");
+                                    }
+                                    if !cfg!(target_os = "linux") {
+                                        actual["tun"]
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .remove("auto-redirect");
+                                    }
+                                } else if actual["tun"]["gso-max-size"].as_u64() == Some(0) {
+                                    actual["tun"]
+                                        .as_object_mut()
+                                        .unwrap()
+                                        .remove("gso-max-size");
+                                }
+                                if actual["tun"]["auto-redirect"].as_bool() == Some(false) {
+                                    actual["tun"]
+                                        .as_object_mut()
+                                        .unwrap()
+                                        .remove("auto-redirect");
+                                }
+                                if attempt == 1 {
+                                    match scenario {
+                                        ConfigurationScenario::TunWrongGso => {
+                                            actual["tun"]["gso-max-size"] = serde_json::json!(65536)
+                                        }
+                                        ConfigurationScenario::TunWrongRoute => {
+                                            actual["tun"]["auto-route"] = serde_json::json!(false)
+                                        }
+                                        ConfigurationScenario::TunWrongDevice => {
+                                            actual["tun"]["device"] =
+                                                serde_json::json!("different-interface")
+                                        }
+                                        _ => (),
+                                    }
+                                }
                             }
                         }
                         if matches!(scenario, ConfigurationScenario::BindFailure) {
@@ -4566,6 +4917,10 @@ mod tests {
             ["PATCH", "PATCH", "PATCH"]
         );
         let patches = fixture.patches.lock().unwrap();
+        assert!(
+            patches[0]["tun"].get("gso-max-size").is_none(),
+            "the legacy disabled snapshot omits zero; active GET independently adds 65536"
+        );
         for patch in patches.iter() {
             assert_eq!(patch.as_object().unwrap().len(), 1);
             assert_eq!(patch["tun"]["device"], "");
@@ -4585,6 +4940,108 @@ mod tests {
                 patch["tun"]["include-interface"],
                 serde_json::json!(["Ethernet", "Wi-Fi"])
             );
+        }
+    }
+
+    #[test]
+    fn tun_readback_defaults_are_exact_and_leave_request_payload_untouched() {
+        for gso in [None, Some(0), Some(32768)] {
+            let mut requested = serde_json::json!({"enable":true,"device":"utun","auto-route":true,"file-descriptor":0});
+            if let Some(gso) = gso {
+                requested["gso-max-size"] = serde_json::json!(gso);
+            }
+            let before = requested.clone();
+            let expected = expected_tun_readback(&requested, None);
+            assert_eq!(
+                expected["gso-max-size"],
+                gso.filter(|gso| *gso != 0).unwrap_or(65536)
+            );
+            assert_eq!(
+                requested, before,
+                "validation normalization must not become PATCH input"
+            );
+            let patch = serde_json::Map::from_iter([("tun".into(), expected.clone())]);
+            for (field, wrong) in [
+                ("gso-max-size", serde_json::json!(12345)),
+                ("device", serde_json::json!("another-device")),
+                ("auto-route", serde_json::json!(false)),
+                ("mtu", serde_json::json!(9000)),
+            ] {
+                let mut actual = expected.clone();
+                actual[field] = wrong;
+                assert_eq!(
+                    patch_readback_differences(&patch, &serde_json::json!({"tun":actual}), true),
+                    [format!("tun.{field}")]
+                );
+            }
+            let mut unexpected = expected.clone();
+            unexpected["private-token-do-not-echo"] = serde_json::json!("sensitive-value");
+            assert_eq!(
+                patch_readback_differences(&patch, &serde_json::json!({"tun":unexpected}), true),
+                ["tun.<unknown>"]
+            );
+        }
+        let request = serde_json::json!({"enable":true,"device":"utun","auto-redirect":true});
+        let expected = expected_tun_readback(&request, None);
+        assert_eq!(
+            expected.get("auto-redirect"),
+            cfg!(target_os = "linux").then_some(&serde_json::Value::Bool(true))
+        );
+        let disabled =
+            serde_json::json!({"enable":false,"device":"","gso-max-size":0,"auto-redirect":false});
+        let expected = expected_tun_readback(&disabled, None);
+        assert!(expected.get("gso-max-size").is_none() && expected.get("auto-redirect").is_none());
+    }
+
+    #[test]
+    fn explicit_tun_gso_route_and_device_mismatches_still_roll_back() {
+        for (scenario, field) in [
+            (ConfigurationScenario::TunWrongGso, "tun.gso-max-size"),
+            (ConfigurationScenario::TunWrongRoute, "tun.auto-route"),
+            (ConfigurationScenario::TunWrongDevice, "tun.device"),
+        ] {
+            let mut fixture = ConfigurationFixture::new(scenario);
+            let source = format!(
+                "{}tun:\n  device: utun\n  gso-max-size: 32768\n",
+                fixture.tun_source()
+            );
+            fixture.core.source = Some(source.clone());
+            let pid = fixture.core.status().pid;
+            let error = fixture.core.reconfigure(source, true).err().unwrap();
+            assert_eq!(error.code, "config_patch_readback_mismatch");
+            assert!(error.message.contains(field), "{}", error.message);
+            let status = fixture.core.status();
+            assert_eq!(status.pid, pid);
+            assert!(status.running && !status.tun && status.error_code.is_none());
+            assert_eq!(*fixture.requests.lock().unwrap(), ["PATCH", "PATCH"]);
+        }
+    }
+
+    #[test]
+    fn automatic_tun_name_requires_current_owned_creation_identity() {
+        let scenarios = [
+            ConfigurationScenario::TunWrongAutomaticIdentity,
+            ConfigurationScenario::TunOldAutomaticGeneration,
+            ConfigurationScenario::TunWrongAutomaticInstance,
+            ConfigurationScenario::TunWrongAutomaticPid,
+            ConfigurationScenario::TunMissingAutomaticIndex,
+        ];
+        for scenario in scenarios
+            .into_iter()
+            .chain(cfg!(windows).then_some(ConfigurationScenario::TunMissingAutomaticIdentity))
+        {
+            let mut fixture = ConfigurationFixture::new(scenario);
+            let source = fixture.tun_source();
+            let pid = fixture.core.status().pid;
+            let error = fixture.core.reconfigure(source, true).err().unwrap();
+            assert!(matches!(
+                error.code.as_str(),
+                "config_patch_readback_mismatch" | "core_controller_identity"
+            ));
+            let status = fixture.core.status();
+            assert_eq!(status.pid, pid);
+            assert!(status.running && !status.tun && status.error_code.is_none());
+            assert_eq!(*fixture.requests.lock().unwrap(), ["PATCH", "PATCH"]);
         }
     }
 

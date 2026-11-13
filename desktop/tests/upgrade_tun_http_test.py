@@ -63,7 +63,7 @@ class ControllerContractTests(unittest.TestCase):
         self.assertFalse(self.thread.is_alive())
 
     def test_read_endpoints_require_200_json_objects(self) -> None:
-        for path in ("/desktop", "/configs"):
+        for path in ("/desktop", "/desktop/health", "/configs"):
             with self.subTest(path=path):
                 self.server.response = (200, b'{"fixture":true}')
                 self.assertEqual(self.fixture.request(self.controller, path), {"fixture": True})
@@ -84,6 +84,7 @@ class ControllerContractTests(unittest.TestCase):
     def test_unexpected_success_codes_and_http_errors_remain_failures(self) -> None:
         for method, path, codes in (("POST", "/desktop/shutdown", (200, 201, 204, 401, 500)),
                                     ("GET", "/desktop", (201, 202, 204, 403, 500)),
+                                    ("GET", "/desktop/health", (201, 202, 204, 403, 500)),
                                     ("GET", "/configs", (201, 202, 204, 403, 500))):
             for status in codes:
                 with self.subTest(method=method, path=path, status=status):

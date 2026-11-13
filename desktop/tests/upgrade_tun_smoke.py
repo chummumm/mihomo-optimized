@@ -91,7 +91,7 @@ class TunUpgradeAcceptance:
         require(actual == self.config_hash, "upgrade_tun_source_yaml_changed")
 
     def request(self, controller: dict, path: str, method: str = "GET") -> dict:
-        expected_status = {("GET", "/desktop"): 200, ("GET", "/configs"): 200,
+        expected_status = {("GET", "/desktop"): 200, ("GET", "/desktop/health"): 200, ("GET", "/configs"): 200,
                            ("POST", "/desktop/shutdown"): 202}.get((method, path))
         require(expected_status is not None, "upgrade_controller_endpoint_invalid")
         url = urlsplit(controller.get("url", ""))
@@ -798,11 +798,61 @@ class TunUpgradeAcceptance:
             evidence["rapidToggles"].append({"cycle": cycle, "milliseconds": elapsed, "pid": current.pid,
                                              "guid": current_adapter["guid"], "interface": current_adapter["interface"]})
         self.failure_ui(evidence, None)
+        reload_controller = status["controller"]
+
+        def reload_health(not_before: float) -> dict | None:
+            observed = self.request(reload_controller, "/desktop/health")
+            require(observed.get("managed") is True and observed.get("state") == "running"
+                    and observed.get("pid") == proxy_core.pid
+                    and isinstance(observed.get("core_instance"), str) and observed["core_instance"]
+                    and all(type(observed.get(key)) is int and observed[key] > 0
+                            for key in ("config_generation", "tun_generation", "creation_count")),
+                    "upgrade_reload_health_identity_invalid")
+            tun = observed.get("tun") or {}
+            if observed.get("stale") is not False or tun.get("state") != "healthy":
+                return None
+            require(tun.get("enabled") is True and tun.get("device") == name
+                    and isinstance(tun.get("identity"), str) and tun["identity"]
+                    and isinstance(observed.get("observed_at"), str), "upgrade_reload_tun_health_invalid")
+            try:
+                sampled = datetime.fromisoformat(observed["observed_at"].replace("Z", "+00:00"))
+            except ValueError:
+                raise SmokeFailure("upgrade_reload_health_timestamp_invalid") from None
+            require(sampled.tzinfo is not None, "upgrade_reload_health_timestamp_invalid")
+            return observed if sampled.timestamp() >= not_before else None
+
+        # The source deliberately omits GSO. Applied listener defaults must
+        # survive the next full reload without replacing this device again.
+        require(b"gso-max-size" not in self.owner.config.read_bytes(), "upgrade_reload_fixture_has_explicit_gso")
+        require(self.request(reload_controller, "/configs")["tun"].get("gso-max-size") == 65536,
+                "upgrade_reload_applied_gso_default_missing")
+        before_reload = wait_until(lambda: reload_health(0), "upgrade_reload_initial_health_not_fresh", 15)
+        before_adapter = self.capture(name, True, current)
+        facts = ("pid", "core_instance", "config_generation", "tun_generation", "creation_count", "observed_at")
+        reload_evidence = evidence["reloadPreservedTun"] = {
+            "before": {key: before_reload[key] for key in facts}, "beforeAdapter": before_adapter}
+        self.checkpoint()
+        started = time.monotonic()
         self.driver.invoke("desktop_reload_config", {"force": True}, timeout=95)
+        reload_evidence["milliseconds"] = round((time.monotonic() - started) * 1000)
+        reload_completed_at = time.time()
         status, current = self.running(name)
         require(current == proxy_core and status.get("lastOperationFailure") is None,
                 "upgrade_reload_replaced_owner_or_restored_old_error")
-        self.capture(name, True, current)
+        after_reload = wait_until(lambda: reload_health(reload_completed_at),
+                                  "upgrade_reload_completed_health_not_fresh", 15)
+        after_adapter = self.capture(name, True, current)
+        reload_evidence.update({"after": {key: after_reload[key] for key in facts}, "afterAdapter": after_adapter})
+        self.checkpoint()
+        require(all(after_reload[key] == before_reload[key]
+                    for key in ("pid", "core_instance", "tun_generation", "creation_count"))
+                and after_reload["config_generation"] >= before_reload["config_generation"]
+                and after_reload["tun"]["identity"] == before_reload["tun"]["identity"]
+                and same_identity(before_adapter, after_adapter)
+                and after_adapter["interface"] == before_adapter["interface"],
+                "upgrade_same_source_reload_recreated_tun")
+        require(self.request(reload_controller, "/configs")["tun"].get("gso-max-size") == 65536,
+                "upgrade_reload_changed_applied_gso_default")
         self.require_configured_name(status, name)
         self.forwarding(evidence, "after_config_reload")
         self.unchanged_source(evidence, "after_rapid_toggle_and_reload")
