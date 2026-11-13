@@ -1,45 +1,29 @@
-name: Inspect saved Windows TUN failure
+name: Validate controller discovery fixtures
 on:
   push:
     branches: [diagnostics/windows-tun-ci-43368503742]
 permissions:
   contents: read
-  actions: read
 jobs:
-  inspect:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
+  contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
     steps:
-      - name: Download existing failed-run evidence
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          artifact-ids: '14011094608'
-          path: evidence
-          merge-multiple: true
-          repository: chummumm/mihomo-optimized
-          run-id: '43368503742'
-          github-token: ${{ github.token }}
-      - name: Read bounded sanitized process and startup evidence
-        shell: python
+          ref: 9c56ff98cfebbbe8ccf0c47ea9d52ae91243f2da
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Python static checker
+        run: python -m pip install pyflakes==3.4.0
+      - name: Validate discovery, native table and HTTP contracts
         run: |
-          import json, re
-          from pathlib import Path
-          root=Path('evidence')
-          print('ARTIFACT_FILES', json.dumps([{'name':str(p.relative_to(root)),'bytes':p.stat().st_size} for p in root.rglob('*') if p.is_file()]))
-          p=next(root.rglob('upgrade.json'))
-          d=json.loads(p.read_text(encoding='utf-8-sig'))
-          n=d.get('nativeTunUpgrade',{})
-          def clean(value):
-              if isinstance(value,dict):
-                  return {k:('<redacted>' if k.lower() in ('secret','token','password','authorization') else clean(v)) for k,v in value.items()}
-              if isinstance(value,list): return [clean(v) for v in value]
-              if isinstance(value,str):
-                  value=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', value)
-                  value=re.sub(r'https?://[^\s\"<>]+', '<url>', value)
-                  value=re.sub(r'(?i)(authorization|secret|token|password)(\s*[=:]\s*)[^\s,;]+', r'\1\2<redacted>', value)
-                  return value[-20000:]
-              return value
-          out={'stage':d.get('stage'),'passed':d.get('passed'),'tests':d.get('tests'),'diagnostics':d.get('diagnostics'),'nativeKeys':list(n),'isolatedProcesses':n.get('isolatedProcesses'),'isolatedCoreLogs':n.get('isolatedCoreLogs'),'controllerResponses':n.get('controllerResponses',[])[-12:],'cleanup':n.get('cleanup'),'scenarios':{k:list(v) if isinstance(v,dict) else type(v).__name__ for k,v in n.get('scenarios',{}).items()}}
-          print('TUN_EXISTING_FAILURE_EVIDENCE_BEGIN')
-          print(json.dumps(clean(out),ensure_ascii=True,indent=2))
-          print('TUN_EXISTING_FAILURE_EVIDENCE_END')
+          python -m py_compile desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
+          python -m pyflakes desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
+          python desktop/tests/upgrade_tun_http_test.py
