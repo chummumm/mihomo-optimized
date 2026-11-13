@@ -4504,6 +4504,7 @@ mod tests {
             .unwrap();
         assert!(core.child.is_none() && !core.termination_unconfirmed);
         drop(core);
+        assert!(crate::diagnostics::flush(Duration::from_secs(2)));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4541,6 +4542,7 @@ mod tests {
                 .unwrap();
             assert!(core.child.is_none() && !core.termination_unconfirmed);
             drop(core);
+            assert!(crate::diagnostics::flush(Duration::from_secs(2)));
             fs::remove_dir_all(directory).unwrap();
         }
     }
@@ -4603,6 +4605,7 @@ mod tests {
             "io_error"
         );
         drop(core);
+        assert!(crate::diagnostics::flush(Duration::from_secs(2)));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4630,6 +4633,7 @@ mod tests {
                 .unwrap();
         assert_eq!(runtime["external-controller"].as_str(), Some("127.0.0.1:0"));
         drop(core);
+        assert!(crate::diagnostics::flush(Duration::from_secs(2)));
         fs::remove_dir_all(directory).unwrap();
     }
 
