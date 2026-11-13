@@ -300,7 +300,7 @@ jobs:
         if: runner.os == 'Windows'
         env:
           MIHOMO_TUN_INTEGRATION: '1'
-        run: go test -v -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun -run Desktop
+        run: go test -v -tags with_gvisor -count=1 -timeout=2m github.com/metacubex/sing-tun github.com/metacubex/sing-tun/internal/wintun -run Desktop
       - name: Verify native startup resource routing, cache isolation and cancellation
         run: go test -tags with_gvisor -count=1 -timeout=5m ./adapter/provider ./adapter/outboundgroup ./component/profile/cachefile ./component/dialer ./component/http ./component/resolver ./config ./hub/executor ./hub/route . -run 'ResourceBootstrap|ReadSelectedSnapshot'
 
@@ -376,7 +376,16 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.33
+              printf '%s\n\n' '## 本次更新：1.0.34
+
+          - Windows TUN 对已核实的本产品设备直接进入 Wintun 原生创建流程，取消必须先观察到 phantom 的额外限制；关闭后的异步移除交由 Windows 协调，原生占用结果和错误码保留。
+          - 按实际 NetCfgInstanceId 关联 PnP 身份并读取真实实例 ID；不同 GUID 的同名设备和身份不符继续受保护，不按名称打开接管。失败携带阶段与本次设备查询结果。
+          - 修正 Wintun GC 清理的原生参数和无返回值 Close API 的处理；保留部分创建失败后的确定性清理与原有网络切换行为。
+          - 配套桌面 0.2.11 修正固定备用名恢复、历史失败提示与 TUN 局部切换，需使用完整桌面安装包取得客户端改动。
+
+          [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.34/docs/releases.md)
+
+          ## 1.0.33
 
           - 修复 Windows SOCKS UDP 回归测试将 TCP 随机端口直接用于 UDP 的假设：UDP relay 独立申请可用端口，SOCKS UDP ASSOCIATE 响应返回实际 relay 地址，保留全部原有目标地址和收发断言。
           - 资源启动与运行期隔离测试通过真实 HTTP 请求等待客户端取消并检查 DeadlineExceeded，避免短延时响应与取消计时器竞争；保留首次慢响应、10 毫秒运行期预算以及临时路由和缓存隔离断言。
