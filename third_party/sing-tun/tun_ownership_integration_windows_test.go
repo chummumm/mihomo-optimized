@@ -1,12 +1,12 @@
 package tun
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -34,7 +34,8 @@ func TestDesktopNativeExclusiveAdapterLifecycle(t *testing.T) {
 	if _, err := rand.Read(nonce[:]); err != nil {
 		t.Fatal(err)
 	}
-	name := fmt.Sprintf("MihomoAlias-%x", nonce)
+	// Exercise explicit utun names without touching a runner's real adapter.
+	name := fmt.Sprintf("utun-%x", nonce)
 	aliases, err := listWindowsInterfaceAliases()
 	if err != nil {
 		t.Fatal(err)
@@ -112,8 +113,8 @@ func TestDesktopNativeExclusiveAdapterLifecycle(t *testing.T) {
 			_ = owned.Close()
 			owned = nil
 		}
-		// Do not poll or sleep here: the production 500 ms alias grace must
-		// handle asynchronous removal immediately after the owned handle closes.
+		// Do not poll or sleep here. Foreign alias removal retains a small grace;
+		// product instances go directly to native creation while closing.
 		started := time.Now()
 		owned, err = NewExclusive(options)
 		if err != nil {
@@ -124,6 +125,7 @@ func TestDesktopNativeExclusiveAdapterLifecycle(t *testing.T) {
 			t.Fatalf("recreate cycle %d did not return an owned native adapter", cycle)
 		}
 		assertAlias(native.InterfaceLUID())
+		assertDesktopNativeSession(t, native)
 		t.Logf("immediate recreate cycle %d completed in %s with LUID %d", cycle, time.Since(started), native.InterfaceLUID())
 	}
 }
@@ -295,16 +297,44 @@ readyLoop:
 	assertHeldIdentity()
 	t.Logf("owned child ready: pid=%d luid=%d guid=%s instance=%q", ready.PID, ready.LUID, ready.GUID.String(), ready.InstanceID)
 	options := desktopNativeFixtureOptions(name)
-	conflicting, conflictErr := NewExclusive(options)
-	if conflicting != nil {
-		// Close only a handle returned by this constructor; never reopen the
-		// first child's adapter to clean up a failed assertion.
-		t.Cleanup(func() { _ = conflicting.Close() })
-	}
-	if conflicting != nil || !errors.Is(conflictErr, os.ErrExist) || createAttempts != 0 {
-		t.Fatalf("live product adapter must be rejected before native creation: adapter=%v err=%v creates=%d", conflicting, conflictErr, createAttempts)
+	// Reach the native owner conflict in a separate process. Its Wintun orphan
+	// cleanup worker must exit before this fresh harness kills the original owner.
+	contenderCtx, stopContender := context.WithTimeout(ctx, 20*time.Second)
+	contender := exec.CommandContext(contenderCtx, os.Args[0], "-test.run=^TestDesktopNativeExclusiveAdapterLiveContender$", "-test.v", "-test.timeout=20s")
+	contender.Env = append(os.Environ(), "MIHOMO_TUN_CONTENDER_ALIAS="+name)
+	contender.Stdout, contender.Stderr = os.Stdout, os.Stderr
+	contenderErr := contender.Run()
+	stopContender()
+	if contenderErr != nil {
+		t.Fatalf("live-owner contender failed: %v", contenderErr)
 	}
 	assertHeldIdentity()
+	if _, err := fmt.Fprintln(input, "check-session"); err != nil {
+		t.Fatalf("ask the original owner to check its session: %v", err)
+	}
+	sessionTimeout := time.NewTimer(5 * time.Second)
+	defer sessionTimeout.Stop()
+sessionLoop:
+	for {
+		select {
+		case err := <-exited:
+			ownerExited = true
+			t.Fatalf("original owner exited after contention: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("original session check cancelled: %v", ctx.Err())
+		case <-sessionTimeout.C:
+			t.Fatal("original owner did not confirm its session after contention")
+		case <-poll.C:
+			data, err := os.ReadFile(readyPath + ".session")
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil || string(data) != "ok" {
+				t.Fatalf("original session check failed: data=%q err=%v", data, err)
+			}
+			break sessionLoop
+		}
+	}
 	select {
 	case err := <-exited:
 		ownerExited = true
@@ -349,11 +379,38 @@ readyLoop:
 		t.Fatalf("recreated adapter has wrong native identity: row=%+v err=%v", row, err)
 	}
 	recovered, err := queryWindowsAdapter(name, expectedGUID)
-	if err != nil || recovered.InstanceID != ready.InstanceID || recovered.GUID != expectedGUID || recovered.Name != name || recovered.TunnelType != exclusiveWindowsTunnelType || recovered.Phantom {
+	if err != nil || recovered.InstanceID == "" || recovered.GUID != expectedGUID || recovered.Name != name || recovered.TunnelType != exclusiveWindowsTunnelType || recovered.Phantom {
 		t.Fatalf("recreated adapter did not regain the exact product instance: identity=%+v err=%v", recovered, err)
 	}
 	assertDesktopNativeSession(t, native)
-	t.Logf("forced-exit recreate completed in %s: previousLUID=%d currentLUID=%d guid=%s instance=%q", time.Since(started), ready.LUID, native.InterfaceLUID(), expectedGUID.String(), recovered.InstanceID)
+	t.Logf("forced-exit recreate completed in %s: previousLUID=%d currentLUID=%d guid=%s previousInstance=%q currentInstance=%q", time.Since(started), ready.LUID, native.InterfaceLUID(), expectedGUID.String(), ready.InstanceID, recovered.InstanceID)
+}
+
+func TestDesktopNativeExclusiveAdapterLiveContender(t *testing.T) {
+	name := os.Getenv("MIHOMO_TUN_CONTENDER_ALIAS")
+	if name == "" {
+		t.Skip("live contender runs only as an explicitly requested subprocess")
+	}
+	requireDesktopNativeIntegration(t)
+	if !strings.HasPrefix(name, "MihomoCrash-") {
+		t.Fatal("invalid live contender fixture alias")
+	}
+	originalCreate := createExclusiveWindowsAdapter
+	creates := 0
+	createExclusiveWindowsAdapter = func(options Options) (windowsAdapter, error) {
+		creates++
+		return originalCreate(options)
+	}
+	t.Cleanup(func() { createExclusiveWindowsAdapter = originalCreate })
+	conflicting, err := NewExclusive(desktopNativeFixtureOptions(name))
+	if conflicting != nil {
+		// Only close a handle actually returned by this constructor, never Open.
+		t.Cleanup(func() { _ = conflicting.Close() })
+	}
+	if conflicting != nil || !errors.Is(err, windows.ERROR_ALREADY_EXISTS) || creates != 1 || !strings.Contains(err.Error(), "stage=create reason=native_busy") {
+		t.Fatalf("live owner must be protected by native creation exclusivity: adapter=%v err=%v creates=%d", conflicting, err, creates)
+	}
+	t.Logf("native creation preserved the original owner: %v", err)
 }
 
 func TestDesktopNativeExclusiveAdapterCrashOwner(t *testing.T) {
@@ -405,9 +462,18 @@ func TestDesktopNativeExclusiveAdapterCrashOwner(t *testing.T) {
 	}
 	// Keep the actual adapter and session alive until the parent terminates us.
 	// EOF permits normal cleanup only when the parent aborts before that crash.
-	var input [1]byte
-	if _, err := io.ReadFull(os.Stdin, input[:]); err != nil && !errors.Is(err, io.EOF) {
-		t.Fatalf("wait for fixture parent: %v", err)
+	commands := bufio.NewScanner(os.Stdin)
+	for commands.Scan() {
+		if commands.Text() != "check-session" {
+			t.Fatalf("unexpected owner fixture command %q", commands.Text())
+		}
+		assertDesktopNativeSession(t, native)
+		if err := os.WriteFile(readyPath+".session", []byte("ok"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := commands.Err(); err != nil {
+		t.Fatal(err)
 	}
 }
 

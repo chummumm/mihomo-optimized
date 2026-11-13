@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -84,10 +83,10 @@ func New(options Options) (WinTun, error) {
 	return configureWindowsAdapter(options, adapter)
 }
 
-// NewExclusive checks for an existing interface before creation and never
-// attaches to an adapter after a failed create. Only an exact product-owned
-// software-device instance proven non-present may be re-enumerated by Create.
-// The read-only alias check does not reserve names against other applications.
+// NewExclusive never adopts an adapter after a failed create. Native product
+// identity admits an existing instance; Windows decides whether its creator
+// still owns it or its previous removal can finish before creation proceeds.
+// A different or unverified interface never authorizes a same-name Create.
 func NewExclusive(options Options) (WinTun, error) {
 	return newWindowsExclusive(options, time.Now, time.Sleep)
 }
@@ -96,37 +95,20 @@ func newWindowsExclusive(options Options, now func() time.Time, wait func(time.D
 	if options.FileDescriptor != 0 {
 		return nil, os.ErrInvalid
 	}
-	// Wintun 0.14.1 can rename a foreign interface when assigning a duplicate
-	// alias. Allow asynchronous removal a short grace period. A crash can leave
-	// a non-present software device registered indefinitely; only the exact
-	// product identity and definitive native phantom state permit re-enumeration.
-	// An active, foreign or unknown instance remains a non-retryable conflict.
+	// Wintun can rename a foreign interface when assigning a duplicate alias.
+	// Only unverified/conflicting names need this short, read-only removal grace.
+	// Verified product instances go straight to native Create even while present.
 	aliasDeadline := now().Add(500 * time.Millisecond)
+	var inspection windowsAdapterInspection
 	for {
-		aliases, err := listWindowsInterfaceAliases()
-		if err != nil {
-			return nil, fmt.Errorf("check existing adapter %q: %w", options.Name, err)
-		}
-		exists := false
-		for _, alias := range aliases {
-			if strings.EqualFold(alias, options.Name) {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			break
-		}
-		reenumerate, err := canReenumerateWindowsAlias(options.Name)
-		if err != nil {
-			return nil, fmt.Errorf("adapter %q already exists but its native ownership could not be verified; stop its owner or choose an unused tun.device: %w: %w", options.Name, os.ErrExist, err)
-		}
-		if reenumerate {
+		var err error
+		inspection, err = inspectExclusiveWindowsAdapter(options.Name)
+		if err == nil {
 			break
 		}
 		remaining := aliasDeadline.Sub(now())
-		if remaining <= 0 {
-			return nil, fmt.Errorf("adapter %q already exists with active, foreign or unverified ownership; stop its owner or choose an unused tun.device: %w", options.Name, os.ErrExist)
+		if !inspection.mayDisappear() || remaining <= 0 {
+			return nil, fmt.Errorf("adapter %q: %w", options.Name, inspection.failure("inspect", inspection.Reason, err))
 		}
 		delay := 50 * time.Millisecond
 		if remaining < delay {
@@ -136,9 +118,18 @@ func newWindowsExclusive(options Options, now func() time.Time, wait func(time.D
 	}
 	adapter, err := createExclusiveWindowsAdapter(options)
 	if err != nil {
-		return nil, err
+		reason := "native_create_failed"
+		if errors.Is(err, os.ErrExist) || errors.Is(err, windows.ERROR_BUSY) ||
+			errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
+			reason = "native_busy"
+		}
+		return nil, fmt.Errorf("adapter %q: %w", options.Name, inspection.failure("create", reason, err))
 	}
-	return configureWindowsAdapter(options, adapter)
+	device, err := configureWindowsAdapter(options, adapter)
+	if err != nil {
+		return nil, fmt.Errorf("adapter %q: %w", options.Name, inspection.failure("initialize", "native_initialization_failed", err))
+	}
+	return device, nil
 }
 
 func configureWindowsAdapter(options Options, adapter windowsAdapter) (WinTun, error) {
@@ -149,8 +140,9 @@ func configureWindowsAdapter(options Options, adapter windowsAdapter) (WinTun, e
 	session, err := adapter.StartSession(0x800000)
 	if err != nil {
 		// A finalizer is not a cleanup barrier for an immediate retry.
+		luid := adapter.LUID()
 		adapter.Close()
-		return nil, err
+		return nil, fmt.Errorf("start Wintun session (luid=%d): %w", luid, err)
 	}
 	nativeTun.session = session
 	nativeTun.readWait = session.ReadWaitEvent()
@@ -158,7 +150,7 @@ func configureWindowsAdapter(options Options, adapter windowsAdapter) (WinTun, e
 	if err != nil {
 		// configure may already own a WFP session as well as the adapter.
 		nativeTun.Close()
-		return nil, err
+		return nil, fmt.Errorf("configure Wintun addresses and routes: %w", err)
 	}
 	return nativeTun, nil
 }
