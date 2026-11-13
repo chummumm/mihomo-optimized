@@ -10,6 +10,8 @@ command and never create/open a Wintun adapter just to inspect its identity.
 from __future__ import annotations
 
 import contextlib
+import ctypes
+from ctypes import wintypes
 import hashlib
 import http.client
 from datetime import datetime
@@ -35,6 +37,7 @@ from windows_smoke import (
 
 OLD_CORE_SOURCE = "96c428bce6b1e7d68327910dad5f426ad29d2d98"
 START_TIMEOUT = 60.0
+DESKTOP_RESTART_CYCLES = 20
 AUTO_RECOVERY_EVENTS = ("tun_device_auto_recovery", "tun_device_auto_recovery_succeeded")
 
 
@@ -199,7 +202,8 @@ class TunUpgradeAcceptance:
             self.secrets.add(secret)
         self.evidence["lastStatus"] = {key: status.get(key) for key in
             ("phase", "errorCode", "desiredRunning", "tun", "tunHealth", "tunDevice", "operation", "pid",
-             "processState", "controlState", "observedAt", "intentRevision", "statusSequence", "lastOperationFailure")}
+             "processState", "controlState", "listenersReady", "statusStale", "observedAt",
+             "intentRevision", "statusSequence", "lastOperationFailure")}
         return status
 
     def recovery_cursor(self) -> dict:
@@ -994,6 +998,129 @@ class TunUpgradeAcceptance:
         self.capture_logs("same-product-forced-exit")
         self.finish_case()
 
+    def restarted_health(self, previous, intent_revision: int, deadline: float, record: dict) -> dict | None:
+        status = self.status(timeout=min(5, self.remaining(deadline)))
+        record["lastStatus"] = dict(self.evidence["lastStatus"])
+        if status.get("statusStale") is True or status.get("intentRevision", 0) <= intent_revision:
+            return None
+        require(status.get("phase") not in ("failed", "error")
+                and status.get("errorCode") is None and status.get("lastOperationFailure") is None,
+                "upgrade_desktop_restart_failed_" + safe_code(status.get("errorCode")))
+        if status.get("phase") != "running" or status.get("operation") is not None:
+            return None
+        require(type(status.get("pid")) is int and status["pid"] != previous.pid
+                and status.get("desiredRunning") is True and status.get("processState") == "alive"
+                and status.get("controlState") == "ready" and status.get("listenersReady") is True,
+                "upgrade_desktop_restart_did_not_replace_core")
+        health = self.request(status["controller"], "/desktop/health")
+        require(health.get("managed") is True and health.get("state") == "running"
+                and health.get("pid") == status["pid"] and isinstance(health.get("core_instance"), str)
+                and health["core_instance"]
+                and all(type(health.get(key)) is int and health[key] > 0
+                        for key in ("config_generation", "tun_generation", "creation_count")),
+                "upgrade_desktop_restart_health_identity_invalid")
+        tun = health.get("tun") or {}
+        record["lastHealth"] = {key: health.get(key) for key in
+            ("pid", "core_instance", "config_generation", "tun_generation", "creation_count", "stale", "observed_at")}
+        record["lastHealth"]["tun"] = {key: tun.get(key) for key in ("enabled", "state", "device", "identity", "index")}
+        if health.get("stale") is not False or tun.get("state") != "healthy":
+            return None
+        require(tun.get("enabled") is True and tun.get("device") == "utun"
+                and isinstance(tun.get("identity"), str) and re.fullmatch(r"[0-9a-f]{16}", tun["identity"]),
+                "upgrade_desktop_restart_tun_identity_invalid")
+        return health
+
+    def confirm_process_handoff(self, previous, current) -> dict:
+        require(previous.pid != current.pid and self.exited(previous) and not self.exited(current),
+                "upgrade_desktop_restart_previous_process_alive")
+        times = [wintypes.FILETIME() for _ in range(4)]
+        require(self.owner.processes.api.GetProcessTimes(self.child_handles[previous],
+                    *(ctypes.byref(value) for value in times)), "upgrade_desktop_restart_process_times_unavailable")
+        created, exited = ((value.dwHighDateTime << 32) | value.dwLowDateTime for value in times[:2])
+        require(created == previous.created and created <= exited <= current.created,
+                "upgrade_desktop_restart_spawned_before_previous_exit")
+        return {"previousPid": previous.pid, "currentPid": current.pid, "previousExitConfirmed": True,
+                "previousExitFileTime": str(exited), "currentCreationFileTime": str(current.created)}
+
+    def desktop_restarts(self) -> None:
+        self.owner.stage = "desktop_tun_repeated_restart"
+        name = "utun"
+        self.native.require_unused(name)
+        self.configure(self.source(name))
+        evidence = self.evidence["scenarios"]["desktopRestarts"] = {
+            "configuredName": name, "sourceYamlSha256": self.config_hash,
+            "requiredCycles": DESKTOP_RESTART_CYCLES, "cycles": []}
+        self.launch_gui("desktop-restarts")
+        self.start_gui(evidence, "initial")
+        status, previous = self.running(name)
+        original_adapter = evidence["initialAdapter"] = self.capture(name, True, previous)
+        self.forwarding(evidence, "before_restart")
+        self.driver.navigate("home")
+        wait_until(lambda: self.driver.ui("RestartCore").get("enabled") is True,
+                   "upgrade_desktop_restart_button_not_ready", 15)
+        last_instance = self.request(status["controller"], "/desktop")["core_instance"]
+
+        for cycle in range(DESKTOP_RESTART_CYCLES):
+            record = {"cycle": cycle, "trigger": "RestartCore" if cycle == 0 else "desktop_restart",
+                      "previousPid": previous.pid, "restartCommandCount": 1, "passed": False}
+            evidence["cycles"].append(record)
+            self.checkpoint()
+            started = time.monotonic()
+            deadline = started + START_TIMEOUT
+            try:
+                # One real UI action covers the button; the remaining cycles
+                # use that same public host command without UIA launch overhead.
+                # Stop and Start remain inside the product. Nothing here waits
+                # for PnP disappearance or retries a failed restart command.
+                if cycle == 0:
+                    require(self.driver.ui("RestartCore", "invoke").get("invoked") is True,
+                            "upgrade_desktop_restart_button_not_invoked")
+                else:
+                    self.driver.invoke("desktop_restart", timeout=self.remaining(deadline))
+                record["commandMilliseconds"] = round((time.monotonic() - started) * 1000)
+                health = wait_until(lambda: self.restarted_health(previous, status["intentRevision"], deadline, record),
+                                    "upgrade_desktop_restart_not_ready", self.remaining(deadline))
+                status, current = self.running(name)
+                record.update(self.confirm_process_handoff(previous, current))
+                require(health["pid"] == current.pid and health["core_instance"] != last_instance,
+                        "upgrade_desktop_restart_reused_core_instance")
+                adapter = record["adapter"] = self.capture(name, True, current)
+                require(adapter["guid"] == original_adapter["guid"]
+                        and int(adapter["interface"]["luid"]) == int(health["tun"]["identity"], 16)
+                        and adapter["interface"]["index"] == health["tun"]["index"],
+                        "upgrade_desktop_restart_changed_name_or_native_identity")
+                require(self.owner.processes.at_paths([self.owner.core]) == [current],
+                        "upgrade_desktop_restart_has_multiple_cores")
+                self.require_configured_name(status, name)
+                self.forwarding(record, "after_restart")
+                self.unchanged_source(record, "after_restart")
+                previous, last_instance = current, health["core_instance"]
+                record["passed"] = True
+            except Exception as error:
+                record["failure"] = safe_code(str(error)) if isinstance(error, SmokeFailure) else type(error).__name__
+                try:
+                    self.status(timeout=5)
+                    record["failureStatus"] = dict(self.evidence["lastStatus"])
+                except Exception as observation_error:
+                    record["failureStatusError"] = type(observation_error).__name__
+                try:
+                    record["failureInterfaces"] = self.native.interfaces(name)
+                    record["failureDevice"] = self.native.query(name, expected_guid(name, exclusive=True))
+                except Exception as observation_error:
+                    record["failureNativeError"] = (safe_code(str(observation_error))
+                        if isinstance(observation_error, SmokeFailure) else type(observation_error).__name__)
+                self.capture_logs("desktop-restart-failure-" + str(cycle))
+                raise
+            finally:
+                record["milliseconds"] = round((time.monotonic() - started) * 1000)
+                self.checkpoint()
+
+        require(len(evidence["cycles"]) == DESKTOP_RESTART_CYCLES
+                and all(record["passed"] for record in evidence["cycles"]), "upgrade_desktop_restart_cycles_incomplete")
+        self.capture_logs("desktop-restarts-complete")
+        self.owner.mark("desktop_tun_repeated_restart")
+        self.finish_case()
+
     def foreign_name_collision(self) -> None:
         self.owner.stage = "live_foreign_tun_preserved"
         name = "MihomoUpgrade-" + uuid.uuid4().hex[:12]
@@ -1047,6 +1174,7 @@ class TunUpgradeAcceptance:
             self.hot_upgrade()
             self.owned_active_collision()
             self.owned_forced_exit()
+            self.desktop_restarts()
             self.foreign_name_collision()
             require(self.owner.command("tun_upgrade_service_remove", self.owner.helper, ["--uninstall"])["exitCode"] == 0,
                     "upgrade_tun_service_remove_failed")
