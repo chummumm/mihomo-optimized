@@ -90,21 +90,53 @@ class TunUpgradeAcceptance:
         self.checkpoint()
         require(actual == self.config_hash, "upgrade_tun_source_yaml_changed")
 
-    @staticmethod
-    def request(controller: dict, path: str, method: str = "GET") -> dict:
+    def request(self, controller: dict, path: str, method: str = "GET") -> dict:
+        expected_status = {("GET", "/desktop"): 200, ("GET", "/configs"): 200,
+                           ("POST", "/desktop/shutdown"): 202}.get((method, path))
+        require(expected_status is not None, "upgrade_controller_endpoint_invalid")
         url = urlsplit(controller.get("url", ""))
         secret = controller.get("secret", "")
         require(url.scheme == "http" and url.hostname == "127.0.0.1" and url.port
                 and not url.username and not url.password and len(secret) >= 32,
                 "upgrade_controller_identity_invalid")
+        # Only allowlisted method/path, numeric status/size and body categories
+        # enter the report. Never retain response data, headers, URLs or secrets.
+        observation = {"method": method, "path": path, "expectedStatus": expected_status,
+                       "status": None, "bytes": 0, "bodyKind": "unread", "accepted": False}
+        history = self.evidence.setdefault("controllerResponses", [])
+        history.append(observation)
+        del history[:-64]
         connection = http.client.HTTPConnection("127.0.0.1", url.port, timeout=3)
         try:
             connection.request(method, path, headers={"Authorization": "Bearer " + secret, "Connection": "close"})
             response = connection.getresponse()
             content = response.read(1024 * 1024 + 1)
-            require(response.status == 200 and len(content) <= 1024 * 1024
-                    and secret.encode() not in content, "upgrade_controller_response_invalid")
-            return json.loads(content) if content else {}
+            observation.update({"status": response.status, "bytes": len(content)})
+            value = None
+            if len(content) > 1024 * 1024:
+                observation["bodyKind"] = "oversized"
+            elif secret.encode() in content:
+                observation["bodyKind"] = "contains_secret"
+            elif not content:
+                observation["bodyKind"] = "empty"
+            else:
+                try:
+                    value = json.loads(content)
+                    observation["bodyKind"] = "json_object" if isinstance(value, dict) else "json_non_object"
+                except (ValueError, UnicodeError):
+                    observation["bodyKind"] = "invalid_json"
+            require(response.status == expected_status, "upgrade_controller_response_status")
+            require(observation["bodyKind"] == "json_object", "upgrade_controller_response_body")
+            if (method, path) == ("POST", "/desktop/shutdown"):
+                # Accepted acknowledges shutdown admission. The caller must
+                # still wait on the exact process handle before any new Create.
+                require(value == {"status": "stopping"}, "upgrade_controller_shutdown_ack_invalid")
+            observation["accepted"] = True
+            return value
+        except (SmokeFailure, OSError, http.client.HTTPException) as error:
+            observation["error"] = str(error) if isinstance(error, SmokeFailure) else type(error).__name__
+            self.checkpoint()
+            raise
         finally:
             connection.close()
 
@@ -629,10 +661,32 @@ class TunUpgradeAcceptance:
         self.checkpoint()
 
     def failure_ui(self, evidence: dict, failure: dict | None) -> None:
+        expected = self.status()
+        require(type(expected.get("intentRevision")) is int and type(expected.get("pid")) is int
+                and type(expected.get("statusSequence")) is int and type(expected.get("tun")) is bool,
+                "upgrade_failure_ui_status_identity_invalid")
+        health = "healthy" if expected["tun"] else "disabled"
         self.driver.navigate("home")
-        phase = self.driver.ui("CorePhase")
-        require(phase.get("found") is True and phase.get("name") in ("运行中", "Running"),
-                "upgrade_live_sidebar_still_reports_historical_tun_failure")
+
+        def ready_sidebar():
+            current = self.status(timeout=3)
+            require(current.get("intentRevision") == expected["intentRevision"]
+                    and current.get("pid") == expected["pid"] and current.get("tun") is expected["tun"]
+                    and current.get("statusSequence", -1) >= expected["statusSequence"],
+                    "upgrade_failure_ui_runtime_identity_changed")
+            require(current.get("lastOperationFailure") == failure,
+                    "upgrade_failure_ui_operation_history_changed")
+            if not (current.get("phase") == "running" and current.get("processState") == "alive"
+                    and current.get("controlState") == "ready" and current.get("tunHealth") == health
+                    and current.get("statusStale") is not True and current.get("operation") is None
+                    and current.get("lastError") is None and current.get("errorCode") is None):
+                return None
+            phase = self.driver.ui("CorePhase")
+            return phase if phase.get("found") is True and phase.get("name") in ("运行中", "Running") else None
+
+        # Successful TUN application may still be checking its first health
+        # sample. Wait for this intent's live state and its actual UI label.
+        wait_until(ready_sidebar, "upgrade_live_sidebar_still_reports_historical_tun_failure", 15)
         self.driver.navigate("settings")
         for page, identifier in (("settings", "settingsLastOperationFailure"), ("home", "homeLastOperationFailure")):
             self.driver.navigate(page)

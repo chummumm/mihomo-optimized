@@ -43,6 +43,8 @@ jobs:
           python-version: '3.12'
       - name: Verify Windows PowerShell UIA result contract
         run: python desktop/tests/windows_smoke.py --uia-json-contract
+      - name: Verify upgrade controller read and shutdown response contracts
+        run: python desktop/tests/upgrade_tun_http_test.py
       - name: Read pinned core source
         id: core
         shell: pwsh
@@ -94,7 +96,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311 pyflakes==3.4.0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pyflakes desktop/tests/windows_smoke.py desktop/tests/upgrade_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_smoke.py desktop/tests/core_update_smoke.py desktop/tests/port_fixture.py desktop/tests/core_smoke.py
+          python -m pyflakes desktop/tests/windows_smoke.py desktop/tests/upgrade_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_http_test.py desktop/tests/core_update_smoke.py desktop/tests/port_fixture.py desktop/tests/core_smoke.py
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
       - name: Verify the unchanged web dashboard
@@ -120,9 +122,12 @@ jobs:
           } finally { Pop-Location }
       - name: Exercise managed core and resource bootstrap on Windows
         working-directory: core-src
-        # Reduce contention around the pinned tests' short wall-clock deadlines.
-        # Keep every package, assertion, deadline and uncached execution intact.
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./component/desktop ./component/resource ./component/http ./component/dialer ./component/resolver ./component/profile/cachefile ./adapter/provider ./adapter/outboundgroup ./config ./hub/executor ./hub/route . -run 'Desktop|ResourceBootstrap|ReadSelectedSnapshot'
+      - name: Repeat startup routing and cancellation across scheduler settings
+        working-directory: core-src
+        timeout-minutes: 3
+        # Every iteration must pass. This is a stability gate, not a retry loop.
+        run: go test -v -tags with_gvisor -count=25 -cpu=1,4 -shuffle=on -timeout=2m ./component/resource -run '^TestResourceBootstrap'
       - name: Verify EasyTier LAN preparation and ordinary TCP deadlines
         working-directory: core-src
         run: go test -p 1 -tags with_gvisor -count=1 -timeout=5m ./component/easytier ./context ./adapter/outbound ./tunnel -run 'EasyTier|DialBudget|TCPDial|TCPFirst|LAN'
