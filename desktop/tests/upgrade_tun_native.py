@@ -12,6 +12,7 @@ import ctypes
 import hashlib
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import uuid
@@ -57,6 +58,35 @@ class InterfaceTable(ctypes.Structure):
     _fields_ = [("count", DWORD), ("rows", InterfaceRow * 1)]
 
 
+class TcpOwnerRow(ctypes.Structure):
+    # MIB_TCPROW_OWNER_PID contains six fixed-width DWORDs, including the
+    # network-byte-order local address/port and the PID that owns the bind.
+    _fields_ = [("state", DWORD), ("local_address", DWORD), ("local_port", DWORD),
+                ("remote_address", DWORD), ("remote_port", DWORD), ("pid", DWORD)]
+
+
+def decode_loopback_listeners(data: bytes, pid: int) -> list[dict]:
+    require(ctypes.sizeof(TcpOwnerRow) == 24 and len(data) >= 4,
+            "upgrade_tcp_owner_table_invalid")
+    count = DWORD.from_buffer_copy(data[:4]).value
+    require(count <= 100000 and 4 + count * ctypes.sizeof(TcpOwnerRow) <= len(data),
+            "upgrade_tcp_owner_table_invalid")
+    listeners = []
+    for index in range(count):
+        offset = 4 + index * ctypes.sizeof(TcpOwnerRow)
+        row = TcpOwnerRow.from_buffer_copy(data[offset:offset + ctypes.sizeof(TcpOwnerRow)])
+        if row.pid != pid:
+            continue
+        require(row.state == 2, "upgrade_tcp_owner_row_not_listening")
+        address = socket.inet_ntoa(row.local_address.to_bytes(4, sys.byteorder))
+        if address != "127.0.0.1":
+            continue
+        port = socket.ntohs(row.local_port & 0xffff)
+        require(port > 0, "upgrade_tcp_owner_port_invalid")
+        listeners.append({"address": address, "port": port, "pid": row.pid})
+    return listeners
+
+
 def expected_guid(name: str, *, exclusive: bool) -> str:
     namespace = "mihomo-optimized/wintun-exclusive/v1\0" if exclusive else "wintun"
     value = hashlib.md5((namespace + name).encode("utf-8"), usedforsecurity=False).digest()
@@ -93,6 +123,8 @@ class NativeTunIdentity:
         self.ip.GetIfTable2Ex.restype = DWORD
         self.ip.FreeMibTable.argtypes = [pointer]
         self.ip.FreeMibTable.restype = None
+        self.ip.GetExtendedTcpTable.argtypes = [pointer, ctypes.POINTER(DWORD), ctypes.c_int, DWORD, ctypes.c_int, DWORD]
+        self.ip.GetExtendedTcpTable.restype = DWORD
         self.setup.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(GUID), ctypes.c_wchar_p, pointer, DWORD]
         self.setup.SetupDiGetClassDevsW.restype = pointer
         self.setup.SetupDiDestroyDeviceInfoList.argtypes = [pointer]
@@ -129,6 +161,33 @@ class NativeTunIdentity:
                     for row in rows if name is None or wide_string(row.alias).casefold() == name.casefold()]
         finally:
             self.ip.FreeMibTable(table)
+
+    def loopback_listeners(self, expected, creator_handle, processes) -> list[dict]:
+        # A PID lookup alone could follow a recycled PID. Hold the exact
+        # CreateProcess identity across the native table query and reject exit.
+        def same_live_owner() -> bool:
+            return (processes.api.WaitForSingleObject(creator_handle, 0) == 258
+                    and processes.from_handle(creator_handle, expected.pid) == expected)
+
+        require(same_live_owner(), "upgrade_tcp_owner_identity_changed")
+        capacity = 65536
+        for _ in range(4):
+            buffer = (ctypes.c_ubyte * capacity)()
+            needed = DWORD(capacity)
+            result = self.ip.GetExtendedTcpTable(buffer, ctypes.byref(needed), False, socket.AF_INET, 3, 0)
+            if result == 122:
+                # Only resize the OS snapshot buffer when the table grows.
+                # This never chooses/retries a controller port or core launch.
+                require(capacity < needed.value <= 4 * 1024 * 1024,
+                        "upgrade_tcp_owner_table_too_large")
+                capacity = min(4 * 1024 * 1024, needed.value + 65536)
+                continue
+            require(result == 0 and 4 <= needed.value <= capacity,
+                    "upgrade_tcp_owner_query_failed_" + str(result))
+            listeners = decode_loopback_listeners(bytes(buffer[:needed.value]), expected.pid)
+            require(same_live_owner(), "upgrade_tcp_owner_identity_changed")
+            return listeners
+        raise RuntimeError("upgrade_tcp_owner_table_kept_growing")
 
     def property(self, devices, device, property_id: int) -> tuple[int, list[str]]:
         kind, needed = DWORD(), DWORD()

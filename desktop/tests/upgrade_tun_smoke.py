@@ -16,8 +16,10 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -41,6 +43,54 @@ def file_hash(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def read_controller_record(home: Path, pid: int, nonce: str) -> dict | None:
+    """Discover a single managed launch; a record never substitutes for readiness."""
+    path = home / "desktop-controller.json"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    require(stat.S_ISREG(metadata.st_mode) and not path.is_symlink()
+            and not getattr(metadata, "st_file_attributes", 0) & 0x400,
+            "upgrade_controller_record_not_regular")
+    try:
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            require(stat.S_ISREG(opened.st_mode)
+                    and not getattr(opened, "st_file_attributes", 0) & 0x400,
+                    "upgrade_controller_record_not_regular")
+            payload = stream.read(4097)
+    except FileNotFoundError:
+        return None
+    require(0 < len(payload) <= 4096, "upgrade_controller_record_size_invalid")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, "upgrade_controller_record_duplicate_key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(payload, object_pairs_hook=unique_object)
+    except (ValueError, UnicodeError):
+        raise SmokeFailure("upgrade_controller_record_json_invalid") from None
+    require(isinstance(value, dict) and set(value) == {
+        "protocolVersion", "pid", "controller", "coreInstance", "launchNonce"},
+        "upgrade_controller_record_fields_invalid")
+    require(type(value["protocolVersion"]) is int and value["protocolVersion"] == 1
+            and type(value["pid"]) is int and value["pid"] == pid and pid > 0
+            and isinstance(nonce, str) and re.fullmatch(r"[0-9a-f]{64}", nonce)
+            and value["launchNonce"] == nonce, "upgrade_controller_record_identity_invalid")
+    address = value["controller"]
+    match = re.fullmatch(r"127\.0\.0\.1:([1-9][0-9]{0,4})", address) if isinstance(address, str) else None
+    require(match and int(match[1]) <= 65535, "upgrade_controller_record_address_invalid")
+    require(isinstance(value["coreInstance"], str)
+            and re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", value["coreInstance"]),
+            "upgrade_controller_record_instance_invalid")
+    return value
+
+
 class TunUpgradeAcceptance:
     def __init__(self, owner, baseline: Path, version: str, source: str) -> None:
         self.owner, self.baseline, self.old_version, self.old_source = owner, baseline, version, source
@@ -54,6 +104,7 @@ class TunUpgradeAcceptance:
         self.child = None
         self.child_output = None
         self.child_controller = None
+        self.child_managed = False
         self.child_identity = None
         self.child_record = None
         self.children = []
@@ -72,9 +123,9 @@ class TunUpgradeAcceptance:
     def checkpoint(self) -> None:
         self.owner.write_report()
 
-    def source(self, name: str) -> bytes:
+    def source(self, name: str, *, mixed: int | None = None) -> bytes:
         return ("# real-upgrade-tun-" + uuid.uuid4().hex + "\n"
-                + profile(free_port(), self.socks.server_address[1]).replace(
+                + profile(free_port() if mixed is None else mixed, self.socks.server_address[1]).replace(
                     "  device: MihomoSmokeTun\n", "  device: " + name + "\n")).encode("utf-8")
 
     def configure(self, content: bytes, *, tun: bool = True) -> None:
@@ -92,7 +143,7 @@ class TunUpgradeAcceptance:
 
     def request(self, controller: dict, path: str, method: str = "GET") -> dict:
         expected_status = {("GET", "/desktop"): 200, ("GET", "/desktop/health"): 200, ("GET", "/configs"): 200,
-                           ("POST", "/desktop/shutdown"): 202}.get((method, path))
+                           ("GET", "/version"): 200, ("POST", "/desktop/shutdown"): 202}.get((method, path))
         require(expected_status is not None, "upgrade_controller_endpoint_invalid")
         url = urlsplit(controller.get("url", ""))
         secret = controller.get("secret", "")
@@ -388,12 +439,19 @@ class TunUpgradeAcceptance:
     def stop_child(self) -> None:
         if self.child is not None:
             if self.child.poll() is None:
-                with contextlib.suppress(Exception):
-                    self.request(self.child_controller, "/desktop/shutdown", "POST")
-                try:
-                    self.child.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    self.child.kill()  # Popen retains the exact CreateProcess handle.
+                if self.child_managed:
+                    with contextlib.suppress(Exception):
+                        self.request(self.child_controller, "/desktop/shutdown", "POST")
+                    try:
+                        self.child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self.child.kill()  # Popen retains the exact CreateProcess handle.
+                        self.child.wait(timeout=10)
+                else:
+                    # This private legacy foreign owner has no managed
+                    # shutdown endpoint. End only its retained process handle;
+                    # it is not the installed-app graceful-stop acceptance.
+                    self.child.kill()
                     self.child.wait(timeout=10)
             if self.child_record is not None:
                 self.child_record["exitCode"] = self.child.poll()
@@ -441,6 +499,10 @@ class TunUpgradeAcceptance:
         require(file_hash(self.old_core) == runtime[self.owner.core.name], "upgrade_old_core_copy_mismatch")
         self.evidence["oldRuntimeFilesVerified"] = len(runtime)
         self.evidence["oldCoreSha256"] = file_hash(self.old_core)
+        require(isinstance(info.get("coreVersion"), str)
+                and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", info["coreVersion"]),
+                "upgrade_old_core_version_invalid")
+        self.old_core_version = "mihomo-optimized-v" + info["coreVersion"] + "-desktop"
 
     def hot_upgrade(self) -> None:
         from upgrade_smoke import uninstall_command
@@ -552,7 +614,9 @@ class TunUpgradeAcceptance:
         self.native.require_unused(name)
         home = self.directory / (name + "-" + uuid.uuid4().hex[:8])
         home.mkdir()
-        content = self.source(name).decode("utf-8").replace(
+        # A private owner is exercised through raw TUN traffic. It has no
+        # mixed-port consumer, so do not probe/release another unused port.
+        content = self.source(name, mixed=0).decode("utf-8").replace(
             "tun:\n  enable: false\n", "tun:\n  enable: true\n  auto-route: "
             + str(auto_route).lower() + "\n  auto-detect-interface: true\n")
         if not auto_route:
@@ -561,15 +625,22 @@ class TunUpgradeAcceptance:
             content = content.replace("198.18.0.1/16", "198.19.0.1/16").replace(
                 "route-address: ['198.18.77.77/32']", "route-address: ['198.19.77.77/32']")
         (home / "config.yaml").write_text(content, encoding="utf-8")
-        self.child_controller = {"url": "http://127.0.0.1:" + str(free_port()), "secret": secrets.token_urlsafe(32)}
+        self.child_controller = {"url": "", "secret": secrets.token_urlsafe(32)}
+        self.child_managed = candidate
         self.secrets.add(self.child_controller["secret"])
         environment = child_environment()
         environment["CLASH_OVERRIDE_SECRET"] = self.child_controller["secret"]
+        nonce = secrets.token_hex(32) if candidate else None
+        if candidate:
+            environment["MIHOMO_DESKTOP_LAUNCH_NONCE"] = nonce
         self.child_identity = None
         self.child_record = None
         self.child_output = tempfile.TemporaryFile()
-        self.child = subprocess.Popen([str(core), "-desktop-managed", "-d", str(home),
-            "-f", str(home / "config.yaml"), "-ext-ctl", self.child_controller["url"].removeprefix("http://")],
+        arguments = [str(core), "-d", str(home), "-f", str(home / "config.yaml"),
+                     "-ext-ctl", "127.0.0.1:0"]
+        if candidate:
+            arguments.append("-desktop-managed")
+        self.child = subprocess.Popen(arguments,
             cwd=home, env=environment, stdin=subprocess.DEVNULL,
             stdout=self.child_output, stderr=self.child_output, close_fds=True,
             creationflags=subprocess.CREATE_NO_WINDOW)
@@ -583,6 +654,7 @@ class TunUpgradeAcceptance:
             "canonicalPath": None, "sameFile": False,
             "creationTime": str(self.child_identity.created) if self.child_identity else None,
             "exitCodeAtInspection": self.child.poll(), "exitCode": None, "candidate": candidate,
+            "managed": candidate, "requestedController": "127.0.0.1:0", "mixedPort": 0,
             "verifiedSha256": expected_hash}
         self.evidence.setdefault("isolatedProcesses", []).append(self.child_record)
         if self.child_identity:
@@ -603,16 +675,44 @@ class TunUpgradeAcceptance:
 
         def ready():
             require(self.child.poll() is None, "upgrade_isolated_core_exited")
+            record = read_controller_record(home, self.child.pid, nonce) if candidate else None
+            if candidate and record is None:
+                return None
+            listeners = self.native.loopback_listeners(
+                self.child_identity, self.child_handles[self.child_identity], self.owner.processes)
+            if not listeners and not candidate:
+                return None
+            require(len(listeners) == 1, "upgrade_isolated_controller_listener_ambiguous")
+            listener = listeners[0]
+            address = listener["address"] + ":" + str(listener["port"])
+            if candidate:
+                require(record["controller"] == address, "upgrade_controller_record_listener_mismatch")
+            self.child_controller["url"] = "http://" + address
+            self.child_record["controllerDiscovery"] = {
+                "mode": "managed_record" if candidate else "legacy_native_owner_table",
+                "pid": listener["pid"], "port": listener["port"],
+                "coreInstance": record["coreInstance"] if candidate else None,
+                "launchNonceMatched": candidate, "exactProcessHandleVerified": True}
             try:
-                value = self.request(self.child_controller, "/desktop")
+                value = self.request(self.child_controller, "/desktop" if candidate else "/version")
             except (OSError, http.client.HTTPException):
                 return None
-            require(value.get("pid") == self.child.pid and value.get("managed") is True,
-                    "upgrade_isolated_core_controller_mismatch")
-            return value if value.get("state") == "running" else None
+            require(not self.exited(self.child_identity)
+                    and self.owner.processes.from_handle(int(self.child._handle), self.child.pid) == self.child_identity,
+                    "upgrade_isolated_core_identity_changed")
+            if candidate:
+                require(value.get("pid") == self.child.pid and value.get("managed") is True
+                        and value.get("api_version") == 1 and value.get("core_instance") == record["coreInstance"],
+                        "upgrade_isolated_core_controller_mismatch")
+                return value if value.get("state") == "running" else None
+            require(value.get("version") == self.old_core_version, "upgrade_legacy_controller_version_mismatch")
+            self.child_record["controllerDiscovery"]["verifiedVersion"] = value["version"]
+            return value
 
         wait_until(ready, "upgrade_isolated_core_start_timeout", 45)
         configuration = self.request(self.child_controller, "/configs")
+        require(configuration.get("mixed-port") == 0 and configuration.get("port") == 0
+                and configuration.get("socks-port") == 0, "upgrade_isolated_unused_proxy_listener_enabled")
         require(configuration.get("tun", {}).get("enable") is True
                 and configuration["tun"].get("device") == name, "upgrade_isolated_tun_not_enabled")
         if not auto_route:
