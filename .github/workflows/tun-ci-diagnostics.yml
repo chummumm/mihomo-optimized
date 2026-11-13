@@ -1,4 +1,4 @@
-name: Validate controller discovery fixtures
+name: Validate controller discovery integration
 on:
   push:
     branches: [diagnostics/windows-tun-ci-43368503742]
@@ -11,19 +11,43 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 8
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: '0'
+      RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 9c56ff98cfebbbe8ccf0c47ea9d52ae91243f2da
+          ref: 8c792030e74b58801b37febbfa8e57b8dbd81d44
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Install Python static checker
         run: python -m pip install pyflakes==3.4.0
-      - name: Validate discovery, native table and HTTP contracts
+      - name: Validate source and fixture contracts
+        shell: bash
         run: |
-          python -m py_compile desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
-          python -m pyflakes desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
+          set -euo pipefail
+          python -m py_compile scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
+          python -m pyflakes scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
           python desktop/tests/upgrade_tun_http_test.py
+          python desktop/tests/core_update_fixture_test.py
+      - name: Install pinned Rust compiler and formatter
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt
+      - name: Reuse existing Windows compilation cache
+        if: runner.os == 'Windows'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: desktop-native-windows-msvc-v2-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: desktop-native-windows-msvc-v2-
+      - name: Check Rust source format
+        working-directory: src-tauri
+        run: cargo +1.99.1 fmt --all -- --check
+      - name: Exercise portable and native library contracts
+        working-directory: src-tauri
+        run: cargo +1.99.1 test --locked --lib
