@@ -216,16 +216,17 @@ impl DesktopManager {
                         "新内核未通过启动和版本检查，正在恢复旧内核",
                     ));
                 }
-                if let Some(client) = &client {
+                let completion = if let Some(client) = &client {
                     client.core_update_call(
                         Request::CompleteCoreUpdate { accept: true },
                         &self.cancellation,
                         source.as_deref(),
-                    )?;
+                    )
                 } else {
                     self.direct_update_core()?
-                        .complete_core_update(true, job.generation)?;
-                }
+                        .complete_core_update(true, job.generation)
+                };
+                self.apply_core_update_completion(completion, client.is_some() && !service_owned)?;
                 prepared = false;
                 prepare_attempted = false;
                 // A proxy error after acceptance must not claim the binary rolled back.
@@ -279,6 +280,20 @@ impl DesktopManager {
         }
         self.publish();
         result
+    }
+
+    /// Completion is newer than commit and any in-flight completion heartbeat.
+    /// An installer-only service cannot replace the direct owner's observation.
+    pub(super) fn apply_core_update_completion(
+        &mut self,
+        completion: Result<CoreStatus>,
+        installer_only: bool,
+    ) -> Result<()> {
+        let status = completion?;
+        if !installer_only {
+            self.core_status = status;
+        }
+        Ok(())
     }
 
     fn direct_update_core(&mut self) -> Result<&mut CoreSupervisor> {

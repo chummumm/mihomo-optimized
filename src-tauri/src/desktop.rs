@@ -1916,6 +1916,137 @@ mod cleanup_observation_tests {
         }
     }
 
+    #[test]
+    fn completed_core_update_replaces_finishing_heartbeat_before_success_is_published() {
+        for tun in [false, true] {
+            let mut fixture = Fixture::new(SOURCE);
+            fixture.manager.preferences.tun = tun;
+            let mut committed = ready(410);
+            committed.service_instance = Some("update-service".into());
+            committed.status_sequence = 10;
+            committed.core_update = Some(core::CoreUpdateStatus {
+                phase: "committed".into(),
+                version: committed.version.clone(),
+            });
+            fixture.installed_runtime(committed);
+
+            let mut finishing = fixture.manager.core_status.clone();
+            finishing.status_sequence = 11;
+            finishing.operation = Some("finishing_core_update".into());
+            let mut heartbeat = fixture.manager.status();
+            heartbeat.apply_core_observation(&finishing);
+            fixture.manager.app.publish_status(heartbeat.clone());
+            // Publishing the old commit cannot erase a newer service operation.
+            fixture.manager.publish();
+            let observed = fixture.manager.status();
+            assert!(observed.phase == Phase::Recovering);
+            assert_eq!(observed.service_sequence, 11);
+            assert_eq!(observed.operation.as_deref(), Some("finishing_core_update"));
+
+            let mut completed = finishing;
+            completed.status_sequence = 12;
+            completed.operation = None;
+            completed.core_update.as_mut().unwrap().phase = "confirmed".into();
+            fixture
+                .manager
+                .apply_core_update_completion(Ok(completed), false)
+                .unwrap();
+            fixture.manager.publish();
+            let observed = fixture.manager.status();
+            assert!(observed.phase == Phase::Running);
+            assert!(observed.operation.is_none());
+            assert_eq!(observed.service_sequence, 12);
+            assert_eq!(observed.pid, Some(410));
+            assert_eq!(observed.tun, tun);
+            let update = fixture.manager.core_status.core_update.as_ref().unwrap();
+            assert_eq!(update.phase, "confirmed");
+
+            // The existing sequence barrier still rejects a delayed heartbeat.
+            fixture.manager.app.publish_status(heartbeat);
+            let observed = fixture.manager.status();
+            assert!(observed.phase == Phase::Running);
+            assert!(observed.operation.is_none());
+            assert_eq!(observed.service_sequence, 12);
+        }
+    }
+
+    #[test]
+    fn installer_completion_preserves_the_local_running_or_stopped_owner() {
+        for running in [false, true] {
+            let mut fixture = Fixture::new(SOURCE);
+            fixture.runtime.lock().unwrap().service_owned = false;
+            fixture.manager.preferences.tun = false;
+            fixture.manager.preferences.desired_running = running;
+            fixture.manager.run_intent = running;
+            let local = if running {
+                ready(411)
+            } else {
+                CoreStatus {
+                    process_state: "exited".into(),
+                    control_state: "unknown".into(),
+                    stop_reason: Some(StopReason::UserStop),
+                    observed_at: core::observed_now(),
+                    ..CoreStatus::default()
+                }
+            };
+            fixture.installed_runtime(local);
+            let before = serde_json::to_value(&fixture.manager.core_status).unwrap();
+            let installer = CoreStatus {
+                process_state: "exited".into(),
+                control_state: "unknown".into(),
+                stop_reason: Some(StopReason::CoreUpdate),
+                service_instance: Some("installer-only".into()),
+                status_sequence: 50,
+                core_update: Some(core::CoreUpdateStatus {
+                    phase: "confirmed".into(),
+                    version: Some("fixture-update".into()),
+                }),
+                ..CoreStatus::default()
+            };
+            fixture
+                .manager
+                .apply_core_update_completion(Ok(installer), true)
+                .unwrap();
+            fixture.manager.publish();
+            assert_eq!(
+                serde_json::to_value(&fixture.manager.core_status).unwrap(),
+                before
+            );
+            let observed = fixture.manager.status();
+            let expected_phase = if running {
+                Phase::Running
+            } else {
+                Phase::Stopped
+            };
+            assert!(observed.phase == expected_phase);
+            assert!(observed.operation.is_none());
+            assert_eq!(observed.pid, running.then_some(411));
+            assert_eq!(observed.desired_running, running);
+            assert!(observed.service_instance.is_none());
+        }
+    }
+
+    #[test]
+    fn failed_core_update_completion_does_not_replace_the_owner_observation() {
+        for installer_only in [false, true] {
+            let mut fixture = Fixture::new(SOURCE);
+            fixture.installed_runtime(ready(412));
+            let before = serde_json::to_value(&fixture.manager.core_status).unwrap();
+            let error = fixture
+                .manager
+                .apply_core_update_completion(
+                    Err(AppError::new("core_update_accept_failed", "fixture failure")),
+                    installer_only,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "core_update_accept_failed");
+            assert_eq!(
+                serde_json::to_value(&fixture.manager.core_status).unwrap(),
+                before
+            );
+        }
+    }
+
     fn conflict(name: &str) -> AppError {
         AppError::new(
             "tun_device_conflict",
