@@ -369,8 +369,18 @@ class CoreUpdateAcceptance(Acceptance):
         self.checkpoint()
         return row, mixed, content
 
-    def observe_intent(self, *, running: bool, tun: bool) -> dict:
+    def observe_intent(self, *, running: bool, tun: bool, completion_row: dict | None = None) -> dict:
         status = self.status(timeout=8)
+        if completion_row is not None:
+            # Preserve the first snapshot after the update task says completed,
+            # before any assertion or extra controller request. Never export
+            # controller credentials or free-form error/configuration text.
+            completion_row["statusAfterUpdate"] = {key: status.get(key) for key in (
+                "phase", "desiredRunning", "tun", "systemProxy", "errorCode", "pid", "operation",
+                "processState", "controlState", "listenersReady", "intentRevision", "serviceInstance",
+                "serviceSequence", "coreVersion", "statusSequence", "observedAt", "statusStale")}
+            completion_row["statusAfterUpdate"]["controllerPresent"] = status.get("controller") is not None
+            self.checkpoint()
         require(status.get("desiredRunning") is running and status.get("tun") is tun
                 and status.get("systemProxy") is False, "core_update_user_intent_changed")
         preferences = json.loads((self.directory / "preferences.json").read_text(encoding="utf-8"))
@@ -506,7 +516,7 @@ class CoreUpdateAcceptance(Acceptance):
         updated_hash = file_hash(self.core)
         require(updated_hash != self.baseline_core_hash, "core_update_binary_not_replaced")
         self.verify_protected_installation()
-        status = self.observe_intent(running=running, tun=tun)
+        status = self.observe_intent(running=running, tun=tun, completion_row=row)
         if running:
             require(status.get("phase") == "running", "core_update_running_intent_not_restored")
             current_pid = self.managed_core(status)["pid"]
