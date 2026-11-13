@@ -10,13 +10,14 @@ use std::{
     collections::{BTreeSet, VecDeque},
     fs,
     io::{Read, Seek, SeekFrom, Write},
-    net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "core_controller_discovery.rs"]
+mod controller_discovery;
 #[path = "core_update_transaction.rs"]
 mod replacement;
 use replacement::CoreReplacement;
@@ -346,6 +347,7 @@ fn safe_core_diagnostic(line: &str) -> Option<String> {
         .map(|(_, diagnostic)| diagnostic)
         .or_else(|| safe_tun_device_conflict(line))
         .or_else(|| safe_resource_diagnostic(line))
+        .or_else(|| controller_discovery::legacy_incompatible_diagnostic(line).map(str::to_owned))
 }
 
 fn tun_device_error(diagnostic: &str) -> Option<AppError> {
@@ -356,6 +358,24 @@ fn tun_device_error(diagnostic: &str) -> Option<AppError> {
         .lines()
         .find_map(safe_tun_device_conflict)
         .map(|cause| AppError::new("tun_device_conflict", format!("TUN 网卡名称冲突：{cause}")))
+}
+
+const LEGACY_CONTROLLER_MESSAGE: &str =
+    "配套内核不支持安全的控制端口发现，请安装完整新版客户端或升级配套内核";
+
+/// Only call after the existing owned-process cleanup has confirmed exit.
+/// A child may finish logging its policy rejection between a failed Windows
+/// job assignment and that exit barrier. Never reinterpret unrelated I/O or
+/// a preparation failure using a previous launch's diagnostic.
+fn confirmed_startup_error(cause: &AppError, spawned: bool, diagnostic: &str) -> AppError {
+    if spawned
+        && cause.code == "io_error"
+        && controller_discovery::legacy_incompatible_diagnostic(diagnostic).is_some()
+    {
+        AppError::new("core_controller_incompatible", LEGACY_CONTROLLER_MESSAGE)
+    } else {
+        cause.clone()
+    }
 }
 
 pub(crate) fn startup_cleanup_error(cause: &AppError, cleanup: &AppError) -> AppError {
@@ -1521,10 +1541,18 @@ impl CoreSupervisor {
                 // the unresolved handle. Do not silently grant another budget.
                 return result;
             }
+            let spawned = self.child.is_some();
             let cleanup = self.terminate_child_until(self.operation_cleanup_deadline(budget));
             self.controller = None;
             if let Err(cleanup) = cleanup {
                 return Err(startup_cleanup_error(cause, &cleanup));
+            }
+            if spawned && cause.code == "io_error" && self.check_cancelled().is_ok() {
+                return Err(confirmed_startup_error(
+                    cause,
+                    spawned,
+                    &self.recent_diagnostic(),
+                ));
             }
         }
         result
@@ -1544,24 +1572,21 @@ impl CoreSupervisor {
         self.check_cancelled()?;
         fs::create_dir_all(&self.home).map_err(|e| AppError::io("无法创建运行目录", e))?;
         fs::create_dir_all(&self.logs).map_err(|e| AppError::io("无法创建日志目录", e))?;
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|e| AppError::io("无法分配本地控制端口", e))?;
-        let port = listener
-            .local_addr()
-            .map_err(|e| AppError::io("无法读取控制端口", e))?
-            .port();
+        let discovery = controller_discovery::LaunchDiscovery::prepare(&self.home)?;
         let mut random = [0_u8; 32];
         getrandom::getrandom(&mut random)
             .map_err(|_| AppError::new("random_failed", "系统随机数不可用"))?;
-        let controller = Controller {
-            url: format!("http://127.0.0.1:{port}"),
+        // Only the child allocates the port. A parent bind/drop probe would
+        // leave a race before the child can acquire the same address.
+        let bootstrap_controller = Controller {
+            url: "http://127.0.0.1:0".into(),
             secret: hex::encode(random),
         };
         let source = self
             .source
             .clone()
             .ok_or_else(|| AppError::new("config_missing", "没有可运行的配置"))?;
-        let runtime = config::runtime_config(&source, self.tun, port)?;
+        let runtime = config::runtime_config(&source, self.tun, 0)?;
         config::atomic_write(&self.home.join("config.yaml"), runtime.as_bytes())?;
         self.rotate_log()?;
         self.log_start = fs::metadata(self.logs.join("core.log")).map_or(0, |file| file.len());
@@ -1575,12 +1600,12 @@ impl CoreSupervisor {
         let stderr = stdout
             .try_clone()
             .map_err(|e| AppError::io("无法打开内核日志", e))?;
-        let mut command = self.command(&controller, budget.resource_remaining()?);
+        let mut command = self.command(&bootstrap_controller, budget.resource_remaining()?);
         command
+            .env(controller_discovery::NONCE_ENV, discovery.nonce())
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
-        drop(listener);
         let child = command
             .spawn()
             .map_err(|e| AppError::io("无法启动配套内核", e))?;
@@ -1595,17 +1620,49 @@ impl CoreSupervisor {
         self.termination_unconfirmed = false;
         #[cfg(windows)]
         {
-            self.job = Some(crate::windows::create_kill_job(
+            match crate::windows::create_kill_job(
                 self.child.as_ref().expect("child stored above"),
-            )?);
+            ) {
+                Ok(job) => self.job = Some(job),
+                Err(error) => {
+                    // A policy-incompatible child can exit before job assignment.
+                    // Use its real startup cause only after exit is confirmed;
+                    // a live/unresolved child still fails the ownership barrier.
+                    if let Some(exit) = self
+                        .child
+                        .as_mut()
+                        .expect("child stored above")
+                        .try_wait()
+                        .map_err(|error| AppError::io("无法读取内核状态", error))?
+                    {
+                        return Err(self.startup_exit_error(exit));
+                    }
+                    return Err(error);
+                }
+            }
         }
-        self.controller = Some(controller.clone());
         self.check_cancelled()?;
+        let discovery_started = Instant::now();
+        let discovered = self.wait_for_controller(
+            &discovery,
+            &bootstrap_controller.secret,
+            budget.work_deadline(),
+        );
+        self.record_lifecycle("core_start_stage", serde_json::json!({"stage":"controller_discovery","durationMs":discovery_started.elapsed().as_millis(),"success":discovered.is_ok(),"errorCode":discovered.as_ref().err().map(|error| &error.code)}));
+        let discovered = discovered?;
+        let controller = discovered.controller;
         let readiness_started = Instant::now();
-        let ready = self.wait_ready(&controller, &source, budget.work_deadline());
+        let ready = self.wait_ready_for_instance(
+            &controller,
+            &source,
+            self.tun,
+            budget.work_deadline(),
+            Some(&discovered.core_instance),
+        );
         self.record_lifecycle("core_start_stage", serde_json::json!({"stage":"readiness","durationMs":readiness_started.elapsed().as_millis(),"success":ready.is_ok(),"errorCode":ready.as_ref().err().map(|error| &error.code)}));
         ready?;
         self.check_cancelled()?;
+        self.controller = Some(controller.clone());
         let version_started = Instant::now();
         if let Ok(timeout) = remaining(budget.work_deadline()) {
             self.version = http_client()?
@@ -1699,6 +1756,64 @@ impl CoreSupervisor {
             .to_string()
     }
 
+    fn startup_exit_error(&self, exit: ExitStatus) -> AppError {
+        let diagnostic = self.recent_diagnostic();
+        if controller_discovery::legacy_incompatible_diagnostic(&diagnostic).is_some() {
+            return AppError::new(
+                "core_controller_incompatible",
+                LEGACY_CONTROLLER_MESSAGE,
+            );
+        }
+        if let Some(error) = tun_device_error(&diagnostic) {
+            return error;
+        }
+        AppError::new(
+            "core_start_failed",
+            format!(
+                "内核在就绪前退出（{}），请检查资源来源、配置或日志{}",
+                exit.code()
+                    .map_or_else(|| "已终止".into(), |n| n.to_string()),
+                if diagnostic.is_empty() {
+                    String::new()
+                } else {
+                    format!("：{diagnostic}")
+                },
+            ),
+        )
+    }
+
+    fn wait_for_controller(
+        &mut self,
+        discovery: &controller_discovery::LaunchDiscovery,
+        secret: &str,
+        deadline: Instant,
+    ) -> Result<controller_discovery::DiscoveredController> {
+        let expected_pid = self.child.as_ref().expect("child stored above").id();
+        while remaining(deadline).is_ok() {
+            self.check_cancelled()?;
+            if let Some(exit) = self
+                .child
+                .as_mut()
+                .expect("child stored above")
+                .try_wait()
+                .map_err(|error| AppError::io("无法读取内核状态", error))?
+            {
+                return Err(self.startup_exit_error(exit));
+            }
+            if let Some(controller) = discovery.read(expected_pid, secret)? {
+                return Ok(controller);
+            }
+            if let Ok(timeout) = remaining(deadline) {
+                thread::sleep(timeout.min(Duration::from_millis(50)));
+            }
+        }
+        Err(AppError::new(
+            "core_start_timeout",
+            "资源准备与控制端口发现已超过本次操作总时限，请检查内核启动日志",
+        ))
+    }
+
+    #[cfg(test)]
     fn wait_ready(
         &mut self,
         controller: &Controller,
@@ -1715,6 +1830,17 @@ impl CoreSupervisor {
         tun: bool,
         deadline: Instant,
     ) -> Result<()> {
+        self.wait_ready_for_instance(controller, source, tun, deadline, None)
+    }
+
+    fn wait_ready_for_instance(
+        &mut self,
+        controller: &Controller,
+        source: &str,
+        tun: bool,
+        deadline: Instant,
+        expected_instance: Option<&str>,
+    ) -> Result<()> {
         let client = http_client()?;
         let expected = config::parse(source)?;
         let mut last_failure = None;
@@ -1727,23 +1853,7 @@ impl CoreSupervisor {
                 .try_wait()
                 .map_err(|e| AppError::io("无法读取内核状态", e))?
             {
-                let diagnostic = self.recent_diagnostic();
-                if let Some(error) = tun_device_error(&diagnostic) {
-                    return Err(error);
-                }
-                return Err(AppError::new(
-                    "core_start_failed",
-                    format!(
-                        "内核在就绪前退出（{}），请检查资源来源、配置或日志{}",
-                        exit.code()
-                            .map_or_else(|| "已终止".into(), |n| n.to_string()),
-                        if diagnostic.is_empty() {
-                            String::new()
-                        } else {
-                            format!("：{diagnostic}")
-                        },
-                    ),
-                ));
+                return Err(self.startup_exit_error(exit));
             }
             let probe = (|| {
                 let info = read_readiness_json(&client, controller, "/desktop", deadline)?;
@@ -1761,6 +1871,18 @@ impl CoreSupervisor {
                         "core_controller_identity",
                         "就绪检查 /desktop：控制接口进程与自有内核不一致",
                     )));
+                }
+                if let Some(instance) = expected_instance {
+                    if info.get("core_instance").and_then(serde_json::Value::as_str)
+                        != Some(instance)
+                        || info.get("controller").and_then(serde_json::Value::as_str)
+                            != Some(controller.url.trim_start_matches("http://"))
+                    {
+                        return Err(ReadinessFailure::Fatal(AppError::new(
+                            "core_controller_identity",
+                            "就绪检查 /desktop：控制接口与本次启动就绪记录不一致",
+                        )));
+                    }
                 }
                 match info.get("state").and_then(serde_json::Value::as_str) {
                     Some("running") => {}
@@ -1815,6 +1937,9 @@ impl CoreSupervisor {
             .arg("-ext-ctl")
             .arg(controller.url.trim_start_matches("http://"))
             .env("CLASH_OVERRIDE_SECRET", &controller.secret)
+            // A -t subprocess must never publish/remove the active child's
+            // record, even when the parent environment happens to contain it.
+            .env_remove(controller_discovery::NONCE_ENV)
             .current_dir(&self.home);
         command
     }
@@ -3691,9 +3816,12 @@ impl Drop for CoreSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+    use std::{
+        net::TcpListener,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
     };
 
     struct UpdateFixture {
@@ -4044,6 +4172,7 @@ mod tests {
             let recoveries = recovery_reads.clone();
             let busy = health_busy.clone();
             let unavailable = health_unavailable.clone();
+            let reported_controller = controller.url.trim_start_matches("http://").to_owned();
             let server = thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     let (mut stream, _) = match listener.accept() {
@@ -4082,7 +4211,7 @@ mod tests {
                         } else {
                             1
                         };
-                        (200, serde_json::json!({"managed":true,"api_version":api,"state":"running","pid":reported_pid,"core_instance":"fixture-instance","capabilities":{"tun_health":health_enabled,"tun_repair":health_enabled,"tun_recovery_operations":async_recovery}}).to_string())
+                        (200, serde_json::json!({"managed":true,"api_version":api,"state":"running","pid":reported_pid,"core_instance":"fixture-instance","controller":reported_controller,"capabilities":{"tun_health":health_enabled,"tun_repair":health_enabled,"tun_recovery_operations":async_recovery}}).to_string())
                     } else if request.starts_with("get /desktop/health ") {
                         if matches!(scenario, ReadinessScenario::HealthDisconnect) {
                             continue;
@@ -4281,6 +4410,249 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap()
+    }
+
+    #[test]
+    fn discovered_controller_still_requires_owned_instance_and_listener_readback() {
+        let mut fixture = ReadinessFixture::new(ReadinessScenario::DisconnectOnce);
+        let directory = diagnostic_test_directory("controller-discovery");
+        fs::create_dir_all(&directory).unwrap();
+        fixture.core.home = directory.clone();
+        fixture.core.controller = None;
+        let discovery = controller_discovery::LaunchDiscovery::prepare(&directory).unwrap();
+        let record = serde_json::json!({
+            "protocolVersion": 1,
+            "pid": fixture.core.child.as_ref().unwrap().id(),
+            "controller": fixture.controller.url.trim_start_matches("http://"),
+            "coreInstance": "fixture-instance",
+            "launchNonce": discovery.nonce(),
+        });
+        fs::write(
+            directory.join("desktop-controller.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let discovered = fixture
+            .core
+            .wait_for_controller(
+                &discovery,
+                &fixture.controller.secret,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(fixture.core.status().controller.is_none());
+        assert_eq!(discovered.controller.url, fixture.controller.url);
+        let wrong = fixture
+            .core
+            .wait_ready_for_instance(
+                &discovered.controller,
+                &fixture.source,
+                fixture.core.tun,
+                Instant::now() + Duration::from_secs(2),
+                Some("a-previous-core-instance"),
+            )
+            .unwrap_err();
+        assert_eq!(wrong.code, "core_controller_identity");
+        assert_eq!(fixture.config_reads.load(Ordering::SeqCst), 0);
+        fixture
+            .core
+            .wait_ready_for_instance(
+                &discovered.controller,
+                &fixture.source,
+                fixture.core.tun,
+                Instant::now() + Duration::from_secs(2),
+                Some(&discovered.core_instance),
+            )
+            .unwrap();
+        assert_eq!(fixture.config_reads.load(Ordering::SeqCst), 2);
+        drop(fixture);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn discovery_cancellation_rejects_a_late_record_and_preserves_exit_barrier() {
+        let directory = diagnostic_test_directory("discovery-cancel");
+        fs::create_dir_all(&directory).unwrap();
+        let discovery = controller_discovery::LaunchDiscovery::prepare(&directory).unwrap();
+        let mut core = CoreSupervisor::new(PathBuf::new(), directory.clone(), directory.clone());
+        core.child = Some(diagnostic_test_child());
+        let pid = core.child.as_ref().unwrap().id();
+        let revision = Arc::new(std::sync::atomic::AtomicU64::new(2));
+        core.set_cancellation(Cancellation::new(revision, 1));
+        fs::write(
+            directory.join("desktop-controller.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "protocolVersion": 1,
+                "pid": pid,
+                "controller": "127.0.0.1:23456",
+                "coreInstance": "late-instance",
+                "launchNonce": discovery.nonce(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = core
+            .wait_for_controller(
+                &discovery,
+                "private-secret",
+                Instant::now() + Duration::from_secs(2),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "operation_cancelled");
+        assert!(core.controller.is_none());
+        assert_eq!(core.child.as_ref().map(Child::id), Some(pid));
+        core.terminate_child_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(core.child.is_none() && !core.termination_unconfirmed);
+        drop(core);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_discovery_policy_exit_is_fast_precise_and_reaped() {
+        for (diagnostic, expected_code) in [
+            (
+                "level=fatal msg=\"desktop-managed controller port must be 1..65535\"\n",
+                "core_controller_incompatible",
+            ),
+            ("a different startup error\n", "core_start_failed"),
+        ] {
+            let directory = diagnostic_test_directory("discovery-exit");
+            fs::create_dir_all(&directory).unwrap();
+            let discovery = controller_discovery::LaunchDiscovery::prepare(&directory).unwrap();
+            fs::write(directory.join("core.log"), diagnostic).unwrap();
+            let mut core =
+                CoreSupervisor::new(PathBuf::new(), directory.clone(), directory.clone());
+            let mut child = diagnostic_test_child();
+            drop(child.stdin.take());
+            core.child = Some(child);
+            let started = Instant::now();
+            let error = core
+                .wait_for_controller(
+                    &discovery,
+                    "private-secret",
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .err()
+                .unwrap();
+            assert_eq!(error.code, expected_code);
+            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(core.controller.is_none() && core.child.is_some());
+            core.terminate_child_until(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            assert!(core.child.is_none() && !core.termination_unconfirmed);
+            drop(core);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn confirmed_exit_requires_an_owned_launch_and_exact_legacy_diagnostic() {
+        let legacy = "desktop-managed controller port must be 1..65535";
+        let job_error = AppError::new("io_error", "无法接管内核进程（系统错误：5）");
+        let classified = confirmed_startup_error(&job_error, true, legacy);
+        assert_eq!(classified.code, "core_controller_incompatible");
+        for (cause, spawned, diagnostic) in [
+            (job_error.clone(), false, legacy),
+            (job_error.clone(), true, ""),
+            (
+                job_error.clone(),
+                true,
+                "desktop-managed controller port must be 1..65535 unrelated-data",
+            ),
+            (AppError::new("operation_cancelled", "cancelled"), true, legacy),
+            (
+                AppError::new("core_termination_unconfirmed", "still owned"),
+                true,
+                legacy,
+            ),
+            (
+                AppError::new("core_start_failed", "different failure"),
+                true,
+                legacy,
+            ),
+        ] {
+            let preserved = confirmed_startup_error(&cause, spawned, diagnostic);
+            assert_eq!(preserved.code, cause.code);
+            assert_eq!(preserved.message, cause.message);
+        }
+        let cleanup = AppError::new("io_error", "cannot confirm exit");
+        let unresolved = startup_cleanup_error(&job_error, &cleanup);
+        assert_eq!(unresolved.code, "core_termination_unconfirmed");
+
+        let directory = diagnostic_test_directory("discovery-old-diagnostic");
+        fs::create_dir_all(&directory).unwrap();
+        let old = format!("{legacy}\n");
+        fs::write(
+            directory.join("core.log"),
+            format!("{old}a different current launch failure\n"),
+        )
+        .unwrap();
+        let mut core = CoreSupervisor::new(PathBuf::new(), directory.clone(), directory.clone());
+        core.log_start = old.len() as u64;
+        let current = core.recent_diagnostic();
+        assert!(
+            current.is_empty(),
+            "old launch policy errors must not be reused"
+        );
+        assert_eq!(
+            confirmed_startup_error(&job_error, true, &current).code,
+            "io_error"
+        );
+        drop(core);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn startup_failure_cleans_owned_process_without_waiting_for_discovery_deadline() {
+        let directory = diagnostic_test_directory("discovery-start-failure");
+        let mut core = CoreSupervisor::new(
+            std::env::current_exe().unwrap(),
+            directory.join("home"),
+            directory.join("logs"),
+        );
+        let started = Instant::now();
+        // The test executable rejects the real managed argv and exits. This
+        // exercises spawn_with_budget's real cleanup, without a test-only
+        // launch implementation or a second process ownership model.
+        let error = core.start("mixed-port: 0\n".into(), false).err().unwrap();
+        assert_eq!(error.code, "core_start_failed");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let status = core.status();
+        assert!(!status.running && !status.desired_running);
+        assert!(status.pid.is_none() && status.controller.is_none());
+        assert!(!core.termination_unconfirmed);
+        let runtime: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(core.home.join("config.yaml")).unwrap()).unwrap();
+        assert_eq!(
+            runtime["external-controller"].as_str(),
+            Some("127.0.0.1:0")
+        );
+        drop(core);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn validation_command_removes_launch_nonce_and_uses_the_live_controller() {
+        let core = CoreSupervisor::new(PathBuf::from("core.exe"), PathBuf::new(), PathBuf::new());
+        let command = core.command(
+            &Controller {
+                url: "http://127.0.0.1:23456".into(),
+                secret: "private-secret".into(),
+            },
+            Duration::from_secs(1),
+        );
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["-ext-ctl", "127.0.0.1:23456"]));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(controller_discovery::NONCE_ENV) && value.is_none()
+        }));
     }
 
     #[derive(Clone, Copy)]
