@@ -4,6 +4,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/metacubex/mihomo/component/desktop"
 	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/log"
 
@@ -12,9 +13,30 @@ import (
 )
 
 func tunNew(options tun.Options) (tunIf tun.Tun, err error) {
+	if !desktop.Enabled() {
+		return createStandaloneWindowsTun(options, func(options tun.Options) (tun.Tun, error) {
+			return tun.New(options)
+		}, time.Now)
+	}
 	return createWindowsTun(options, func(options tun.Options) (tun.Tun, error) {
 		return tun.NewExclusive(options)
 	}, time.Now, time.Sleep)
+}
+
+// Standalone startup preserves the upstream v1.19.34 Windows retry policy:
+// only a failed attempt taking at least one second admits another attempt.
+// The managed supervisor's ownership and retry rules do not apply here.
+func createStandaloneWindowsTun(options tun.Options, create func(tun.Options) (tun.Tun, error), now func() time.Time) (device tun.Tun, err error) {
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		started := now()
+		device, err = create(options)
+		if err == nil || now().Sub(started) < time.Second {
+			return
+		}
+		log.Warnln("Start Tun interface timeout: %s [retrying %d/%d]", err, attempt, maxAttempts)
+	}
+	return
 }
 
 func retryableWindowsTunError(err error) bool {

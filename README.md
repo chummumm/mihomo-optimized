@@ -6,6 +6,8 @@
 
 [下载 Releases](https://github.com/chummumm/mihomo-optimized/releases) · [构建状态](https://github.com/chummumm/mihomo-optimized/actions/workflows/build.yml) · [完整配置说明](docs/dns-proxy.md) · [验证记录](docs/dns-rule-routing-validation.md)
 
+**1.0.37 更新：** [恢复普通 Windows 核心的上游 TUN 兼容路径](docs/releases.md#1037windows-普通核心与受管桌面的-tun-策略)。普通命令行及第三方客户端通过 `-d`、`-f`、`-ext-ctl-pipe` 启动时，使用上游通用 GUID 和创建／打开／重试流程；显式启用 `-desktop-managed` 的配套桌面继续使用专属身份与独占保护。无需新增 YAML 配置，Windows 服务或管理员权限本身不会切换模式。
+
 **1.0.29 更新：** [统一 DNS 配置与建连反馈](docs/releases.md#1029dns-配置统一与-tcp-建连反馈)。DNS 上游独立选路统一使用 `dns.respect-rules`，`nameserver-policy` 与直连池的 follow-policy 可在自动分流中使用；移除旧 `dns-upstream-rule-routing`，升级时请按下文迁移并完整重载。TCP 入站接通既有握手成功 / 失败反馈，协议与系统栈边界见发行说明。
 
 **1.0.28 修复：** [Windows TUN 强制退出后的恢复](docs/releases.md#1028windows-tun-强制退出后的恢复)，以创建时的产品专属身份和 Windows 明确的“不在场”设备状态，允许重新枚举本产品的同一个设备实例；活动实例、外部网卡及身份不明的旧残留仍返回冲突。包含 [1.0.26 的 Wi-Fi 切换与 TUN 恢复修复](docs/releases.md#1026wi-fi-切换与-windows-tun-恢复)；配套桌面 0.2.6 支持恢复期间及时停止。
@@ -47,7 +49,7 @@ UDP、TCP 和 DoT 上游在实际出口固定时共享连接，多个查询通�
 
 新增的 DNS 面板数据由本机控制器提供，查询记录、趋势和上游统计只保存在进程内存中，不写数据库或日志文件，也不发送遥测。无需维护第二份分流规则；观测不会改变 DNS 回答和出口选择。优化范围、缓存安全边界及测试方式见 [DNS 性能说明](docs/dns-performance.md)。
 
-正式版本采用 **`mihomo-optimized-vX.Y.Z`**，当前源码版本为 `mihomo-optimized-v1.0.29`。tag、发行标题、`version.txt` 和运行内核版本一致；`PROJECT_VERSION` 记录独立项目版本，上游 mihomo 的版本与提交另存于 `UPSTREAM_VERSION` / `UPSTREAM_COMMIT`。源码哈希保留在 BUILDINFO 中。**旧版 `v1.19.32-optimized-N` 及更早内核首次切换到新系列，需要手动安装一次**；新系列随后可通过 YAML 启用内核后台检查和更新，详见[更新说明](docs/releases.md#内核自动更新)。
+正式版本采用 **`mihomo-optimized-vX.Y.Z`**，当前源码版本为 `mihomo-optimized-v1.0.37`。tag、发行标题、`version.txt` 和运行内核版本一致；`PROJECT_VERSION` 记录独立项目版本，上游 mihomo 的版本与提交另存于 `UPSTREAM_VERSION` / `UPSTREAM_COMMIT`。源码哈希保留在 BUILDINFO 中。**旧版 `v1.19.32-optimized-N` 及更早内核首次切换到新系列，需要手动安装一次**；新系列随后可通过 YAML 启用内核后台检查和更新，详见[更新说明](docs/releases.md#内核自动更新)。
 
 ## 启动资源下载
 

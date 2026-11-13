@@ -8,6 +8,12 @@ makes the patch reproducible for every build; it does not modify a module cache.
 
 ## Windows ownership
 
+The Windows listener selects upstream-compatible `New` for standalone cores
+and `NewExclusive` only when the immutable `desktop-managed` policy is enabled.
+Service/elevation status and interface names do not select a mode. Standalone
+creation also uses the pinned upstream listener's elapsed-time retry policy;
+the managed path retains its separate error-class and total retry budget.
+
 The Windows ownership changes are limited to `tun_windows.go`,
 `tun_ownership_windows.go` and `stack_mixed.go`:
 
@@ -40,8 +46,11 @@ The Windows ownership changes are limited to `tun_windows.go`,
   The read-only guard does not atomically reserve aliases against another
   application's simultaneous creation of a different instance.
 - `NewExclusive` also refuses to open a pre-existing adapter after a failed
-  create. Mihomo uses this entry point; upstream `New` retains its original
-  semantics.
+  create. The managed Windows desktop uses this entry point. Standalone `New`
+  uses the shared upstream GUID and opens an existing adapter only after an
+  `os.ErrExist` creation error, then starts a session. This compatibility path
+  retains Wintun's own naming and session arbitration; it does not inherit the
+  exclusive path's foreign-alias guarantees.
 - Failed `StartSession` closes the owned adapter before returning.
 - Failed configuration closes the session, adapter and any WFP engine already
   acquired by that attempt.

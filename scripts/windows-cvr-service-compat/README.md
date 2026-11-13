@@ -1,0 +1,97 @@
+# Official Clash Verge Rev Service acceptance
+
+This harness installs and runs the **official production** Windows service,
+then asks that service to start the newly compiled optimized core. It needs
+Python 3.11+, PowerShell 7 and an elevated, disposable GitHub-hosted Windows x64
+runner. It refuses other environments, an already registered
+`clash_verge_service`, or an existing `ProgramData/clash-verge-service` state
+directory. Run it sequentially after the ordinary/managed TUN acceptance.
+
+```powershell
+python scripts/windows-cvr-service-compat/run.py `
+  --core "$env:RUNNER_TEMP/mihomo-controller-test.exe" `
+  --report "$env:RUNNER_TEMP/windows-cvr-service-compat/report.json"
+```
+
+Allow a separate **six-minute** workflow step. A passing run should normally
+take about one to two minutes; installation, each IPC mutation and uninstall
+have finite deadlines. Preserve the report and its sibling evidence directory
+with `if: always()`. No Rust build or third-party Python package is required.
+
+## Pins and protocol
+
+All service behavior below is taken from official tag `v2.7.7`, resolved to
+commit [`3ed29700b093190b5e7addcaa892e77f172af544`](https://github.com/clash-verge-rev/clash-verge-service-ipc/tree/3ed29700b093190b5e7addcaa892e77f172af544).
+The official release workflow builds `standalone client`, without the `test`
+feature. Its test driver cannot be reused unchanged because its start command
+hardcodes `mock_binary` and a minimal rule-mode configuration.
+
+The downloaded archive is:
+
+```text
+https://github.com/clash-verge-rev/clash-verge-service-ipc/releases/download/v2.7.7/clash-verge-service-ipc-v2.7.7-x86_64-pc-windows-msvc.zip
+SHA-256 91316df6662b0962d13dcf18f71d0182a62dc5a1a68769a3adc34cda07538bdf
+```
+
+The checksum is pinned from the release asset's `digest` in the official
+[GitHub release API](https://api.github.com/repos/clash-verge-rev/clash-verge-service-ipc/releases/tags/v2.7.7).
+The same release publishes `SHA256SUMS`. Extraction starts only after the full
+archive matches this checksum; only its four exact expected files are accepted.
+The report also records the official executable digest and tested core digest.
+
+The thin Python client uses the fixed commit's public HTTP-over-named-pipe
+protocol; it does not depend on a floating SDK. Requests reuse
+`scripts/test-windows-tun-compat.py`, including its bounded subprocess transport
+and **server PID check before sending credentials**.
+
+Relevant fixed source contracts:
+
+- [`src/lib.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/lib.rs): production pipe `\\.\pipe\clash-verge-service`, protocol epoch/revision `2.6`, public version handshake.
+- [`src/core/structure.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/core/structure.rs) and [`src/client/mod.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/client/mod.rs): owner/session envelopes, `GET /status`, `POST /clash/start`, `DELETE /clash/stop` and `RuntimeBundle`.
+- [`src/core/auth.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/core/auth.rs): real Windows SID, 32-byte owner token file, matching owner and protected DACL granting only that SID, LocalSystem and Administrators full access. `windows.ps1` creates these credentials in a fresh temporary directory. Tokens are neither printed nor retained as artifacts.
+- [`src/bin/install_service.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/bin/install_service.rs): `--install-service --install-core <absolute path> --sha256 <digest>` stages the test core and starts the SCM LocalSystem service.
+- [`src/core/runtime_generation/assets.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/core/runtime_generation/assets.rs): the request's absolute source path is mapped by filename to the installer-approved copy in the protected `cores` directory. The harness verifies the actual process runs that copy.
+- [`src/core/manager.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/core/manager.rs) and [`src/core/paths.rs`](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/3ed29700b093190b5e7addcaa892e77f172af544/src/core/paths.rs): the service supplies `-d`, `-f`, `-ext-ctl-pipe` and `LISTEN_NAMEDPIPE_SDDL`. The core pipe is `\\.\pipe\verge-mihomo-production-<SHA256(owner SID)>`; it supplies no `-desktop-managed`.
+
+## Assertions and cleanup
+
+Two service-managed start/stop cycles run against the same isolated random TUN
+name. Each cycle verifies:
+
+1. The official service commits the correct owner session and reports a core PID.
+2. The process's executable, digest, parent service PID and actual argument list
+   match the requested new core and ordinary CVR launch contract.
+3. The real core pipe's server PID matches that process, `/version` agrees with
+   the compiled executable's `-v`, `/configs` has the requested TUN, and
+   `/desktop` returns 404.
+4. IP Helper reports the upstream generic GUID, original name and valid native
+   identity. A raw TCP request to a single test `/32` passes through TUN and
+   the in-process loopback SOCKS fixture, which returns an unpredictable body.
+5. `DELETE /clash/stop` clears running and desired state, and the held core
+   process handle confirms exit. The second start happens without a harness
+   wait for adapter disappearance.
+
+The official Windows service implements this normal **service API stop** using
+`Child.kill`/`TerminateProcess`; the report does not call it graceful in-core
+shutdown. The separate compatibility test covers clean native resource closure.
+
+In `finally`, the harness rechecks the registered executable/account, official
+executable checksum and the exact approved test-core set before using the
+official uninstaller. If ownership has changed it fails without uninstalling
+the unknown installation. The uninstaller must remove the SCM service and the
+approved core, all held test core handles must report exit, and the test TUN
+must disappear. The harness never deletes or renames an adapter. It does not
+recursively remove `ProgramData`; the official service may leave its state/log
+directory on the disposable runner. Existing installations are never test
+targets, and this is not a local-machine cleanup utility.
+
+This verifies the official headless service/core boundary at the pinned version.
+It does not exercise the CVR GUI, all CVR versions, or arbitrary user
+configurations. A successful report is required before claiming this acceptance
+has passed.
+
+Portable syntax check (no installation or network access):
+
+```text
+python -m py_compile scripts/windows-cvr-service-compat/run.py scripts/test-windows-tun-compat.py
+```

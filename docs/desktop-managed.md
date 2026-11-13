@@ -4,6 +4,31 @@ The standalone daemon keeps its existing behavior. A desktop supervisor opts in
 with `-desktop-managed` or `CLASH_DESKTOP_MANAGED=true` before configuration is
 parsed. This is an immutable process policy; it is not a YAML setting.
 
+## Windows TUN ownership boundary
+
+Starting with core 1.0.37, a standalone Windows core uses the pinned upstream
+Mihomo/sing-tun creation policy: the shared `MD5("wintun" + deviceName)` GUID,
+Create, Open only for the existing-device error, then StartSession. It also
+preserves the upstream Windows attempt rule: a failed attempt lasting less
+than one second returns immediately; a slower failure allows up to three
+attempts in total. This includes third-party hosts using `-ext-ctl-pipe`.
+
+An explicitly enabled desktop policy uses `NewExclusive`, the stable
+`mihomo-optimized/wintun-exclusive/v1` namespace, product identity checks and
+the managed retry budget. The choice uses `desktop.Enabled()` before the
+first TUN is created; readiness is not a mode selector. Both direct and service
+launches by this project's desktop enable that policy. Running as a Windows
+service, running elevated or enabling TUN does not enable it implicitly.
+
+The shared deterministic cleanup of failed sessions/configuration and the
+actual handle LUID checks apply to both modes. Standalone mode retains the
+upstream Wintun alias behavior, which can rename a different existing instance
+when a requested alias is occupied; it does not promise the managed mode's
+foreign-alias protection. Stop the previous host before replacing its core.
+An old generic `Meta Tunnel` identity is not evidence of product ownership and
+does not authorize a managed process to adopt or delete it. Changing modes
+requires a new process, not a YAML reload.
+
 ## Bootstrap
 
 Create a private, existing data directory first. Start the core with:
