@@ -1,53 +1,96 @@
-name: Validate atomic update completion
+name: Inspect saved successful update snapshots
 on:
   push:
     branches: [diagnostics/windows-tun-ci-43368503742]
 permissions:
   contents: read
+  actions: read
 jobs:
-  contracts:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2022]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    env:
-      CARGO_INCREMENTAL: '0'
-      RUSTFLAGS: ${{ matrix.os == 'windows-2022' && '-C target-feature=+crt-static' || '' }}
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Download existing successful verification evidence
+        uses: actions/download-artifact@v4
         with:
-          ref: 88913fb12efcdbfbc74eb5840d477744b1fbca9f
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install Python static checker
-        run: python -m pip install pyflakes==3.4.0
-      - name: Validate source and fixture contracts
-        shell: bash
+          artifact-ids: '14019793604'
+          path: evidence
+          merge-multiple: true
+          repository: chummumm/mihomo-optimized
+          run-id: '43387721436'
+          github-token: ${{ github.token }}
+      - name: Print whitelisted post-update snapshots
+        shell: python
         run: |
-          set -euo pipefail
-          python -m py_compile scripts/desktop-release-notes.py scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
-          python -m pyflakes scripts/desktop-release-notes.py scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_http_test.py
-          python desktop/tests/upgrade_tun_http_test.py
-          python desktop/tests/core_update_fixture_test.py
-      - name: Install pinned Rust compiler and formatter
-        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt
-      - name: Reuse existing Windows compilation cache
-        if: runner.os == 'Windows'
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: desktop-native-windows-msvc-v2-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: desktop-native-windows-msvc-v2-
-      - name: Check Rust source format
-        working-directory: src-tauri
-        run: cargo +1.99.1 fmt --all -- --check
-      - name: Exercise portable and native library contracts
-        working-directory: src-tauri
-        run: cargo +1.99.1 test --locked --lib
+          import json, re
+          from pathlib import Path
+
+          matches = list(Path('evidence').rglob('core-update.json'))
+          if len(matches) != 1:
+              raise SystemExit('expected_one_core_update_report')
+          path = matches[0]
+          if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 1024 * 1024:
+              raise SystemExit('invalid_core_update_report_file')
+          try:
+              data = json.loads(path.read_text(encoding='utf-8-sig'))
+          except (OSError, UnicodeError, ValueError):
+              raise SystemExit('unreadable_core_update_report') from None
+          if not isinstance(data, dict) or not isinstance(data.get('scenarios'), dict):
+              raise SystemExit('invalid_core_update_report_shape')
+
+          def boolean(value):
+              if value is None or type(value) is bool:
+                  return value
+              raise SystemExit('invalid_saved_boolean')
+
+          def number(value):
+              if value is None or type(value) is int and 0 <= value < 2 ** 64:
+                  return value
+              raise SystemExit('invalid_saved_integer')
+
+          def atom(value):
+              if value is None or type(value) is str and re.fullmatch(r'[A-Za-z0-9_.-]{0,128}', value):
+                  return value
+              raise SystemExit('invalid_saved_identifier')
+
+          bool_fields = ('desiredRunning', 'tun', 'systemProxy', 'listenersReady',
+                         'statusStale', 'controllerPresent')
+          number_fields = ('pid', 'intentRevision', 'serviceSequence',
+                           'statusSequence', 'observedAt')
+          atom_fields = ('phase', 'errorCode', 'processState', 'controlState',
+                         'serviceInstance', 'coreVersion')
+          out = {
+              'artifactId': 14019793604,
+              'sourceRun': 43387721436,
+              'sourceHead': '88913fb12efcdbfbc74eb5840d477744b1fbca9f',
+              'reportPassed': boolean(data.get('passed')),
+              'scenarios': {},
+          }
+          for name in ('running_auto_update', 'tun_auto_update', 'stopped_auto_update'):
+              row = data['scenarios'].get(name)
+              if not isinstance(row, dict) or not isinstance(row.get('statusAfterUpdate'), dict):
+                  raise SystemExit('missing_expected_post_update_snapshot')
+              source = row['statusAfterUpdate']
+              snapshot = {}
+              for field in bool_fields:
+                  if field in source:
+                      snapshot[field] = boolean(source[field])
+              for field in number_fields:
+                  if field in source:
+                      snapshot[field] = number(source[field])
+              for field in atom_fields:
+                  if field in source:
+                      snapshot[field] = atom(source[field])
+              if 'operation' in source:
+                  # Never export operation bodies, labels or free-form errors.
+                  snapshot['operation'] = None if source['operation'] is None else {'present': True}
+              observations = row.get('observations')
+              final = observations[-1] if isinstance(observations, list) and observations else {}
+              out['scenarios'][name] = {
+                  'manualUpdateCommands': number(row.get('manualUpdateCommands')),
+                  'lastUpdateStatus': atom(final.get('status')) if isinstance(final, dict) else None,
+                  'statusAfterUpdate': snapshot,
+              }
+          print('POST_UPDATE_SNAPSHOTS_BEGIN')
+          print(json.dumps(out, ensure_ascii=True, sort_keys=True, indent=2))
+          print('POST_UPDATE_SNAPSHOTS_END')
