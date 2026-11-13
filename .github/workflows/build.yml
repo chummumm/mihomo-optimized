@@ -452,6 +452,7 @@ jobs:
           - 处理旧 optimized 核心崩溃后遗留的产品 GUID：严格确认本产品身份，取得同一实例的原生创建者句柄并正常关闭，再创建通用网卡。仍有创建者持有时明确拒绝，避免跨 GUID 换核留下断开接口。
           - 保留会话及部分配置失败的确定性清理、Wintun Close 修复、实际句柄身份检查和路由错误处理。替换前先由原宿主停止旧核心；普通模式采用上游原生同名处理，受管模式继续保护外部同名设备。
           - 新增真实 Wintun 创建者与实际核心命名管道启动验收，验证通用身份复用、活动会话保护和身份切换；另使用固定 SHA-256 的 Clash Verge Service IPC 2.7.7 正式服务验证核心启动、TUN 实际转发和停止。受管原生生命周期回归继续执行。
+          - 修复发布竞态检测发现的 AnyTLS 服务端首包缓存读取／关闭冲突：认证后独立保存未消费帧并立即归还首包缓冲池，关闭底层连接仍可打断阻塞读取；同时修正认证失败时的缓存引用释放。
 
           [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.37/docs/releases.md) · [Windows 模式边界](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.37/docs/desktop-managed.md#windows-tun-ownership-boundary)
 
