@@ -13,6 +13,21 @@ preserves the upstream Windows attempt rule: a failed attempt lasting less
 than one second returns immediately; a slower failure allows up to three
 attempts in total. This includes third-party hosts using `-ext-ctl-pipe`.
 
+Standalone optimized versions before 1.0.37 could also create product-scoped
+devices. A forced exit skips Wintun's normal explicit uninstall, so creating a
+different generic GUID can leave the old product device renamed and disconnected.
+Before generic creation, the standalone path retires a strictly identified
+legacy product instance: native Create must acquire that instance's creator
+ownership, its returned GUID/LUID must match, and Close releases that newly
+owned handle through Wintun's normal uninstall. It never Opens the old product
+device or deletes one merely by name. A live creator blocks migration and no
+generic creation follows that failure. Renamed product instances retain their
+original-name-derived GUID and require matching current alias/native properties;
+missing PnP identity admits only the precise original-alias interface evidence
+already accepted by the managed 1.0.36 path. Creator ownership is distinct from
+a session borrowed with Open; a borrower does not extend the creator's software
+device lifetime after that creator exits.
+
 An explicitly enabled desktop policy uses `NewExclusive`, the stable
 `mihomo-optimized/wintun-exclusive/v1` namespace, product identity checks and
 the managed retry budget. The choice uses `desktop.Enabled()` before the

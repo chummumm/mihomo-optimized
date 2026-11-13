@@ -14,8 +14,22 @@ Service/elevation status and interface names do not select a mode. Standalone
 creation also uses the pinned upstream listener's elapsed-time retry policy;
 the managed path retains its separate error-class and total retry budget.
 
+Standalone creation first retires a strictly verified legacy product instance
+left by optimized versions that applied the exclusive policy to all Windows
+cores. It acquires the old product GUID through native Create, validates the
+returned handle and Closes that newly owned creator before generic creation.
+This supplies the explicit normal uninstall skipped by a crashed old creator.
+A live creator or ambiguous identity stops migration; it never falls back to
+generic creation after a failed product claim. The original requested name
+derives the product GUID, while complete native properties and the current
+unique alias identify a product device renamed by a previous generic Create.
+An absent native identity only admits the precise original-alias product row
+already allowed by the managed path. No Open, session probe, explicit device
+deletion or fixed sleep is used. Creator ownership is not a guarantee that an
+independent Open borrower can outlive the software-device creator.
+
 The Windows ownership changes are limited to `tun_windows.go`,
-`tun_ownership_windows.go` and `stack_mixed.go`:
+`tun_ownership_windows.go`, `tun_migration_windows.go` and `stack_mixed.go`:
 
 - `NewExclusive` supplies a stable product-specific requested GUID namespace
   (`mihomo-optimized/wintun-exclusive/v1`) and the tunnel type `Mihomo Optimized`

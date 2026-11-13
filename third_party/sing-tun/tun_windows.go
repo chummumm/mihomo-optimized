@@ -69,6 +69,11 @@ func New(options Options) (WinTun, error) {
 	if options.FileDescriptor != 0 {
 		return nil, os.ErrInvalid
 	}
+	if err := migrateLegacyWindowsAdapter(options.Name); err != nil {
+		// A failed product claim must not enter the generic Create/Open fallback:
+		// doing so could rename an adapter whose original creator is still alive.
+		return nil, err
+	}
 	adapter, err := createWindowsAdapter(options)
 	if err != nil {
 		if !errors.Is(err, os.ErrExist) {

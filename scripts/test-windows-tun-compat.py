@@ -22,6 +22,7 @@ ordinary /restart endpoint is also exercised, including its replacement PID.
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 from datetime import datetime, timezone
 import hashlib
@@ -477,6 +478,94 @@ def same_owner(before: dict, after: dict) -> None:
             "existing native owner stopped being a present device")
 
 
+def known_pnp_snapshot(instance_ids: list[str]) -> dict:
+    """Inspect only previously observed fixture instances after a test failure."""
+    result = {"startedAt": timestamp(), "requestedInstanceIds": instance_ids,
+              "timeoutSeconds": 15}
+    if not instance_ids:
+        return {**result, "skipped": "no previously observed fixture instance", "finishedAt": timestamp()}
+    # Enumerate Net devices before filtering exact IDs so an absent device is
+    # distinguishable from a failed query. No Wintun DLL/API is invoked here.
+    script = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
+function Read-QueryError($record) {
+    return @{ message = $record.Exception.Message; hresult = $record.Exception.HResult;
+              fullyQualifiedErrorId = $record.FullyQualifiedErrorId }
+}
+$request = [Console]::In.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop
+$result = [ordered]@{ queryStartedAt = [DateTime]::UtcNow.ToString('o');
+    allEnumerationSucceeded = $false; presentEnumerationSucceeded = $false;
+    enumerationErrors = @(); devices = @() }
+$allNet = @()
+$presentNet = @()
+try {
+    $allNet = @(Get-PnpDevice -Class Net -ErrorAction Stop)
+    $result.allEnumerationSucceeded = $true
+} catch {
+    $result.enumerationErrors += @{ query = 'all'; error = (Read-QueryError $_) }
+}
+try {
+    $presentNet = @(Get-PnpDevice -Class Net -PresentOnly -ErrorAction Stop)
+    $result.presentEnumerationSucceeded = $true
+} catch {
+    $result.enumerationErrors += @{ query = 'present'; error = (Read-QueryError $_) }
+}
+foreach ($instanceId in $request.instanceIds) {
+    $device = [ordered]@{ instanceId = $instanceId; knownToPnp = $null; present = $null;
+        information = @(); devnodeStatus = $null; problemCode = $null; propertyErrors = @() }
+    if ($result.allEnumerationSucceeded) {
+        $known = @($allNet | Where-Object { $_.InstanceId -ieq $instanceId })
+        $device.knownToPnp = $known.Count -gt 0
+        $device.information = @($known | Select-Object InstanceId, Status, Class, FriendlyName)
+    }
+    if ($result.presentEnumerationSucceeded) {
+        $device.present = @($presentNet | Where-Object { $_.InstanceId -ieq $instanceId }).Count -gt 0
+    }
+    foreach ($property in @(
+        @{ key = 'DEVPKEY_Device_DevNodeStatus'; field = 'devnodeStatus' },
+        @{ key = 'DEVPKEY_Device_ProblemCode'; field = 'problemCode' }
+    )) {
+        try {
+            $value = @(Get-PnpDeviceProperty -InstanceId $instanceId -KeyName $property.key -ErrorAction Stop)
+            if ($value.Count -ne 1) { throw 'PnP property query did not return one value' }
+            $device[$property.field] = $value[0].Data
+        } catch {
+            $device.propertyErrors += @{ key = $property.key; error = (Read-QueryError $_) }
+        }
+    }
+    $result.devices += $device
+}
+$result['queryFinishedAt'] = [DateTime]::UtcNow.ToString('o')
+$result | ConvertTo-Json -Depth 8 -Compress
+"""
+    try:
+        powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        command = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        completed = subprocess.run([str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive",
+            "-EncodedCommand", command], input=json.dumps({"instanceIds": instance_ids}),
+            env=child_environment(), text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        result.update({"exitCode": completed.returncode, "stderr": completed.stderr})
+        if completed.returncode == 0:
+            try:
+                result["observation"] = json.loads(completed.stdout.lstrip("\ufeff"))
+            except ValueError:
+                result["stdout"] = completed.stdout
+                raise
+        else:
+            result.update({"error": "PowerShell PnP inspection failed", "stdout": completed.stdout})
+    except Exception as error:
+        result["error"] = repr(error)
+        if isinstance(error, subprocess.TimeoutExpired):
+            for key, value in (("stdout", error.stdout), ("stderr", error.stderr)):
+                result[key] = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+    result["finishedAt"] = timestamp()
+    return result
+
+
 class OwnerFixture:
     def __init__(self, case: Case, namespace: str, session: bool) -> None:
         self.case, self.events, self.last = case, queue.Queue(), None
@@ -841,6 +930,12 @@ class Case:
                 except Exception as error:
                     observed["inspectionError"] = repr(error)
             snapshot["owners"].append(observed)
+        if label.startswith("failure-"):
+            instance_ids = sorted({event["pnp_instance_id"] for owner in self.owners
+                for event in (getattr(owner, "initial", None), owner.last)
+                if isinstance(event, dict) and isinstance(event.get("pnp_instance_id"), str)
+                and event["pnp_instance_id"]})
+            snapshot["pnp"] = known_pnp_snapshot(instance_ids)
         path = self.directory / (label + ".json")
         path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
         self.record.setdefault("snapshots", []).append(str(path))
@@ -863,6 +958,12 @@ class Case:
         self.record["cleanup"] = {"errors": errors, "remainingInterfaces": rows,
                                   "externalDeviceRemoval": False}
         self.suite.checkpoint()
+        if errors or rows:
+            try:
+                self.snapshot("failure-after-cleanup")
+            except Exception as error:
+                self.record["cleanup"]["snapshotError"] = repr(error)
+                self.suite.checkpoint()
         require(not errors and not rows, f"owned fixture cleanup incomplete: {self.record['cleanup']}")
 
 
@@ -956,6 +1057,41 @@ class Suite:
                 "contending ordinary core stole or damaged the existing active session")
         case.record["existingSessionSurvived"] = True
 
+    def live_product(self, case: Case, *, session: bool) -> None:
+        owner = OwnerFixture(case, "product", session)
+        before = owner.command("session_probe" if session else "inspect")
+        same_owner(owner.initial, before)
+        core = Core(case, "ordinary-migration-contender")
+        core.start()
+        core.expect_failure("stage=migrate reason=legacy_product_claim_failed")
+        after = owner.command("session_probe" if session else "inspect")
+        same_owner(owner.initial, after)
+        require(after["session_active"] is session,
+                "rejected ordinary migration changed the live product owner's session")
+        rows = self.windows.interfaces(case.name)
+        proof = {"initialSession": session, "ownerPid": owner.process.pid,
+                 "interfacesAfterRejection": rows}
+        case.record["liveProductGuard"] = proof
+        require(len(rows) == 1 and all(rows[0][key] == before[key]
+                for key in ("guid", "luid", "index", "alias", "if_type")),
+                f"rejected ordinary migration replaced, renamed or added an interface: {rows}")
+        if session:
+            require(after["probe"]["read_event"] == before["probe"]["read_event"] > 0
+                    and after["probe"]["receive"] in {"empty", "packet"},
+                    "rejected ordinary migration damaged the live product session")
+            proof["originalSessionSurvived"] = True
+        else:
+            started = owner.command("session_start")
+            same_owner(before, started)
+            probe = owner.command("session_probe")
+            same_owner(before, probe)
+            require(started["session_active"] is True and probe["session_active"] is True
+                    and probe["probe"]["read_event"] > 0
+                    and probe["probe"]["receive"] in {"empty", "packet"},
+                    "rejected ordinary migration damaged the idle product creator")
+            proof["creatorCanStartSessionAfterRejection"] = True
+        self.checkpoint()
+
     def released_owner(self, case: Case, *, namespace: str, crash: bool) -> None:
         owner = OwnerFixture(case, namespace, True)
         core = Core(case, "ordinary-after-owner")  # Prepare all files before the handoff.
@@ -982,6 +1118,10 @@ class Suite:
             self.run_case("fresh_ordinary_restart_and_reload", self.fresh_restart_reload)
             self.run_case("idle_generic_managed_refuses_ordinary_borrows", self.borrow_generic)
             self.run_case("active_generic_session_is_not_stolen", self.active_generic)
+            self.run_case("idle_product_owner_is_not_migrated",
+                          lambda case: self.live_product(case, session=False))
+            self.run_case("active_product_owner_is_not_migrated",
+                          lambda case: self.live_product(case, session=True))
             self.run_case("generic_normal_close_immediate_start",
                           lambda case: self.released_owner(case, namespace="generic", crash=False))
             self.run_case("generic_crash_immediate_start",
