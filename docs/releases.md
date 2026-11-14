@@ -2,6 +2,14 @@
 
 项目使用独立版本 **`mihomo-optimized-vX.Y.Z`**，首版为 `mihomo-optimized-v1.0.0`。`main` 的源码、依赖或构建配置变更在全部测试和完整编译成功后生成固定提交的 GitHub Release。Latest 仅在该构建仍对应当前 `main` 时更新；PR 只做合并前检查，不生成正式发布包。纯文档变更不消耗版本号，也不触发自动发布。
 
+## 1.0.38：旧版 UOT 写入计数
+
+修正 issue [#72](https://github.com/chummumm/mihomo-optimized/issues/72) 提供线索中已确认的 UOT 写入计数缺陷：固定依赖 `sing v0.5.9` 在底层连接没有向量写接口时，将封装头也计入返回长度，可能让共享 UDP DNS 把已经完整发送的查询误判为 `short write` 并关闭连接。
+
+Shadowsocks UDP-over-TCP 和 TUIC UDP-over-Stream 的旧版 UOT 构造接入共用适配：仅对缺少向量写接口的连接合并并单次发送完整帧，校验整帧长度，再由 UOT 返回原始数据长度。真正的部分写入仍返回错误，底层错误原样保留；已有向量写路径、新版 UOT 与 VLESS/XUDP 保持原有实现。共享 DNS 的长度和响应校验保持严格，不增加配置或诊断日志。
+
+回归覆盖真实 UOT 报文的编码／解码、成功写入计数、封装头内和数据中途的短写、底层错误，以及经过实际出站连接包装的共享／独立 DNS 查询与连接复用。该修复确认的是 UOT 分支缺陷；issue 中用户实机的完整故障仍需其使用实际节点复测确认。
+
 ## 1.0.37：Windows 普通核心与受管桌面的 TUN 策略
 
 修复 issue [#92](https://github.com/chummumm/mihomo-optimized/issues/92)：此前 Windows 创建入口无条件使用产品专属 GUID 和独占预检查，导致普通命令行核心或第三方客户端替换核心时，将上游通用 GUID 的同名 `Meta Tunnel` 误当成必须拒绝的产品身份冲突。

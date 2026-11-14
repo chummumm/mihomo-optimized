@@ -299,6 +299,9 @@ jobs:
           cache: true
       - name: Verify native core replacement, rollback and macOS signing
         run: go test -tags with_gvisor -count=1 -timeout=5m ./component/updater ./component/resource ./component/mmdb ./component/geodata ./rules/provider
+      - name: Verify legacy UOT write counts and shared DNS on Windows
+        if: runner.os == 'Windows'
+        run: go test -v -tags with_gvisor -count=1 -timeout=2m ./common/net ./dns -run '^(TestUOTConn|TestDNSClientLegacyUOT)'
       - name: Repeat Windows startup routing and cancellation across scheduler settings
         if: runner.os == 'Windows'
         timeout-minutes: 3
@@ -445,7 +448,15 @@ jobs:
             {
               printf 'mihomo-optimized `%s`\n\n' "$BUILD_VERSION"
               printf 'Source commit: `%s`\n\n' "$BUILD_SHA"
-              printf '%s\n\n' '## 本次更新：1.0.37
+              printf '%s\n\n' '## 本次更新：1.0.38
+
+          - 修正旧版 UOT 在缺少向量写接口时将封装头计入写入长度的问题，避免共享 UDP DNS 将完整发送误判为 short write（issue #72 提供的源码线索）。
+          - Shadowsocks UDP-over-TCP、TUIC UDP-over-Stream 的旧版 UOT 路径统一校验完整帧写入；保留真实短写和底层错误处理，不放宽共享 DNS 校验，不增加诊断日志。
+          - 新增 UOT 写入边界及真实出站包装下的共享／独立 DNS 回归。修复范围限于已确认的 UOT 分支，实机问题仍等待用户复测反馈。
+
+          [完整发行说明](https://github.com/chummumm/mihomo-optimized/blob/mihomo-optimized-v1.0.38/docs/releases.md)
+
+          ## 1.0.37
 
           - 修复 Windows 普通核心替换时，上游通用 GUID 的同名网卡被产品独占预检查拒绝的问题（issue #92）。普通核心恢复上游通用 GUID、Create / Open / StartSession 和 Windows 重试流程，支持第三方宿主使用 -d、-f、-ext-ctl-pipe 启动。
           - 只有显式 desktop-managed 的自家桌面保留专属身份与独占创建；管理员权限、Windows 服务和开启 TUN 本身不会切换模式。无需新增 YAML 配置。
