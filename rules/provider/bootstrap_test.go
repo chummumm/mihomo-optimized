@@ -55,24 +55,24 @@ func TestResourceBootstrapClassicalGeoSharesRouteAndDeadline(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			releaseHandler := make(chan struct{})
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/rules" {
 					_, _ = w.Write([]byte("payload:\n  - GEOSITE,cn\n"))
 					return
 				}
 				if expired {
-					time.Sleep(100 * time.Millisecond)
+					select {
+					case <-r.Context().Done():
+					case <-releaseHandler:
+					}
+					return
 				}
 				_, _ = w.Write(data)
 			}))
 			defer server.Close()
+			defer close(releaseHandler)
 			dialer := &bootstrapRuleDialer{address: strings.TrimPrefix(server.URL, "http://")}
-			timeout := 2 * time.Second
-			if expired {
-				timeout = 40 * time.Millisecond
-			}
-			scope := resource.NewBootstrap(context.Background(), timeout, dialer, nil)
-			defer scope.Close()
 			geodata.SetGeoSiteUrl("http://unresolvable.invalid/geo?token=must-not-appear")
 			parse := func(tp, payload, target string, params []string, subRules map[string][]C.Rule) (C.Rule, error) {
 				return common.NewGEOSITE(payload, target)
@@ -80,12 +80,29 @@ func TestResourceBootstrapClassicalGeoSharesRouteAndDeadline(t *testing.T) {
 			path := filepath.Join(C.Path.HomeDir(), "rules.yaml")
 			provider := NewRuleSetProvider("bootstrap-classical", P.Classical, P.YamlRule, 0, resource.NewHTTPVehicle("http://unresolvable.invalid/rules", path, "", nil, 10*time.Millisecond, 1024), nil, nil, parse).(*RuleSetProvider)
 			defer provider.Close()
+			// Successful initialization checks routing and publication, not a
+			// two-second HTTP/cache/filesystem performance bound. Keep a test
+			// watchdog; exercise the shared deadline separately below.
+			timeout := time.Minute
+			if deadline, ok := t.Deadline(); ok {
+				timeout = time.Until(deadline)
+				cleanup := timeout / 10
+				if cleanup > time.Second {
+					cleanup = time.Second
+				}
+				timeout -= cleanup
+			}
+			if expired {
+				timeout = 40 * time.Millisecond
+			}
+			scope := resource.NewBootstrap(context.Background(), timeout, dialer, nil)
+			defer scope.Close()
 			err = provider.InitialContext(scope.Context())
 			if dialer.calls.Load() != 2 {
 				t.Fatalf("provider and nested Geo did not share scoped route: %d %v", dialer.calls.Load(), err)
 			}
 			if expired {
-				if err == nil || !strings.Contains(err.Error(), "[resource-bootstrap]") || strings.Contains(err.Error(), "must-not-appear") {
+				if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "[resource-bootstrap]") || strings.Contains(err.Error(), "must-not-appear") {
 					t.Fatalf("unsafe/missing Geo failure: %v", err)
 				}
 				for _, file := range []string{path, C.Path.GeoSite()} {
