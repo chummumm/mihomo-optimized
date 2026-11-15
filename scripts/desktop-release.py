@@ -99,7 +99,7 @@ def main():
     notes = Path(os.environ['RUNNER_TEMP']) / 'desktop-release-notes.md'
     with notes.open('w', encoding='utf-8') as output:
         subprocess.run([sys.executable, str(ROOT / 'scripts/desktop-release-notes.py')], stdout=output, check=True)
-    title = f'Mihomo Optimized Desktop v{version}'
+    title = f'Mihomo Optimized Desktop {version}（Windows）'
     if release is None:
         run('gh', 'release', 'create', tag, '--repo', REPOSITORY, '--target', source, '--draft', '--latest=false', '--title', title, '--notes-file', str(notes))
     assets = sorted(str(path) for path in (ROOT / 'artifacts/desktop').iterdir() if path.is_file())

@@ -41,6 +41,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Verify version-specific desktop release notes
+        run: |
+          python scripts/desktop-release-notes.py --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/test-desktop-release-notes.py
       - name: Verify Windows PowerShell UIA result contract
         run: python desktop/tests/windows_smoke.py --uia-json-contract
       - name: Verify upgrade controller read and shutdown response contracts
