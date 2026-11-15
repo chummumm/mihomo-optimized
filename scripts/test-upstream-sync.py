@@ -78,7 +78,8 @@ class StableSyncTests(unittest.TestCase):
         write(self.fork, "UPSTREAM_VERSION", "v1.0.0\n")
         write(self.fork, "UPSTREAM_COMMIT", self.initial + "\n")
         write(self.fork, "PROJECT_VERSION", "1.0.7\n")
-        for name in ["upstream-sync.sh", "ci-check.sh", "test-upstream-sync.py", "release-build.py", "test-release-build.py"]:
+        write(self.fork, "docs/changelog.md", "# Release notes\n\n## 1.0.7\n\n- Existing fork change.\n")
+        for name in ["upstream-sync.sh", "ci-check.sh", "test-upstream-sync.py", "release-build.py", "test-release-build.py", "release-notes.py", "test-release-notes.py"]:
             target = self.fork / "scripts" / name
             target.parent.mkdir(exist_ok=True)
             shutil.copyfile(SOURCE_ROOT / "scripts" / name, target)
@@ -102,6 +103,8 @@ class StableSyncTests(unittest.TestCase):
         write(self.upstream, ".github/workflows/build.yml", "changed upstream automation\n")
         write(self.upstream, ".github/workflows/unexpected.yml", "new upstream dispatch\n")
         write(self.upstream, "scripts/release-build.py", "unexpected build replacement\n")
+        write(self.upstream, "scripts/release-notes.py", "unexpected notes replacement\n")
+        write(self.upstream, "docs/changelog.md", "unexpected upstream notes\n")
         write(self.upstream, "packaging/unexpected", "unexpected package hook\n")
         write(self.upstream, "PROJECT_VERSION", "9000.0.0\n")
         self.latest = commit(self.upstream, "new upstream release")
@@ -123,15 +126,26 @@ class StableSyncTests(unittest.TestCase):
         self.assertFalse((self.fork / ".github/workflows/unexpected.yml").exists())
         self.assertFalse((self.fork / "packaging/unexpected").exists())
         self.assertEqual((self.fork / "scripts/release-build.py").read_bytes(), (SOURCE_ROOT / "scripts/release-build.py").read_bytes())
+        self.assertEqual((self.fork / "scripts/release-notes.py").read_bytes(), (SOURCE_ROOT / "scripts/release-notes.py").read_bytes())
         self.assertEqual((self.fork / "UPSTREAM_COMMIT").read_text().strip(), latest)
         self.assertEqual((self.fork / "PROJECT_VERSION").read_text(), "1.0.8\n")
         self.assertIn("PROJECT_VERSION", git(self.fork, "diff", "--cached", "--name-only").splitlines())
+        self.assertIn("docs/changelog.md", git(self.fork, "diff", "--cached", "--name-only").splitlines())
+        summary = (self.fork / "docs/changelog.md").read_text()
+        self.assertIn("## 1.0.8\n", summary)
+        self.assertIn("releases/tag/v1.0.1", summary)
+        self.assertIn("commit/" + latest, summary)
+        self.assertNotIn("unexpected upstream notes", summary)
+        rendered = run(self.fork, "python3", "scripts/release-notes.py").stdout
+        self.assertNotIn("Existing fork change.", rendered)
+        self.assertIn("releases/tag/v1.0.1", rendered)
         merged = commit(self.fork, "tested sync")
         parents = git(self.fork, "show", "-s", "--format=%P", "HEAD").split()
         self.assertEqual(parents, [self.base, latest])
         result = self.sync("v1.0.1")
         self.assertIn("changed=false", result.stdout)
         self.assertEqual((self.fork / "PROJECT_VERSION").read_text(), "1.0.8\n")
+        self.assertEqual((self.fork / "docs/changelog.md").read_text(), summary)
         self.assert_clean_base(merged)
 
     def test_existing_upstream_merge_only_updates_metadata(self):

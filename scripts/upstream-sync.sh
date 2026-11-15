@@ -66,6 +66,7 @@ git merge-base --is-ancestor "$current_commit" "$base_commit" || {
   printf 'Recorded upstream commit is not an ancestor of this fork.\n' >&2
   exit 1
 }
+python3 scripts/release-notes.py --check
 emit base_commit "$base_commit"
 if [[ "$tag" == "$current_tag" ]]; then
   emit changed false
@@ -127,6 +128,9 @@ preserved=(
   scripts/test-upstream-sync.py
   scripts/release-build.py
   scripts/test-release-build.py
+  scripts/release-notes.py
+  scripts/test-release-notes.py
+  docs/changelog.md
   packaging
   UPSTREAM_VERSION
   UPSTREAM_COMMIT
@@ -150,12 +154,14 @@ if [[ -n "$conflicts" ]]; then
 fi
 git diff --exit-code "$base_commit" -- .github/workflows \
   scripts/upstream-sync.sh scripts/ci-check.sh scripts/test-upstream-sync.py \
-  scripts/release-build.py scripts/test-release-build.py packaging PROJECT_VERSION
+  scripts/release-build.py scripts/test-release-build.py \
+  scripts/release-notes.py scripts/test-release-notes.py docs/changelog.md packaging PROJECT_VERSION
 
 printf '%s\n' "$tag" > UPSTREAM_VERSION
 printf '%s\n' "$upstream_commit" > UPSTREAM_COMMIT
 printf '%s\n' "$next_project" > PROJECT_VERSION
-git add UPSTREAM_VERSION UPSTREAM_COMMIT PROJECT_VERSION
+python3 scripts/release-notes.py --record-upstream "$tag" --upstream-commit "$upstream_commit"
+git add UPSTREAM_VERSION UPSTREAM_COMMIT PROJECT_VERSION docs/changelog.md
 emit changed true
 emit upstream_commit "$upstream_commit"
 printf 'Prepared %s. Test this candidate before committing or pushing.\n' "$tag"

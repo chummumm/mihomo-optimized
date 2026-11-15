@@ -9,6 +9,8 @@ export SKIP_CONCURRENT_TEST=1
 
 case "${1:-test}" in
   test)
+    python3 scripts/test-release-notes.py
+    python3 scripts/release-notes.py --check
     python3 scripts/test-upstream-sync.py
     python3 scripts/test-release-build.py
     CGO_ENABLED=0 go test -tags with_gvisor -count=1 -timeout=5m \

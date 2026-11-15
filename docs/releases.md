@@ -2,6 +2,8 @@
 
 项目使用独立版本 **`mihomo-optimized-vX.Y.Z`**，首版为 `mihomo-optimized-v1.0.0`。`main` 的源码、依赖或构建配置变更在全部测试和完整编译成功后生成固定提交的 GitHub Release。Latest 仅在该构建仍对应当前 `main` 时更新；PR 只做合并前检查，不生成正式发布包。纯文档变更不消耗版本号，也不触发自动发布。
 
+每个 Release 只展示该版本的简短更新与必要迁移提醒，正文统一来自[内核版本摘要](changelog.md)。本页保留详细历史、安装方法和通用迁移说明。发布脚本根据 `PROJECT_VERSION` 精确选择摘要，版本不匹配或缺失时停止；上游自动同步同时记录准确的上游版本。
+
 ## 1.0.38：旧版 UOT 写入计数
 
 修正 issue [#72](https://github.com/chummumm/mihomo-optimized/issues/72) 提供线索中已确认的 UOT 写入计数缺陷：固定依赖 `sing v0.5.9` 在底层连接没有向量写接口时，将封装头也计入返回长度，可能让共享 UDP DNS 把已经完整发送的查询误判为 `short write` 并关闭连接。
