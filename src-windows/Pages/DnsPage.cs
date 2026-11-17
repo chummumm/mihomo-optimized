@@ -86,7 +86,15 @@ public sealed class DnsPage : NativePage
         outcome.SelectedIndex = 0; outcome.Id("DnsOutcomeFilter");
 
         var overview = ContentPanel();
-        overview.Children.Add(Heading("最近 24 小时", overviewUpdated, "RefreshDns", RefreshAsync));
+        var sweep = new RotateTransform();
+        var flush = Action("清理缓存", "FlushDnsCache", () =>
+        {
+            ProxyVisuals.Tween(sweep, RotateTransform.AngleProperty, -12, 0, 220);
+            return Session.ApiAsync(HttpMethod.Post, "cache/dns/flush");
+        });
+        DnsVisuals.SmallButton(flush); flush.Style = FluentControls.Style("Ghost"); flush.Margin = new Thickness(8, 0, 0, 0);
+        flush.Content = DnsVisuals.Inline(new FluentIcon("broom", 14) { Margin = new Thickness(0, 0, 6, 0), RenderTransform = sweep, RenderTransformOrigin = new Point(.5, .5) }, Ui.Label("清理缓存", 12));
+        overview.Children.Add(Heading("最近 24 小时", overviewUpdated, "RefreshDns", RefreshAsync, flush));
         foreach (string label in new[] { "查询量", "QPS", "缓存命中率", "错误", "平均耗时" })
         {
             var title = DnsVisuals.Caption(label); title.FontWeight = FontWeights.Medium; title.LineHeight = 17.16;
@@ -161,11 +169,6 @@ public sealed class DnsPage : NativePage
         stateIcon.Margin = new Thickness(0, 0, 0, 12); stateIcon.SetResourceReference(Control.ForegroundProperty, "TextTertiaryBrush"); stateTitle.Margin = new Thickness(0, 0, 0, 8); stateHint.LineHeight = 23.8; stateHint.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
         stateRetry = Action("重试", "RetryDns", RefreshAsync); stateRetry.HorizontalAlignment = HorizontalAlignment.Left; stateRetry.Margin = new Thickness(0, 16, 0, 0);
         stateCard = DnsVisuals.Card(Ui.Column(stateLoading, stateIcon, stateTitle, stateHint, stateRetry), new Thickness(24), 8); stateCard.MaxWidth = 640; stateCard.HorizontalAlignment = HorizontalAlignment.Stretch;
-        var flushMenu = new ContextMenu(); var flush = L.Bind(new MenuItem().Id("FlushDnsCache"), HeaderedItemsControl.HeaderProperty, "清空 DNS 缓存");
-        flush.Click += async (_, _) => await RunAsync(async () =>
-        {
-            await Session.ApiAsync(HttpMethod.Post, "cache/dns/flush"); Message("DNS 回答缓存已清空。");
-        }); flushMenu.Items.Add(flush); capacity.ContextMenu = flushMenu;
         SetScrollableBody(Ui.Column(capacity, tabs, stateCard));
         Loaded += (_, _) => Responsive(); SizeChanged += (_, _) => Responsive();
         UpdatePaging(); ShowState("正在读取 DNS 数据…", "", true); RenderTrend();
@@ -183,9 +186,11 @@ public sealed class DnsPage : NativePage
         var hint = DnsVisuals.Caption("仅统计仍保留的查询明细，不包含已过期或被淘汰的记录。"); hint.Margin = new Thickness(0, 6, 0, 0); list.Margin = new Thickness(0, 12, 0, 0); return Ui.Column(Ui.Label(label, 14, true), hint, list);
     }
     private static StackPanel Field(string label, Control input) { var text = Ui.Label(label, 12); text.FontWeight = FontWeights.Medium; text.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush"); text.Margin = new Thickness(0, 0, 0, 6); return Ui.Column(text, input); }
-    private DnsFlowPanel Heading(string title, TextBlock updated, string id, Func<Task> operation)
+    private DnsFlowPanel Heading(string title, TextBlock updated, string id, Func<Task> operation, UIElement? action = null)
     {
-        var row = new DnsFlowPanel { Gap = 12, RowGap = 8, SpaceBetween = true, Margin = new Thickness(0, 0, 0, 12) }; row.Children.Add(Ui.Label(title, 14, true)); row.Children.Add(ResourceStatus(updated, id, operation)); return row;
+        var row = new DnsFlowPanel { Gap = 12, RowGap = 8, SpaceBetween = true, Margin = new Thickness(0, 0, 0, 12) };
+        var actions = ResourceStatus(updated, id, operation); if (action is not null) actions.Children.Add(action);
+        row.Children.Add(Ui.Label(title, 14, true)); row.Children.Add(actions); return row;
     }
     private StackPanel ResourceStatus(TextBlock updated, string id, Func<Task> operation)
     {

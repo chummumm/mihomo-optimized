@@ -23,6 +23,8 @@ const CN = {
         empty: '暂时没有 DNS 查询。',
         noMatches: '保留的明细中没有符合条件的查询。',
         refresh: '刷新',
+        clearCache: '清理缓存',
+        clearCacheError: '清理 DNS 缓存失败。',
         retry: '重试',
         updated: '更新于',
         errors: {
@@ -402,7 +404,7 @@ const CN = {
             title: '连接信息',
             id: 'ID',
             start: '开始时间',
-            host: '域名',
+            host: '地址',
             hostEmpty: '空',
             dstIP: 'IP',
             dstIPEmpty: '空',

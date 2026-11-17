@@ -23,6 +23,8 @@ const EN = {
         empty: 'No DNS queries yet.',
         noMatches: 'No matching queries in the retained history.',
         refresh: 'Refresh',
+        clearCache: 'Clear cache',
+        clearCacheError: 'Unable to clear DNS cache.',
         retry: 'Retry',
         updated: 'Updated',
         errors: {
@@ -402,7 +404,7 @@ const EN = {
             title: 'Connection',
             id: 'ID',
             start: 'Started',
-            host: 'Host',
+            host: 'Address',
             hostEmpty: 'Empty',
             dstIP: 'IP',
             dstIPEmpty: 'Empty',

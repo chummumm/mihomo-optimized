@@ -13,6 +13,7 @@ public static partial class L
         catalog.TryAdd("暂时没有 DNS 查询。", "No DNS queries yet.");
         catalog.TryAdd("保留的明细中没有符合条件的查询。", "No matching queries in the retained history.");
         catalog.TryAdd("刷新", "Refresh");
+        catalog.TryAdd("清理缓存", "Clear cache");
         catalog.TryAdd("重试", "Retry");
         catalog.TryAdd("更新于", "Updated");
         catalog.TryAdd("当前内核不支持 DNS 查询统计。", "This kernel does not support DNS observability.");

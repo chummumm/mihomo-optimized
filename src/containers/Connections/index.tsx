@@ -143,7 +143,7 @@ export default function Connections () {
         () => [
             columnHelper.accessor(Columns.Host, { minSize: 260, size: 260, header: t(`columns.${Columns.Host}`), cell: cell => <span className="connections-host" data-state={hostState(cell.row.original)}>{cell.getValue()}</span> }),
             columnHelper.accessor(Columns.Network, { minSize: 80, size: 80, header: t(`columns.${Columns.Network}`) }),
-            columnHelper.accessor(Columns.Type, { minSize: 100, size: 100, header: t(`columns.${Columns.Type}`), cell: cell => <span className={classnames('connections-type', { dns: cell.getValue() === 'DNS' })}>{cell.getValue()}</span> }),
+            columnHelper.accessor(Columns.Type, { minSize: 100, size: 100, header: t(`columns.${Columns.Type}`), cell: cell => <span className="connections-type">{cell.getValue()}</span> }),
             columnHelper.accessor(Columns.Chains, {
                 minSize: 200,
                 size: 200,

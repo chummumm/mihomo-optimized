@@ -364,6 +364,9 @@ async function main() {
     // effect to populate the opened drawer before checking its contents.
     await details.getByText(sniff.id, { exact: true }).waitFor()
     await details.getByText('sniff.example.test:443', { exact: true }).waitFor()
+    assert.equal(await details.getByText('Address', { exact: true }).count(), 1, 'the journey endpoint is labeled Address for domains and IPs')
+    assert.equal(await details.getByText('Host', { exact: true }).count(), 0, 'the old journey label is gone')
+    if (process.env.CONNECTION_DETAIL_SCREENSHOT) await page.screenshot({ path: process.env.CONNECTION_DETAIL_SCREENSHOT, animations: 'disabled' })
     await details.getByText('Open', { exact: true }).waitFor()
     assert.equal(await details.locator('time').getAttribute('datetime'), sniff.start, 'details expose the original start timestamp')
     assert.match(await details.locator('time').textContent(), /Jan 1, 2026/, 'start time follows English locale')
@@ -398,6 +401,11 @@ async function main() {
     ]) {
         const cells = page.locator('[data-connection-id="' + item.id + '"] .connections-block')
         assert.equal((await cells.nth(2).textContent()).trim(), type, 'connection type: ' + item.id)
+        const typeDecoration = await cells.nth(2).locator('.connections-type').evaluate(element => {
+            const style = getComputedStyle(element)
+            return { border: style.borderWidth, radius: style.borderRadius, padding: style.padding }
+        })
+        assert.deepEqual(typeDecoration, { border: '0px', radius: '0px', padding: '0px' }, type + ' uses the shared plain-text type style')
         assert.equal((await cells.nth(3).textContent()).trim(), chain, 'connection node: ' + item.id)
         assert.equal((await cells.nth(4).textContent()).trim(), rule, 'connection rule: ' + item.id)
         await cells.first().click()

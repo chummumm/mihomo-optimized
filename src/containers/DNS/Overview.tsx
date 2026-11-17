@@ -1,10 +1,10 @@
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
-import { Card } from '@components'
+import { Button, Card, error } from '@components'
 import type { Client } from '@lib/request'
 
-import { DNSStatus } from './Status'
 import { DNSTrend } from './DNSTrend'
+import { DNSStatus } from './Status'
 import { cacheHitRatio, completedMinuteQPS, formatDNSNumber } from './helpers'
 import { useDNSI18n, useDNSResource } from './hooks'
 import type { DNSTopEntry } from './types'
@@ -40,6 +40,42 @@ export function DNSOverview ({ client, instanceID, instanceChanged }: OverviewPr
     const fetcher = useCallback(async (signal: AbortSignal) => (await client.getDNSStats(signal)).data, [client])
     const resource = useDNSResource(fetcher, 5000)
     const data = resource.data?.instance_id === instanceID ? resource.data : undefined
+    const clearRequest = useRef<AbortController>()
+    const clearError = useRef<() => void>()
+    const [clearing, setClearing] = useState(false)
+
+    useEffect(() => {
+        setClearing(false)
+        return () => {
+            clearRequest.current?.abort()
+            clearRequest.current = undefined
+            const dismissError = clearError.current
+            clearError.current = undefined
+            // The message owns a separate React root; close it after this cleanup.
+            if (dismissError) queueMicrotask(dismissError)
+        }
+    }, [client, instanceID])
+
+    async function clearCache () {
+        // Lock synchronously, before a second click can precede the disabled render.
+        if (clearRequest.current) return
+        const request = new AbortController()
+        clearRequest.current = request
+        clearError.current?.()
+        setClearing(true)
+        try {
+            await client.flushDNSCache(request.signal)
+        } catch {
+            if (!request.signal.aborted && clearRequest.current === request) {
+                clearError.current = error(t('clearCacheError'))
+            }
+        } finally {
+            if (clearRequest.current === request) {
+                clearRequest.current = undefined
+                setClearing(false)
+            }
+        }
+    }
 
     useEffect(() => {
         if (resource.data && resource.data.instance_id !== instanceID) instanceChanged()
@@ -57,7 +93,11 @@ export function DNSOverview ({ client, instanceID, instanceChanged }: OverviewPr
     const share = (value: number) => counts.queries > 0 ? `${value / counts.queries * 100}%` : '0%'
 
     return <>
-        <div className="dns-section-heading"><h2>{t('last24h')}</h2><DNSStatus {...resource} /></div>
+        <div className="dns-section-heading dns-overview-heading">
+            <h2>{t('last24h')}</h2>
+            <DNSStatus {...resource} />
+            <Button size="sm" icon="broom" disabled={clearing} onClick={clearCache}>{t('clearCache')}</Button>
+        </div>
         <Card className="dns-metrics">
             {cards.map(card => <div key={card.label} className="dns-metric">
                 <span className="dns-metric-label">{card.label}</span>

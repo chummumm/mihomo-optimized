@@ -2253,6 +2253,18 @@ class Acceptance:
 
         driver.navigate("dns")
         found("DnsTabs")
+        flush = found("FlushDnsCache", enabled=True)
+        require(flush.get("name") == "清理缓存" and not flush.get("offscreen"),
+                "native_dns_cache_action_missing_from_overview")
+        for _ in range(2):
+            driver.ui("FlushDnsCache", "invoke")
+            require(found("FlushDnsCache", enabled=True).get("name") == "清理缓存",
+                    "native_dns_cache_action_label_changed")
+            notice = driver.ui("dnsNotice")
+            require(not notice.get("found") or notice.get("offscreen") or not notice.get("name"),
+                    "native_dns_cache_action_showed_status_notice")
+            require(not driver.snapshot().get("error"), "native_dns_cache_action_failed")
+        checked("dns_cache_clear_action_reusable_without_status_notice")
         capture("windows-dns.png")
         driver.ui("DnsQueriesTab", "select")
         found("DnsPageNumber", enabled=True)
