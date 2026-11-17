@@ -44,7 +44,7 @@ function makeRecords (prefix, count) {
 }
 
 function state (name, count) {
-    return { name, instance: `${name}-1`, records: makeRecords(name, count), secret: `test-${name}-secret`, supported: true, enabled: true, emptyStats: false, detailedUpstreams: true, pageMetadata: true, capabilityFailure: false, delay: '', pending: 0 }
+    return { name, instance: `${name}-1`, records: makeRecords(name, count), secret: `test-${name}-secret`, supported: true, enabled: true, emptyStats: false, detailedUpstreams: true, pageMetadata: true, capabilityFailure: false, delay: '', pending: 0, flushStatus: 204, holdFlush: false, pendingFlush: undefined }
 }
 
 const stateA = state('controller-a', 140)
@@ -57,16 +57,36 @@ function json (res, code, data) {
     res.end(JSON.stringify(data))
 }
 
+function finishFlush (res, status = 204) {
+    if (status !== 204) return json(res, status, { message: 'cache flush failed' })
+    res.writeHead(204, { 'Cache-Control': 'no-store' })
+    res.end()
+}
+
 function api (req, res, current) {
     const url = new URL(req.url, 'http://127.0.0.1')
     if (req.headers.origin === uiOrigin) res.setHeader('Access-Control-Allow-Origin', uiOrigin)
     if (req.method === 'OPTIONS') {
         const headers = String(req.headers['access-control-request-headers'] || '').toLowerCase().split(',').map(value => value.trim()).filter(Boolean)
-        preflights.push({ path: url.pathname, headers })
-        res.setHeader('Access-Control-Allow-Methods', 'GET')
+        preflights.push({ path: url.pathname, headers, method: req.headers['access-control-request-method'] })
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST')
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         res.writeHead(204)
         res.end()
+        return
+    }
+    if (url.pathname === '/cache/dns/flush') {
+        requests.push({ state: current.name, path: url.pathname, method: req.method, params: Object.fromEntries(url.searchParams), headers: req.headers })
+        if (req.method !== 'POST') return json(res, 405, {})
+        if (req.headers.authorization !== `Bearer ${current.secret}`) return json(res, 401, { message: 'unauthorized' })
+        if (!current.holdFlush) return finishFlush(res, current.flushStatus)
+        current.pendingFlush = res
+        pendingResponses.add(res)
+        res.on('close', () => {
+            pendingResponses.delete(res)
+            if (current.pendingFlush === res) current.pendingFlush = undefined
+            if (!res.writableEnded) aborted.push(url.pathname)
+        })
         return
     }
     if (!url.pathname.startsWith('/dns/observability')) {
@@ -156,7 +176,7 @@ function api (req, res, current) {
 const apiServer = http.createServer((req, res) => api(req, res, stateA))
 const uiServer = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1')
-    if (/^\/(dns\/|version$|configs$|connections$|rules$|providers\/|proxies$)/.test(url.pathname)) return api(req, res, stateB)
+    if (/^\/(dns\/|cache\/|version$|configs$|connections$|rules$|providers\/|proxies$)/.test(url.pathname)) return api(req, res, stateB)
     const file = path.resolve(dist, `.${url.pathname === '/' ? '/index.html' : url.pathname}`)
     if (!file.startsWith(`${dist}${path.sep}`) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
         res.writeHead(404)
@@ -186,6 +206,7 @@ async function until (check, label, timeout = 6000) {
     throw new Error(`Timed out: ${label}`)
 }
 const count = (suffix, name = stateA.name) => requests.filter(request => request.state === name && request.path === `/dns/observability${suffix}`).length
+const flushCount = (name = stateA.name) => requests.filter(request => request.state === name && request.path === '/cache/dns/flush').length
 const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
 
 async function run () {
@@ -227,6 +248,63 @@ async function run () {
             try { await fetch(`${origin}/dns/observability`, { headers: { Authorization: `Bearer ${secret}`, 'X-Forbidden-DNS': '1' } }); return false } catch { return true }
         }, { origin: apiOrigin, secret: stateA.secret })
         assert(denied, 'negative CORS control: forbidden headers must fail; web security must remain enabled')
+
+        const clearCache = page.getByRole('button', { name: 'Clear cache', exact: true })
+        const readingsBeforeFlush = await page.locator('.dns-metrics').textContent()
+        stateA.holdFlush = true
+        const gestureCount = await clearCache.evaluate(button => {
+            button.click()
+            button.click()
+            // The click gesture is a plain WAAPI Animation on the broom wrapper.
+            return button.querySelector('.icon-broom').getAnimations().filter(animation => animation.constructor === Animation).length
+        })
+        await until(() => stateA.pendingFlush != null, 'cache flush reaches the selected controller')
+        assert.equal(flushCount(), 1, 'repeated clicks send a single POST while clearing')
+        assert.equal(await clearCache.isDisabled(), true, 'duplicate requests are locked until the response')
+        assert.equal(await clearCache.textContent(), 'Clear cache', 'the button keeps its label while the request is pending')
+        assert.equal(await clearCache.locator('.button-spinner, .icon-check').count(), 0, 'cache clearing has no spinner or completion icon')
+        assert(gestureCount > 0, 'the broom gives one brief click gesture')
+        assert(preflights.some(request => request.path === '/cache/dns/flush' && request.method === 'POST'), 'cache mutation works through real cross-origin POST preflight')
+        finishFlush(stateA.pendingFlush)
+        await until(async () => await clearCache.isEnabled(), '204 re-enables the cache button')
+        assert.equal(await page.locator('.message-container').count(), 0, 'successful clearing does not create a message')
+        assert.equal(await page.locator('.dns-metrics').textContent(), readingsBeforeFlush, 'clearing answer caches does not reset statistics')
+
+        stateA.holdFlush = false
+        stateA.flushStatus = 500
+        await clearCache.click()
+        await until(async () => await page.getByRole('alert').filter({ hasText: 'Unable to clear DNS cache.' }).count() === 1, 'failed clearing uses the existing error feedback')
+        assert.equal(await clearCache.isEnabled(), true, 'a failed request can be retried')
+        assert.equal(await clearCache.textContent(), 'Clear cache', 'errors do not change the action label')
+
+        stateA.holdFlush = true
+        stateA.flushStatus = 204
+        const abortsBeforeFlushSwitch = aborted.filter(path => path === '/cache/dns/flush').length
+        await clearCache.click()
+        await until(() => stateA.pendingFlush != null, 'a new cache flush is pending before controller switch')
+        await navigate(uiPort, stateB.secret)
+        await until(async () => await clearCache.isEnabled().catch(() => false), 'new controller has an independent cache action')
+        await until(() => aborted.filter(path => path === '/cache/dns/flush').length > abortsBeforeFlushSwitch, 'controller switch aborts the old mutation response')
+        assert.equal(flushCount(stateB.name), 0, 'controller switch does not replay the cache mutation')
+        assert.equal(await page.locator('.message-container').count(), 0, 'old controller feedback is dismissed')
+        stateA.holdFlush = false
+
+        await page.emulateMedia({ reducedMotion: 'reduce' })
+        stateB.holdFlush = true
+        await clearCache.focus()
+        await page.keyboard.press('Enter')
+        await until(() => stateB.pendingFlush != null, 'the cache button supports keyboard activation')
+        // Existing CSS transitions may settle for 1 ms under reduced motion;
+        // count only the custom gesture, not CSSTransition/CSSAnimation objects.
+        assert.equal(await clearCache.locator('.icon-broom').evaluate(icon => icon.getAnimations().filter(animation => animation.constructor === Animation).length), 0, 'reduced motion does not start the broom WAAPI gesture')
+        finishFlush(stateB.pendingFlush)
+        await until(async () => await clearCache.isEnabled(), 'the new controller completes its own cache request')
+        stateB.holdFlush = false
+        await page.emulateMedia({ reducedMotion: 'no-preference' })
+        await navigate(apiPort, stateA.secret)
+        await until(async () => await metric('Cache hit ratio').textContent().catch(() => '') === '70%', 'return to the first controller after cache action checks')
+        console.log('PASS DNS cache action: authenticated POST/204, duplicate lock, fixed label, silent success, errors, controller isolation, keyboard and reduced motion')
+
         const trend = page.locator('.dns-trend-card')
         await until(async () => await trend.locator('.dns-line').count() === 3, 'trend draws three lines')
         assert.equal(await trend.locator('.dns-band-queries').count(), 0, 'the trend is a line chart, not a min/max band')
@@ -542,6 +620,38 @@ async function run () {
             }
         }
 
+        async function checkCacheActionLayout (width, height, language) {
+            await page.setViewportSize({ width, height })
+            const heading = page.locator('.dns-overview-heading')
+            await heading.scrollIntoViewIfNeeded()
+            const geometry = await heading.evaluate(element => {
+                const button = element.querySelector(':scope > button')
+                const rect = button.getBoundingClientRect()
+                const label = button.querySelector('.button-label')
+                const title = element.querySelector('h2').getBoundingClientRect()
+                return { left: rect.left, right: rect.right, top: rect.top, titleTop: title.top, viewport: innerWidth, labelWidth: label.clientWidth, labelScrollWidth: label.scrollWidth }
+            })
+            assert(geometry.left >= 0 && geometry.right <= geometry.viewport + 1, `${language} ${width}px cache button fits the viewport`)
+            assert(geometry.labelScrollWidth <= geometry.labelWidth + 1, `${language} ${width}px cache action keeps its complete label`)
+            assert(Math.abs(geometry.top - geometry.titleTop) < 16, `${language} ${width}px cache action stays beside the overview heading`)
+            if (process.env.DNS_SCREENSHOT_DIR) {
+                fs.mkdirSync(process.env.DNS_SCREENSHOT_DIR, { recursive: true })
+                await page.screenshot({ path: path.join(process.env.DNS_SCREENSHOT_DIR, `cache-${language}-${width}.png`), animations: 'disabled', timeout: 15000 })
+            }
+        }
+
+        async function captureCacheButtonStates (language) {
+            if (!process.env.DNS_SCREENSHOT_DIR) return
+            const button = page.locator('.dns-overview-heading > button')
+            await button.hover()
+            await page.screenshot({ path: path.join(process.env.DNS_SCREENSHOT_DIR, `cache-${language}-hover.png`), animations: 'disabled' })
+            await page.mouse.down()
+            await page.screenshot({ path: path.join(process.env.DNS_SCREENSHOT_DIR, `cache-${language}-pressed.png`), animations: 'disabled' })
+            await page.mouse.up()
+            await until(async () => await button.isEnabled(), 'pressed cache action returns to rest')
+            await page.mouse.move(0, 0)
+        }
+
         await jump.fill('7')
         await jump.press('Enter')
         await until(async () => /Page 7 \/ 25/.test(await paging()), 'jump within a larger retained history')
@@ -556,6 +666,25 @@ async function run () {
         await until(async () => /第\s*7\s*\/\s*25\s*页/.test(await paging()), 'Chinese jump')
         for (const [width, height] of [[390, 844], [320, 640], [820, 780]]) await checkPaginationLayout(width, height, 'zh')
         console.log('PASS DNS pagination layout: 320/390/820px, Chinese/English, 1,234 records and page 7/25')
+
+        await page.getByRole('tab', { name: '概览', exact: true }).click()
+        await page.getByRole('button', { name: '清理缓存', exact: true }).waitFor()
+        for (const [width, height] of [[1440, 1000], [820, 780], [390, 844], [320, 640]]) await checkCacheActionLayout(width, height, 'zh')
+        await page.emulateMedia({ colorScheme: 'dark' })
+        await checkCacheActionLayout(1440, 1000, 'zh-dark')
+        await captureCacheButtonStates('zh-dark')
+        await checkCacheActionLayout(390, 844, 'zh-dark')
+        await page.emulateMedia({ colorScheme: 'light' })
+        await navigate(uiPort, stateB.secret, '/settings')
+        await page.getByRole('button', { name: 'English', exact: true }).click()
+        await navigate(uiPort, stateB.secret)
+        await clearCache.waitFor()
+        for (const [width, height] of [[1440, 1000], [820, 780], [390, 844], [320, 640]]) await checkCacheActionLayout(width, height, 'en')
+        await page.emulateMedia({ colorScheme: 'dark' })
+        await checkCacheActionLayout(1440, 1000, 'en-dark')
+        await captureCacheButtonStates('en-dark')
+        await checkCacheActionLayout(390, 844, 'en-dark')
+        console.log('PASS DNS cache action layout: fixed labels beside the heading at 320/390/820/1440px in Chinese/English and light/dark themes')
 
         const persisted = await page.evaluate(async needle => {
             const leaks = []
@@ -585,11 +714,12 @@ async function run () {
         }, marker)
         assert.deepEqual(persisted, [], 'DNS records must not enter browser persistent stores')
         assert(responses.filter(response => response.status === 200).every(response => response.headers['cache-control'] === 'no-store'), 'all successful DNS API responses forbid HTTP caching')
-        assert(requests.filter(request => request.path.startsWith('/dns/observability')).every(request => request.method === 'GET'), 'UI only reads DNS APIs')
+        assert(requests.filter(request => request.path.startsWith('/dns/observability')).every(request => request.method === 'GET'), 'observability APIs remain read-only')
+        assert(requests.filter(request => request.path === '/cache/dns/flush').every(request => request.method === 'POST' && request.headers.authorization === `Bearer ${request.state === stateA.name ? stateA.secret : stateB.secret}`), 'cache clearing uses authenticated POSTs on the selected controller')
         assert(requests.filter(request => request.headers.origin === uiOrigin).every(request => !request.headers['cache-control'] && !request.headers.pragma), 'UI does not require forbidden CORS request headers')
         assert.deepEqual(errors, [], 'no uncaught browser exceptions')
         console.log('PASS DNS storage/privacy: no records in localStorage, sessionStorage, IndexedDB or CacheStorage; HTTP no-store')
-        console.log(`PASS DNS browser regression (${browser.version()}, ${requests.length} DNS GET requests, two local ports)`)
+        console.log(`PASS DNS browser regression (${browser.version()}, ${requests.filter(request => request.method === 'GET').length} DNS GET requests, ${requests.filter(request => request.method === 'POST').length} cache POST requests, two local ports)`)
     } finally {
         for (const res of pendingResponses) res.destroy()
         if (browser) await browser.close()

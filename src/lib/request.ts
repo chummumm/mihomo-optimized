@@ -3,10 +3,9 @@ import axios, { type AxiosInstance } from 'axios'
 import type { DNSObservability, DNSQueries, DNSQueryParams, DNSStats, DNSUpstreams } from '@containers/DNS/types'
 import type { UpdateSnapshot } from '@containers/Settings/update-state'
 
+import { DEFAULT_PROBE_URL, normalizeProbeURL } from './probe'
 import { invokeConfig, isDesktop } from '../platform/desktop'
 import type { DesktopConfigDocument } from '../platform/model'
-
-import { DEFAULT_PROBE_URL, normalizeProbeURL } from './probe'
 
 export interface Config {
     port: number
@@ -280,5 +279,8 @@ export class Client {
     async getDNSUpstreams (signal: AbortSignal) {
         return await this.getDNS<DNSUpstreams>('/upstreams', signal)
     }
-}
 
+    async flushDNSCache (signal: AbortSignal) {
+        return await this.axiosClient.post<void>('cache/dns/flush', undefined, { signal, timeout: 10000 })
+    }
+}

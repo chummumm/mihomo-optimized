@@ -530,13 +530,6 @@
     font-stretch: var(--mono-dense);
 }
 
-.connections-type.dns {
-    padding: 2px 7px;
-    border: 1px solid var(--hair-2);
-    border-radius: 6px;
-    color: var(--text-2);
-}
-
 /* Group hops shrink first so the final hop, the node, keeps its name. */
 .connections-route {
     display: flex;

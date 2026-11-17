@@ -61,6 +61,17 @@ const gestures: Record<string, Gesture> = {
         duration: 560,
         origin: '50% 88%',
     },
+    // a short sweep, independent of how long the cache request takes
+    broom: {
+        frames: [
+            { transform: 'translateX(0) rotate(0deg)' },
+            { transform: 'translateX(-2px) rotate(-10deg)', offset: 0.3 },
+            { transform: 'translateX(1px) rotate(5deg)', offset: 0.65 },
+            { transform: 'translateX(0) rotate(0deg)' },
+        ],
+        duration: 380,
+        origin: '75% 25%',
+    },
     plus: turn(180),
     close: turn(180),
     // closing every connection: the plugs shudder apart

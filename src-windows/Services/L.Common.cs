@@ -58,6 +58,7 @@ public static partial class L
         catalog["发现新版本 {0}，可在设置中更新。"] = "Version {0} is available. Open Settings to update.";
         catalog["取消"] = "Canceled";
         catalog["取消平均等待"] = "Canceled mean wait";
+        catalog["地址"] = "Address";
         catalog["域名"] = "Domain";
         catalog["复制"] = "Copy";
         catalog["实时刷新"] = "Live refresh";

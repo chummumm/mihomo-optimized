@@ -70,7 +70,20 @@ jobs:
           fi
           pnpm exec playwright install --with-deps chromium webkit
       - name: Verify connection scrolling, counts and memory-only DNS pages
+        env:
+          DNS_SCREENSHOT_DIR: /tmp/mihomo-dns-cache-frames
+          CONNECTION_DETAIL_SCREENSHOT: /tmp/mihomo-connection-address.png
         run: pnpm test:browser
+      - name: Collect DNS action and connection detail frames
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-dns-cache-frames
+          path: |
+            /tmp/mihomo-dns-cache-frames/
+            /tmp/mihomo-connection-address.png
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Collect throughput edge regression frames
         if: always()
         uses: actions/upload-artifact@v4

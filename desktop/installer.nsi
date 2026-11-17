@@ -214,6 +214,13 @@ Section "Install"
   ${EndIf}
   Call MihomoCloseApplication
   !insertmacro NSIS_HOOK_PREINSTALL
+  ; Published WPF versions shipped this version-qualified .NET diagnostic DLL.
+  ; Copying a newer runtime cannot replace its different filename. Remove only
+  ; the known retired component after the application and service have stopped.
+  Delete "$INSTDIR\mscordaccore_amd64_amd64_10.0.1426.52326.dll"
+  IfFileExists "$INSTDIR\mscordaccore_amd64_amd64_10.0.1426.52326.dll" 0 +3
+    SetErrorLevel 1
+    Abort "Unable to remove an obsolete runtime component. Close the application and retry."
   SetOutPath "$INSTDIR"
   SetOverwrite ifdiff
   ClearErrors

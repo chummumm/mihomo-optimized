@@ -387,7 +387,11 @@ class UpgradeAcceptance:
                     and item["actualSize"] == item["expectedSize"], "installed_binary_mismatch_" + name)
         actual_files = {path.relative_to(self.install_dir).as_posix()
                         for path in self.install_dir.rglob("*") if path.is_file()}
-        require(actual_files == set(self.expected_hashes) | {"resources/build-info.json", "uninstall.exe"},
+        expected_files = set(self.expected_hashes) | {"resources/build-info.json", "uninstall.exe"}
+        evidence["unexpectedFiles"] = sorted(actual_files - expected_files)
+        evidence["missingFiles"] = sorted(expected_files - actual_files)
+        self.write_report()
+        require(actual_files == expected_files,
                 "installed_unexpected_legacy_runtime_file")
         self.assert_registration(self.info["desktopVersion"])
         require(self.config.is_file() and digest(self.config) == (configuration_hash or self.marker_hash),

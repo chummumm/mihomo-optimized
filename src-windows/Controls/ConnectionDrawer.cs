@@ -91,7 +91,7 @@ internal sealed class ConnectionDrawer : Border
         {
             layoutStamp = stamp; journey.Children.Clear(); facts.Children.Clear(); facts.RowDefinitions.Clear(); facts.ColumnDefinitions.Clear(); values.Clear();
             var stages = new List<(string Label, string Value, string Kind)> { ("来源", value.Source, "origin"), ("入口", value.Inbound, "normal") };
-            if (!value.Dns) stages.Add(("规则", value.Rule, "normal")); stages.Add(("代理", value.Chain, "routed")); stages.Add(("域名", value.Host, "end"));
+            if (!value.Dns) stages.Add(("规则", value.Rule, "normal")); stages.Add(("代理", value.Chain, "routed")); stages.Add(("地址", value.Host, "end"));
             for (var index = 0; index < stages.Count; index++) { var stage = stages[index]; journey.Children.Add(new JourneyStop(stage.Label, stage.Value, stage.Kind, value.Hops.FirstOrDefault()?.Brush ?? "TextTertiaryBrush", index, index < stages.Count - 1)); }
             AddFact("destination", "IP", value.Destination); AddPair("上传", value.Upload, "下载", value.Download); AddFact("start", "开始时间", value.Started); AddFact("process", "进程", value.Process); AddFact("path", "路径", value.ProcessPath); AddFact("id", "ID", value.Id);
         }

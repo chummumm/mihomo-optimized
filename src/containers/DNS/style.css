@@ -1082,6 +1082,15 @@ select.dns-input {
         margin-left: 0;
     }
 
+    .dns-overview-heading > .dns-resource-status {
+        order: 1;
+        width: 100%;
+    }
+
+    .dns-overview-heading > .button {
+        margin-left: auto;
+    }
+
     .dns-details-fields {
         grid-template-columns: minmax(0, 1fr);
     }

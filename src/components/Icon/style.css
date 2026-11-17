@@ -101,6 +101,14 @@
         transform: rotate(-11deg);
     }
 
+    .icon-broom > svg {
+        transform-origin: 75% 25%;
+    }
+
+    :is(button:not(:disabled), a):hover .icon-broom > svg {
+        transform: rotate(-8deg);
+    }
+
     :is(button:not(:disabled), a):hover .icon-plus > svg,
     :is(button:not(:disabled), a):hover .icon-close > svg {
         transform: rotate(90deg);
