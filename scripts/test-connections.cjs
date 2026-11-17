@@ -366,7 +366,23 @@ async function main() {
     await details.getByText('sniff.example.test:443', { exact: true }).waitFor()
     assert.equal(await details.getByText('Address', { exact: true }).count(), 1, 'the journey endpoint is labeled Address for domains and IPs')
     assert.equal(await details.getByText('Host', { exact: true }).count(), 0, 'the old journey label is gone')
-    if (process.env.CONNECTION_DETAIL_SCREENSHOT) await page.screenshot({ path: process.env.CONNECTION_DETAIL_SCREENSHOT, animations: 'disabled' })
+    if (process.env.CONNECTION_DETAIL_SCREENSHOT) {
+        // Motion's drawer can still be sliding after its text becomes visible.
+        // Capture only at the open target, with its full bounds steady for three frames.
+        await page.waitForFunction(state => {
+            const drawer = document.querySelector('.connections-card .card.translate-x-0')
+            if (!drawer) return false
+            const rect = drawer.getBoundingClientRect()
+            const transform = new DOMMatrixReadOnly(getComputedStyle(drawer).transform)
+            const atTarget = Math.abs(transform.m41) < 0.1 && Math.abs(transform.m42) < 0.1
+                && rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth + 0.5 && rect.bottom <= innerHeight + 0.5
+            const bounds = [rect.x, rect.y, rect.width, rect.height]
+            state.stable = atTarget && state.bounds && bounds.every((value, index) => Math.abs(value - state.bounds[index]) < 0.1) ? state.stable + 1 : 0
+            state.bounds = bounds
+            return state.stable >= 2
+        }, { stable: 0, bounds: null }, { polling: 'raf' })
+        await page.screenshot({ path: process.env.CONNECTION_DETAIL_SCREENSHOT, animations: 'disabled' })
+    }
     await details.getByText('Open', { exact: true }).waitFor()
     assert.equal(await details.locator('time').getAttribute('datetime'), sniff.start, 'details expose the original start timestamp')
     assert.match(await details.locator('time').textContent(), /Jan 1, 2026/, 'start time follows English locale')

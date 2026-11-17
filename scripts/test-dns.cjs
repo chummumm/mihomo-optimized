@@ -255,7 +255,8 @@ async function run () {
         const gestureCount = await clearCache.evaluate(button => {
             button.click()
             button.click()
-            return button.querySelector('.icon-broom').getAnimations().length
+            // The click gesture is a plain WAAPI Animation on the broom wrapper.
+            return button.querySelector('.icon-broom').getAnimations().filter(animation => animation.constructor === Animation).length
         })
         await until(() => stateA.pendingFlush != null, 'cache flush reaches the selected controller')
         assert.equal(flushCount(), 1, 'repeated clicks send a single POST while clearing')
@@ -293,7 +294,9 @@ async function run () {
         await clearCache.focus()
         await page.keyboard.press('Enter')
         await until(() => stateB.pendingFlush != null, 'the cache button supports keyboard activation')
-        assert.equal(await clearCache.locator('.icon-broom').evaluate(icon => icon.getAnimations({ subtree: true }).length), 0, 'reduced motion disables the broom gesture')
+        // Existing CSS transitions may settle for 1 ms under reduced motion;
+        // count only the custom gesture, not CSSTransition/CSSAnimation objects.
+        assert.equal(await clearCache.locator('.icon-broom').evaluate(icon => icon.getAnimations().filter(animation => animation.constructor === Animation).length), 0, 'reduced motion does not start the broom WAAPI gesture')
         finishFlush(stateB.pendingFlush)
         await until(async () => await clearCache.isEnabled(), 'the new controller completes its own cache request')
         stateB.holdFlush = false
