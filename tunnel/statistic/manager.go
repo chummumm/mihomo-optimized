@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/memory"
 )
@@ -94,6 +95,14 @@ func (m *Manager) Memory() uint64 {
 func (m *Manager) Snapshot() *Snapshot {
 	connections := make([]*TrackerInfo, 0)
 	m.Range(func(c Tracker) bool {
+		// Hide traffic consumed by the actual built-in DNS terminal from
+		// HTTP/WebSocket connection lists. Keep it in the registry so bulk
+		// close and provider replacement still manage its full lifetime.
+		if _, local := N.FindUpstream[interface{ LocalDNS() bool }](c, func(conn interface{ LocalDNS() bool }) bool {
+			return conn.LocalDNS()
+		}); local {
+			return true
+		}
 		connections = append(connections, c.Info())
 		return true
 	})
@@ -149,4 +158,3 @@ type Snapshot struct {
 	SampledAt float64 `json:"sampledAt"`
 	Sequence  uint64  `json:"sequence"`
 }
-

@@ -18,7 +18,7 @@ const nativeTransportCapacity = 64
 
 // Every configured upstream keeps a legacy client and a bounded set of private
 // protocol clients. Only immutable connection-routing identity keys this pool;
-// query/source identities stay in the logical query cache and tracker.
+// query/source identities stay in the logical query cache and DNS observations.
 type nativeClientState struct {
 	bound  bool
 	mu     sync.Mutex
@@ -237,7 +237,7 @@ func cloneNativeClient(dc dnsClient, plan *tunnel.DNSRoutingPlan, lifetime conte
 }
 
 func exchangeNativeTransport(ctx context.Context, message *D.Msg, dc dnsClient) (*D.Msg, error, bool) {
-	state, dialer, network, endpoint := nativeClientDetails(dc)
+	state, dialer, _, _ := nativeClientDetails(dc)
 	if state != nil && state.isClosed() {
 		return nil, net.ErrClosed, true
 	}
@@ -249,8 +249,8 @@ func exchangeNativeTransport(ctx context.Context, message *D.Msg, dc dnsClient) 
 	if upstream == nil && (route == nil || icontext.DNSBootstrap(ctx)) {
 		return nil, nil, false
 	}
-	// Port 53 uses the same frozen transport pool as encrypted DNS. Logical
-	// query trackers remain separate from persistent DNS-TRANSPORT sockets.
+	// Port 53 uses the same frozen transport pool as encrypted DNS. Only real
+	// DNS-TRANSPORT sockets are published to the connections API.
 	if route != nil && route.err != nil {
 		return nil, route.err, true
 	}
@@ -304,24 +304,10 @@ func exchangeNativeTransport(ctx context.Context, message *D.Msg, dc dnsClient) 
 		return nil, err, true
 	}
 	defer pool.release(entry)
-	var tracker *tunnel.DNSNativeQueryTracker
-	if !icontext.DNSBootstrap(ctx) {
-		ctx, tracker, err = plan.TrackNativeQuery(ctx, endpoint, network, message.Len())
-		if err != nil {
-			return nil, err, true
-		}
-		defer tracker.Close()
-	}
+	// A query is not another network connection. Its source and QNAME remain
+	// in the routing/observation context; the pool and request contexts own its
+	// cancellation without adding a synthetic client entry to /connections.
 	answer, err := entry.client.ExchangeContext(ctx, message)
-	if errors.Is(context.Cause(ctx), tunnel.ErrDNSNativeQueryClosed) {
-		if route != nil {
-			route.closed.Store(true)
-		}
-		if upstream != nil {
-			upstream.closed.Store(true)
-		}
-		return nil, tunnel.ErrDNSNativeQueryClosed, true
-	}
 	if err == nil {
 		if answer == nil || !answer.Response || answer.Opcode != message.Opcode || answer.Id != message.Id {
 			err = errors.New("native DNS received an unrelated response")
@@ -335,9 +321,6 @@ func exchangeNativeTransport(ctx context.Context, message *D.Msg, dc dnsClient) 
 	}
 	if err != nil {
 		return nil, err, true
-	}
-	if tracker != nil {
-		tracker.DownloadTotal.Add(int64(answer.Len()))
 	}
 	return answer, nil, true
 }

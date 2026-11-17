@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
-	"strings"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,7 +12,6 @@ import (
 
 	"github.com/metacubex/mihomo/component/dnsstats"
 	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 	D "github.com/miekg/dns"
 )
@@ -125,7 +124,7 @@ func TestDNSRuleRoutingNativePoolResetAndClose(t *testing.T) {
 	}
 }
 
-func TestDNSRuleRoutingNativeDashboardCloseDoesNotRetry(t *testing.T) {
+func TestDNSRuleRoutingNativeQueriesStayInDNSObservations(t *testing.T) {
 	for _, protocol := range []string{"udp53", "h2"} {
 		t.Run(protocol, func(t *testing.T) {
 			routingTestEnable(t)
@@ -136,19 +135,11 @@ func TestDNSRuleRoutingNativeDashboardCloseDoesNotRetry(t *testing.T) {
 			var leaf C.ProxyAdapter
 			var servers []NameServer
 			var seen func()
-			var pending func() int
 			if protocol == "udp53" {
-				outbound := newRoutingTestOutbound("dashboard-raw")
+				outbound := newRoutingTestOutbound("query-visibility-raw")
 				outbound.gate = release
 				leaf, servers = outbound, []NameServer{{Addr: "192.0.2.53:53"}}
-				seen = func() {
-					select {
-					case <-outbound.questions:
-					case <-time.After(time.Second):
-						t.Fatal("DNS did not reach its upstream")
-					}
-				}
-				pending = func() int { return len(outbound.questions) }
+				seen = func() { routingTestNextQuestion(t, outbound) }
 			} else {
 				server := newEncryptedRoutingServer(t, protocol, true, func(ctx context.Context, _ string) bool {
 					select {
@@ -158,72 +149,47 @@ func TestDNSRuleRoutingNativeDashboardCloseDoesNotRetry(t *testing.T) {
 						return false
 					}
 				})
-				leaf, servers = newEncryptedRoutingOutbound("dashboard-h2"), []NameServer{server.ns}
+				leaf, servers = newEncryptedRoutingOutbound("query-visibility-h2"), []NameServer{server.ns}
 				seen = func() { server.next(t) }
-				pending = func() int { return len(server.seen) }
 			}
 			r := NewResolver(Config{RuleRouting: true, Main: servers}).Resolver
 			t.Cleanup(func() { unblock(); r.Close() })
-			query := routingTestQuery("dashboard-stop.example", 71)
+			service := NewService(r, &ResolverEnhancer{mode: C.DNSNormal})
+			query := routingTestQuery("query-visibility.example", 71)
 			observations := dnsstats.New()
-			ctx := r.cacheControl.Context(dnsstats.WithManager(routingTestContext(leaf, routingTestOrigin()), observations))
-			prepared, _, err := r.prepareDNSRouting(ctx, query)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// Use the prepared routing context: the in-flight identity includes
-			// its source port even when the completed-answer cache shares ports.
-			flightKey := r.cacheControl.FlightKey(prepared, r.cacheKey(prepared, query))
+			origin := routingTestOrigin()
+			origin.Type, origin.InName = C.INNER, "DNS"
+			origin.SrcIP = netip.MustParseAddr("192.168.3.1")
+			ctx := dnsstats.WithManager(routingTestContext(leaf, origin), observations)
 			result := make(chan error, 1)
-			go func() { _, err := r.ExchangeContext(ctx, query); result <- err }()
+			go func() { _, err := service.ServeMsg(ctx, query); result <- err }()
 			seen()
-			var tracker statistic.Tracker
+			// Observe while the query is still blocked, not after its entry
+			// would have disappeared even with the old logical tracker.
+			routingTestAssertOnlyTransport(t, leaf.Name())
+			unblock()
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("DNS query did not finish")
+			}
+			page := observations.Queries(dnsstats.Filter{})
+			if len(page.Items) != 1 || page.Items[0].Client != "192.168.3.1" || page.Items[0].QName != "query-visibility.example" || page.Items[0].Source != "DNS" {
+				t.Fatalf("hiding the logical connection lost its DNS query record: %+v", page)
+			}
+			if stats := observations.Upstreams(); len(stats.Items) != 1 || stats.Items[0].Attempts != 1 || stats.Items[0].Successes != 1 {
+				t.Fatalf("DNS upstream statistics changed: %+v", stats)
+			}
+			r.Close()
 			statistic.DefaultManager.Range(func(item statistic.Tracker) bool {
-				info := item.Info()
-				_, logical := item.(*tunnel.DNSNativeQueryTracker)
-				matches := logical && !info.DNS && info.Metadata.Host == strings.TrimSuffix(query.Question[0].Name, ".") && info.Chain.Last() == leaf.Name()
-				if matches {
-					tracker = item
-					return false
+				if item.Info().Chain.Last() == leaf.Name() {
+					t.Error("resolver shutdown retained its transport tracker")
 				}
 				return true
 			})
-			if tracker == nil {
-				t.Fatal("active DNS query was not visible in connections")
-			}
-			_ = tracker.Close()
-			select {
-			case err := <-result:
-				if err == nil {
-					t.Fatal("manually closed DNS exchange succeeded")
-				}
-			case <-time.After(time.Second):
-				t.Fatal("dashboard close did not interrupt the resolver")
-			}
-			// The old automatic retry is registered before the caller returns.
-			// Joining its key is a deterministic barrier, not a sleep window.
-			barrier := r.group.DoChan(flightKey, func() (*dnsExchangeResult, error) { return &dnsExchangeResult{Msg: new(D.Msg)}, nil })
-			select {
-			case <-barrier:
-			case <-time.After(time.Second):
-				t.Fatal("manual close resurrected a blocked DNS retry")
-			}
-			if pending() != 0 {
-				t.Fatal("manual close contacted the upstream again")
-			}
-			if statistic.DefaultManager.Get(tracker.ID()) != nil {
-				t.Fatal("manually closed query remained visible")
-			}
-			upstreams := observations.Upstreams().Items
-			if len(upstreams) != 1 || upstreams[0].Attempts != 1 || upstreams[0].Canceled != 1 || upstreams[0].Errors != 0 {
-				t.Fatalf("manual close was not attributed to cancellation: %+v", upstreams)
-			}
-			unblock()
-			// Terminal cancellation belongs only to the old logical request.
-			if _, err := r.ExchangeContext(ctx, query); err != nil {
-				t.Fatalf("new request inherited the old terminal state: %v", err)
-			}
-			seen()
 		})
 	}
 }

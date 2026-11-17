@@ -107,5 +107,5 @@ func (d *DNSDialer) matchUpstream(ctx context.Context, metadata *C.Metadata, qna
 		origin = &C.Metadata{Type: C.INNER, NetWork: metadata.NetWork}
 	}
 	return &DNSRoutingPlan{route: route, origin: origin.Clone(), upstream: metadata,
-		epoch: DNSRoutingEpoch(), inbound: icontext.DNSRoutingInbound(ctx)}, nil
+		epoch: DNSRoutingEpoch()}, nil
 }

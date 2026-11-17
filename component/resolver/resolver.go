@@ -282,11 +282,13 @@ func ResolveECH(ctx context.Context, host string) ([]byte, error) {
 	return ResolveECHWithResolver(ctx, host, DefaultResolver)
 }
 
+// ClearCache returns after invalidation so a successful flush API response
+// cannot be followed by a lookup in the old cache generation.
 func ClearCache() {
 	if DefaultResolver != nil {
-		go DefaultResolver.ClearCache()
+		DefaultResolver.ClearCache()
 	}
-	go SystemResolver.ClearCache() // SystemResolver unneeded check nil
+	SystemResolver.ClearCache() // SystemResolver unneeded check nil
 }
 
 func ResetConnection() {
