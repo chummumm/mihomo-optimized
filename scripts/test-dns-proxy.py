@@ -571,7 +571,6 @@ def check_builtin_dns(config, api_port, upstream_a, upstream_b, policy_port, pol
             transport_id = None
             retired_id = None
             expected_upload = expected_download = 0
-            query_ids = set()
             framing = 2 if network == "tcp" else 0
 
             for probe, label in enumerate(("first", "second-longer", "after-reload")):
@@ -587,16 +586,20 @@ def check_builtin_dns(config, api_port, upstream_a, upstream_b, policy_port, pol
                 before_upload, before_download = expected_upload, expected_download
                 expected_upload += len(query) + framing
 
-                def logical_queries(active):
-                    return [item for item in active if item["metadata"].get("host") == name]
+                def client_queries(active):
+                    return [item for item in active
+                            if item["metadata"].get("host") == name or
+                            item["metadata"].get("sniffHost") == name or
+                            (item["metadata"].get("sourceIP") == "127.0.0.1" and
+                             int(item["metadata"].get("sourcePort", 0)) == udp.getsockname()[1])]
 
                 with upstream_b.hold(name, network) as gate:
                     udp.sendto(query, ("127.0.0.1", dns_port))
                     active = wait_connections(
                         lambda items: len(upstream_connections(items, network)) == 1 and
-                        upstream_connections(items, network)[0]["upload"] >= expected_upload and
-                        len(logical_queries(items)) == 1,
-                        "built-in DNS missing its marked shared transport or independent query")
+                        upstream_connections(items, network)[0]["upload"] >= expected_upload,
+                        "built-in DNS missing its marked shared transport")
+                    assert not client_queries(active), "built-in DNS query leaked into ordinary connections"
                     entry = upstream_connections(active, network)[0]
                     if transport_id is None:
                         transport_id = entry["id"]
@@ -614,29 +617,15 @@ def check_builtin_dns(config, api_port, upstream_a, upstream_b, policy_port, pol
                     assert entry["upload"] == expected_upload and entry["download"] == before_download, entry
                     assert entry["upload"] - before_upload == len(query) + framing, entry
 
-                    logical = logical_queries(active)[0]
-                    metadata = logical["metadata"]
-                    assert logical.get("dns") is not True, "logical query was marked as a physical transport"
-                    assert logical["id"] != transport_id and logical["id"] not in query_ids, logical
-                    query_ids.add(logical["id"])
-                    assert metadata["type"] == "Inner" and metadata["inboundName"] == "DNS", metadata
-                    assert metadata["host"] == name and metadata["sniffHost"] == name, metadata
-                    assert metadata["network"] == "udp", "upstream protocol replaced the real client protocol"
-                    assert metadata["sourceIP"] == "127.0.0.1" and int(metadata["sourcePort"]) == udp.getsockname()[1], metadata
-                    assert metadata["inboundIP"] == "127.0.0.1" and int(metadata["inboundPort"]) == dns_port, metadata
-                    assert metadata["destinationIP"] == "203.0.113.53" and int(metadata["destinationPort"]) == 53, metadata
-                    assert logical["chains"][:3] == ["B", "Chosen", "DNSOuter"], logical
-                    assert logical["rule"] == "DomainSuffix" and logical["rulePayload"] == "shared-visible.example", logical
-                    assert logical["upload"] == len(query) and logical["download"] == 0, logical
-
                     gate.set()
                     response = udp.recvfrom(65535)[0]
                     check_answer(response, query, upstream_b.answer)
                     expected_download += len(make_answer(query, upstream_b.answer)) + framing
                     active = wait_connections(
-                        lambda items: all(item["id"] != logical["id"] for item in items) and
-                        any(item["id"] == transport_id and item["download"] >= expected_download for item in items),
-                        "query completion removed the shared transport or retained its logical query")
+                        lambda items: any(item["id"] == transport_id and item["download"] >= expected_download
+                                          for item in items),
+                        "query completion removed the shared transport or lost its traffic")
+                    assert not client_queries(active), "completed DNS query leaked into ordinary connections"
                     matches = upstream_connections(active, network)
                     assert len(matches) == 1 and matches[0]["id"] == transport_id, matches
                     after = matches[0]
@@ -661,7 +650,7 @@ def check_builtin_dns(config, api_port, upstream_a, upstream_b, policy_port, pol
     with upstream_a.record_lock:
         assert not any(name == "second.example" for _, name, _, _ in upstream_a.records[before:]), \
             "private nameserver-policy queried the public main pool"
-    print("PASS built-in DNS TCP/UDP: original QNAME/IN/SRC rules, private nameserver-policy override and explicit DNS exit without public-pool queries, shared physical connection IDs and exact cumulative/incremental traffic, independent query/source observations, neutral transport metadata, reload/API-close cleanup, selector-aware cache/ID and REJECT/DROP")
+    print("PASS built-in DNS TCP/UDP: original QNAME/IN/SRC rules, private nameserver-policy override and explicit DNS exit without public-pool queries, shared physical connection IDs and exact cumulative/incremental traffic, client queries absent from ordinary connections with independent DNS observations, neutral transport metadata, reload/API-close cleanup, selector-aware cache/ID and REJECT/DROP")
 
 
 @contextlib.contextmanager

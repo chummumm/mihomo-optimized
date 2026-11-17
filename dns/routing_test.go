@@ -283,20 +283,24 @@ func routingTestNextQuestion(t *testing.T, a *routingTestOutbound) string {
 	}
 }
 
-func routingTestLogicalMetadata(t *testing.T, name, leaf string) *C.Metadata {
+func routingTestAssertOnlyTransport(t *testing.T, leaf string) {
 	t.Helper()
-	var metadata *C.Metadata
+	physical := 0
 	statistic.DefaultManager.Range(func(item statistic.Tracker) bool {
-		if _, ok := item.(*tunnel.DNSNativeQueryTracker); ok && item.Info().Metadata.Host == name && item.Info().Chain.Last() == leaf {
-			metadata = item.Info().Metadata.Clone()
-			return false
+		info := item.Info()
+		if info.Chain.Last() != leaf {
+			return true
+		}
+		physical++
+		metadata := info.Metadata
+		if !info.DNS || metadata.Host != "" || metadata.SniffHost != "" || metadata.SrcIP.IsValid() || metadata.SrcPort != 0 || metadata.InName != "DNS-TRANSPORT" {
+			t.Errorf("logical DNS query leaked into connections: %+v", info)
 		}
 		return true
 	})
-	if metadata == nil {
-		t.Fatal("logical DNS query lost its independent tracker")
+	if physical != 1 {
+		t.Fatalf("got %d DNS transport trackers, want one", physical)
 	}
-	return metadata
 }
 
 func TestDNSRuleRoutingCacheScopeAndRealDestination(t *testing.T) {
@@ -312,9 +316,14 @@ func TestDNSRuleRoutingCacheScopeAndRealDestination(t *testing.T) {
 	a.gate = release
 	first := sharedDNSAsync(r, ctx, routingTestQuery("claude.ai", 1))
 	routingTestNextQuestion(t, a)
-	logical := routingTestLogicalMetadata(t, "claude.ai", a.Name())
-	if logical.SrcIP != md.SrcIP || logical.SrcPort != md.SrcPort || logical.InName != md.InName || logical.InUser != md.InUser || logical.Process != md.Process || logical.NetWork != C.UDP {
-		t.Fatalf("logical query lost its source identity: %+v", logical)
+	routingTestAssertOnlyTransport(t, a.Name())
+	prepared, _, err := r.prepareDNSRouting(ctx, routingTestQuery("claude.ai", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin := queryRoute(prepared).plan.OriginMetadata()
+	if origin.SrcIP != md.SrcIP || origin.SrcPort != md.SrcPort || origin.InName != md.InName || origin.InUser != md.InUser || origin.Process != md.Process || origin.NetWork != C.UDP {
+		t.Fatalf("DNS route lost its source identity: %+v", origin)
 	}
 	unblock()
 	if got := sharedDNSResult(t, first); got.err != nil {
@@ -515,8 +524,8 @@ func TestDNSRuleRoutingStaleRefreshPreservesCancelledSource(t *testing.T) {
 	routingTestExchange(t, r, ctx, query)
 	call := routingTestNextCall(t, a)
 	routingTestNextQuestion(t, a)
-	logical := routingTestLogicalMetadata(t, "refresh.example", a.Name())
-	if logical.SrcIP != md.SrcIP || logical.Process != md.Process || logical.SpecialRules != md.SpecialRules || call.fixed != a || call.bootstrap || call.metadata.InName != "DNS-TRANSPORT" {
+	routingTestAssertOnlyTransport(t, a.Name())
+	if call.fixed != a || call.bootstrap || call.metadata.InName != "DNS-TRANSPORT" {
 		t.Fatalf("background refresh lost its business scope: %+v", call)
 	}
 	unblock()

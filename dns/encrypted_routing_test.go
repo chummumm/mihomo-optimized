@@ -27,7 +27,6 @@ import (
 	"github.com/metacubex/mihomo/component/dnsstats"
 	C "github.com/metacubex/mihomo/constant"
 	icontext "github.com/metacubex/mihomo/context"
-	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 	"github.com/metacubex/quic-go"
 	"github.com/metacubex/quic-go/http3"
@@ -398,36 +397,29 @@ func TestDNSMarkerEncryptedTransportAndClientOrigin(t *testing.T) {
 				if seen := server.next(t); seen.name != query.Question[0].Name {
 					t.Fatalf("unexpected upstream question: %+v", seen)
 				}
-				// Receiving the real encrypted request is the barrier: its
-				// logical query and its upstream socket must both be registered.
+				// Receiving the real encrypted request is the barrier. Its
+				// actual upstream is visible; the client query is never a connection.
 				endpoint := netip.MustParseAddrPort(server.address)
-				var logical, physical int
+				physical := 0
 				statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
 					info := tracker.Info()
-					if info.Metadata.AddrPort() != endpoint || info.Chain.Last() != leaf.Name() {
+					if info.Chain.Last() != leaf.Name() {
 						return true
 					}
+					physical++
 					md := info.Metadata
-					if _, ok := tracker.(*tunnel.DNSNativeQueryTracker); ok {
-						logical++
-						if info.DNS || md.Type != C.INNER || md.InName != "DNS" || md.NetWork != network ||
-							md.SrcIP.String() != "192.0.2.10" || md.SrcPort != 41000 || md.InPort != 1053 || md.Host != "client-origin.example" {
-							t.Errorf("client query was marked as a resolver socket or lost its origin: %+v", info)
-						}
-					} else {
-						physical++
-						upstreamNetwork := C.TCP
-						if protocol == "h3" || protocol == "quic" {
-							upstreamNetwork = C.UDP
-						}
-						if !info.DNS || md.Type != C.INNER || md.InName != "DNS-TRANSPORT" || md.SrcIP.IsValid() || md.NetWork != upstreamNetwork {
-							t.Errorf("resolver socket has incorrect explicit origin: %+v", info)
-						}
+					upstreamNetwork := C.TCP
+					if protocol == "h3" || protocol == "quic" {
+						upstreamNetwork = C.UDP
+					}
+					if !info.DNS || md.Type != C.INNER || md.InName != "DNS-TRANSPORT" || md.SrcIP.IsValid() || md.SrcPort != 0 ||
+						md.Host != "" || md.SniffHost != "" || md.NetWork != upstreamNetwork || md.AddrPort() != endpoint {
+						t.Errorf("client query leaked into resolver connections: %+v", info)
 					}
 					return true
 				})
-				if logical != 1 || physical != 1 {
-					t.Fatalf("got %d client-query and %d transport trackers, want exactly one of each", logical, physical)
+				if physical != 1 {
+					t.Fatalf("got %d connection trackers, want only the real DNS transport", physical)
 				}
 				unblock()
 				select {

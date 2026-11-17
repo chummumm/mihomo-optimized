@@ -8,11 +8,8 @@ import (
 	"strings"
 	"sync"
 	stdatomic "sync/atomic"
-	"time"
 
-	"github.com/metacubex/mihomo/common/atomic"
 	N "github.com/metacubex/mihomo/common/net"
-	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
@@ -168,15 +165,6 @@ func (p *DNSRoutingPlan) listenNativeDNS(ctx context.Context, network, addr stri
 	return p.nativePacket(ctx, metadata)
 }
 
-// DNSNativeQueryTracker represents a logical query, not a shared HTTP/QUIC
-// connection. Its payload counters do not increment global wire-byte totals.
-type DNSNativeQueryTracker struct {
-	*statistic.TrackerInfo
-	endpoint string
-	cancel   context.CancelCauseFunc
-	once     sync.Once
-}
-
 var ErrDNSNativeQueryClosed = errors.New("DNS query closed through the connections API")
 
 type dnsQueryCloseHandlerKey struct{}
@@ -231,49 +219,4 @@ func (c dnsQueryNormalCloser) Close() error {
 		c.state.finished.Store(true)
 	}
 	return c.close()
-}
-
-func (t *DNSNativeQueryTracker) ID() string                   { return t.UUID.String() }
-func (t *DNSNativeQueryTracker) Info() *statistic.TrackerInfo { return t.TrackerInfo }
-func (t *DNSNativeQueryTracker) Chains() C.Chain              { return t.Chain }
-func (t *DNSNativeQueryTracker) ProviderChains() C.Chain      { return t.ProviderChain }
-func (t *DNSNativeQueryTracker) RemoteDestination() string    { return t.endpoint }
-func (t *DNSNativeQueryTracker) AppendToChains(adapter C.ProxyAdapter) {
-	t.Chain = append(t.Chain, adapter.Name())
-	t.ProviderChain = append(t.ProviderChain, adapter.ProxyInfo().ProviderName)
-}
-func (t *DNSNativeQueryTracker) Close() error {
-	t.once.Do(func() { statistic.DefaultManager.Leave(t); t.cancel(ErrDNSNativeQueryClosed) })
-	return nil
-}
-
-func (p *DNSRoutingPlan) TrackNativeQuery(ctx context.Context, endpoint string, network C.NetWork, upload int) (context.Context, *DNSNativeQueryTracker, error) {
-	metadata := p.origin.Clone()
-	if err := metadata.SetRemoteAddress(endpoint); err != nil {
-		return ctx, nil, err
-	}
-	metadata.Host, metadata.SniffHost = p.route.qname, p.route.qname
-	// The logical query belongs to its actual DNS client. The separate
-	// DNS-TRANSPORT tracker describes DoH/DoQ/TLS's upstream transport.
-	if !p.inbound {
-		metadata.NetWork = network
-	}
-	metadata.RemoteDst = endpoint
-	ctx, cancel := context.WithCancelCause(ctx)
-	tracker := &DNSNativeQueryTracker{
-		// A logical query retains its client's identity. Only the separate
-		// resolver-owned upstream socket receives the DNS transport marker.
-		TrackerInfo: &statistic.TrackerInfo{UUID: utils.NewUUIDV4(), Start: time.Now(), Metadata: metadata,
-			UploadTotal: atomic.NewInt64(int64(upload)), DownloadTotal: atomic.NewInt64(0)},
-		endpoint: endpoint, cancel: cancel,
-	}
-	tracker.AppendToChains(p.route.proxy)
-	for i := len(p.route.groups) - 1; i >= 0; i-- {
-		tracker.AppendToChains(p.route.groups[i])
-	}
-	if p.route.rule != nil {
-		tracker.Rule, tracker.RulePayload = p.route.rule.RuleType().String(), p.route.rule.Payload()
-	}
-	statistic.DefaultManager.Join(tracker)
-	return ctx, tracker, nil
 }

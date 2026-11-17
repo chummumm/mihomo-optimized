@@ -730,9 +730,19 @@ type Resolvers struct {
 }
 
 func (rs Resolvers) ClearCache() {
-	rs.Resolver.ClearCache()
-	rs.ProxyResolver.ClearCache()
-	rs.DirectResolver.ClearCache()
+	// Business default-nameserver and proxy bootstrap can own separate caches.
+	// Visit shared roots once so each cache advances its generation once.
+	seen := make(map[*Resolver]struct{}, 5)
+	for _, r := range []*Resolver{rs.Resolver, rs.ProxyResolver, rs.DirectResolver, rs.BootstrapResolver} {
+		for r != nil {
+			if _, ok := seen[r]; ok {
+				break
+			}
+			seen[r] = struct{}{}
+			r.ClearCache()
+			r = r.defaultResolver
+		}
+	}
 }
 
 func (rs Resolvers) ResetConnection() {

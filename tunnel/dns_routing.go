@@ -53,7 +53,6 @@ type DNSRoutingPlan struct {
 	// pins the same destination IP used by IP/GEOIP rules through the dial.
 	upstream *C.Metadata
 	epoch    uint64
-	inbound  bool
 }
 
 func PrepareDNSRouting(ctx context.Context, qname string, origin *C.Metadata) (*DNSRoutingPlan, error) {
@@ -88,7 +87,7 @@ func PrepareDNSRouting(ctx context.Context, qname string, origin *C.Metadata) (*
 	copyOrigin := origin.Clone()
 	copyOrigin.InboundDstIP = netip.Addr{}
 	copyOrigin.Process, copyOrigin.ProcessPath, copyOrigin.Uid = metadata.Process, metadata.ProcessPath, metadata.Uid
-	return &DNSRoutingPlan{route: route, origin: copyOrigin, epoch: DNSRoutingEpoch(), inbound: icontext.DNSRoutingInbound(ctx)}, nil
+	return &DNSRoutingPlan{route: route, origin: copyOrigin, epoch: DNSRoutingEpoch()}, nil
 }
 
 func (p *DNSRoutingPlan) Type() C.AdapterType { return p.route.proxy.Type() }
