@@ -30,6 +30,9 @@ def available_ports(count: int) -> list[int]:
                         if error.errno not in (errno.EADDRINUSE, errno.EACCES, 10048, 10013) and getattr(
                                 error, "winerror", None) not in (10048, 10013):
                             raise
+                        # Keep UDP reserved so port 0 cannot immediately select
+                        # the same TCP-conflicting candidate on the next attempt.
+                        reservations.enter_context(candidate.pop_all())
                         continue
                     reservations.enter_context(candidate.pop_all())
                     ports.append(port)
