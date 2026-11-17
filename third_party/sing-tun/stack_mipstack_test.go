@@ -231,6 +231,9 @@ func TestTCPHandshakeAndData(t *testing.T) {
 			d := newMemoryTun()
 			source, target := netip.MustParseAddr(pair[0]), netip.MustParseAddr(pair[1])
 			result := make(chan error, 1)
+			delivered := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseHandler := func() { releaseOnce.Do(func() { close(delivered) }) }
 			h := &testHandler{tcp: func(_ context.Context, c net.Conn, m M.Metadata) error {
 				defer c.Close()
 				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
@@ -247,9 +250,18 @@ func TestTCPHandshakeAndData(t *testing.T) {
 					_, err = c.Write([]byte("world"))
 				}
 				result <- err
+				if err == nil {
+					// Write queues bytes asynchronously. This fixture tests
+					// handshake/data delivery, so close only after the read side
+					// has observed the payload, independently of close scheduling.
+					<-delivered
+				}
 				return err
 			}}
 			testStack(t, d, h, nil)
+			// Registered after stack cleanup so failures release the handler
+			// before closing the stack that owns it.
+			t.Cleanup(releaseHandler)
 			d.in <- tcpPacket(source, target, 100, 0, 2, nil)
 			synAck := readPacket(t, d)
 			offset := 20
@@ -263,12 +275,23 @@ func TestTCPHandshakeAndData(t *testing.T) {
 			d.in <- tcpPacket(source, target, 101, ack, 16, nil)
 			d.in <- tcpPacket(source, target, 101, ack, 24, []byte("hello"))
 			for {
-				p := readPacket(t, d)
+				var p []byte
+				select {
+				case p = <-d.out:
+				case <-time.After(3 * time.Second):
+					select {
+					case err := <-result:
+						t.Fatalf("timed out waiting for TUN response; handler result: %v", err)
+					default:
+						t.Fatal("timed out waiting for TUN response; handler has not completed I/O")
+					}
+				}
 				tcpOffset := int(p[offset+12]>>4) * 4
 				if bytes.Contains(p[offset+tcpOffset:], []byte("world")) {
 					break
 				}
 			}
+			releaseHandler()
 			if err := <-result; err != nil {
 				t.Fatal(err)
 			}
