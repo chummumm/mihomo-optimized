@@ -1,0 +1,171 @@
+# REFERENCE ONLY — this file is not an enabled GitHub Actions workflow.
+# Do not rename/copy this into .github/workflows and delete its stop steps.
+# The current repository has no approved SignPath integration, PE metadata
+# preparation, NSIS uninstaller signing, or signed-output validation implemented.
+# This example documents real Action inputs and the order of two request phases.
+# A reviewed implementation must move the completed steps into the existing
+# windows-desktop.yml so its final attestation keeps the updater's trusted identity.
+# See signpath-integration.md for required work and manual approval requirements.
+
+name: SignPath Windows reference (not integrated)
+
+'on':
+  workflow_dispatch:
+    inputs:
+      expected_source_sha:
+        description: Exact reviewed clash-dashboard source commit (40 hexadecimal characters)
+        required: true
+        type: string
+      desktop_version:
+        description: Actual desktop version in that source; does not create PE metadata
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  reference:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/clash-dashboard'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    # Proposed environment name. Its protection/reviewers must be configured in
+    # GitHub settings; this line alone does not provide any human approval.
+    # SignPath's own production policy must separately require manual approval.
+    environment: signpath-release
+    steps:
+      - name: Check out the selected source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Reject missing real configuration and mismatched source
+        shell: pwsh
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          DESKTOP_VERSION: ${{ inputs.desktop_version }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_RELEASE_POLICY_SLUG: ${{ vars.SIGNPATH_RELEASE_POLICY_SLUG }}
+          SIGNPATH_RUNTIME_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_RUNTIME_ARTIFACT_CONFIGURATION_SLUG }}
+          SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG }}
+          SIGNPATH_EXPECTED_CERTIFICATE_SHA256: ${{ vars.SIGNPATH_EXPECTED_CERTIFICATE_SHA256 }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $required = @(
+            'SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG',
+            'SIGNPATH_RELEASE_POLICY_SLUG',
+            'SIGNPATH_RUNTIME_ARTIFACT_CONFIGURATION_SLUG',
+            'SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG',
+            'SIGNPATH_EXPECTED_CERTIFICATE_SHA256', 'SIGNPATH_API_TOKEN'
+          )
+          $missing = @($required | Where-Object {
+            [String]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+          })
+          if ($missing.Count) {
+            throw ('SignPath is not configured; missing key names: ' + ($missing -join ', '))
+          }
+          $organization = [Guid]::Empty
+          if (![Guid]::TryParse($env:SIGNPATH_ORGANIZATION_ID, [ref]$organization) -or $organization -eq [Guid]::Empty) {
+            throw 'Invalid actual SignPath organization ID'
+          }
+          foreach ($key in @(
+            'SIGNPATH_PROJECT_SLUG', 'SIGNPATH_RELEASE_POLICY_SLUG',
+            'SIGNPATH_RUNTIME_ARTIFACT_CONFIGURATION_SLUG',
+            'SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG'
+          )) {
+            if ([Environment]::GetEnvironmentVariable($key) -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') {
+              throw ('Invalid actual SignPath slug in ' + $key)
+            }
+          }
+          if ($env:SIGNPATH_EXPECTED_CERTIFICATE_SHA256 -notmatch '^[A-Fa-f0-9]{64}$') {
+            throw 'Expected certificate must be the approved DER certificate SHA-256'
+          }
+          if ($env:EXPECTED_SOURCE_SHA -notmatch '^[a-f0-9]{40}$' -or $env:EXPECTED_SOURCE_SHA -cne $env:GITHUB_SHA) {
+            throw 'Selected source does not match the explicitly reviewed commit'
+          }
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($env:DESKTOP_VERSION -notmatch '^\d+\.\d+\.\d+$' -or $env:DESKTOP_VERSION -cne $version) {
+            throw 'Requested desktop version does not match the selected source'
+          }
+          # Never print token values or other supplied configuration values.
+
+      - name: Stop because this is an unimplemented reference
+        shell: pwsh
+        run: |
+          throw 'REFERENCE_NOT_INTEGRATED: implement and review the real build, PE resources, artifact configuration, signed-output validation, NSIS uninstaller signing, and final provenance in windows-desktop.yml before enabling signing. No signing request or release is made by this example.'
+
+      # UNREACHABLE REFERENCE STEPS BELOW.
+      # Real implementation must build from the selected source on GitHub-hosted
+      # runners, preserve the fixed core pin, verify PE product metadata, and stage
+      # exactly the approved runtime programs at these paths BEFORE this upload.
+      # That staging/build work is intentionally not represented as already done.
+      - name: Reference — upload unsigned approved runtime programs
+        id: upload_runtime
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: signpath-runtime-unsigned
+          path: |
+            artifacts/signpath/runtime-unsigned/mihomo-optimized.exe
+            artifacts/signpath/runtime-unsigned/mihomo-core.exe
+            artifacts/signpath/runtime-unsigned/mihomo-desktop-service.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Reference — request runtime signing and wait for human approval
+        id: sign_runtime
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_RELEASE_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_RUNTIME_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload_runtime.outputs.artifact-id }}
+          github-token: ${{ github.token }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: artifacts/signpath/runtime-signed
+          parameters: |
+            version: ${{ toJSON(inputs.desktop_version) }}
+
+      - name: Stop before incomplete verification and installer preparation
+        shell: pwsh
+        run: |
+          throw 'REFERENCE_STAGE_INCOMPLETE: verify the returned file set, Authenticode, approved certificate and PE metadata; replace exact bundle inputs; implement and validate NSIS uninstaller signing; bundle with --no-binary-patching; assemble portable ZIP from the same signed files. These operations are not implemented here.'
+
+      # The real installer stage follows successful runtime verification AND a
+      # completed/reviewed NSIS uninstaller signing path. Signing the outer setup
+      # EXE alone does not sign any EXEs embedded inside it.
+      - name: Reference — upload the final unsigned installer
+        id: upload_installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: signpath-installer-unsigned
+          path: artifacts/signpath/installer-unsigned/mihomo-desktop-${{ inputs.desktop_version }}-windows-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Reference — request installer signing and wait for human approval
+        id: sign_installer
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_RELEASE_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload_installer.outputs.artifact-id }}
+          github-token: ${{ github.token }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: artifacts/signpath/installer-signed
+          parameters: |
+            version: ${{ toJSON(inputs.desktop_version) }}
+
+      - name: Stop before unimplemented final verification and publication
+        shell: pwsh
+        run: |
+          throw 'REFERENCE_RELEASE_NOT_IMPLEMENTED: verify final signatures and installed/portable contents; run Windows acceptance; attest the final signed bytes from the trusted windows-desktop.yml workflow; regenerate checksums; publish a new desktop version with --latest=false. This example deliberately has no release-writing permissions or publish step.'
