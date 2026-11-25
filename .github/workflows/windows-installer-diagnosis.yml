@@ -41,12 +41,17 @@ jobs:
           if ($helper.Count -ne 1) { throw 'Exact fresh helper was not found' }
           $installDirectory = Join-Path $env:ProgramFiles 'Mihomo Optimized'
           if (Test-Path -LiteralPath $installDirectory) { throw 'Runner is not clean: target already exists' }
+          $nativeRegistry = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized'
+          $legacyRegistry = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized'
+          if ((Test-Path -LiteralPath $nativeRegistry) -or (Test-Path -LiteralPath $legacyRegistry)) { throw 'Runner is not clean: product registration already exists' }
           if (Get-Service -Name MihomoOptimizedService -ErrorAction SilentlyContinue) { throw 'Runner is not clean: service already exists' }
           $env:DIAG_SETUP = $setup[0].FullName
           $env:DIAG_HELPER = $helper[0].FullName
           $env:DIAG_INSTALL = $installDirectory
           @'
-          import hashlib, json, os, pathlib, subprocess
+          import hashlib, json, os, pathlib, subprocess, sys
+          sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+          sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
           setup = pathlib.Path(os.environ['DIAG_SETUP'])
           helper = pathlib.Path(os.environ['DIAG_HELPER'])
           target = pathlib.Path(os.environ['DIAG_INSTALL'])
@@ -56,19 +61,20 @@ jobs:
           assert sha(setup) == 'da138a63c160e4267ccd272352a509dc23b0932a41a645adcd2c586cbc44a29b', 'wrong setup artifact'
           assert sha(helper) == '9fdeb4351473f1a2a6f3fb7f10f38d9e56f8839b6798ea6ce585a0ea25d807e8', 'wrong helper artifact'
           def probe(name, executable, arguments, cwd, timeout=90):
-              print('\nPROBE ' + name, flush=True)
-              print(json.dumps({'executable': str(executable), 'arguments': arguments, 'cwd': str(cwd)}, ensure_ascii=False), flush=True)
+              print('\nPROBE ' + os.environ.get('DIAG_PHASE', 'before_registry_protection') + '/' + name, flush=True)
+              print(json.dumps({'executable': str(executable), 'arguments': arguments, 'cwd': str(cwd)}, ensure_ascii=True), flush=True)
               try:
                   result = subprocess.run(arguments, executable=str(executable), cwd=str(cwd), stdin=subprocess.DEVNULL,
                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
                       creationflags=subprocess.CREATE_NO_WINDOW)
                   print('EXIT_CODE=' + str(result.returncode), flush=True)
-                  print('STDOUT:\n' + result.stdout.decode('utf-8', errors='replace'), flush=True)
-                  print('STDERR:\n' + result.stderr.decode('utf-8', errors='replace'), flush=True)
+                  print('STDOUT_JSON=' + json.dumps(result.stdout.decode('utf-8', errors='replace'), ensure_ascii=True), flush=True)
+                  print('STDERR_JSON=' + json.dumps(result.stderr.decode('utf-8', errors='replace'), ensure_ascii=True), flush=True)
               except Exception as error:
                   print(type(error).__name__ + ': ' + str(error), flush=True)
           raw = f'"{setup}" /S /D={target}'
-          probe('original_install', setup, raw, setup.parent, 180)
+          if os.environ.get('DIAG_PHASE') != 'after_registry_protection':
+              probe('original_install', setup, raw, setup.parent, 180)
           probe('validate_from_private_directory', helper, [str(helper), '--validate-directory', str(target)], helper.parent)
           # On this fresh runner finalize can validate/reach SCM but cannot
           # start a pre-existing service: assert absence immediately before it.
@@ -127,4 +133,21 @@ jobs:
             Get-ChildItem -LiteralPath $installDirectory -Force | Select-Object Name, Mode, Length, Attributes | Format-Table -AutoSize
             Write-Output "INSTALLED_FILE_COUNT=$(@(Get-ChildItem -LiteralPath $installDirectory -Recurse -File).Count)"
           }
+          # This fixture established absence of both product registry views before
+          # running the pinned candidate. Protect only the new key created by
+          # that exact installation; never migrate or adopt an existing key.
+          $createdRegistration = Get-ItemProperty -LiteralPath $nativeRegistry
+          if ($createdRegistration.InstallLocation -cne $installDirectory -or $createdRegistration.MainBinaryName -cne 'mihomo-optimized.exe' -or $createdRegistration.DisplayVersion -cne '0.2.14') {
+            throw 'Refusing registry protection: newly created registration identity differs'
+          }
+          if (Test-Path -LiteralPath $legacyRegistry) { throw 'Unexpected legacy product registration was created' }
+          Write-Output 'DIAGNOSIS_ONLY_PROTECT_FRESH_PRODUCT_REGISTRY'
+          $freshKeyAcl = [System.Security.AccessControl.RegistrySecurity]::new()
+          $freshKeyAcl.SetSecurityDescriptorSddlForm('O:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;BU)', ([System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Access))
+          Set-Acl -LiteralPath $nativeRegistry -AclObject $freshKeyAcl
+          $protectedKeyAcl = Get-Acl -LiteralPath $nativeRegistry
+          [pscustomobject]@{Path=$nativeRegistry; Owner=$protectedKeyAcl.Owner; Sddl=$protectedKeyAcl.Sddl} | ConvertTo-Json -Compress
+          $env:DIAG_PHASE = 'after_registry_protection'
+          & python (Join-Path $env:RUNNER_TEMP 'diagnose-installer.py')
+          Write-Output "AFTER_PROTECTION_PYTHON_EXIT=$LASTEXITCODE"
           exit 0
