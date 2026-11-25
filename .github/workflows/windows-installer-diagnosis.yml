@@ -1,40 +1,112 @@
-name: Windows controller file API probe
+name: Windows controller reader diagnosis
+
 on:
   push:
     branches: [diagnose/windows-installer]
+
 permissions:
   contents: read
+  actions: read
+
 jobs:
-  probe:
+  diagnose-controller-reader:
     runs-on: windows-2022
-    timeout-minutes: 5
+    timeout-minutes: 10
+    env:
+      PYTHONUTF8: '1'
+      PYTHONUNBUFFERED: '1'
     steps:
-      - name: Inspect replacement behavior with open target handles
+      - name: Check out the exact diagnostic branch commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the fixed Windows test dependency
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311
+
+      - name: Download the already built candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: mihomo-desktop-windows-x64
+          run-id: 45634476951
+          github-token: ${{ github.token }}
+          path: candidate-artifact
+
+      - name: Extract and verify the identical core executable
         shell: python
         run: |
-          import ctypes, json, pathlib, tempfile
-          from ctypes import wintypes as W
-          K = ctypes.WinDLL('kernel32', use_last_error=True)
-          K.CreateFileW.argtypes = [W.LPCWSTR,W.DWORD,W.DWORD,W.LPVOID,W.DWORD,W.DWORD,W.HANDLE]
-          K.CreateFileW.restype = W.HANDLE
-          K.MoveFileExW.argtypes = [W.LPCWSTR,W.LPCWSTR,W.DWORD]
-          K.MoveFileExW.restype = W.BOOL
-          K.CloseHandle.argtypes = [W.HANDLE]
-          K.CloseHandle.restype = W.BOOL
-          for label, access in [('none',0),('attributes',0x80),('read_control',0x20000),('generic_read',0x80000000)]:
-              with tempfile.TemporaryDirectory(prefix='mihomo-reader-api-') as d:
-                  target, source = pathlib.Path(d)/'record.json', pathlib.Path(d)/'replacement.json'
-                  target.write_bytes(b'old')
-                  source.write_bytes(b'new')
-                  handle = K.CreateFileW(str(target),access,7,None,3,0x00200000,None)
-                  if handle == ctypes.c_void_p(-1).value:
-                      raise ctypes.WinError(ctypes.get_last_error())
-                  try:
-                      ctypes.set_last_error(0)
-                      success = bool(K.MoveFileExW(str(source),str(target),1))
-                      error = ctypes.get_last_error() if not success else 0
-                      print(json.dumps({'access':label,'share':7,'replacedWhileOpen':success,'winError':error}),flush=True)
-                  finally:
-                      if not K.CloseHandle(handle):
-                          raise ctypes.WinError(ctypes.get_last_error())
-                  assert target.read_bytes() == (b'new' if success else b'old')
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import zipfile
+
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          archives = list((root / 'candidate-artifact').rglob('mihomo-desktop-0.2.14-windows-x64-portable.zip'))
+          if len(archives) != 1:
+              raise RuntimeError('The exact candidate portable archive was not found')
+          output = root / 'artifacts' / 'controller-reader-diagnosis'
+          reports = root / 'artifacts' / 'verification'
+          output.mkdir(parents=True, exist_ok=True)
+          reports.mkdir(parents=True, exist_ok=True)
+          expected = 'c7247bd59a316e9f5bc74aa8c063e04c88bdc40c4fd427e32a0c46e90a18b38b'
+          with zipfile.ZipFile(archives[0]) as archive:
+              entries = [entry for entry in archive.infolist()
+                         if not entry.is_dir() and entry.filename.replace('\\', '/').split('/')[-1] == 'mihomo-core.exe']
+              if len(entries) != 1:
+                  raise RuntimeError('A unique core executable was not found in the portable archive')
+              data = archive.read(entries[0])
+              actual = hashlib.sha256(data).hexdigest()
+              if actual != expected:
+                  raise RuntimeError(f'Unexpected core SHA256: {actual}')
+              # Read one verified member into a fixed destination; no archive
+              # directory names or installer binaries are executed/extracted.
+              core = output / 'mihomo-core.exe'
+              core.write_bytes(data)
+          test = root / 'desktop' / 'tests' / 'controller_smoke.py'
+          if not test.is_file():
+              raise RuntimeError('The diagnostic controller test is missing from this commit')
+          provenance = {
+              'diagnosticCommit': os.environ['GITHUB_SHA'],
+              'sourceRunId': 45634476951,
+              'sourceArtifact': 'mihomo-desktop-windows-x64',
+              'portableArchive': archives[0].name,
+              'portableArchiveSha256': hashlib.sha256(archives[0].read_bytes()).hexdigest(),
+              'coreSha256': actual,
+              'controllerTestSha256': hashlib.sha256(test.read_bytes()).hexdigest(),
+          }
+          (reports / 'controller-reader-provenance.json').write_text(
+              json.dumps(provenance, ensure_ascii=True, indent=2) + '\n', encoding='utf-8')
+          print(json.dumps(provenance, ensure_ascii=True, indent=2), flush=True)
+
+      - name: Run all controller scenarios with the stale-record publication barrier
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $core = Join-Path $env:GITHUB_WORKSPACE 'artifacts/controller-reader-diagnosis/mihomo-core.exe'
+          $report = Join-Path $env:GITHUB_WORKSPACE 'artifacts/verification/controller-discovery.json'
+          $log = Join-Path $env:GITHUB_WORKSPACE 'artifacts/verification/controller-discovery.log'
+          & python desktop/tests/controller_smoke.py --require-tun --core $core --report $report 2>&1 | Tee-Object -FilePath $log
+          $controllerExit = $LASTEXITCODE
+          Write-Output "CONTROLLER_TEST_EXIT=$controllerExit"
+          exit $controllerExit
+
+      - name: Retain controller diagnosis evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-controller-reader-diagnosis
+          path: |
+            artifacts/verification/controller-discovery.json
+            artifacts/verification/controller-discovery.log
+            artifacts/verification/controller-reader-provenance.json
+          if-no-files-found: warn
+          retention-days: 7
