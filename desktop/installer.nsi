@@ -233,12 +233,8 @@ FunctionEnd
   ${If} $0 == '"$INSTDIR\mihomo-optimized.exe" --tray'
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "MihomoOptimized"
   ${EndIf}
-  DeleteRegKey HKLM "${UNINSTALL_KEY}"
-  ; Legacy registration is removed only after trusted maintenance has verified
-  ; that both views describe this same installation.
-  SetRegView 32
-  DeleteRegKey HKLM "${UNINSTALL_KEY}"
-  SetRegView 64
+  ; The fresh maintenance helper already retired the authenticated original
+  ; registry objects by handle. Never reopen a writable legacy key by name.
 !macroend
 
 Section "Install"
@@ -271,6 +267,7 @@ Section "Install"
     Abort "Unable to copy the complete application."
   ${EndIf}
   WriteUninstaller "$INSTDIR\uninstall.exe"
+  !insertmacro NSIS_HOOK_REGISTERINSTALL
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "${PRODUCTNAME}"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "Publisher" "Mihomo Optimized contributors"
@@ -283,11 +280,6 @@ Section "Install"
   WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoRepair" 1
   ; Retain the legacy root Start Menu shortcut instead of leaving a duplicate.
   CreateShortcut "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\mihomo-optimized.exe"
-  ${If} $MihomoLegacy32Location != ""
-    SetRegView 32
-    DeleteRegKey HKLM "${UNINSTALL_KEY}"
-    SetRegView 64
-  ${EndIf}
   !insertmacro NSIS_HOOK_POSTINSTALL
   Call MihomoCleanupMaintenance
   ${If} $PassiveMode = 1

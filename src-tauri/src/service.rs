@@ -34,7 +34,12 @@ use windows_service::{
 
 pub const SERVICE_NAME: &str = "MihomoOptimizedService";
 
+mod anchors;
 mod maintenance;
+
+pub(crate) fn require_legacy_installation_anchor(directory: &Path) -> Result<()> {
+    anchors::require_anchor(directory)
+}
 
 #[derive(Clone, Default, Serialize)]
 pub struct ServiceStatusView {
@@ -74,13 +79,16 @@ pub fn entry() -> Result<()> {
             maintenance::check(Path::new(directory), Path::new(manifest))
         }
         [action, directory] if action == "--validate-directory" => {
-            installation::validate_existing_directory(Path::new(directory))
+            installation::validate_existing_directory_for_maintenance(Path::new(directory))
         }
         [action, directory, manifest] if action == "--installer-prepare" => {
             maintenance::replace_files(Path::new(directory), Path::new(manifest))
         }
         [action, directory] if action == "--installer-finalize" => {
             installer_finalize(Path::new(directory))
+        }
+        [action, directory] if action == "--installer-register" => {
+            installation::register_directory(Path::new(directory)).map(|_| ())
         }
         [action, directory] if action == "--uninstall-directory" => {
             uninstall_directory(Path::new(directory))

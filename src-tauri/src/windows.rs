@@ -73,6 +73,36 @@ pub fn current_sid() -> Result<String> {
     unsafe { process_sid(GetCurrentProcess()) }
 }
 
+/// A filtered administrator token must not begin a privileged registry
+/// migration and discover its missing authority after retiring the old key.
+pub(crate) fn require_elevated_administrator() -> Result<()> {
+    use windows_sys::Win32::Security::CheckTokenMembership;
+    unsafe {
+        let mut administrators = std::ptr::null_mut();
+        if ConvertStringSidToSidW(wide("S-1-5-32-544").as_ptr(), &mut administrators) == 0 {
+            return Err(last_error("无法检查管理员身份"));
+        }
+        let mut member = 0;
+        let success = CheckTokenMembership(std::ptr::null_mut(), administrators, &mut member);
+        let error = if success == 0 {
+            Some(last_error("无法检查提升权限"))
+        } else {
+            None
+        };
+        LocalFree(administrators);
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if member == 0 && current_sid()? != "S-1-5-18" {
+            return Err(AppError::new(
+                "service_elevation_required",
+                "请以管理员身份运行完整安装包进行安装或移除",
+            ));
+        }
+        Ok(())
+    }
+}
+
 unsafe fn process_sid(process: HANDLE) -> Result<String> {
     let mut raw_token = std::ptr::null_mut();
     if OpenProcessToken(process, TOKEN_QUERY, &mut raw_token) == 0 {
@@ -504,6 +534,7 @@ enum SecurityBoundary {
     Product,
     Ancestor,
     Registry,
+    Service,
 }
 
 impl SecurityBoundary {
@@ -514,7 +545,10 @@ impl SecurityBoundary {
                 DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES,
                 FILE_WRITE_DATA, FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
             },
-            System::Registry::{KEY_CREATE_LINK, KEY_CREATE_SUB_KEY, KEY_SET_VALUE},
+            System::{
+                Registry::{KEY_CREATE_LINK, KEY_CREATE_SUB_KEY, KEY_SET_VALUE},
+                Services::SERVICE_CHANGE_CONFIG,
+            },
         };
         let control = GENERIC_ALL | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
         match self {
@@ -528,6 +562,7 @@ impl SecurityBoundary {
             }
             Self::Ancestor => control | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD,
             Self::Registry => control | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK,
+            Self::Service => control | SERVICE_CHANGE_CONFIG,
         }
     }
 
@@ -544,6 +579,10 @@ impl SecurityBoundary {
             Self::Registry => AppError::new(
                 "service_untrusted_registration",
                 "Windows 安装记录权限不安全，请使用完整安装包修复",
+            ),
+            Self::Service => AppError::new(
+                "service_untrusted_identity",
+                "Windows 服务身份可被普通用户修改，无法作为旧安装的可信凭据",
             ),
         }
     }
@@ -644,16 +683,34 @@ fn require_admin_path_policy(path: &Path, boundary: SecurityBoundary) -> Result<
 }
 
 pub(crate) fn require_admin_registry_key(key: HANDLE) -> Result<()> {
-    use windows_sys::Win32::Security::{
-        Authorization::SE_REGISTRY_KEY, OWNER_SECURITY_INFORMATION,
-    };
+    require_admin_object(
+        key,
+        windows_sys::Win32::Security::Authorization::SE_REGISTRY_KEY,
+        SecurityBoundary::Registry,
+    )
+}
+
+pub(crate) fn require_admin_service(service: HANDLE) -> Result<()> {
+    require_admin_object(
+        service,
+        windows_sys::Win32::Security::Authorization::SE_SERVICE,
+        SecurityBoundary::Service,
+    )
+}
+
+fn require_admin_object(
+    object: HANDLE,
+    object_type: windows_sys::Win32::Security::Authorization::SE_OBJECT_TYPE,
+    boundary: SecurityBoundary,
+) -> Result<()> {
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
     unsafe {
         let mut owner = std::ptr::null_mut();
         let mut dacl = std::ptr::null_mut();
         let mut descriptor = std::ptr::null_mut();
         let error = GetSecurityInfo(
-            key,
-            SE_REGISTRY_KEY,
+            object,
+            object_type,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
             std::ptr::null_mut(),
@@ -663,11 +720,11 @@ pub(crate) fn require_admin_registry_key(key: HANDLE) -> Result<()> {
         );
         if error != 0 {
             return Err(AppError::io(
-                "无法验证安装记录权限",
+                "无法验证系统对象权限",
                 std::io::Error::from_raw_os_error(error as i32),
             ));
         }
-        let result = verify_admin_security(owner, dacl, SecurityBoundary::Registry);
+        let result = verify_admin_security(owner, dacl, boundary);
         LocalFree(descriptor);
         result
     }
@@ -1340,6 +1397,36 @@ mod tests {
         assert!(
             check_security_descriptor("O:BAD:NO_ACCESS_CONTROL", SecurityBoundary::Product)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_terminal_server_registry_write_is_not_an_administrator_grant() {
+        // This effective inherited grant is present on the Windows runner's
+        // Uninstall parent. Inherit-only grants do not affect the current key;
+        // the corresponding effective Terminal Server User grant does.
+        let legacy =
+            "O:BAD:AI(A;ID;KR;;;BU)(A;ID;KA;;;BA)(A;ID;KA;;;SY)(A;ID;CCDCLCSWRPSDRC;;;S-1-5-13)";
+        assert_eq!(
+            check_security_descriptor(legacy, SecurityBoundary::Registry)
+                .unwrap_err()
+                .code,
+            "service_untrusted_registration"
+        );
+        let protected = "O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KR;;;BU)";
+        check_security_descriptor(protected, SecurityBoundary::Registry).unwrap();
+    }
+
+    #[test]
+    fn service_identity_rejects_configuration_replacement_but_allows_query() {
+        let query = "O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00020001;;;BU)";
+        check_security_descriptor(query, SecurityBoundary::Service).unwrap();
+        let configuration = "O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00000002;;;BU)";
+        assert_eq!(
+            check_security_descriptor(configuration, SecurityBoundary::Service)
+                .unwrap_err()
+                .code,
+            "service_untrusted_identity"
         );
     }
 }

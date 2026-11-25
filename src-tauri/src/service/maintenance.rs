@@ -174,15 +174,18 @@ pub(super) fn replace_files(target: &Path, list: &Path) -> Result<()> {
     check(target, list)?;
     super::installer_prepare(target)?;
     let mut guard = installation::prepared_guard(target)?;
-    // Recheck after the installer owns the directory; a file created between
-    // preflight and ACL hardening must not be promoted into trusted runtime.
+    // Recheck while the installer pins the protected directory; a file added
+    // after preflight must not be promoted into trusted runtime.
     check_payload(guard.directory(), &entries)?;
     remove_files(&mut guard, &entries, false, false)
 }
 
 pub(super) fn remove_installation(target: &Path, list: &Path, parent_pid: u32) -> Result<()> {
     let entries = manifest(list)?;
-    let mut guard = installation::maintenance_guard(target)?;
+    // Keep the authenticated original registry objects until cleanup succeeds.
+    // NSIS must never reopen a writable legacy key by name to delete it.
+    let registration = installation::maintenance_registration(target)?;
+    let mut guard = installation::maintenance_guard(registration.directory())?;
     let directory = guard.directory().to_path_buf();
     let directory_existed = guard.directory_exists();
     // NSIS normally runs an extracted uninstaller. Its documented _?= test/
@@ -200,7 +203,7 @@ pub(super) fn remove_installation(target: &Path, list: &Path, parent_pid: u32) -
         // never gets a chance to swap this path between unlock and deletion.
         guard.remove_empty_directory(&directory)?;
     }
-    Ok(())
+    registration.remove()
 }
 
 fn pin_file_directories(

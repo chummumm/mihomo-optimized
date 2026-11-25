@@ -19,9 +19,10 @@ import sys
 import tempfile
 import time
 import uuid
+import zipfile
 
 from upgrade_smoke import (
-    EXECUTABLES, PRODUCT, UpgradeAcceptance, digest, executable_path,
+    EXECUTABLES, PRODUCT, UNINSTALL_KEY, UpgradeAcceptance, digest, executable_path,
     failure_code, registration, service_snapshot, uninstall_command,
 )
 from upgrade_tun_smoke import TunUpgradeAcceptance
@@ -45,7 +46,8 @@ REQUIRED_CASES = {
     "failed_upgrade_preserves_running_install", "unsafe_install_can_uninstall",
     "foreign_service_preserved", "custom_core_update", "custom_desktop_update_identity",
     "broken_install_remove_mode", "retained_directory_authority_rejected",
-    "unsafe_directory_removed_and_recreated", "empty_unsafe_directory_recreated", "final_cleanup",
+    "unsafe_directory_removed_and_recreated", "empty_unsafe_directory_recreated",
+    "legacy_registry_handle_retired", "weak_registry_foreign_target_rejected", "final_cleanup",
 }
 
 
@@ -177,6 +179,105 @@ class RetainedDirectoryAuthority:
         self.desktop.close()
 
 
+class RetainedRegistryAuthority:
+    """Grant only this fixture's old product key an ordinary user's retained write."""
+    def __init__(self) -> None:
+        import win32security
+        import winreg
+
+        self.desktop = RestrictedDesktop()
+        self.handle = None
+        self.information = win32security.DACL_SECURITY_INFORMATION
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0,
+                                winreg.KEY_READ | 0x40000 | winreg.KEY_WOW64_64KEY) as key:
+                self.original_location = winreg.QueryValueEx(key, "InstallLocation")[0]
+                descriptor = win32security.GetSecurityInfo(int(key), win32security.SE_REGISTRY_KEY, self.information)
+                self.original_sddl = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(
+                    descriptor, 1, self.information)
+                self.original_protected = bool(descriptor.GetSecurityDescriptorControl()[0] & 0x1000)
+                dacl = descriptor.GetSecurityDescriptorDacl()
+                dacl.AddAccessAllowedAceEx(dacl.GetAclRevision(), 0, winreg.KEY_SET_VALUE,
+                    win32security.CreateWellKnownSid(win32security.WinBuiltinUsersSid, None))
+                win32security.SetSecurityInfo(int(key), win32security.SE_REGISTRY_KEY, self.information,
+                                             None, None, dacl, None)
+            win32security.ImpersonateLoggedOnUser(self.desktop.token)
+            try:
+                self.handle = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0,
+                                            winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
+            finally:
+                win32security.RevertToSelf()
+            require(self.write_location(self.original_location) == 0, "fixture_legacy_registry_write_unavailable")
+        except BaseException:
+            self.close()
+            raise
+
+    def write_location(self, value: str) -> int:
+        import win32security
+        import winreg
+
+        win32security.ImpersonateLoggedOnUser(self.desktop.token)
+        try:
+            winreg.SetValueEx(self.handle, "InstallLocation", 0, winreg.REG_SZ, value)
+            return 0
+        except OSError as error:
+            return error.winerror
+        finally:
+            win32security.RevertToSelf()
+
+    def assert_retired(self, target: Path) -> dict:
+        import win32security
+        import winreg
+
+        before = registration()
+        error = self.write_location(str(target.parent / "stale registry handle target"))
+        require(before is not None and registration() == before, "old_registry_handle_changed_new_installation")
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0,
+                            winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+            descriptor = win32security.GetSecurityInfo(int(key), win32security.SE_REGISTRY_KEY, self.information)
+            require(descriptor.GetSecurityDescriptorControl()[0] & 0x1000, "new_registry_dacl_still_inherits")
+            dacl = descriptor.GetSecurityDescriptorDacl()
+            forbidden = 0x40000000 | 0x10000000 | 0x10000 | 0x40000 | 0x80000 | 0x2 | 0x4 | 0x20
+            for index in range(dacl.GetAceCount()):
+                ace = dacl.GetAce(index)
+                if ace[0][1] & 0x8 or ace[0][0] in (1, 6, 10, 12):
+                    continue
+                require(win32security.ConvertSidToStringSid(ace[-1]) != "S-1-5-13" or not ace[1] & forbidden,
+                        "new_registry_allows_terminal_server_user_write")
+            sddl = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(descriptor, 1, self.information)
+        win32security.ImpersonateLoggedOnUser(self.desktop.token)
+        try:
+            try:
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0,
+                                    winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
+            except OSError as denied:
+                require(denied.winerror == 5, "new_registry_access_check_failed")
+            else:
+                key.Close()
+                require(False, "new_registry_allows_ordinary_write")
+        finally:
+            win32security.RevertToSelf()
+        return {"retiredHandleWriteWinError": error, "newKeyOrdinaryWriteDenied": True, "newKeyDacl": sddl}
+
+    def restore(self) -> None:
+        import win32security
+        import winreg
+
+        require(self.write_location(self.original_location) == 0, "fixture_legacy_registry_restore_failed")
+        descriptor = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(self.original_sddl, 1)
+        protection = (win32security.PROTECTED_DACL_SECURITY_INFORMATION if self.original_protected
+                      else win32security.UNPROTECTED_DACL_SECURITY_INFORMATION)
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0, 0x40000 | winreg.KEY_WOW64_64KEY) as key:
+            win32security.SetSecurityInfo(int(key), win32security.SE_REGISTRY_KEY, self.information | protection,
+                                         None, None, descriptor.GetSecurityDescriptorDacl(), None)
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self.handle.Close()
+            self.handle = None
+        self.desktop.close()
+
+
 class DisposableVolume:
     def __init__(self, owner: "CustomInstallAcceptance") -> None:
         self.owner = owner
@@ -244,6 +345,7 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         self.tun = None
         self.redirect: Path | None = None
         self.foreign_helper: Path | None = None
+        self.diagnostic_directory: Path | None = None
 
     def write_report(self) -> None:
         temporary = self.artifacts / "custom-install.json.tmp"
@@ -253,6 +355,112 @@ class CustomInstallAcceptance(UpgradeAcceptance):
     def select(self, directory: Path) -> None:
         self.install_dir = directory
         self.app, self.core, self.helper, self.verifier, self.host = [directory / name for name in EXECUTABLES]
+
+    def command(self, name: str, executable: Path, arguments: list[str] | str,
+                timeout: float = 90) -> dict:
+        installer = executable.name.endswith("-setup.exe") or executable.name == "uninstall.exe"
+        target = self.install_dir
+        if isinstance(arguments, str) and " /D=" in arguments:
+            target = Path(arguments.rsplit(" /D=", 1)[1])
+        try:
+            result = super().command(name, executable, arguments, timeout)
+        except Exception:
+            if installer:
+                self.capture_installer_failure(name, target)
+            raise
+        if installer and result["exitCode"] != 0:
+            self.capture_installer_failure(name, target)
+        return result
+
+    def diagnostic_helper(self) -> Path:
+        """Execute only the verified candidate bytes from a separate owned ACL boundary."""
+        import win32security
+
+        if self.diagnostic_directory is None:
+            directory = Path(os.environ["ProgramFiles"]) / ("MihomoDiagnostics-" + uuid.uuid4().hex)
+            directory.mkdir()  # Never reuse a pre-existing maintenance directory.
+            self.diagnostic_directory = directory
+            set_directory_security(directory)
+            helper = directory / "mihomo-maintenance.exe"
+            archive = self.candidate.with_name(self.candidate.name.removesuffix("-setup.exe") + "-portable.zip")
+            with zipfile.ZipFile(archive) as bundle:
+                with bundle.open(PRODUCT + "/mihomo-desktop-service.exe") as source, helper.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+            require(digest(helper) == self.expected_hashes["mihomo-desktop-service.exe"],
+                    "diagnostic_candidate_helper_hash_mismatch")
+            manifest = directory / "installer-files.json"
+            payload = Path("desktop/generated/installer-files.json").read_bytes()
+            require(len(payload) < 1024 * 1024, "diagnostic_manifest_too_large")
+            with manifest.open("xb") as output:
+                output.write(payload)
+            descriptor = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+                "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)", 1)
+            for path in (helper, manifest):
+                win32security.SetFileSecurity(str(path), win32security.OWNER_SECURITY_INFORMATION
+                    | win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+                    descriptor)
+        helper = self.diagnostic_directory / "mihomo-maintenance.exe"
+        require(digest(helper) == self.expected_hashes["mihomo-desktop-service.exe"],
+                "diagnostic_candidate_helper_hash_mismatch")
+        return helper
+
+    def capture_installer_failure(self, name: str, target: Path) -> None:
+        """Read-only evidence supplements a failure; it never changes its assertion."""
+        import win32security
+        import winreg
+
+        event = {"command": name, "target": str(target), "paths": [], "registry": [], "probes": []}
+        self.report.setdefault("installerFailureEvidence", []).append(event)
+        information = win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION
+        try:
+            critical = {*EXECUTABLES, "uninstall.exe", "wintun.dll", "resources/build-info.json"}
+            critical.update(path for path in self.expected_hashes
+                            if path.endswith((".deps.json", ".runtimeconfig.json")))
+            directories = {parent for path in self.expected_hashes for parent in Path(path).parents}
+            paths = {target, *target.parents, *(target / path for path in critical | directories)}
+            for path in sorted(paths, key=str):
+                row = {"path": str(path)}
+                event["paths"].append(row)
+                try:
+                    metadata = path.lstat()
+                    row.update({"attributes": metadata.st_file_attributes, "links": metadata.st_nlink,
+                                "isDirectory": stat.S_ISDIR(metadata.st_mode)})
+                    descriptor = win32security.GetNamedSecurityInfo(str(path), win32security.SE_FILE_OBJECT, information)
+                    row["sddl"] = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(
+                        descriptor, 1, information)
+                except Exception as error:
+                    row["error"] = failure_code(error)
+            for view, flag in ((64, winreg.KEY_WOW64_64KEY), (32, winreg.KEY_WOW64_32KEY)):
+                row = {"view": view}
+                event["registry"].append(row)
+                try:
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0, winreg.KEY_READ | flag) as key:
+                        descriptor = win32security.GetSecurityInfo(int(key), win32security.SE_REGISTRY_KEY, information)
+                        row["sddl"] = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(
+                            descriptor, 1, information)
+                        row["values"] = {}
+                        for value in ("DisplayVersion", "InstallLocation", "MainBinaryName", "UninstallString"):
+                            try:
+                                row["values"][value] = winreg.QueryValueEx(key, value)[0]
+                            except OSError as error:
+                                row["values"][value] = {"error": failure_code(error)}
+                except Exception as error:
+                    row["error"] = failure_code(error)
+            helper = self.diagnostic_helper()
+            for probe, arguments in (
+                ("installer_preflight", ["--installer-check", str(target), str(helper.parent / "installer-files.json")]),
+                ("validate_directory", ["--validate-directory", str(target)]),
+            ):
+                result = super().command(name + "_diagnostic_" + probe, helper, arguments, 45)
+                event["probes"].append({"probe": probe, "exitCode": result["exitCode"],
+                                        "stdout": result["stdout"], "stderr": result["stderr"]})
+        except Exception as error:
+            event["captureError"] = failure_code(error)
+        self.write_report()
+        # NSIS is a GUI executable and may emit nothing on its own stdout. Keep
+        # these explicitly labelled probes visible even on the first failed run.
+        print("INSTALLER_FAILURE_EVIDENCE " + json.dumps({key: value for key, value in event.items()
+              if key not in ("paths", "registry")}, ensure_ascii=True), flush=True)
 
     def install_at(self, directory: Path, label: str, *, installer: Path | None = None) -> None:
         require(registration() is None and registration(32) is None, "previous_fixture_installation_remains")
@@ -350,10 +558,17 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         require(result["exitCode"] != 0 and registration() is not None and self.app.is_file(),
                 "published_custom_uninstall_failure_not_reproduced")
         self.mark("broken_0_2_13_reproduced")
-        self.stage = "repair_broken_custom_install"
-        require(self.command(self.stage, self.candidate, ["/S"], 180)["exitCode"] == 0,
-                "broken_custom_repair_failed")
-        self.assert_candidate_files()
+        authority = RetainedRegistryAuthority()
+        try:
+            self.stage = "repair_broken_custom_install"
+            require(self.command(self.stage, self.candidate, ["/S"], 180)["exitCode"] == 0,
+                    "broken_custom_repair_failed")
+            self.assert_registration(self.info["desktopVersion"])
+            self.assert_candidate_files()
+            self.report["legacyRegistryReplacement"] = authority.assert_retired(target)
+            self.mark("legacy_registry_handle_retired")
+        finally:
+            authority.close()
         self.tun_lifecycle("broken_0_2_13_repaired")
 
     def missing_runtime(self, target: Path) -> None:
@@ -391,6 +606,35 @@ class CustomInstallAcceptance(UpgradeAcceptance):
     def remove_broken_install(self, target: Path) -> None:
         legacy = self.download_baseline(BROKEN_VERSION, BROKEN_URL, BROKEN_SHA256, 128 * 1024 * 1024)
         self.install_at(target, "broken_remove_install", installer=legacy)
+        foreign = target.parent / "非本产品 注册目标"
+        foreign.mkdir()
+        set_directory_security(foreign)
+        for name in (*EXECUTABLES, "uninstall.exe"):
+            (foreign / name).write_bytes(b"fixture sentinel; never execute\n")
+        protected_files = {path: digest(path) for directory in (target, foreign)
+                           for path in directory.rglob("*") if path.is_file()}
+        authority = RetainedRegistryAuthority()
+        try:
+            require(authority.write_location(str(foreign)) == 0, "fixture_weak_registration_not_writable")
+            before = registration()
+            self.stage = "weak_registry_foreign_target_rejected"
+            self.select(foreign)
+            try:
+                result = self.command(self.stage, self.candidate, ["/S", "/REMOVE"], 180)
+            finally:
+                self.select(target)
+            require(result["exitCode"] != 0 and registration() == before,
+                    "weak_registry_redirected_product_removal")
+            require(all(path.is_file() and digest(path) == checksum for path, checksum in protected_files.items()),
+                    "weak_registry_removal_changed_original_or_foreign_files")
+            self.report["weakRegistryRedirection"] = {"original": str(target), "foreign": str(foreign),
+                "unchangedFiles": len(protected_files), "installerExitCode": result["exitCode"]}
+            self.mark(self.stage)
+        finally:
+            try:
+                authority.restore()
+            finally:
+                authority.close()
         try:
             set_directory_security(target.parent, UNSAFE_DIRECTORY_SDDL)
             # Normal reinstall cannot secure someone else's shared parent. The
@@ -646,6 +890,8 @@ class CustomInstallAcceptance(UpgradeAcceptance):
             attempt("owned_parent_remove", lambda: remove_owned_tree(self.fixture_root))
         if self.volume is not None:
             attempt("owned_volume_detach", self.volume.close)
+        if self.diagnostic_directory is not None:
+            attempt("owned_diagnostic_directory_remove", lambda: remove_owned_tree(self.diagnostic_directory))
         attempt("final_registration_absence", lambda: require(registration() is None and registration(32) is None,
                                                                "fixture_registration_remains"))
         self.report["diagnostics"].extend(failures)

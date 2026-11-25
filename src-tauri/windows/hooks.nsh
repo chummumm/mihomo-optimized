@@ -151,6 +151,12 @@ FunctionEnd
   !insertmacro MihomoRunMaintenance "" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --installer-finalize "$INSTDIR"' "finalize"
 !macroend
 
+!macro NSIS_HOOK_REGISTERINSTALL
+  ; The fresh helper creates a new registry object with its final protected SD.
+  ; NSIS only fills metadata after the identity and ACL boundary already exist.
+  !insertmacro MihomoRunMaintenance "" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --installer-register "$INSTDIR"' "register_installation"
+!macroend
+
 !macro NSIS_HOOK_CHECKUNINSTALL PREFIX
   Call ${PREFIX}MihomoEnsureMaintenance
   !insertmacro MihomoRunMaintenance "${PREFIX}" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --uninstall-check "$INSTDIR"' "uninstall_preflight"

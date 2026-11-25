@@ -9,13 +9,17 @@ use crate::{
     error::{AppError, Result},
     windows,
 };
+use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Read,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
 };
 use windows_sys::Win32::{
-    Foundation::{GetLastError, LocalFree, ERROR_ALREADY_EXISTS, INVALID_HANDLE_VALUE},
+    Foundation::{
+        GetLastError, LocalFree, RtlNtStatusToDosError, ERROR_ALREADY_EXISTS, INVALID_HANDLE_VALUE,
+    },
     Security::{
         Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW, SECURITY_ATTRIBUTES,
     },
@@ -27,14 +31,19 @@ use windows_sys::Win32::{
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, OPEN_EXISTING,
         READ_CONTROL,
     },
+    System::Registry::{
+        RegCreateKeyExW, RegOpenKeyExW, REG_CREATED_NEW_KEY, REG_OPTION_NON_VOLATILE,
+        REG_OPTION_OPEN_LINK,
+    },
 };
 use winreg::{
-    enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY},
+    enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_32KEY, KEY_WOW64_64KEY},
     RegKey,
 };
 
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized";
 const PRODUCT_DIRECTORY_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)";
+const REGISTRATION_SDDL: &str = "O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KR;;;BU)";
 const MAX_TREE_DEPTH: usize = 64;
 
 fn registration_error() -> AppError {
@@ -44,15 +53,53 @@ fn registration_error() -> AppError {
     )
 }
 
-fn read_registration(view: u32) -> Result<Option<PathBuf>> {
-    let key = match RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(UNINSTALL_KEY, KEY_READ | view)
-    {
-        Ok(key) => key,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(AppError::io("无法读取 Windows 安装记录", error)),
+struct Registration {
+    key: RegKey,
+    directory: PathBuf,
+    protected: bool,
+}
+
+fn read_registration(view: u32, access: u32) -> Result<Option<Registration>> {
+    let mut raw = std::ptr::null_mut();
+    let result = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            windows::wide(UNINSTALL_KEY).as_ptr(),
+            REG_OPTION_OPEN_LINK,
+            access | view,
+            &mut raw,
+        )
     };
-    windows::require_admin_registry_key(key.raw_handle())?;
+    if result == 2 || result == 3 {
+        return Ok(None);
+    }
+    if result != 0 {
+        return Err(AppError::io(
+            "无法读取 Windows 安装记录",
+            std::io::Error::from_raw_os_error(result as i32),
+        ));
+    }
+    // RegKey owns and closes non-predefined handles too. Native opening is
+    // required here because winreg's ordinary open follows registry links.
+    let key = RegKey::predef(raw);
+    // Never follow an attacker-controlled registry symbolic link while reading
+    // a legacy candidate or retiring its original key object.
+    match key.get_raw_value("SymbolicLinkValue") {
+        Ok(value) if value.vtype == winreg::enums::REG_LINK => {
+            return Err(AppError::new(
+                "service_untrusted_registration",
+                "安装记录不能使用注册表符号链接",
+            ));
+        }
+        Ok(_) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(AppError::io("无法检查 Windows 安装记录", error)),
+    }
+    let protected = match windows::require_admin_registry_key(key.raw_handle()) {
+        Ok(()) => true,
+        Err(error) if error.code == "service_untrusted_registration" => false,
+        Err(error) => return Err(error),
+    };
     let binary: String = key
         .get_value("MainBinaryName")
         .map_err(|_| registration_error())?;
@@ -68,19 +115,54 @@ fn read_registration(view: u32) -> Result<Option<PathBuf>> {
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
         .unwrap_or(location);
-    Ok(Some(normalize_directory(Path::new(location))?))
+    let directory = normalize_directory(Path::new(location))?;
+    Ok(Some(Registration {
+        key,
+        directory,
+        protected,
+    }))
 }
 
 fn registered_directory() -> Result<Option<PathBuf>> {
-    let native = read_registration(KEY_WOW64_64KEY)?;
-    let legacy = read_registration(KEY_WOW64_32KEY)?;
-    match (native, legacy) {
-        (Some(native), Some(legacy)) if !same_location(&native, &legacy)? => {
-            Err(registration_error())
-        }
-        (Some(directory), _) | (None, Some(directory)) => Ok(Some(directory)),
-        (None, None) => Ok(None),
+    let records = registration_records(KEY_READ)?;
+    for record in &records {
+        // Ordinary runtime paths never use weak legacy metadata as authority.
+        windows::require_admin_registry_key(record.key.raw_handle())?;
     }
+    common_registered_directory(&records)
+}
+
+fn registration_records(access: u32) -> Result<Vec<Registration>> {
+    let mut records = Vec::new();
+    for view in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
+        if let Some(record) = read_registration(view, access)? {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
+fn common_registered_directory(records: &[Registration]) -> Result<Option<PathBuf>> {
+    let Some(first) = records.first() else {
+        return Ok(None);
+    };
+    for record in records.iter().skip(1) {
+        if !same_location(&first.directory, &record.directory)? {
+            return Err(registration_error());
+        }
+    }
+    Ok(Some(first.directory.clone()))
+}
+
+fn installer_registered_directory() -> Result<Option<PathBuf>> {
+    let records = registration_records(KEY_READ)?;
+    let directory = common_registered_directory(&records)?;
+    if let Some(directory) = &directory {
+        if records.iter().any(|record| !record.protected) {
+            require_legacy_identity(directory)?;
+        }
+    }
+    Ok(directory)
 }
 
 /// Produce an unambiguous local DOS path without requiring its files to exist.
@@ -216,6 +298,16 @@ fn require_parent_chain(directory: &Path) -> Result<()> {
 fn require_registered_directory(directory: &Path) -> Result<PathBuf> {
     let requested = normalize_directory(directory)?;
     let registered = registered_directory()?.ok_or_else(registration_error)?;
+    match_registered_location(&requested, &registered)
+}
+
+fn require_installer_registered_directory(directory: &Path) -> Result<PathBuf> {
+    let requested = normalize_directory(directory)?;
+    let registered = installer_registered_directory()?.ok_or_else(registration_error)?;
+    match_registered_location(&requested, &registered)
+}
+
+fn match_registered_location(requested: &Path, registered: &Path) -> Result<PathBuf> {
     if !same_location(&requested, &registered)? {
         return Err(registration_error());
     }
@@ -238,6 +330,12 @@ fn existing_directory_spelling(directory: &Path) -> Result<PathBuf> {
 
 fn protected_directory(directory: &Path) -> Result<PathBuf> {
     let directory = require_registered_directory(directory)?;
+    protected_layout_directory(&directory)
+}
+
+fn protected_layout_directory(directory: &Path) -> Result<PathBuf> {
+    let directory = normalize_directory(directory)?;
+    windows::reject_reparse_path(&directory)?;
     require_supported_volume(&directory)?;
     require_parent_chain(&directory)?;
     windows::require_admin_protected(&directory)?;
@@ -277,6 +375,103 @@ pub fn validate_existing_directory(directory: &Path) -> Result<()> {
     windows::validate_installation_files(&directory, false)
 }
 
+/// An elevated installer can use separately authenticated legacy evidence to
+/// locate an old UI, but every file it might execute must still be protected.
+pub fn validate_existing_directory_for_maintenance(directory: &Path) -> Result<()> {
+    let directory = require_installer_registered_directory(directory)?;
+    let directory = protected_layout_directory(&directory)?;
+    validate_runtime_tree(&directory, 0)?;
+    windows::validate_installation_files(&directory, false)
+}
+
+fn require_legacy_identity(directory: &Path) -> Result<()> {
+    let directory = normalize_directory(directory)?;
+    windows::reject_reparse_path(&directory)?;
+    match crate::service::require_legacy_installation_anchor(&directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code == "service_legacy_identity_missing" => {
+            if protected_legacy_product_layout(&directory).is_ok() {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+// The registry is only a hint here. This fallback is useful when a user removed
+// the Start Menu shortcut: an independently admin-owned installed bundle and
+// its build manifest identify the product without executing any old code.
+fn protected_legacy_product_layout(directory: &Path) -> Result<()> {
+    let directory = protected_layout_directory(directory)?;
+    validate_runtime_tree(&directory, 0)?;
+    for name in [
+        "mihomo-optimized.exe",
+        "mihomo-desktop-service.exe",
+        "mihomo-core.exe",
+        "uninstall.exe",
+    ] {
+        let path = directory.join(name);
+        windows::reject_reparse_path(&path)?;
+        windows::reject_hard_links(&path)?;
+        windows::require_admin_protected(&path)?;
+    }
+    let manifest = directory.join("resources").join("build-info.json");
+    windows::reject_reparse_path(&manifest)?;
+    windows::reject_hard_links(&manifest)?;
+    windows::require_admin_protected(&manifest)?;
+    if fs::metadata(&manifest)
+        .map_err(|error| AppError::io("无法检查旧版本构建记录", error))?
+        .len()
+        > 1024 * 1024
+    {
+        return Err(registration_error());
+    }
+    let bytes =
+        fs::read(&manifest).map_err(|error| AppError::io("无法读取旧版本构建记录", error))?;
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| registration_error())?;
+    let text = |name| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let commit =
+        |value: &str| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if text("repository") != "chummumm/mihomo-optimized"
+        || semver::Version::parse(text("desktopVersion")).is_err()
+        || !commit(text("uiCommit"))
+        || !commit(text("coreCommit"))
+    {
+        return Err(registration_error());
+    }
+    let expected = value
+        .get("companions")
+        .and_then(|companions| companions.get("mihomo-desktop-service-x86_64-pc-windows-msvc.exe"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(registration_error)?;
+    let mut service = fs::File::open(directory.join("mihomo-desktop-service.exe"))
+        .map_err(|error| AppError::io("无法验证旧服务程序", error))?;
+    let mut digest = Sha256::new();
+    let mut block = [0u8; 64 * 1024];
+    loop {
+        let count = service
+            .read(&mut block)
+            .map_err(|error| AppError::io("无法验证旧服务程序", error))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&block[..count]);
+    }
+    if !hex::encode(digest.finalize()).eq_ignore_ascii_case(expected) {
+        return Err(registration_error());
+    }
+    Ok(())
+}
+
 fn require_existing_directory_boundary(directory: &Path) -> Result<()> {
     windows::require_admin_protected(directory).map_err(|error| {
         if error.code == "service_untrusted_permissions" {
@@ -305,7 +500,7 @@ pub fn preflight_directory(directory: &Path) -> Result<PathBuf> {
     windows::reject_reparse_path(&directory)?;
     require_supported_volume(&directory)?;
     require_parent_chain(&directory)?;
-    let registered = registered_directory()?;
+    let registered = installer_registered_directory()?;
     if let Some(registered) = &registered {
         if !same_location(&directory, registered)? {
             return Err(registration_error());
@@ -677,6 +872,162 @@ pub fn prepare_directory(directory: &Path) -> Result<PathBuf> {
     existing_directory_spelling(&directory)
 }
 
+fn reject_registration_children(key: &RegKey) -> Result<()> {
+    match key.enum_keys().next() {
+        None => Ok(()),
+        Some(Ok(_)) => Err(AppError::new(
+            "service_untrusted_registration",
+            "安装记录包含非本产品创建的子项，未删除或接管该记录",
+        )),
+        Some(Err(error)) => Err(AppError::io("无法检查旧安装记录", error)),
+    }
+}
+
+fn retire_registration(key: &RegKey) -> Result<()> {
+    // Delete this exact opened object. Changing its DACL would leave earlier
+    // KEY_SET_VALUE / WRITE_DAC handles authorized; deleting by a path could
+    // instead reach an object replaced after the identity check.
+    let status = unsafe { windows_sys::Wdk::System::Registry::NtDeleteKey(key.raw_handle()) };
+    if status < 0 {
+        return Err(AppError::io(
+            "无法退休旧安装记录",
+            std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32),
+        ));
+    }
+    Ok(())
+}
+
+fn create_registration_key() -> Result<RegKey> {
+    unsafe {
+        let mut descriptor = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            windows::wide(REGISTRATION_SDDL).as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(windows::last_error("无法生成安装记录权限"));
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let mut raw = std::ptr::null_mut();
+        let mut disposition = 0;
+        let result = RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            windows::wide(UNINSTALL_KEY).as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE | REG_OPTION_OPEN_LINK,
+            KEY_READ | KEY_SET_VALUE | DELETE | KEY_WOW64_64KEY,
+            &attributes,
+            &mut raw,
+            &mut disposition,
+        );
+        LocalFree(descriptor);
+        if result != 0 {
+            return Err(AppError::io(
+                "无法创建受保护的安装记录",
+                std::io::Error::from_raw_os_error(result as i32),
+            ));
+        }
+        let key = RegKey::predef(raw);
+        if disposition != REG_CREATED_NEW_KEY {
+            return Err(AppError::new(
+                "service_registration_race",
+                "安装记录已被其他进程创建，未接管现有对象；请重新运行完整安装包",
+            ));
+        }
+        Ok(key)
+    }
+}
+
+/// Publish the identity only after all new program files are in place, and
+/// before NSIS writes any metadata. The key is born with its final owner and
+/// protected DACL; inherited Terminal Server User grants are never accepted.
+pub fn register_directory(directory: &Path) -> Result<PathBuf> {
+    windows::require_elevated_administrator()?;
+    let canonical = protected_layout_directory(directory)?;
+    let directory = normalize_directory(&canonical)?;
+    let _guard = DirectoryGuard::new(directory.clone(), false)?;
+    validate_runtime_tree(&directory, 0)?;
+    windows::validate_installation_files(&canonical, false)?;
+
+    let records = registration_records(KEY_READ | DELETE)?;
+    if let Some(registered) = common_registered_directory(&records)? {
+        match_registered_location(&directory, &registered)?;
+        if records.iter().any(|record| !record.protected) {
+            require_legacy_identity(&directory)?;
+        }
+    }
+    for record in &records {
+        reject_registration_children(&record.key)?;
+    }
+    for record in &records {
+        retire_registration(&record.key)?;
+    }
+    drop(records);
+
+    let key = create_registration_key()?;
+    let result = (|| {
+        windows::require_admin_registry_key(key.raw_handle())?;
+        key.set_value("InstallLocation", &directory.to_string_lossy().as_ref())
+            .map_err(|error| AppError::io("无法登记安装目录", error))?;
+        key.set_value("MainBinaryName", &windows::APPLICATION_EXE)
+            .map_err(|error| AppError::io("无法登记程序身份", error))?;
+        require_registered_directory(&directory)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        // Only this newly created object is eligible for rollback. Never
+        // delete an existing object returned by a racing RegCreateKeyExW.
+        let _ = retire_registration(&key);
+        return Err(error);
+    }
+    Ok(directory)
+}
+
+/// Retains the independently authenticated registration objects throughout
+/// file/service removal. Cleanup must never reopen the weak legacy key by name
+/// to delete it after another process could have replaced that name.
+pub struct MaintenanceRegistration {
+    directory: PathBuf,
+    records: Vec<Registration>,
+}
+
+impl MaintenanceRegistration {
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    pub fn remove(self) -> Result<()> {
+        for record in &self.records {
+            reject_registration_children(&record.key)?;
+        }
+        for record in &self.records {
+            retire_registration(&record.key)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn maintenance_registration(directory: &Path) -> Result<MaintenanceRegistration> {
+    windows::require_elevated_administrator()?;
+    let records = registration_records(KEY_READ | DELETE)?;
+    let registered = common_registered_directory(&records)?.ok_or_else(registration_error)?;
+    let directory = match_registered_location(&normalize_directory(directory)?, &registered)?;
+    if records.iter().any(|record| !record.protected) {
+        require_legacy_identity(&directory)?;
+    }
+    for record in &records {
+        reject_registration_children(&record.key)?;
+    }
+    Ok(MaintenanceRegistration { directory, records })
+}
+
 /// The installer writes its trusted HKLM record after replacing every shipped
 /// file, then calls this before starting a service from the new installation.
 pub fn finalize_directory(directory: &Path) -> Result<PathBuf> {
@@ -692,7 +1043,7 @@ pub fn finalize_directory(directory: &Path) -> Result<PathBuf> {
 /// require complete binaries or the runtime permission boundary. Nothing from
 /// this path may be executed by a caller using this weaker cleanup contract.
 pub fn maintenance_directory(directory: &Path) -> Result<PathBuf> {
-    require_registered_directory(directory)
+    require_installer_registered_directory(directory)
 }
 
 pub fn maintenance_guard(directory: &Path) -> Result<DirectoryGuard> {
