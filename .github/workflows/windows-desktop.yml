@@ -212,7 +212,7 @@ jobs:
       - name: Test custom installation paths, separate NTFS volume, TUN and resilient uninstall
         timeout-minutes: 20
         run: python desktop/tests/custom_install_smoke.py
-      - name: Test legacy installer upgrade and native TUN lifecycle
+      - name: Install and verify a fresh candidate for runtime acceptance
         run: ./desktop/tests/setup-windows.ps1
       - name: Test independent automatic core updates while running, in TUN and stopped
         timeout-minutes: 35

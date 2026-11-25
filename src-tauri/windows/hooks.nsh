@@ -4,9 +4,9 @@ Var MihomoMaintenanceStage
 Var MihomoMaintenanceError
 Var MihomoMaintenanceDetails
 Var MihomoMaintenanceDirectory
-Var MihomoOldRuntimeTrusted
+Var MihomoRuntimeTrusted
 
-; Maintenance never executes the helper from the installation being repaired.
+; Maintenance uses the helper embedded in the current installer/uninstaller.
 ; Create a unique directory directly beneath the OS Program Files folder with
 ; its final administrator-only DACL at creation, then extract the new payload.
 !macro DefineMaintenanceBootstrap PREFIX
@@ -97,17 +97,16 @@ Function ${PREFIX}MihomoCleanupMaintenance
   ${EndIf}
 FunctionEnd
 
-Function ${PREFIX}MihomoValidateOldRuntime
-  ; A damaged/custom legacy installation can still be cleaned without running
-  ; any of its potentially user-writable executables elevated. Trusted running
-  ; installations keep their existing graceful --quit behavior.
+Function ${PREFIX}MihomoValidateRuntime
+  ; A complete, protected runtime may receive a graceful --quit. Cleanup does
+  ; not execute installed binaries when runtime validation fails.
   System::Store "s"
-  StrCpy $MihomoOldRuntimeTrusted 0
+  StrCpy $MihomoRuntimeTrusted 0
   nsExec::ExecToStack /TIMEOUT=45000 '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --validate-directory "$INSTDIR"'
   Pop $0
   Pop $1
   ${If} $0 = 0
-    StrCpy $MihomoOldRuntimeTrusted 1
+    StrCpy $MihomoRuntimeTrusted 1
   ${EndIf}
   System::Store "l"
 FunctionEnd
@@ -128,7 +127,7 @@ FunctionEnd
     DetailPrint "Mihomo maintenance failed: stage=$MihomoMaintenanceStage, helper=$MihomoMaintenanceError; $MihomoMaintenanceDetails"
     IfSilent mihomo_maintenance_skip_message_${STAGE} 0
     ${If} $PassiveMode != 1
-      MessageBox MB_ICONSTOP|MB_OK "无法完成操作。阶段：$MihomoMaintenanceStage$\r$\n$MihomoMaintenanceDetails$\r$\n如旧版本因目录权限无法修复，可退出托盘程序后运行本安装包 /REMOVE 安全卸载。"
+      MessageBox MB_ICONSTOP|MB_OK "无法完成操作。阶段：$MihomoMaintenanceStage$\r$\n$MihomoMaintenanceDetails"
     ${EndIf}
     mihomo_maintenance_skip_message_${STAGE}:
     Call ${PREFIX}MihomoCleanupMaintenance
@@ -140,7 +139,7 @@ FunctionEnd
 !macro NSIS_HOOK_CHECKINSTALL
   Call MihomoEnsureMaintenance
   !insertmacro MihomoRunMaintenance "" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --installer-check "$INSTDIR" "$MihomoMaintenanceDirectory\installer-files.json"' "preflight"
-  Call MihomoValidateOldRuntime
+  Call MihomoValidateRuntime
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL
@@ -152,7 +151,7 @@ FunctionEnd
 !macroend
 
 !macro NSIS_HOOK_REGISTERINSTALL
-  ; The fresh helper creates a new registry object with its final protected SD.
+  ; The helper creates protected registration or validates its existing key.
   ; NSIS only fills metadata after the identity and ACL boundary already exist.
   !insertmacro MihomoRunMaintenance "" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --installer-register "$INSTDIR"' "register_installation"
 !macroend
@@ -160,7 +159,7 @@ FunctionEnd
 !macro NSIS_HOOK_CHECKUNINSTALL PREFIX
   Call ${PREFIX}MihomoEnsureMaintenance
   !insertmacro MihomoRunMaintenance "${PREFIX}" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --uninstall-check "$INSTDIR"' "uninstall_preflight"
-  Call ${PREFIX}MihomoValidateOldRuntime
+  Call ${PREFIX}MihomoValidateRuntime
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL PREFIX

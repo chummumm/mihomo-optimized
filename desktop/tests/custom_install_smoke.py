@@ -4,7 +4,7 @@
 Only disposable, elevated GitHub Windows runners may execute this fixture.
 The second disk is a newly created 1 GiB expandable VHD; no existing disk is
 formatted and no shared parent directory has its permissions changed. The
-normal upgrade/UI suite runs afterwards against its unchanged default path.
+normal installed-UI suite runs afterwards against its default path.
 """
 
 from __future__ import annotations
@@ -32,26 +32,15 @@ from core_update_smoke import CoreUpdateAcceptance
 from windows_smoke import RestrictedDesktop, SERVICE_NAME, SocksFixture, require, wait_until
 
 
-BROKEN_VERSION = "0.2.13"
-BROKEN_SOURCE = "dae8d7c987d1b04633184fe9a243a457edc412a0"
-BROKEN_URL = (
-    "https://github.com/chummumm/mihomo-optimized/releases/download/"
-    "mihomo-desktop-v0.2.13/mihomo-desktop-0.2.13-windows-x64-setup.exe"
-)
-BROKEN_SHA256 = "6429ffbde55e989fd41246075ae281e9bcdcf5d40db242b7804660f1fc831a07"
 SAFE_DIRECTORY_SDDL = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)"
 UNSAFE_DIRECTORY_SDDL = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BU)"
 REQUIRED_CASES = {
     "default_never_service_uninstall", "same_volume_tun", "separate_volume_unicode_tun",
-    "broken_0_2_13_reproduced", "broken_0_2_13_repaired", "missing_runtime_uninstall",
-    "unsafe_parent_rejected_before_copy", "reparse_parent_rejected_before_copy",
-    "subst_mappings_rejected_before_copy",
+    "missing_runtime_uninstall", "unsafe_parent_rejected_before_copy",
+    "reparse_parent_rejected_before_copy", "subst_mappings_rejected_before_copy",
     "failed_upgrade_preserves_running_install", "unsafe_install_can_uninstall",
     "foreign_service_preserved", "custom_core_update", "custom_desktop_update_identity",
-    "broken_install_remove_mode", "retained_directory_authority_rejected",
-    "unsafe_directory_removed_and_recreated", "empty_unsafe_directory_recreated",
-    "legacy_registry_handle_retired", "weak_registry_foreign_target_rejected",
-    "forged_shortcut_replacement_rejected", "final_cleanup",
+    "empty_unsafe_directory_recreated", "final_cleanup",
 }
 
 
@@ -225,105 +214,6 @@ class RetainedDirectoryAuthority:
 
     def close(self) -> None:
         self.release_handle()
-        self.desktop.close()
-
-
-class RetainedRegistryAuthority:
-    """Grant only this fixture's old product key an ordinary user's retained write."""
-    def __init__(self) -> None:
-        import win32security
-        import winreg
-
-        self.desktop = RestrictedDesktop()
-        self.handle = None
-        self.information = win32security.DACL_SECURITY_INFORMATION
-        try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0,
-                                winreg.KEY_READ | 0x40000 | winreg.KEY_WOW64_64KEY) as key:
-                self.original_location = winreg.QueryValueEx(key, "InstallLocation")[0]
-                descriptor = win32security.GetSecurityInfo(int(key), win32security.SE_REGISTRY_KEY, self.information)
-                self.original_sddl = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(
-                    descriptor, 1, self.information)
-                self.original_protected = bool(descriptor.GetSecurityDescriptorControl()[0] & 0x1000)
-                dacl = descriptor.GetSecurityDescriptorDacl()
-                dacl.AddAccessAllowedAceEx(dacl.GetAclRevision(), 0, winreg.KEY_SET_VALUE,
-                    win32security.CreateWellKnownSid(win32security.WinBuiltinUsersSid, None))
-                win32security.SetSecurityInfo(int(key), win32security.SE_REGISTRY_KEY, self.information,
-                                             None, None, dacl, None)
-            win32security.ImpersonateLoggedOnUser(self.desktop.token)
-            try:
-                self.handle = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0,
-                                            winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
-            finally:
-                win32security.RevertToSelf()
-            require(self.write_location(self.original_location) == 0, "fixture_legacy_registry_write_unavailable")
-        except BaseException:
-            self.close()
-            raise
-
-    def write_location(self, value: str) -> int:
-        import win32security
-        import winreg
-
-        win32security.ImpersonateLoggedOnUser(self.desktop.token)
-        try:
-            winreg.SetValueEx(self.handle, "InstallLocation", 0, winreg.REG_SZ, value)
-            return 0
-        except OSError as error:
-            return error.winerror
-        finally:
-            win32security.RevertToSelf()
-
-    def assert_retired(self, target: Path) -> dict:
-        import win32security
-        import winreg
-
-        before = registration()
-        error = self.write_location(str(target.parent / "stale registry handle target"))
-        require(before is not None and registration() == before, "old_registry_handle_changed_new_installation")
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0,
-                            winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
-            descriptor = win32security.GetSecurityInfo(int(key), win32security.SE_REGISTRY_KEY, self.information)
-            require(descriptor.GetSecurityDescriptorControl()[0] & 0x1000, "new_registry_dacl_still_inherits")
-            dacl = descriptor.GetSecurityDescriptorDacl()
-            forbidden = 0x40000000 | 0x10000000 | 0x10000 | 0x40000 | 0x80000 | 0x2 | 0x4 | 0x20
-            for index in range(dacl.GetAceCount()):
-                ace = dacl.GetAce(index)
-                if ace[0][1] & 0x8 or ace[0][0] in (1, 6, 10, 12):
-                    continue
-                require(win32security.ConvertSidToStringSid(ace[-1]) != "S-1-5-13" or not ace[1] & forbidden,
-                        "new_registry_allows_terminal_server_user_write")
-            sddl = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(descriptor, 1, self.information)
-        win32security.ImpersonateLoggedOnUser(self.desktop.token)
-        try:
-            try:
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0,
-                                    winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
-            except OSError as denied:
-                require(denied.winerror == 5, "new_registry_access_check_failed")
-            else:
-                key.Close()
-                require(False, "new_registry_allows_ordinary_write")
-        finally:
-            win32security.RevertToSelf()
-        return {"retiredHandleWriteWinError": error, "newKeyOrdinaryWriteDenied": True, "newKeyDacl": sddl}
-
-    def restore(self) -> None:
-        import win32security
-        import winreg
-
-        require(self.write_location(self.original_location) == 0, "fixture_legacy_registry_restore_failed")
-        descriptor = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(self.original_sddl, 1)
-        protection = (win32security.PROTECTED_DACL_SECURITY_INFORMATION if self.original_protected
-                      else win32security.UNPROTECTED_DACL_SECURITY_INFORMATION)
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0, 0x40000 | winreg.KEY_WOW64_64KEY) as key:
-            win32security.SetSecurityInfo(int(key), win32security.SE_REGISTRY_KEY, self.information | protection,
-                                         None, None, descriptor.GetSecurityDescriptorDacl(), None)
-
-    def close(self) -> None:
-        if self.handle is not None:
-            self.handle.Close()
-            self.handle = None
         self.desktop.close()
 
 
@@ -580,29 +470,26 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         print("INSTALLER_FAILURE_EVIDENCE " + json.dumps({key: value for key, value in event.items()
               if key not in ("paths", "registry")}, ensure_ascii=True), flush=True)
 
-    def install_at(self, directory: Path, label: str, *, installer: Path | None = None) -> None:
+    def install_at(self, directory: Path, label: str) -> None:
         require(registration() is None and registration(32) is None, "previous_fixture_installation_remains")
         require(service_snapshot().get("winError") == 1060, "previous_fixture_service_remains")
         self.select(directory)
         require(not directory.exists(), "fixture_install_directory_preexists")
         self.installed_paths.append(directory)
         self.stage = label
-        executable = installer or self.candidate
         # NSIS /D= must be the final, unquoted argument, including spaces.
-        command = f'"{executable}" /S /D={directory}'
-        result = self.command(label, executable, command, 180)
+        command = f'"{self.candidate}" /S /D={directory}'
+        result = self.command(label, self.candidate, command, 180)
         require(result["exitCode"] == 0, label + "_failed")
-        self.assert_registration(BROKEN_VERSION if installer else self.info["desktopVersion"])
+        self.assert_registration(self.info["desktopVersion"])
         self.report["paths"].append({"label": label, "path": str(directory)})
-        if installer is None:
-            self.assert_candidate_files()
+        self.assert_candidate_files()
 
-    def uninstall_current(self, label: str, *, through_setup: bool = False) -> None:
+    def uninstall_current(self, label: str) -> None:
         self.stage = label
         uninstaller = self.install_dir / "uninstall.exe"
         require(uninstaller.is_file(), "fixture_uninstaller_missing")
-        result = (self.command(label, self.candidate, ["/S", "/REMOVE"], 180) if through_setup
-                  else self.command(label, uninstaller, uninstall_command(uninstaller), 180))
+        result = self.command(label, uninstaller, uninstall_command(uninstaller), 180)
         require(result["exitCode"] == 0, label + "_failed")
         self.assert_no_service()
         require(registration() is None and registration(32) is None, "fixture_uninstall_record_remains")
@@ -666,31 +553,6 @@ class CustomInstallAcceptance(UpgradeAcceptance):
             tun.cleanup()
             self.tun = None
 
-    def reproduce_and_repair(self, target: Path) -> None:
-        legacy = self.download_baseline(BROKEN_VERSION, BROKEN_URL, BROKEN_SHA256, 128 * 1024 * 1024)
-        self.install_at(target, "broken_custom_install", installer=legacy)
-        installed = json.loads((target / "resources/build-info.json").read_text(encoding="utf-8-sig"))
-        require(installed.get("uiCommit") == BROKEN_SOURCE, "broken_baseline_source_mismatch")
-        result = self.command("broken_tun_service", self.helper, ["--install", "--owner-sid", self.sid])
-        require(result["exitCode"] != 0 and "service_install_required" in result["stderr"],
-                "published_custom_tun_failure_not_reproduced")
-        uninstaller = target / "uninstall.exe"
-        result = self.command("broken_custom_uninstall", uninstaller, uninstall_command(uninstaller), 180)
-        require(result["exitCode"] != 0 and registration() is not None and self.app.is_file(),
-                "published_custom_uninstall_failure_not_reproduced")
-        self.mark("broken_0_2_13_reproduced")
-        authority = RetainedRegistryAuthority()
-        try:
-            self.stage = "repair_broken_custom_install"
-            require(self.command(self.stage, self.candidate, ["/S"], 180)["exitCode"] == 0,
-                    "broken_custom_repair_failed")
-            self.assert_registration(self.info["desktopVersion"])
-            self.assert_candidate_files()
-            self.report["legacyRegistryReplacement"] = authority.assert_retired(target)
-            self.mark("legacy_registry_handle_retired")
-        finally:
-            authority.close()
-        self.tun_lifecycle("broken_0_2_13_repaired")
 
     def missing_runtime(self, target: Path) -> None:
         self.install_at(target, "partial_custom_install")
@@ -727,129 +589,6 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         self.uninstall_current("custom_core_update_uninstall")
         self.mark("custom_core_update")
 
-    def reject_forged_shortcut(self, foreign: Path, desktop: RestrictedDesktop,
-                              protected_files: dict[Path, str]) -> None:
-        import pythoncom
-        import win32security
-        from win32com.shell import shell, shellcon
-
-        self.stage = "forged_shortcut_replacement_rejected"
-        shortcut = Path(shell.SHGetFolderPath(0, shellcon.CSIDL_COMMON_PROGRAMS, None, 0)) / (PRODUCT + ".lnk")
-        source_directory = self.fixture_root / "forged shortcut source"
-        source_directory.mkdir()
-        set_directory_security(source_directory)
-        source = source_directory / (PRODUCT + ".lnk")
-        require(source.drive.casefold() == shortcut.drive.casefold(), "fixture_shortcut_cross_volume")
-        information = win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION
-        original_security = win32security.GetNamedSecurityInfo(str(shortcut), win32security.SE_FILE_OBJECT, information)
-        original_owner = win32security.ConvertSidToStringSid(original_security.GetSecurityDescriptorOwner())
-        metadata = shortcut.lstat()
-        require(stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
-                and not metadata.st_file_attributes & 0x400 and 0 < metadata.st_size <= 1024 * 1024
-                and original_owner == "S-1-5-32-544", "fixture_original_shortcut_invalid")
-        original_bytes = shortcut.read_bytes()
-        original_hash = digest(shortcut)
-        evidence = self.report["forgedShortcut"] = {"shortcut": str(shortcut), "originalSha256": original_hash,
-            "originalOwner": original_owner, "source": str(source), "token": desktop.check_token(desktop.token)}
-        link = persistent = None
-        pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
-        try:
-            link = pythoncom.CoCreateInstance(
-                shell.CLSID_ShellLink, None, pythoncom.CLSCTX_INPROC_SERVER, shell.IID_IShellLink)
-            link.SetPath(str(foreign / "mihomo-optimized.exe"))
-            persistent = link.QueryInterface(pythoncom.IID_IPersistFile)
-            persistent.Save(str(source), True)
-        finally:
-            persistent = link = None
-            pythoncom.CoUninitialize()
-        writable = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
-            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + desktop.sid + ")", 1)
-        win32security.SetFileSecurity(str(source), information | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
-                                     writable)
-        payload = source.read_bytes()
-        require(0 < len(payload) <= 1024 * 1024, "fixture_forged_shortcut_size_invalid")
-        hardened = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
-            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)(A;;SD;;;" + desktop.sid + ")", 1)
-        win32security.ImpersonateLoggedOnUser(desktop.token)
-        try:
-            source.write_bytes(b"ordinary-user-controlled shortcut\n")
-            source.write_bytes(payload)
-            require(source.read_bytes() == payload, "fixture_shortcut_not_ordinary_user_controlled")
-            # The ordinary user seals an admin-owned object they controlled.
-            # Its current owner/DACL alone cannot authenticate its payload.
-            win32security.SetFileSecurity(str(source), win32security.DACL_SECURITY_INFORMATION
-                | win32security.PROTECTED_DACL_SECURITY_INFORMATION, hardened)
-        finally:
-            win32security.RevertToSelf()
-        source_security = win32security.GetNamedSecurityInfo(str(source), win32security.SE_FILE_OBJECT, information)
-        require(win32security.ConvertSidToStringSid(source_security.GetSecurityDescriptorOwner()) == original_owner,
-                "fixture_forged_shortcut_owner_changed")
-        evidence["sourceDacl"] = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(
-            source_security, 1, information)
-        evidence["sourceSha256"] = digest(source)
-        error_code = None
-        # No source/target handle remains open: denial must come from namespace
-        # permissions, not this fixture introducing a sharing violation.
-        win32security.ImpersonateLoggedOnUser(desktop.token)
-        try:
-            try:
-                os.replace(source, shortcut)
-            except OSError as error:
-                error_code = error.winerror
-        finally:
-            win32security.RevertToSelf()
-        evidence["replaceWinError"] = error_code
-        require(error_code == 5, "forged_shortcut_replacement_not_access_denied")
-        current_security = win32security.GetNamedSecurityInfo(str(shortcut), win32security.SE_FILE_OBJECT, information)
-        require(shortcut.read_bytes() == original_bytes and digest(shortcut) == original_hash
-                and win32security.ConvertSidToStringSid(current_security.GetSecurityDescriptorOwner()) == original_owner
-                and source.read_bytes() == payload, "forged_shortcut_replacement_changed_files")
-        require(all(path.is_file() and digest(path) == checksum for path, checksum in protected_files.items()),
-                "forged_shortcut_attempt_changed_product_or_foreign_files")
-        self.mark(self.stage)
-
-    def remove_broken_install(self, target: Path) -> None:
-        legacy = self.download_baseline(BROKEN_VERSION, BROKEN_URL, BROKEN_SHA256, 128 * 1024 * 1024)
-        self.install_at(target, "broken_remove_install", installer=legacy)
-        foreign = target.parent / "非本产品 注册目标"
-        foreign.mkdir()
-        set_directory_security(foreign)
-        for name in (*EXECUTABLES, "uninstall.exe"):
-            (foreign / name).write_bytes(b"fixture sentinel; never execute\n")
-        protected_files = {path: digest(path) for directory in (target, foreign)
-                           for path in directory.rglob("*") if path.is_file()}
-        authority = RetainedRegistryAuthority()
-        try:
-            require(authority.write_location(str(foreign)) == 0, "fixture_weak_registration_not_writable")
-            self.reject_forged_shortcut(foreign, authority.desktop, protected_files)
-            before = registration()
-            self.stage = "weak_registry_foreign_target_rejected"
-            self.select(foreign)
-            try:
-                result = self.command(self.stage, self.candidate, ["/S", "/REMOVE"], 180)
-            finally:
-                self.select(target)
-            require(result["exitCode"] != 0 and registration() == before,
-                    "weak_registry_redirected_product_removal")
-            require(all(path.is_file() and digest(path) == checksum for path, checksum in protected_files.items()),
-                    "weak_registry_removal_changed_original_or_foreign_files")
-            self.report["weakRegistryRedirection"] = {"original": str(target), "foreign": str(foreign),
-                "unchangedFiles": len(protected_files), "installerExitCode": result["exitCode"]}
-            self.mark(self.stage)
-        finally:
-            try:
-                authority.restore()
-            finally:
-                authority.close()
-        try:
-            set_directory_security(target.parent, UNSAFE_DIRECTORY_SDDL)
-            # Normal reinstall cannot secure someone else's shared parent. The
-            # fresh setup's explicit maintenance route must still remove this
-            # old installation without running its broken installed helper.
-            self.uninstall_current("broken_remove_setup", through_setup=True)
-            self.mark("broken_install_remove_mode")
-        finally:
-            set_directory_security(target.parent)
 
     def recreate_with_retained_handle(self, target: Path, authority: RetainedDirectoryAuthority,
                                      label: str, evidence: dict) -> None:
@@ -882,34 +621,6 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         self.uninstall_current(label + "_uninstall")
         self.mark(label)
 
-    def retained_directory_authority(self, target: Path) -> None:
-        legacy = self.download_baseline(BROKEN_VERSION, BROKEN_URL, BROKEN_SHA256, 128 * 1024 * 1024)
-        self.install_at(target, "unsafe_legacy_directory_install", installer=legacy)
-        set_directory_security(target, UNSAFE_DIRECTORY_SDDL)
-        authority = RetainedDirectoryAuthority(target)
-        evidence = self.report["retainedDirectoryAuthority"] = {}
-        try:
-            before = registration()
-            hashes = {name: digest(target / name) for name in EXECUTABLES}
-            self.stage = "retained_directory_authority_rejected"
-            result = self.command(self.stage, self.candidate, ["/S"], 90)
-            require(result["exitCode"] != 0 and registration() == before,
-                    "unsafe_legacy_directory_repair_accepted")
-            require(all(digest(target / name) == value for name, value in hashes.items())
-                    and directory_identity(target) == authority.identity,
-                    "unsafe_legacy_preflight_modified_installation")
-            require(authority.reset_old_acl() == 0, "retained_authority_fixture_lost_before_cleanup")
-            self.mark(self.stage)
-            self.stage = "unsafe_legacy_remove_with_retained_handle"
-            result = self.command(self.stage, self.candidate, ["/S", "/REMOVE"], 180)
-            require(result["exitCode"] == 0, "unsafe_legacy_maintenance_remove_failed")
-            self.assert_no_service()
-            require(registration() is None and registration(32) is None
-                    and not self.owner_file.exists(), "unsafe_legacy_maintenance_identity_remains")
-            self.assert_marker()
-            self.recreate_with_retained_handle(target, authority, "unsafe_directory_removed_and_recreated", evidence)
-        finally:
-            authority.close()
 
     def empty_directory_authority(self, target: Path) -> None:
         require(not target.exists(), "fixture_empty_directory_preexists")
@@ -1101,10 +812,7 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         self.install_at(parent / PRODUCT, "separate_volume_unicode_install")
         self.tun_lifecycle("separate_volume_unicode_tun", check_desktop_update=True)
         self.custom_core_update(parent / "内核 更新")
-        self.reproduce_and_repair(parent / "旧版 修复")
-        self.missing_runtime(parent / "残留 清理")
-        self.remove_broken_install(parent / "旧版 卸载")
-        self.retained_directory_authority(parent / "旧目录 权限")
+        self.missing_runtime(parent / "配套 文件 缺失")
         self.empty_directory_authority(parent / "空目录 权限")
         self.unsafe_existing_install(self.fixture_root / "invalidated install")
         self.foreign_service(self.fixture_root / "foreign conflict")

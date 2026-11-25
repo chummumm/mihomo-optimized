@@ -34,12 +34,7 @@ use windows_service::{
 
 pub const SERVICE_NAME: &str = "MihomoOptimizedService";
 
-mod anchors;
 mod maintenance;
-
-pub(crate) fn require_legacy_installation_anchor(directory: &Path) -> Result<()> {
-    anchors::require_anchor(directory)
-}
 
 #[derive(Clone, Default, Serialize)]
 pub struct ServiceStatusView {
@@ -79,7 +74,7 @@ pub fn entry() -> Result<()> {
             maintenance::check(Path::new(directory), Path::new(manifest))
         }
         [action, directory] if action == "--validate-directory" => {
-            installation::validate_existing_directory_for_maintenance(Path::new(directory))
+            installation::validate_existing_directory(Path::new(directory))
         }
         [action, directory, manifest] if action == "--installer-prepare" => {
             maintenance::replace_files(Path::new(directory), Path::new(manifest))
@@ -366,8 +361,7 @@ fn install(owner_sid: &str) -> Result<()> {
 }
 
 fn set_installed_running(running: bool) -> Result<()> {
-    // An old uninstall may leave only this helper behind. Stopping the fixed SCM
-    // service must not require the application/core files that were just removed.
+    // Stopping the registered service must not depend on complete runtime files.
     let directory = if running {
         // The privileged maintenance start must repair the same fixed rename
         // gap as SCM startup before requiring the core executable to exist.

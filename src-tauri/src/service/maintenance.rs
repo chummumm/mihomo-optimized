@@ -182,8 +182,7 @@ pub(super) fn replace_files(target: &Path, list: &Path) -> Result<()> {
 
 pub(super) fn remove_installation(target: &Path, list: &Path, parent_pid: u32) -> Result<()> {
     let entries = manifest(list)?;
-    // Keep the authenticated original registry objects until cleanup succeeds.
-    // NSIS must never reopen a writable legacy key by name to delete it.
+    // Keep the protected registration object until cleanup succeeds.
     let registration = installation::maintenance_registration(target)?;
     let mut guard = installation::maintenance_guard(registration.directory())?;
     let directory = guard.directory().to_path_buf();
@@ -199,8 +198,8 @@ pub(super) fn remove_installation(target: &Path, list: &Path, parent_pid: u32) -
     uninstall_directory(&directory)?;
     if directory_existed {
         remove_files(&mut guard, &entries, keep_uninstaller, true)?;
-        // Delete the pinned directory object itself. Its unsafe legacy parent
-        // never gets a chance to swap this path between unlock and deletion.
+        // Delete the pinned directory object itself so its parent cannot swap
+        // the path between unlock and deletion.
         guard.remove_empty_directory(&directory)?;
     }
     registration.remove()

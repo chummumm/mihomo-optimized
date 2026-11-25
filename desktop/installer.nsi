@@ -40,10 +40,8 @@ VIAddVersionKey "LegalCopyright" "Mihomo Optimized contributors"
 
 Var PassiveMode
 Var UpdateMode
-Var RemoveMode
 Var MihomoCloseError
 Var MihomoPreviousLocation
-Var MihomoLegacy32Location
 !include "..\src-tauri\windows\hooks.nsh"
 
 ; Validate actual mapped files, not a process name. Never terminate a recovery
@@ -82,12 +80,11 @@ Function ${PREFIX}MihomoCloseApplication
       ${If} $UpdateMode = 1
         Goto mihomo_close_continue
       ${EndIf}
-      ; Presence of the native host identifies versions supporting --quit.
-      ; Legacy versions must be exited using their tray menu before upgrading.
-      ${If} $MihomoOldRuntimeTrusted != 1
-        Goto mihomo_close_legacy
+      ; Only a complete, protected runtime may receive an elevated --quit.
+      ${If} $MihomoRuntimeTrusted != 1
+        Goto mihomo_close_manual
       ${EndIf}
-      IfFileExists "$INSTDIR\mihomo-desktop-host.exe" 0 mihomo_close_legacy
+      IfFileExists "$INSTDIR\mihomo-desktop-host.exe" 0 mihomo_close_manual
       nsExec::ExecToStack /TIMEOUT=45000 '"$INSTDIR\mihomo-optimized.exe" --quit'
       Pop $2
       Pop $3
@@ -96,7 +93,7 @@ Function ${PREFIX}MihomoCloseApplication
         Goto mihomo_close_done
       ${EndIf}
       Goto mihomo_close_continue
-      mihomo_close_legacy:
+      mihomo_close_manual:
       IfSilent mihomo_close_continue 0
       ${If} $PassiveMode = 1
         Goto mihomo_close_continue
@@ -135,31 +132,11 @@ Function MihomoSkipPassive
   ${EndIf}
 FunctionEnd
 
-; Legacy Tauri installs stored InstallLocation surrounded by literal quotes.
-; Both native and legacy registry views must resolve to the same actual path.
-Function MihomoNormalizeLocation
-  Exch $0
-  Push $1
-  Push $2
-  StrCpy $1 $0 1
-  StrCpy $2 $0 1 -1
-  ${If} $1 == '"'
-  ${AndIf} $2 == '"'
-    StrLen $1 $0
-    IntOp $1 $1 - 2
-    StrCpy $0 $0 $1 1
-  ${EndIf}
-  Pop $2
-  Pop $1
-  Exch $0
-FunctionEnd
-
 Function .onInit
   StrCpy $PassiveMode 0
   StrCpy $UpdateMode 0
-  StrCpy $RemoveMode 0
   StrCpy $MihomoMaintenanceDirectory ""
-  StrCpy $MihomoOldRuntimeTrusted 0
+  StrCpy $MihomoRuntimeTrusted 0
   ${GetOptions} $CMDLINE "/P" $0
   ${IfNot} ${Errors}
     StrCpy $PassiveMode 1
@@ -168,11 +145,6 @@ Function .onInit
   ${IfNot} ${Errors}
     StrCpy $PassiveMode 1
     StrCpy $UpdateMode 1
-  ${EndIf}
-  ${GetOptions} $CMDLINE "/REMOVE" $0
-  ${IfNot} ${Errors}
-    StrCpy $PassiveMode 1
-    StrCpy $RemoveMode 1
   ${EndIf}
   ${IfNot} ${RunningX64}
     MessageBox MB_ICONSTOP|MB_OK "This application requires 64-bit Windows."
@@ -189,39 +161,17 @@ Function .onInit
     MessageBox MB_ICONSTOP|MB_OK "This application requires Windows 10 version 1809 or later."
     Abort
   ${EndIf}
-  ReadRegStr $0 HKLM "${UNINSTALL_KEY}" "InstallLocation"
-  Push $0
-  Call MihomoNormalizeLocation
-  Pop $MihomoPreviousLocation
-  SetRegView 32
-  ReadRegStr $0 HKLM "${UNINSTALL_KEY}" "InstallLocation"
-  Push $0
-  Call MihomoNormalizeLocation
-  Pop $MihomoLegacy32Location
-  SetRegView 64
-  ${If} $MihomoPreviousLocation == ""
-    StrCpy $MihomoPreviousLocation $MihomoLegacy32Location
-  ${ElseIf} $MihomoLegacy32Location != ""
-  ${AndIf} $MihomoPreviousLocation != $MihomoLegacy32Location
-    SetErrorLevel 1
-    Abort "Conflicting application installations were found in the 32-bit and 64-bit registry views."
-  ${EndIf}
+  ReadRegStr $MihomoPreviousLocation HKLM "${UNINSTALL_KEY}" "InstallLocation"
   ${If} $MihomoPreviousLocation != ""
     StrCpy $INSTDIR $MihomoPreviousLocation
-  ${EndIf}
-  ${If} $RemoveMode = 1
-  ${AndIf} $MihomoPreviousLocation == ""
-    SetErrorLevel 1
-    Abort "No registered Mihomo installation was found to remove."
   ${EndIf}
 FunctionEnd
 
 Function un.onInit
   StrCpy $PassiveMode 0
   StrCpy $UpdateMode 0
-  StrCpy $RemoveMode 0
   StrCpy $MihomoMaintenanceDirectory ""
-  StrCpy $MihomoOldRuntimeTrusted 0
+  StrCpy $MihomoRuntimeTrusted 0
   SetRegView 64
   SetShellVarContext all
 FunctionEnd
@@ -233,21 +183,10 @@ FunctionEnd
   ${If} $0 == '"$INSTDIR\mihomo-optimized.exe" --tray'
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "MihomoOptimized"
   ${EndIf}
-  ; The fresh maintenance helper already retired the authenticated original
-  ; registry objects by handle. Never reopen a writable legacy key by name.
+  ; Maintenance already deleted the protected registration by its exact handle.
 !macroend
 
 Section "Install"
-  ${If} $RemoveMode = 1
-    !insertmacro NSIS_HOOK_CHECKUNINSTALL ""
-    Call MihomoCloseApplication
-    !insertmacro NSIS_HOOK_PREUNINSTALL ""
-    !insertmacro MihomoUnregisterInstallation
-    Call MihomoCleanupMaintenance
-    SetAutoClose true
-    SetErrorLevel 0
-    Goto mihomo_install_done
-  ${EndIf}
   ${If} $MihomoPreviousLocation != ""
   ${AndIf} $INSTDIR != $MihomoPreviousLocation
     SetErrorLevel 1
@@ -278,7 +217,7 @@ Section "Install"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\mihomo-optimized.exe"
   WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoModify" 1
   WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoRepair" 1
-  ; Retain the legacy root Start Menu shortcut instead of leaving a duplicate.
+  ; Create the product Start Menu shortcut.
   CreateShortcut "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\mihomo-optimized.exe"
   !insertmacro NSIS_HOOK_POSTINSTALL
   Call MihomoCleanupMaintenance
@@ -286,7 +225,6 @@ Section "Install"
     SetAutoClose true
   ${EndIf}
   SetErrorLevel 0
-  mihomo_install_done:
 SectionEnd
 
 Section "Uninstall"
