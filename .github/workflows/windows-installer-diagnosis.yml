@@ -32,7 +32,7 @@ jobs:
       - name: Install the original Windows token bindings
         run: |
           python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311
-      - name: Probe real roots and child-owned SUBST aliases
+      - name: Probe real roots and supervisor-owned SUBST aliases
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
