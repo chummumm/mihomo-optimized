@@ -2,10 +2,11 @@
 """Exercise managed controller discovery with real core processes.
 
 Based on scripts/test-desktop-controller.py at core commit
-a96045f8581f0a1d4ddbc66a74bdb736b2f936e2. Keep its process, identity,
-publication-failure and real TUN assertions intact. The Windows reader shares
-delete access, as the desktop host does, so observing a stale record cannot
-prevent the core from replacing that record.
+a96045f8581f0a1d4ddbc66a74bdb736b2f936e2. Its process, identity, failure
+and real TUN assertions remain intact. The Windows stale-record case waits
+for the owned child's post-publication log before opening the old target:
+even metadata-only target handles with delete sharing can block MoveFileEx
+replacement on Windows. Normal discovery reads remain unchanged.
 
 Usage: python3 desktop/tests/controller_smoke.py --core /path/to/mihomo
 --require-tun adds the Windows test for TUN cleanup after controller bind failure.
@@ -16,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import ctypes
 import hashlib
 import http.client
 import json
@@ -35,7 +35,6 @@ import time
 RECORD = "desktop-controller.json"
 NONCE_ENV = "MIHOMO_DESKTOP_LAUNCH_NONCE"
 FIELDS = {"protocolVersion", "pid", "controller", "coreInstance", "launchNonce"}
-FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 
 
 class Failure(RuntimeError):
@@ -85,51 +84,14 @@ def unique_fields(items: list[tuple[str, object]]) -> dict:
     return result
 
 
-@contextlib.contextmanager
-def shared_windows_record(path: Path):
-    """Pin a readable disk-file object without blocking atomic replacement."""
-    import pywintypes
-    import win32con
-    import win32file
-
-    handle = None
-    try:
-        handle = win32file.CreateFile(str(path), win32con.GENERIC_READ,
-            win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE | win32con.FILE_SHARE_DELETE,
-            None, win32con.OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, None)
-        information = win32file.GetFileInformationByHandle(handle)
-        require(win32file.GetFileType(handle) == 1 and not information[0] & (0x10 | 0x400),
-                "discovery record is not a regular file")
-        require(((information[5] << 32) | information[6]) <= 4096,
-                "discovery record exceeds 4 KiB")
-        yield handle
-    except pywintypes.error as error:
-        # Keep the original readiness loop's FileNotFoundError behavior when
-        # publication races the open; other I/O failures remain fatal.
-        raise ctypes.WinError(error.winerror) from None
-    finally:
-        if handle is not None:
-            handle.Close()
-
-
-def read_windows_record(handle) -> bytes:
-    import win32file
-
-    return win32file.ReadFile(handle, 4097)[1]
-
-
 def read_record(path: Path) -> tuple[bytes, dict]:
     info = path.lstat()
     require(stat.S_ISREG(info.st_mode) and not path.is_symlink()
             and not (getattr(info, "st_file_attributes", 0) & 0x400),
             "discovery record is not a regular file")
     require(info.st_size <= 4096, "discovery record exceeds 4 KiB")
-    if os.name == "nt":
-        with shared_windows_record(path) as handle:
-            data = read_windows_record(handle)
-    else:
-        with path.open("rb") as source:
-            data = source.read(4097)
+    with path.open("rb") as source:
+        data = source.read(4097)
     require(len(data) <= 4096, "discovery record grew beyond 4 KiB")
     record = json.loads(data, object_pairs_hook=unique_fields)
     require(type(record) is dict and set(record) == FIELDS,
@@ -149,36 +111,6 @@ def read_record(path: Path) -> tuple[bytes, dict]:
             and re.fullmatch(r"[0-9a-f]{64}", record["launchNonce"]) is not None,
             "invalid discovery launch identity")
     return data, record
-
-
-def windows_reader_contract(root: Path, report: dict) -> None:
-    """Force replacement while the exact reader handle stays open, without timing races."""
-    report["stage"] = "discovery_reader_contract"
-    directory = root / "reader-contract"
-    directory.mkdir()
-    record = directory / RECORD
-    replacement = directory / "replacement.json"
-    old = {"protocolVersion": 1, "pid": os.getpid(), "controller": "127.0.0.1:1",
-           "coreInstance": "old-object", "launchNonce": "a" * 64}
-    new = {**old, "coreInstance": "new-object", "launchNonce": "b" * 64}
-    old_bytes, new_bytes = (json.dumps(value).encode() for value in (old, new))
-    record.write_bytes(old_bytes)
-    replacement.write_bytes(new_bytes)
-    with record.open("rb") as blocked:
-        try:
-            os.replace(replacement, record)
-        except OSError as error:
-            require(error.winerror in (5, 32), "ordinary reader replacement failed for an unrelated reason")
-        else:
-            raise Failure("ordinary reader did not reproduce the Windows replacement conflict")
-        require(blocked.read(4097) == old_bytes, "failed replacement changed the old record")
-    report["checks"].append("ordinary_reader_blocks_atomic_replacement")
-    with shared_windows_record(record) as handle:
-        os.replace(replacement, record)
-        require(read_windows_record(handle) == old_bytes, "shared reader switched to the replacement object")
-        data, parsed = read_record(record)
-        require(data == new_bytes and parsed == new, "new path did not expose the atomic replacement")
-    report["checks"].append("reader_shares_delete_and_retains_open_object")
 
 
 class Core:
@@ -259,6 +191,21 @@ class Core:
                 and status.get("core_instance") == self.record["coreInstance"]
                 and status.get("controller") == self.record["controller"],
                 "authenticated desktop identity disagreed with discovery")
+
+    def wait_for_discovery_publication(self) -> None:
+        # At the pinned core revision, hub/route/managed_controller.go logs
+        # this only AFTER synchronous PublishController (including Rename)
+        # succeeds. Observe the separate child log without opening its stale
+        # target. This is only a synchronization barrier: ready() still proves
+        # PID, nonce, schema and authenticated status within the SAME deadline.
+        deadline = self.started + self.timeout
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                raise Failure("core exited before discovery publication:\n" + self.log_tail())
+            if "RESTful API listening at:" in self.log_tail():
+                return
+            time.sleep(0.02)
+        raise Failure("managed discovery publication timed out:\n" + self.log_tail())
 
     def ready(self) -> dict:
         deadline = self.started + self.timeout
@@ -375,9 +322,17 @@ def run(executable: Path, root: Path, timeout: float, report: dict, require_tun:
         "protocolVersion": 1, "pid": os.getpid(), "controller": "127.0.0.1:1",
         "coreInstance": "stale", "launchNonce": secrets.token_hex(32),
     }), encoding="utf-8")
+    previous = (home / RECORD).stat()  # Close all target handles before launching the writer.
     with Core(executable, home, timeout=timeout) as core:
+        if os.name == "nt":
+            core.wait_for_discovery_publication()
         core.ready()
         require(core.record["coreInstance"] != "stale", "stale discovery was accepted")
+        current = (home / RECORD).stat()  # Publication and authenticated readiness are now complete.
+        require(previous.st_ino != 0 and current.st_ino != 0, "stale discovery file identity unavailable")
+        require((previous.st_dev, previous.st_ino) != (current.st_dev, current.st_ino),
+                "stale discovery file object was not replaced")
+        report["stale_record_replaced_object"] = True
         core.shutdown()
     report["checks"].append("new_launch_replaces_stale_record")
 
@@ -445,10 +400,7 @@ def main() -> int:
         with executable.open("rb") as source:
             report["core_sha256"] = hashlib.file_digest(source, "sha256").hexdigest()
         with tempfile.TemporaryDirectory(prefix="mihomo-controller-") as directory:
-            root = Path(directory).resolve()
-            if os.name == "nt":
-                windows_reader_contract(root, report)
-            run(executable, root, arguments.timeout, report, arguments.require_tun)
+            run(executable, Path(directory).resolve(), arguments.timeout, report, arguments.require_tun)
         report["passed"], report["stage"], result = True, "complete", 0
     except (Failure, OSError, ValueError, http.client.HTTPException, subprocess.SubprocessError) as error:
         report["error"] = str(error)
