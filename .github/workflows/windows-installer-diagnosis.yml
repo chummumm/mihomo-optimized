@@ -1,4 +1,4 @@
-name: Windows shell and UIA startup diagnosis
+name: Windows sixth candidate custom-path diagnosis
 
 on:
   push:
@@ -9,20 +9,17 @@ permissions:
   actions: read
 
 jobs:
-  diagnose-startup:
+  diagnose-custom-paths:
     runs-on: windows-2022
-    timeout-minutes: 12
+    timeout-minutes: 25
     env:
-      CARGO_INCREMENTAL: 0
-      GOTOOLCHAIN: local
-      RUSTFLAGS: -C target-feature=+crt-static
       PYTHONUTF8: '1'
       PYTHONUNBUFFERED: '1'
     steps:
-      - name: Check out the unchanged production source
+      - name: Check out the exact candidate source
         uses: actions/checkout@v4
         with:
-          ref: e544948cca3449c4ea8a6f37e3d0df2be7084ed8
+          ref: 84cc0f8baadd84cb768b3907a1c7a61aa10af3fd
           persist-credentials: false
 
       - name: Check out this diagnostic commit separately
@@ -32,30 +29,87 @@ jobs:
           path: diagnostic-source
           persist-credentials: false
 
-      - name: Install the same SDK
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.402'
-
       - name: Install Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Observe the original shell command then the unchanged UIA contract
+      - name: Install the fixed Windows test dependency
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311
+
+      - name: Download the exact sixth candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: mihomo-desktop-windows-x64
+          run-id: 45672045725
+          github-token: ${{ github.token }}
+          path: artifacts/desktop
+
+      - name: Recreate diagnostic metadata without changing production tests
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          distribution = root / 'artifacts' / 'desktop'
+          info_path = distribution / 'build-info.json'
+          info = json.loads(info_path.read_text(encoding='utf-8-sig'))
+          source = '84cc0f8baadd84cb768b3907a1c7a61aa10af3fd'
+          setup = distribution / 'mihomo-desktop-0.2.14-windows-x64-setup.exe'
+          def sha(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+          if (info.get('uiCommit') != source or info.get('desktopVersion') != '0.2.14'
+                  or sha(setup) != 'e05ea9dd5328190e3a4be1dd3cc63377f1e6ec03ea6b361cc3e39a99e193b461'):
+              raise RuntimeError('Candidate source or installer bytes differ from the sixth CI run')
+          # Reproduce scripts/build-native-desktop.py's generated allowlist;
+          # metadata and package checksums are verified again by load_candidate.
+          generated = root / 'desktop' / 'generated'
+          generated.mkdir(parents=True, exist_ok=True)
+          names = sorted(set(info['runtimeFiles']) | {
+              'resources/build-info.json', 'uninstall.exe',
+              'mscordaccore_amd64_amd64_10.0.1426.52326.dll',
+          })
+          (generated / 'installer-files.json').write_text(
+              json.dumps({'files': names}, ensure_ascii=False) + '\n', encoding='utf-8')
+          provenance = {
+              'partialDiagnostic': True,
+              'candidateSource': source,
+              'candidateRunId': 45672045725,
+              'candidateArtifactId': 15052215832,
+              'candidateInstallerSha256': sha(setup),
+              'diagnosticCommit': os.environ['GITHUB_SHA'],
+              'testOverlays': [],
+          }
+          harness = root / 'diagnostic-source' / '.github' / 'diagnostics' / 'sixth-full-custom-path-diagnosis.py'
+          provenance['harnessSha256'] = sha(harness)
+          reports = root / 'artifacts' / 'verification'
+          reports.mkdir(parents=True, exist_ok=True)
+          (reports / 'sixth-custom-provenance.json').write_text(
+              json.dumps(provenance, ensure_ascii=True, indent=2) + '\n', encoding='utf-8')
+          print(json.dumps(provenance, ensure_ascii=True, indent=2), flush=True)
+
+      - name: Run original custom path cases with one explicit baseline omission
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
-          $harness = Join-Path $env:GITHUB_WORKSPACE 'diagnostic-source/.github/diagnostics/windows-startup-diagnosis.py'
-          & python $harness --workspace $env:GITHUB_WORKSPACE
-          exit $LASTEXITCODE
+          $harness = Join-Path $env:GITHUB_WORKSPACE 'diagnostic-source/.github/diagnostics/sixth-full-custom-path-diagnosis.py'
+          $log = Join-Path $env:GITHUB_WORKSPACE 'artifacts/verification/sixth-custom-console.log'
+          & python $harness 2>&1 | Tee-Object -FilePath $log
+          $diagnosticExit = $LASTEXITCODE
+          Write-Output "PARTIAL_CUSTOM_PATH_DIAGNOSTIC_EXIT=$diagnosticExit"
+          exit $diagnosticExit
 
-      - name: Retain scoped startup evidence
+      - name: Retain partial diagnosis evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-startup-diagnosis
+          name: sixth-custom-path-diagnosis
           path: artifacts/verification/
           if-no-files-found: warn
           retention-days: 7
