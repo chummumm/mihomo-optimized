@@ -1,181 +1,110 @@
-name: Windows installer diagnosis
+name: Windows registry API diagnosis
 on:
   push:
     branches: [diagnose/windows-installer]
 permissions:
   contents: read
-  actions: read
 jobs:
-  diagnose:
+  probe:
     runs-on: windows-2022
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
-      - name: Download the exact failed candidate
-        uses: actions/download-artifact@v4
-        with:
-          name: mihomo-desktop-windows-x64
-          run-id: 45634476951
-          github-token: ${{ github.token }}
-          path: candidate-artifact
-      - name: Reproduce install and retain direct helper errors
+      - name: Verify exact key creation and retained handle retirement
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $candidateRoot = Join-Path $env:GITHUB_WORKSPACE 'candidate-artifact'
-          $setup = @(Get-ChildItem -LiteralPath $candidateRoot -Recurse -File -Filter 'mihomo-desktop-0.2.14-windows-x64-setup.exe')
-          $portable = @(Get-ChildItem -LiteralPath $candidateRoot -Recurse -File -Filter 'mihomo-desktop-0.2.14-windows-x64-portable.zip')
-          if ($setup.Count -ne 1 -or $portable.Count -ne 1) { throw 'Exact candidate files were not found' }
-          $privateRoot = Join-Path $env:ProgramFiles ('MihomoInstallerDiagnosis-' + [Guid]::NewGuid().ToString('N'))
-          New-Item -ItemType Directory -Path $privateRoot | Out-Null
-          $acl = Get-Acl -LiteralPath $privateRoot
-          $acl.SetAccessRuleProtection($true, $false)
-          $adminSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
-          $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
-          $acl.SetOwner($adminSid)
-          foreach ($sid in @($adminSid, $systemSid)) {
-            $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
-          }
-          Set-Acl -LiteralPath $privateRoot -AclObject $acl
-          Expand-Archive -LiteralPath $portable[0].FullName -DestinationPath $privateRoot
-          $helper = @(Get-ChildItem -LiteralPath $privateRoot -Recurse -File -Filter 'mihomo-desktop-service.exe')
-          if ($helper.Count -ne 1) { throw 'Exact fresh helper was not found' }
-          $installDirectory = Join-Path $env:ProgramFiles 'Mihomo Optimized'
-          if (Test-Path -LiteralPath $installDirectory) { throw 'Runner is not clean: target already exists' }
-          $nativeRegistry = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized'
-          $legacyRegistry = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized'
-          if ((Test-Path -LiteralPath $nativeRegistry) -or (Test-Path -LiteralPath $legacyRegistry)) { throw 'Runner is not clean: product registration already exists' }
-          if (Get-Service -Name MihomoOptimizedService -ErrorAction SilentlyContinue) { throw 'Runner is not clean: service already exists' }
-          $env:DIAG_SETUP = $setup[0].FullName
-          $env:DIAG_HELPER = $helper[0].FullName
-          $env:DIAG_INSTALL = $installDirectory
           @'
-          import hashlib, json, os, pathlib, subprocess, sys
-          sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
-          sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
-          setup = pathlib.Path(os.environ['DIAG_SETUP'])
-          helper = pathlib.Path(os.environ['DIAG_HELPER'])
-          target = pathlib.Path(os.environ['DIAG_INSTALL'])
-          def sha(path):
-              with path.open('rb') as stream:
-                  return hashlib.file_digest(stream, 'sha256').hexdigest()
-          assert sha(setup) == 'da138a63c160e4267ccd272352a509dc23b0932a41a645adcd2c586cbc44a29b', 'wrong setup artifact'
-          assert sha(helper) == '9fdeb4351473f1a2a6f3fb7f10f38d9e56f8839b6798ea6ce585a0ea25d807e8', 'wrong helper artifact'
-          def probe(name, executable, arguments, cwd, timeout=90):
-              print('\nPROBE ' + os.environ.get('DIAG_PHASE', 'before_registry_protection') + '/' + name, flush=True)
-              print(json.dumps({'executable': str(executable), 'arguments': arguments, 'cwd': str(cwd)}, ensure_ascii=True), flush=True)
-              try:
-                  result = subprocess.run(arguments, executable=str(executable), cwd=str(cwd), stdin=subprocess.DEVNULL,
-                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
-                      creationflags=subprocess.CREATE_NO_WINDOW)
-                  print('EXIT_CODE=' + str(result.returncode), flush=True)
-                  print('STDOUT_JSON=' + json.dumps(result.stdout.decode('utf-8', errors='replace'), ensure_ascii=True), flush=True)
-                  print('STDERR_JSON=' + json.dumps(result.stderr.decode('utf-8', errors='replace'), ensure_ascii=True), flush=True)
-              except Exception as error:
-                  print(type(error).__name__ + ': ' + str(error), flush=True)
-          raw = f'"{setup}" /S /D={target}'
-          if os.environ.get('DIAG_PHASE') != 'after_registry_protection':
-              probe('original_install', setup, raw, setup.parent, 180)
-          probe('validate_from_private_directory', helper, [str(helper), '--validate-directory', str(target)], helper.parent)
-          # On this fresh runner finalize can validate/reach SCM but cannot
-          # start a pre-existing service: assert absence immediately before it.
-          service = subprocess.run(['sc.exe', 'query', 'MihomoOptimizedService'], capture_output=True)
-          print('SCM_BEFORE_FINALIZE=' + str(service.returncode), flush=True)
-          print(service.stdout.decode('utf-8', errors='replace'), flush=True)
-          if service.returncode == 1060:
-              probe('finalize_from_private_directory', helper, [str(helper), '--installer-finalize', str(target)], helper.parent)
-              if target.is_dir():
-                  probe('finalize_with_target_cwd', helper, [str(helper), '--installer-finalize', str(target)], target)
-          else:
-              print('Finalization probe skipped: service absence was not proven', flush=True)
-          '@ | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'diagnose-installer.py') -Encoding utf8
-          & python (Join-Path $env:RUNNER_TEMP 'diagnose-installer.py')
-          $pythonExit = $LASTEXITCODE
-          Write-Output "PYTHON_EXIT=$pythonExit"
-          Write-Output "POWERSHELL_64BIT=$([Environment]::Is64BitProcess)"
-          $inspect = @(
-            $env:ProgramFiles,
-            $installDirectory,
-            (Join-Path $installDirectory 'resources'),
-            (Join-Path $installDirectory 'cs'),
-            (Join-Path $installDirectory 'mihomo-optimized.exe'),
-            (Join-Path $installDirectory 'mihomo-desktop-host.exe'),
-            (Join-Path $installDirectory 'mihomo-desktop-service.exe'),
-            (Join-Path $installDirectory 'mihomo-core.exe'),
-            (Join-Path $installDirectory 'uninstall.exe'),
-            (Join-Path $installDirectory 'mihomo-optimized.dll'),
-            (Join-Path $installDirectory 'coreclr.dll'),
-            (Join-Path $installDirectory 'hostpolicy.dll'),
-            (Join-Path $installDirectory 'mihomo-optimized.runtimeconfig.json'),
-            (Join-Path $installDirectory 'resources\build-info.json'),
-            (Join-Path $installDirectory 'cs\PresentationCore.resources.dll'),
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized',
-            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized'
-          )
-          foreach ($location in $inspect) {
-            try {
-              $item = Get-Item -LiteralPath $location -ErrorAction Stop
-              $permissions = Get-Acl -LiteralPath $location -ErrorAction Stop
-              [pscustomobject]@{Path=$location; Owner=$permissions.Owner; Sddl=$permissions.Sddl; Attributes=$item.Attributes; Length=$item.Length} | ConvertTo-Json -Compress
-            } catch { Write-Output "INSPECT_ERROR $location : $($_.Exception.Message)" }
-          }
-          foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
-            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
-            $key = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized')
-            try {
-              if ($null -eq $key) { Write-Output "REGISTRY_VIEW=$view ABSENT"; continue }
-              $values = @{}
-              foreach ($name in $key.GetValueNames()) { $values[$name] = $key.GetValue($name) }
-              [pscustomobject]@{RegistryView="$view"; Values=$values} | ConvertTo-Json -Depth 4 -Compress
-            } finally { if ($null -ne $key) { $key.Dispose() }; $base.Dispose() }
-          }
-          if (Test-Path -LiteralPath $installDirectory) {
-            Get-ChildItem -LiteralPath $installDirectory -Force | Select-Object Name, Mode, Length, Attributes | Format-Table -AutoSize
-            Write-Output "INSTALLED_FILE_COUNT=$(@(Get-ChildItem -LiteralPath $installDirectory -Recurse -File).Count)"
-          }
-          # This fixture established absence of both product registry views before
-          # running the pinned candidate. Protect only the new key created by
-          # that exact installation; never migrate or adopt an existing key.
-          $createdRegistration = Get-ItemProperty -LiteralPath $nativeRegistry
-          if ($createdRegistration.InstallLocation -cne $installDirectory -or $createdRegistration.MainBinaryName -cne 'mihomo-optimized.exe' -or $createdRegistration.DisplayVersion -cne '0.2.14') {
-            throw 'Refusing registry protection: newly created registration identity differs'
-          }
-          if (Test-Path -LiteralPath $legacyRegistry) { throw 'Unexpected legacy product registration was created' }
-          Write-Output 'DIAGNOSIS_ONLY_PROTECT_FRESH_PRODUCT_REGISTRY'
-          $freshKeyAcl = [System.Security.AccessControl.RegistrySecurity]::new()
-          $freshKeyAcl.SetSecurityDescriptorSddlForm('O:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;BU)', ([System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Access))
-          @'
-          import ctypes, winreg
-          from ctypes import wintypes
-          advapi = ctypes.WinDLL('advapi32', use_last_error=True)
-          kernel = ctypes.WinDLL('kernel32', use_last_error=True)
-          advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
-          advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
-          advapi.GetSecurityDescriptorDacl.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)]
-          advapi.GetSecurityDescriptorDacl.restype = wintypes.BOOL
-          advapi.SetSecurityInfo.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-          advapi.SetSecurityInfo.restype = wintypes.DWORD
-          kernel.LocalFree.argtypes = [ctypes.c_void_p]
-          kernel.LocalFree.restype = ctypes.c_void_p
-          sd = ctypes.c_void_p()
-          if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW('O:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;BU)', 1, ctypes.byref(sd), None):
-              raise ctypes.WinError(ctypes.get_last_error())
+          import ctypes, json, uuid, winreg
+          from ctypes import wintypes as W
+          A = ctypes.WinDLL('advapi32', use_last_error=True)
+          N = ctypes.WinDLL('ntdll', use_last_error=True)
+          K = ctypes.WinDLL('kernel32', use_last_error=True)
+          P = ctypes.c_void_p
+          class SA(ctypes.Structure):
+              _fields_ = [('length', W.DWORD), ('descriptor', P), ('inherit', W.BOOL)]
+          A.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [W.LPCWSTR,W.DWORD,ctypes.POINTER(P),ctypes.POINTER(W.DWORD)]
+          A.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = W.BOOL
+          A.RegCreateKeyExW.argtypes = [P,W.LPCWSTR,W.DWORD,W.LPWSTR,W.DWORD,W.DWORD,ctypes.POINTER(SA),ctypes.POINTER(P),ctypes.POINTER(W.DWORD)]
+          A.RegCreateKeyExW.restype = W.LONG
+          A.RegOpenKeyExW.argtypes = [P,W.LPCWSTR,W.DWORD,W.DWORD,ctypes.POINTER(P)]
+          A.RegOpenKeyExW.restype = W.LONG
+          A.RegSetValueExW.argtypes = [P,W.LPCWSTR,W.DWORD,W.DWORD,P,W.DWORD]
+          A.RegSetValueExW.restype = W.LONG
+          A.RegQueryValueExW.argtypes = [P,W.LPCWSTR,P,ctypes.POINTER(W.DWORD),P,ctypes.POINTER(W.DWORD)]
+          A.RegQueryValueExW.restype = W.LONG
+          A.RegCloseKey.argtypes = [P]
+          A.RegCloseKey.restype = W.LONG
+          N.NtDeleteKey.argtypes = [P]
+          N.NtDeleteKey.restype = W.LONG
+          K.LocalFree.argtypes = [P]
+          K.LocalFree.restype = P
+          sd = P()
+          assert A.ConvertStringSecurityDescriptorToSecurityDescriptorW('O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KR;;;BU)',1,ctypes.byref(sd),None)
+          sa = SA(ctypes.sizeof(SA),sd,False)
+          handles = []
+          children = []
+          root = None
+          owned_root = False
+          name = 'MihomoRegistryProbe-' + uuid.uuid4().hex
+          
+          def create(parent, child, flags):
+              handle, disposition = P(), W.DWORD()
+              error = A.RegCreateKeyExW(parent,child,0,None,flags,winreg.KEY_ALL_ACCESS|winreg.KEY_WOW64_64KEY,ctypes.byref(sa),ctypes.byref(handle),ctypes.byref(disposition))
+              if error: raise ctypes.WinError(error)
+              handles.append(handle)
+              return handle, disposition.value
+          
+          def put(handle, value, kind=winreg.REG_SZ):
+              data = value.encode('utf-16-le') + (b'\x00\x00' if kind==winreg.REG_SZ else b'')
+              buffer = ctypes.create_string_buffer(data)
+              return A.RegSetValueExW(handle,'SymbolicLinkValue' if kind==winreg.REG_LINK else 'InstallLocation',0,kind,buffer,len(data))
+          
+          def get(handle, field):
+              kind, size = W.DWORD(), W.DWORD(32768)
+              buffer = ctypes.create_string_buffer(size.value)
+              error = A.RegQueryValueExW(handle,field,None,ctypes.byref(kind),buffer,ctypes.byref(size))
+              if error: raise ctypes.WinError(error)
+              return kind.value, buffer.raw[:size.value].decode('utf-16-le').rstrip('\x00')
+          
           try:
-              present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
-              if not advapi.GetSecurityDescriptorDacl(sd, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)) or not present or not dacl:
-                  raise RuntimeError('Invalid diagnostic DACL')
-              with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized', 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY | 0x40000) as key:
-                  error = advapi.SetSecurityInfo(int(key), 4, 4 | 0x80000000, None, None, dacl, None)
-                  if error:
-                      raise ctypes.WinError(error)
-              print('NATIVE_FRESH_KEY_DACL_SET=0')
+              with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,'SOFTWARE',0,winreg.KEY_READ|winreg.KEY_CREATE_SUB_KEY|winreg.KEY_WOW64_64KEY) as software:
+                  root, disposition = create(int(software),name,0)
+              assert disposition==1, 'Refusing a pre-existing probe namespace'
+              owned_root = True
+              child, disposition = create(root,'created',8)
+              children.append(child)
+              assert disposition==1
+              print('REG_CREATE_OPEN_LINK_NEW=passed',flush=True)
+              link, disposition = create(root,'link',2)
+              children.append(link)
+              assert disposition==1
+              target = '\\Registry\\Machine\\SOFTWARE\\' + name + '\\target'
+              assert put(link,target,winreg.REG_LINK)==0
+              opened, disposition = create(root,'link',8)
+              assert disposition==2 and get(opened,'SymbolicLinkValue')==(winreg.REG_LINK,target)
+              absent = P()
+              assert A.RegOpenKeyExW(root,'target',8,winreg.KEY_READ,ctypes.byref(absent))==2
+              print('REG_CREATE_OPEN_LINK_DOES_NOT_FOLLOW=passed',flush=True)
+              old, disposition = create(root,'retired',8)
+              children.append(old)
+              assert disposition==1 and put(old,'original')==0
+              retained = P()
+              assert A.RegOpenKeyExW(root,'retired',8,winreg.KEY_SET_VALUE,ctypes.byref(retained))==0
+              handles.append(retained)
+              assert N.NtDeleteKey(old)==0
+              new, disposition = create(root,'retired',8)
+              children.append(new)
+              assert disposition==1 and put(new,'replacement')==0
+              error = put(retained,'stale writer')
+              assert error==1018 and get(new,'InstallLocation')==(winreg.REG_SZ,'replacement')
+              print(json.dumps({'NtDeleteKeyRetiresOpenHandles':True,'oldWriteWinError':error,'replacementCreatedWhileOldHandleOpen':True}),flush=True)
           finally:
-              kernel.LocalFree(sd)
+              for handle in reversed(children):
+                  N.NtDeleteKey(handle)
+              if owned_root:
+                  N.NtDeleteKey(root)
+              for handle in reversed(handles):
+                  A.RegCloseKey(handle)
+              K.LocalFree(sd)
           '@ | & python -
-          if ($LASTEXITCODE -ne 0) { throw 'Native diagnostic key protection failed' }
-          $protectedKeyAcl = Get-Acl -LiteralPath $nativeRegistry
-          [pscustomobject]@{Path=$nativeRegistry; Owner=$protectedKeyAcl.Owner; Sddl=$protectedKeyAcl.Sddl} | ConvertTo-Json -Compress
-          $env:DIAG_PHASE = 'after_registry_protection'
-          & python (Join-Path $env:RUNNER_TEMP 'diagnose-installer.py')
-          Write-Output "AFTER_PROTECTION_PYTHON_EXIT=$LASTEXITCODE"
-          exit 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
