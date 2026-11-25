@@ -4,7 +4,7 @@ use crate::{
     windows,
 };
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::{fs, path::Path};
 use windows_api::{
     core::{BSTR, HRESULT},
     Win32::{
@@ -100,6 +100,24 @@ fn program_matches(actual: &str, expected: &str) -> bool {
         .unwrap_or(actual)
         .to_lowercase()
         == expected.to_lowercase()
+}
+
+/// Removing this installation's rules does not execute its core. Its trusted
+/// HKLM identity remains usable after a partial uninstall removed the binary.
+pub fn remove_installed_rules(directory: &Path) -> Result<()> {
+    let executable = directory.join("mihomo-core.exe");
+    let program = executable
+        .to_str()
+        .ok_or_else(|| AppError::new("firewall_path_invalid", "无法编码已登记的防火墙程序路径"))?;
+    let program = program.strip_prefix(r"\\?\").unwrap_or(program);
+    let bytes = program.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1..3] != *b":\\" {
+        return Err(AppError::new(
+            "firewall_path_invalid",
+            "防火墙清理需要已登记的本地安装路径",
+        ));
+    }
+    configure(program, false)
 }
 
 pub fn configure(program: &str, install: bool) -> Result<()> {

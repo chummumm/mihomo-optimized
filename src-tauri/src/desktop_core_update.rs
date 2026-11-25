@@ -1,5 +1,5 @@
 //! Independent core updates run inside the existing desktop lifecycle owner.
-//! Program Files writes belong to the authenticated service; portable builds
+//! Registered installation writes belong to the authenticated service; portable builds
 //! use the same verified transaction in their unprivileged supervisor.
 use super::*;
 use crate::core_update::{UpdateJob, UpdateOutcome};
@@ -44,7 +44,7 @@ impl DesktopManager {
             return Ok(());
         }
         self.cancellation.check()?;
-        if let Ok(directory) = windows::protected_install_dir() {
+        if let Some(directory) = windows::installed_directory()? {
             // A stopped service is fine for an ordinary direct start, but only
             // that service may recover a privileged replacement.
             if service::status()?.running {
@@ -102,7 +102,7 @@ impl DesktopManager {
             None
         };
         let service_owned = matches!(self.running, Some(RunningCore::Service(_)));
-        let needs_service = service_owned || windows::protected_install_dir().is_ok();
+        let needs_service = service_owned || windows::installed_directory()?.is_some();
         if self.running.is_none() {
             self.recover_core_update_before_start()?;
         }

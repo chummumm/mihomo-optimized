@@ -986,7 +986,7 @@ impl DesktopManager {
         let use_service = if self.preferences.tun {
             self.ensure_service()?;
             true
-        } else if windows::protected_install_dir().is_ok() {
+        } else if windows::installed_directory()?.is_some() {
             // Ordinary proxy mode can reuse an already running trusted owner,
             // but must never install/start a service or prompt for elevation.
             prefer_installed_service(true, &service::status()?)

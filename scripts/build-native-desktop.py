@@ -78,6 +78,13 @@ def main():
     info_path.write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
     generated = ROOT / "desktop/generated"
     generated.mkdir(parents=True, exist_ok=True)
+    # The fresh elevated helper owns deletion, with path handles retained for
+    # the complete operation. Never trust a manifest in the old installation.
+    installed_files = sorted({path.relative_to(output).as_posix() for path in files} | {
+        "uninstall.exe", "mscordaccore_amd64_amd64_10.0.1426.52326.dll",
+    })
+    (generated / "installer-files.json").write_text(
+        json.dumps({"files": installed_files}, ensure_ascii=False) + "\n", encoding="utf-8")
     manifest = ["; Generated from dist-native. Delete only files shipped by this installer."]
     for path in files:
         relative = nsis_text(path.relative_to(output).as_posix())

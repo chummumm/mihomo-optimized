@@ -589,7 +589,14 @@ class CoreUpdateAcceptance(Acceptance):
         self.mark(name)
         self.close_scenario()
 
-    def run(self) -> None:
+    def run(self, *, scenarios: tuple[str, ...] = ("running_auto_update", "tun_auto_update", "stopped_auto_update"),
+            check_legacy: bool = True) -> None:
+        requested = {
+            "running_auto_update": (True, False),
+            "tun_auto_update": (True, True),
+            "stopped_auto_update": (False, True),
+        }
+        require(scenarios and all(name in requested for name in scenarios), "core_update_scenarios_invalid")
         require(self.core.is_file() and self.host.is_file() and self.helper.is_file(), "installed_sidecars_missing")
         self.require_idle_installation()
         require(all(not path.exists() for path in self.update_files()), "preexisting_core_update_transaction")
@@ -605,10 +612,11 @@ class CoreUpdateAcceptance(Acceptance):
         self.socks = SocksFixture()
         sidecars = {path: file_hash(path) for path in (self.app, self.host, self.helper)}
         self.prepare_baseline()
-        self.unsupported_published_core()
-        self.scenario("running_auto_update", running=True, tun=False)
-        self.scenario("tun_auto_update", running=True, tun=True)
-        self.scenario("stopped_auto_update", running=False, tun=True)
+        if check_legacy:
+            self.unsupported_published_core()
+        for name in scenarios:
+            running, tun = requested[name]
+            self.scenario(name, running=running, tun=tun)
         require(all(file_hash(path) == checksum for path, checksum in sidecars.items()),
                 "core_update_replaced_desktop_application")
         self.mark("desktop_application_unchanged")

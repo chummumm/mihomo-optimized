@@ -37,8 +37,8 @@ use windows_sys::Win32::{
         },
     },
     UI::Shell::{
-        FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
-        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        FOLDERID_LocalAppData, FOLDERID_ProgramData, SHGetKnownFolderPath, ShellExecuteExW,
+        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     },
 };
 
@@ -332,6 +332,14 @@ pub fn protected_install_dir() -> Result<PathBuf> {
     checked_install_dir(false)
 }
 
+/// `None` means this executable is a portable copy. An installation whose
+/// registered path or permissions are damaged must not fall back to portable
+/// writes, particularly while recovering an interrupted privileged update.
+pub fn installed_directory() -> Result<Option<PathBuf>> {
+    let executable = std::env::current_exe().map_err(|e| AppError::io("无法定位程序", e))?;
+    crate::installation::directory_for_application(&executable)
+}
+
 /// Service startup and its privileged maintenance start repair an interrupted
 /// rename. Ordinary client construction must not undo an active update.
 pub fn protected_install_dir_for_core_recovery() -> Result<PathBuf> {
@@ -339,28 +347,17 @@ pub fn protected_install_dir_for_core_recovery() -> Result<PathBuf> {
 }
 
 fn checked_install_dir(recover_core: bool) -> Result<PathBuf> {
-    let executable = std::env::current_exe().map_err(|e| AppError::io("无法定位程序", e))?;
-    reject_reparse_path(&executable)?;
-    let directory = executable
-        .parent()
-        .ok_or_else(|| AppError::new("service_install_required", "请先安装桌面版以使用 TUN"))?
-        .canonicalize()
-        .map_err(|e| AppError::io("无法定位安装目录", e))?;
-    let program_files = known_folder(&FOLDERID_ProgramFiles)?
-        .canonicalize()
-        .map_err(|e| AppError::io("无法定位受保护目录", e))?;
-    if !directory.starts_with(&program_files) || directory == program_files {
-        return Err(AppError::new(
+    let directory = installed_directory()?.ok_or_else(|| {
+        AppError::new(
             "service_install_required",
-            "TUN 服务需要安装版；请运行安装包将程序安装到 Program Files",
-        ));
-    }
-    for ancestor in directory
-        .ancestors()
-        .take_while(|path| path.starts_with(&program_files))
-    {
-        require_admin_protected(ancestor)?;
-    }
+            "TUN 服务需要已注册的安装版，请运行完整安装包完成安装",
+        )
+    })?;
+    validate_installation_files(&directory, recover_core)?;
+    Ok(directory)
+}
+
+pub(crate) fn validate_installation_files(directory: &Path, recover_core: bool) -> Result<()> {
     if recover_core {
         let core = directory.join("mihomo-core.exe");
         let (backup, marker) = crate::core::core_update_recovery_paths(&core)?;
@@ -390,7 +387,7 @@ fn checked_install_dir(recover_core: bool) -> Result<PathBuf> {
         let candidate = directory.join(filename).canonicalize().map_err(|_| {
             AppError::new("service_binary_missing", "安装目录缺少配套程序，请重新安装")
         })?;
-        if candidate.parent() != Some(directory.as_path()) {
+        if candidate.parent() != Some(directory) {
             return Err(AppError::new(
                 "service_untrusted_path",
                 "服务程序不能通过链接指向安装目录以外",
@@ -405,7 +402,7 @@ fn checked_install_dir(recover_core: bool) -> Result<PathBuf> {
         reject_hard_links(&wintun)?;
         require_admin_protected(&wintun)?;
     }
-    Ok(directory)
+    Ok(())
 }
 
 pub fn secure_directory(path: &Path, owner_sid: Option<&str>) -> Result<()> {
@@ -493,36 +490,132 @@ pub fn reject_hard_links(path: &Path) -> Result<()> {
 /// A protected file's owner must also be trusted: removing a user's write ACE
 /// alone does not remove an owner's ability to grant write access again.
 pub fn require_admin_protected(path: &Path) -> Result<()> {
-    use windows_sys::Win32::{
-        Foundation::{GENERIC_ALL, GENERIC_WRITE},
-        Security::{
-            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
-            GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION,
-        },
-        Storage::FileSystem::{
-            DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
-            FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
-        },
-    };
-    fn trusted(sid: &str) -> bool {
-        matches!(
-            sid,
-            "S-1-5-18"
-                | "S-1-5-32-544"
-                | "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
-        )
-    }
-    unsafe fn sid_text(sid: *mut core::ffi::c_void) -> Result<String> {
-        let mut text = std::ptr::null_mut();
-        if sid.is_null() || ConvertSidToStringSidW(sid, &mut text) == 0 {
-            return Err(last_error("无法验证文件所有者"));
+    require_admin_path_policy(path, SecurityBoundary::Product)
+}
+
+/// Creating unrelated siblings is harmless; deleting, replacing, or changing
+/// the security of an ancestor would let a user replace the installed service.
+pub(crate) fn require_admin_parent(path: &Path) -> Result<()> {
+    require_admin_path_policy(path, SecurityBoundary::Ancestor)
+}
+
+#[derive(Clone, Copy)]
+enum SecurityBoundary {
+    Product,
+    Ancestor,
+    Registry,
+}
+
+impl SecurityBoundary {
+    fn forbidden_mask(self) -> u32 {
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_ALL, GENERIC_WRITE},
+            Storage::FileSystem::{
+                DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES,
+                FILE_WRITE_DATA, FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+            },
+            System::Registry::{KEY_CREATE_LINK, KEY_CREATE_SUB_KEY, KEY_SET_VALUE},
+        };
+        let control = GENERIC_ALL | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
+        match self {
+            Self::Product => {
+                control
+                    | FILE_WRITE_DATA
+                    | FILE_APPEND_DATA
+                    | FILE_WRITE_EA
+                    | FILE_WRITE_ATTRIBUTES
+                    | FILE_DELETE_CHILD
+            }
+            Self::Ancestor => control | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD,
+            Self::Registry => control | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK,
         }
-        let value = read_wide(text);
-        LocalFree(text.cast());
-        Ok(value)
     }
-    let unsafe_acl = || {
-        AppError::new("service_untrusted_permissions", "TUN 服务需要管理员保护的安装目录。请通过安装包重新安装到 Program Files，勿从普通用户可修改的目录启动服务")
+
+    fn error(self) -> AppError {
+        match self {
+            Self::Product => AppError::new(
+                "service_untrusted_permissions",
+                "安装目录或程序可被普通用户修改，请运行完整安装包修复目录权限",
+            ),
+            Self::Ancestor => AppError::new(
+                "service_untrusted_parent",
+                "安装目录的上级文件夹可被普通用户替换，请选择受管理员保护的父目录；安装器不会更改共享父目录权限",
+            ),
+            Self::Registry => AppError::new(
+                "service_untrusted_registration",
+                "Windows 安装记录权限不安全，请使用完整安装包修复",
+            ),
+        }
+    }
+}
+
+fn trusted_security_owner(sid: &str) -> bool {
+    matches!(
+        sid,
+        "S-1-5-18"
+            | "S-1-5-32-544"
+            | "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+    )
+}
+
+unsafe fn security_sid_text(sid: PSID) -> Result<String> {
+    let mut text = std::ptr::null_mut();
+    if sid.is_null() || ConvertSidToStringSidW(sid, &mut text) == 0 {
+        return Err(last_error("无法验证安全主体"));
+    }
+    let value = read_wide(text);
+    LocalFree(text.cast());
+    Ok(value)
+}
+
+// The descriptor remains owned by the querying function until this returns.
+unsafe fn verify_admin_security(
+    owner: PSID,
+    dacl: *mut windows_sys::Win32::Security::ACL,
+    boundary: SecurityBoundary,
+) -> Result<()> {
+    use windows_sys::Win32::Security::{GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER, INHERIT_ONLY_ACE};
+    if !trusted_security_owner(&security_sid_text(owner)?)
+        || dacl.is_null()
+        || IsValidAcl(dacl) == 0
+    {
+        return Err(boundary.error());
+    }
+    for index in 0..(*dacl).AceCount as u32 {
+        let mut raw = std::ptr::null_mut();
+        if GetAce(dacl, index, &mut raw) == 0 {
+            return Err(last_error("无法验证权限项"));
+        }
+        let header = &*raw.cast::<ACE_HEADER>();
+        if header.AceFlags as u32 & INHERIT_ONLY_ACE != 0
+            || [1_u8, 6, 10, 12].contains(&header.AceType)
+        {
+            continue;
+        }
+        if header.AceSize < 8 {
+            return Err(boundary.error());
+        }
+        let ace = &*raw.cast::<ACCESS_ALLOWED_ACE>();
+        if ace.Mask & boundary.forbidden_mask() == 0 {
+            continue;
+        }
+        // Object and callback grants have different SID layouts. Refuse write
+        // grants from these uncommon ACEs instead of interpreting their SID.
+        if header.AceType != 0
+            || !trusted_security_owner(&security_sid_text(
+                std::ptr::addr_of!(ace.SidStart).cast_mut().cast(),
+            )?)
+        {
+            return Err(boundary.error());
+        }
+    }
+    Ok(())
+}
+
+fn require_admin_path_policy(path: &Path, boundary: SecurityBoundary) -> Result<()> {
+    use windows_sys::Win32::Security::{
+        Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+        OWNER_SECURITY_INFORMATION,
     };
     unsafe {
         let mut owner = std::ptr::null_mut();
@@ -544,51 +637,37 @@ pub fn require_admin_protected(path: &Path) -> Result<()> {
                 std::io::Error::from_raw_os_error(error as i32),
             ));
         }
-        let result = (|| {
-            if !trusted(&sid_text(owner)?) || dacl.is_null() {
-                return Err(unsafe_acl());
-            }
-            let write_mask = GENERIC_ALL
-                | GENERIC_WRITE
-                | DELETE
-                | WRITE_DAC
-                | WRITE_OWNER
-                | FILE_WRITE_DATA
-                | FILE_APPEND_DATA
-                | FILE_WRITE_EA
-                | FILE_WRITE_ATTRIBUTES
-                | FILE_DELETE_CHILD;
-            for index in 0..(*dacl).AceCount as u32 {
-                let mut raw = std::ptr::null_mut();
-                if GetAce(dacl, index, &mut raw) == 0 {
-                    return Err(last_error("无法验证目录权限项"));
-                }
-                let header = &*raw.cast::<ACE_HEADER>();
-                if header.AceFlags as u32 & INHERIT_ONLY_ACE != 0 {
-                    continue;
-                }
-                // Deny ACEs cannot grant a write permission. Object/callback grants
-                // are conservatively refused when they carry any write bit.
-                if [1_u8, 6, 10, 12].contains(&header.AceType) {
-                    continue;
-                }
-                if header.AceSize < 8 {
-                    return Err(unsafe_acl());
-                }
-                let ace = &*raw.cast::<ACCESS_ALLOWED_ACE>();
-                if ace.Mask & write_mask == 0 {
-                    continue;
-                }
-                if header.AceType != 0
-                    || !trusted(&sid_text(
-                        std::ptr::addr_of!(ace.SidStart).cast_mut().cast(),
-                    )?)
-                {
-                    return Err(unsafe_acl());
-                }
-            }
-            Ok(())
-        })();
+        let result = verify_admin_security(owner, dacl, boundary);
+        LocalFree(descriptor);
+        result
+    }
+}
+
+pub(crate) fn require_admin_registry_key(key: HANDLE) -> Result<()> {
+    use windows_sys::Win32::Security::{
+        Authorization::SE_REGISTRY_KEY, OWNER_SECURITY_INFORMATION,
+    };
+    unsafe {
+        let mut owner = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        let error = GetSecurityInfo(
+            key,
+            SE_REGISTRY_KEY,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if error != 0 {
+            return Err(AppError::io(
+                "无法验证安装记录权限",
+                std::io::Error::from_raw_os_error(error as i32),
+            ));
+        }
+        let result = verify_admin_security(owner, dacl, SecurityBoundary::Registry);
         LocalFree(descriptor);
         result
     }
@@ -818,8 +897,20 @@ fn launch_service_helper(
     action: ServiceAction,
     cancellation: Option<&crate::lifecycle::Cancellation>,
 ) -> Result<ServiceHelper> {
-    let directory = protected_install_dir()?;
-    let service = wide(directory.join("mihomo-desktop-service.exe"));
+    let directory = match action {
+        ServiceAction::Install => protected_install_dir()?,
+        // Removing a service must still work when a core update was interrupted
+        // or an unrelated companion file is missing. Only the executable we
+        // actually elevate needs the full file trust check here.
+        ServiceAction::Uninstall => installed_directory()?.ok_or_else(|| {
+            AppError::new("service_install_required", "请从已安装的桌面程序移除服务")
+        })?,
+    };
+    let service_path = directory.join("mihomo-desktop-service.exe");
+    reject_reparse_path(&service_path)?;
+    reject_hard_links(&service_path)?;
+    require_admin_protected(&service_path)?;
+    let service = wide(&service_path);
     let sid = current_sid()?;
     let parameters = match action {
         ServiceAction::Install => format!("--install --owner-sid {sid}"),
@@ -1179,5 +1270,76 @@ mod tests {
         apply_dacl(&file, &format!("O:{sid}D:P(A;;FA;;;SY)(A;;FA;;;{sid})")).unwrap();
         fs::remove_dir_all(directory).unwrap();
         assert_eq!(result.unwrap_err().code, "service_untrusted_permissions");
+    }
+
+    fn check_security_descriptor(sddl: &str, boundary: SecurityBoundary) -> Result<()> {
+        use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, GetSecurityDescriptorOwner};
+        unsafe {
+            let mut descriptor = std::ptr::null_mut();
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide(sddl).as_ptr(),
+                    1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                ),
+                0
+            );
+            let mut owner = std::ptr::null_mut();
+            let mut dacl = std::ptr::null_mut();
+            let mut present = 0;
+            let mut defaulted = 0;
+            assert_ne!(
+                GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted),
+                0
+            );
+            assert_ne!(
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted),
+                0
+            );
+            let result = verify_admin_security(owner, dacl, boundary);
+            LocalFree(descriptor);
+            result
+        }
+    }
+
+    #[test]
+    fn installation_ancestors_allow_sibling_creation_without_allowing_replacement() {
+        // FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY on the ancestor itself. This is
+        // a normal system-volume root permission, not permission to replace an
+        // existing administrator-owned child installation.
+        let siblings = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x00000006;;;BU)";
+        assert!(check_security_descriptor(siblings, SecurityBoundary::Ancestor).is_ok());
+        assert!(check_security_descriptor(siblings, SecurityBoundary::Product).is_err());
+        assert!(check_security_descriptor(siblings, SecurityBoundary::Registry).is_err());
+        for replacement in [
+            0x00010000u32,
+            0x00000040,
+            0x00040000,
+            0x00080000,
+            0x00000100,
+        ] {
+            let descriptor =
+                format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x{replacement:08x};;;BU)");
+            assert_eq!(
+                check_security_descriptor(&descriptor, SecurityBoundary::Ancestor)
+                    .unwrap_err()
+                    .code,
+                "service_untrusted_parent"
+            );
+        }
+    }
+
+    #[test]
+    fn registration_and_parent_owners_cannot_regrant_untrusted_access() {
+        let descriptor = "O:S-1-5-21-1-2-3-1001D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)";
+        assert!(check_security_descriptor(descriptor, SecurityBoundary::Registry).is_err());
+        assert!(check_security_descriptor(descriptor, SecurityBoundary::Ancestor).is_err());
+        let inherited_only = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;OICIIO;FA;;;BU)";
+        assert!(check_security_descriptor(inherited_only, SecurityBoundary::Ancestor).is_ok());
+        assert!(
+            check_security_descriptor("O:BAD:NO_ACCESS_CONTROL", SecurityBoundary::Product)
+                .is_err()
+        );
     }
 }

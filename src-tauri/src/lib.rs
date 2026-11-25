@@ -13,6 +13,8 @@ pub mod error;
 mod firewall;
 #[cfg(all(windows, feature = "desktop"))]
 mod host;
+#[cfg(windows)]
+pub mod installation;
 pub mod lifecycle;
 #[cfg(windows)]
 mod power;

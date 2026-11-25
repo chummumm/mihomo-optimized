@@ -40,6 +40,7 @@ VIAddVersionKey "LegalCopyright" "Mihomo Optimized contributors"
 
 Var PassiveMode
 Var UpdateMode
+Var RemoveMode
 Var MihomoCloseError
 Var MihomoPreviousLocation
 Var MihomoLegacy32Location
@@ -83,6 +84,9 @@ Function ${PREFIX}MihomoCloseApplication
       ${EndIf}
       ; Presence of the native host identifies versions supporting --quit.
       ; Legacy versions must be exited using their tray menu before upgrading.
+      ${If} $MihomoOldRuntimeTrusted != 1
+        Goto mihomo_close_legacy
+      ${EndIf}
       IfFileExists "$INSTDIR\mihomo-desktop-host.exe" 0 mihomo_close_legacy
       nsExec::ExecToStack /TIMEOUT=45000 '"$INSTDIR\mihomo-optimized.exe" --quit'
       Pop $2
@@ -153,6 +157,9 @@ FunctionEnd
 Function .onInit
   StrCpy $PassiveMode 0
   StrCpy $UpdateMode 0
+  StrCpy $RemoveMode 0
+  StrCpy $MihomoMaintenanceDirectory ""
+  StrCpy $MihomoOldRuntimeTrusted 0
   ${GetOptions} $CMDLINE "/P" $0
   ${IfNot} ${Errors}
     StrCpy $PassiveMode 1
@@ -161,6 +168,11 @@ Function .onInit
   ${IfNot} ${Errors}
     StrCpy $PassiveMode 1
     StrCpy $UpdateMode 1
+  ${EndIf}
+  ${GetOptions} $CMDLINE "/REMOVE" $0
+  ${IfNot} ${Errors}
+    StrCpy $PassiveMode 1
+    StrCpy $RemoveMode 1
   ${EndIf}
   ${IfNot} ${RunningX64}
     MessageBox MB_ICONSTOP|MB_OK "This application requires 64-bit Windows."
@@ -197,32 +209,61 @@ Function .onInit
   ${If} $MihomoPreviousLocation != ""
     StrCpy $INSTDIR $MihomoPreviousLocation
   ${EndIf}
+  ${If} $RemoveMode = 1
+  ${AndIf} $MihomoPreviousLocation == ""
+    SetErrorLevel 1
+    Abort "No registered Mihomo installation was found to remove."
+  ${EndIf}
 FunctionEnd
 
 Function un.onInit
   StrCpy $PassiveMode 0
   StrCpy $UpdateMode 0
+  StrCpy $RemoveMode 0
+  StrCpy $MihomoMaintenanceDirectory ""
+  StrCpy $MihomoOldRuntimeTrusted 0
   SetRegView 64
   SetShellVarContext all
 FunctionEnd
 
+!macro MihomoUnregisterInstallation
+  Delete "$SMPROGRAMS\${PRODUCTNAME}.lnk"
+  Delete "$DESKTOP\${PRODUCTNAME}.lnk"
+  ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "MihomoOptimized"
+  ${If} $0 == '"$INSTDIR\mihomo-optimized.exe" --tray'
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "MihomoOptimized"
+  ${EndIf}
+  DeleteRegKey HKLM "${UNINSTALL_KEY}"
+  ; Legacy registration is removed only after trusted maintenance has verified
+  ; that both views describe this same installation.
+  SetRegView 32
+  DeleteRegKey HKLM "${UNINSTALL_KEY}"
+  SetRegView 64
+!macroend
+
 Section "Install"
+  ${If} $RemoveMode = 1
+    !insertmacro NSIS_HOOK_CHECKUNINSTALL ""
+    Call MihomoCloseApplication
+    !insertmacro NSIS_HOOK_PREUNINSTALL ""
+    !insertmacro MihomoUnregisterInstallation
+    Call MihomoCleanupMaintenance
+    SetAutoClose true
+    SetErrorLevel 0
+    Goto mihomo_install_done
+  ${EndIf}
   ${If} $MihomoPreviousLocation != ""
   ${AndIf} $INSTDIR != $MihomoPreviousLocation
     SetErrorLevel 1
     Abort "An upgrade must use the existing installation directory. Uninstall first to change it."
   ${EndIf}
+  !insertmacro NSIS_HOOK_CHECKINSTALL
   Call MihomoCloseApplication
   !insertmacro NSIS_HOOK_PREINSTALL
-  ; Published WPF versions shipped this version-qualified .NET diagnostic DLL.
-  ; Copying a newer runtime cannot replace its different filename. Remove only
-  ; the known retired component after the application and service have stopped.
-  Delete "$INSTDIR\mscordaccore_amd64_amd64_10.0.1426.52326.dll"
-  IfFileExists "$INSTDIR\mscordaccore_amd64_amd64_10.0.1426.52326.dll" 0 +3
-    SetErrorLevel 1
-    Abort "Unable to remove an obsolete runtime component. Close the application and retry."
   SetOutPath "$INSTDIR"
-  SetOverwrite ifdiff
+  ; Maintenance removed every shipped target first. Copy fresh files rather
+  ; than reusing old timestamps or previously opened user-writable inodes.
+  SetOverwrite on
   ClearErrors
   File /r "..\dist-native\*"
   ${If} ${Errors}
@@ -248,26 +289,38 @@ Section "Install"
     SetRegView 64
   ${EndIf}
   !insertmacro NSIS_HOOK_POSTINSTALL
+  Call MihomoCleanupMaintenance
   ${If} $PassiveMode = 1
     SetAutoClose true
   ${EndIf}
   SetErrorLevel 0
+  mihomo_install_done:
 SectionEnd
 
 Section "Uninstall"
+  !insertmacro NSIS_HOOK_CHECKUNINSTALL "un."
   Call un.MihomoCloseApplication
-  !insertmacro NSIS_HOOK_PREUNINSTALL
-  ; Generated exact file list. Never recursively remove application/user data.
-  !include "generated\uninstall-files.nsh"
-  Delete "$SMPROGRAMS\${PRODUCTNAME}.lnk"
-  Delete "$DESKTOP\${PRODUCTNAME}.lnk"
-  ; Remove only this installation's autostart value for the current user.
-  ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "MihomoOptimized"
-  ${If} $0 == '"$INSTDIR\mihomo-optimized.exe" --tray'
-    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "MihomoOptimized"
-  ${EndIf}
-  DeleteRegKey HKLM "${UNINSTALL_KEY}"
-  Delete "$INSTDIR\uninstall.exe"
-  RMDir "$INSTDIR"
+  !insertmacro NSIS_HOOK_PREUNINSTALL "un."
+  !insertmacro MihomoUnregisterInstallation
+  Call un.MihomoCleanupMaintenance
   SetErrorLevel 0
 SectionEnd
+
+Function .onInstFailed
+  Call MihomoCleanupMaintenance
+FunctionEnd
+Function .onInstSuccess
+  Call MihomoCleanupMaintenance
+FunctionEnd
+Function .onGUIEnd
+  Call MihomoCleanupMaintenance
+FunctionEnd
+Function un.onUninstFailed
+  Call un.MihomoCleanupMaintenance
+FunctionEnd
+Function un.onUninstSuccess
+  Call un.MihomoCleanupMaintenance
+FunctionEnd
+Function un.onGUIEnd
+  Call un.MihomoCleanupMaintenance
+FunctionEnd

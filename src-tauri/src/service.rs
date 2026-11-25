@@ -3,6 +3,7 @@ use crate::{
     core::CoreSupervisor,
     core_runtime::{CoreRuntime, RuntimeRequest},
     error::{AppError, Result},
+    installation,
     lifecycle::{OwnerLease, PowerSignal, StopReason, SystemAwakeClock},
     service_ipc::{AuthenticatedOwner, AuthenticatedRequest, Reply, Request, Server},
     windows,
@@ -12,7 +13,7 @@ use std::{
     collections::VecDeque,
     ffi::OsString,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
@@ -32,6 +33,8 @@ use windows_service::{
 };
 
 pub const SERVICE_NAME: &str = "MihomoOptimizedService";
+
+mod maintenance;
 
 #[derive(Clone, Default, Serialize)]
 pub struct ServiceStatusView {
@@ -67,6 +70,33 @@ pub fn entry() -> Result<()> {
     match args.as_slice() {
         [action, marker, sid] if action == "--install" && marker == "--owner-sid" => install(sid),
         [action] if action == "--uninstall" => uninstall(),
+        [action, directory, manifest] if action == "--installer-check" => {
+            maintenance::check(Path::new(directory), Path::new(manifest))
+        }
+        [action, directory] if action == "--validate-directory" => {
+            installation::validate_existing_directory(Path::new(directory))
+        }
+        [action, directory, manifest] if action == "--installer-prepare" => {
+            maintenance::replace_files(Path::new(directory), Path::new(manifest))
+        }
+        [action, directory] if action == "--installer-finalize" => {
+            installer_finalize(Path::new(directory))
+        }
+        [action, directory] if action == "--uninstall-directory" => {
+            uninstall_directory(Path::new(directory))
+        }
+        [action, directory] if action == "--uninstall-check" => {
+            uninstall_check(Path::new(directory))
+        }
+        [action, directory, manifest, parent_pid] if action == "--remove-installation" => {
+            maintenance::remove_installation(
+                Path::new(directory),
+                Path::new(manifest),
+                parent_pid
+                    .parse()
+                    .map_err(|_| AppError::new("invalid_pid", "无效的卸载程序进程"))?,
+            )
+        }
         [action] if action == "--stop-for-update" => set_installed_running(false),
         [action] if action == "--start-if-installed" => set_installed_running(true),
         [action, pid, marker, instance] if action == "--watch-user" && marker == "--instance" => {
@@ -84,6 +114,159 @@ pub fn entry() -> Result<()> {
     }
 }
 
+fn service_info(directory: &Path) -> ServiceInfo {
+    ServiceInfo {
+        name: SERVICE_NAME.into(),
+        display_name: "Mihomo Optimized TUN Service".into(),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: directory.join("mihomo-desktop-service.exe"),
+        launch_arguments: vec![],
+        dependencies: vec![],
+        account_name: None,
+        account_password: None,
+    }
+}
+
+// SCM returns the complete ImagePath, including its optional surrounding
+// quotes. Do not parse it as a shell command or accept trailing arguments.
+fn service_image_matches(actual: &Path, expected: &Path) -> bool {
+    fn normalize(path: &Path) -> Option<String> {
+        let text = path.to_str()?;
+        let text = if let Some(quoted) = text.strip_prefix('"') {
+            quoted.strip_suffix('"')?
+        } else {
+            text
+        };
+        if text.contains('"') {
+            return None;
+        }
+        Some(
+            text.strip_prefix(r"\\?\")
+                .unwrap_or(text)
+                .replace('/', "\\")
+                .to_lowercase(),
+        )
+    }
+    match (normalize(actual), normalize(expected)) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => false,
+    }
+}
+
+fn require_owned_service(service: &Service, directory: &Path) -> Result<()> {
+    let configuration = service.query_config().map_err(service_error)?;
+    let system_account = configuration
+        .account_name
+        .as_deref()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("LocalSystem")
+                || name.eq_ignore_ascii_case(r"NT AUTHORITY\SYSTEM")
+        });
+    if configuration.service_type != ServiceType::OWN_PROCESS
+        || configuration.display_name != "Mihomo Optimized TUN Service"
+        || !system_account
+        || !service_image_matches(
+            &configuration.executable_path,
+            &directory.join("mihomo-desktop-service.exe"),
+        )
+    {
+        return Err(AppError::new(
+            "service_installation_conflict",
+            "同名 Windows 服务不属于当前安装目录，未停止、修改或删除该服务",
+        ));
+    }
+    Ok(())
+}
+
+fn installer_check(target: &Path) -> Result<()> {
+    let directory = installation::preflight_directory(target)?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(service_error)?;
+    // Read-only preflight must not wait for or alter a service transition.
+    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG) {
+        Ok(service) => {
+            let registered = installation::maintenance_directory(&directory)?;
+            require_owned_service(&service, &registered)
+        }
+        Err(error) if has_service_error(&error, 1060) || has_service_error(&error, 1072) => Ok(()),
+        Err(error) => Err(service_error(error)),
+    }
+}
+
+fn uninstall_check(target: &Path) -> Result<()> {
+    let directory = installation::maintenance_directory(target)?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(service_error)?;
+    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG) {
+        Ok(service) => require_owned_service(&service, &directory),
+        Err(error) if has_service_error(&error, 1060) || has_service_error(&error, 1072) => Ok(()),
+        Err(error) => Err(service_error(error)),
+    }
+}
+
+fn installer_prepare(target: &Path) -> Result<()> {
+    installer_check(target)?;
+    let directory = installation::prepare_directory(target)?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(service_error)?;
+    if let Some(service) = open_maintenance_service(
+        &manager,
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+    )? {
+        require_owned_service(&service, &directory)?;
+        stop_service(&service)?;
+    }
+    Ok(())
+}
+
+fn installer_finalize(target: &Path) -> Result<()> {
+    let directory = installation::finalize_directory(target)?;
+    start_owned_service_if_installed(&directory)
+}
+
+fn start_owned_service_if_installed(directory: &Path) -> Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(service_error)?;
+    let Some(service) = open_maintenance_service(
+        &manager,
+        ServiceAccess::START
+            | ServiceAccess::QUERY_STATUS
+            | ServiceAccess::QUERY_CONFIG
+            | ServiceAccess::CHANGE_CONFIG,
+    )?
+    else {
+        return Ok(());
+    };
+    require_owned_service(&service, directory)?;
+    // Reapply the exact quoted executable path for this verified installation;
+    // a stale/foreign ImagePath is rejected above rather than taken over.
+    service
+        .change_config(&service_info(directory))
+        .map_err(service_error)?;
+    windows::configure_tun_firewall(directory, true)?;
+    start_service(&service)
+}
+
+fn start_service(service: &Service) -> Result<()> {
+    if service.query_status().map_err(service_error)?.current_state == ServiceState::Stopped {
+        service.start::<&str>(&[]).map_err(service_error)?;
+    }
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(15) {
+        if service.query_status().map_err(service_error)?.current_state == ServiceState::Running {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(AppError::new(
+        "service_start_failed",
+        "服务已安装但未能启动，请检查 Windows 服务状态",
+    ))
+}
+
 fn valid_user_sid(sid: &str) -> bool {
     sid.starts_with("S-1-5-21-")
         && sid.len() < 180
@@ -98,6 +281,19 @@ fn install(owner_sid: &str) -> Result<()> {
         return Err(AppError::new("invalid_owner", "服务所属用户标识无效"));
     }
     let directory = windows::protected_install_dir()?;
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )
+    .map_err(service_error)?;
+    let access = ServiceAccess::START
+        | ServiceAccess::QUERY_STATUS
+        | ServiceAccess::CHANGE_CONFIG
+        | ServiceAccess::QUERY_CONFIG;
+    let existing = open_maintenance_service(&manager, access)?;
+    if let Some(service) = &existing {
+        require_owned_service(service, &directory)?;
+    }
     // Both the installed executables and persistent service state are administrator-only
     // writable. Unprivileged clients supply configuration text, never filesystem paths.
     windows::apply_dacl(
@@ -145,49 +341,20 @@ fn install(owner_sid: &str) -> Result<()> {
     windows::secure_directory(&data.join("logs"), None)?;
     windows::secure_admin_tree(&data.join("runtime"), None)?;
     windows::secure_admin_tree(&data.join("logs"), Some(owner_sid))?;
-    let manager = ServiceManager::local_computer(
-        None::<&str>,
-        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
-    )
-    .map_err(service_error)?;
-    let access = ServiceAccess::START | ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG;
-    let service = match manager.open_service(SERVICE_NAME, access) {
-        Ok(service) => service,
-        Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1060) => manager
-            .create_service(
-                &ServiceInfo {
-                    name: SERVICE_NAME.into(),
-                    display_name: "Mihomo Optimized TUN Service".into(),
-                    service_type: ServiceType::OWN_PROCESS,
-                    start_type: ServiceStartType::AutoStart,
-                    error_control: ServiceErrorControl::Normal,
-                    executable_path: directory.join("mihomo-desktop-service.exe"),
-                    launch_arguments: vec![],
-                    dependencies: vec![],
-                    account_name: None,
-                    account_password: None,
-                },
-                access,
-            )
+    let service = match existing {
+        Some(service) => {
+            service
+                .change_config(&service_info(&directory))
+                .map_err(service_error)?;
+            service
+        }
+        None => manager
+            .create_service(&service_info(&directory), access)
             .map_err(service_error)?,
-        Err(error) => return Err(service_error(error)),
     };
     service.set_description("Runs only the bundled Mihomo core for the installed user's TUN mode; stops the core when the desktop session disconnects.").map_err(service_error)?;
     windows::configure_tun_firewall(&directory, true)?;
-    if service.query_status().map_err(service_error)?.current_state == ServiceState::Stopped {
-        service.start::<&str>(&[]).map_err(service_error)?;
-    }
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(15) {
-        if service.query_status().map_err(service_error)?.current_state == ServiceState::Running {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Err(AppError::new(
-        "service_start_failed",
-        "服务已安装但未能启动，请检查 Windows 服务状态",
-    ))
+    start_service(&service)
 }
 
 fn set_installed_running(running: bool) -> Result<()> {
@@ -196,42 +363,27 @@ fn set_installed_running(running: bool) -> Result<()> {
     let directory = if running {
         // The privileged maintenance start must repair the same fixed rename
         // gap as SCM startup before requiring the core executable to exist.
-        Some(windows::protected_install_dir_for_core_recovery()?)
+        windows::protected_install_dir_for_core_recovery()?
     } else {
-        None
+        let executable =
+            std::env::current_exe().map_err(|error| AppError::io("无法定位维护程序", error))?;
+        executable
+            .parent()
+            .ok_or_else(|| AppError::new("service_path_invalid", "无法定位维护程序目录"))?
+            .to_path_buf()
     };
+    if running {
+        return start_owned_service_if_installed(&directory);
+    }
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(service_error)?;
-    let access = ServiceAccess::QUERY_STATUS
-        | if running {
-            ServiceAccess::START
-        } else {
-            ServiceAccess::STOP
-        };
+    let access = ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG | ServiceAccess::STOP;
     let service = match open_maintenance_service(&manager, access)? {
         Some(service) => service,
         None => return Ok(()),
     };
-    if let Some(directory) = directory {
-        windows::configure_tun_firewall(&directory, true)?;
-    } else {
-        return stop_service(&service);
-    }
-    let current = service.query_status().map_err(service_error)?.current_state;
-    if current == ServiceState::Stopped {
-        service.start::<&str>(&[]).map_err(service_error)?;
-    }
-    let started = Instant::now();
-    while service.query_status().map_err(service_error)?.current_state != ServiceState::Running {
-        if started.elapsed() > Duration::from_secs(40) {
-            return Err(AppError::new(
-                "service_transition_timeout",
-                "等待服务切换状态超时",
-            ));
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Ok(())
+    require_owned_service(&service, &directory)?;
+    stop_service(&service)
 }
 
 fn has_service_error(error: &windows_service::Error, code: i32) -> bool {
@@ -356,19 +508,32 @@ fn maintenance_timeout(code: &str, message: String, last_error: Option<AppError>
 }
 
 fn uninstall() -> Result<()> {
-    let directory = windows::protected_install_dir()?;
+    let executable =
+        std::env::current_exe().map_err(|error| AppError::io("无法定位维护程序", error))?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| AppError::new("service_path_invalid", "无法定位维护程序目录"))?;
+    uninstall_directory(directory)
+}
+
+fn uninstall_directory(target: &Path) -> Result<()> {
+    let directory = installation::maintenance_directory(target)?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(service_error)?;
     let service = open_maintenance_service(
         &manager,
-        ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
+        ServiceAccess::STOP
+            | ServiceAccess::DELETE
+            | ServiceAccess::QUERY_STATUS
+            | ServiceAccess::QUERY_CONFIG,
     )?;
     if let Some(service) = &service {
+        require_owned_service(service, &directory)?;
         stop_service(service)?;
     }
     // A previous partial uninstall may have already removed the SCM entry.
     // Always remove this installation's firewall rules before clearing ownership.
-    windows::configure_tun_firewall(&directory, false)?;
+    crate::firewall::remove_installed_rules(&directory)?;
     if let Some(service) = service {
         match service.delete() {
             Ok(()) => (),
@@ -384,6 +549,9 @@ fn uninstall() -> Result<()> {
     }
     let owner = windows::service_data_dir()?.join("owner.sid");
     if owner.exists() {
+        windows::reject_reparse_path(&owner)?;
+        windows::reject_hard_links(&owner)?;
+        windows::require_admin_protected(&owner)?;
         fs::remove_file(owner).map_err(|e| AppError::io("无法清理服务所有者", e))?;
     }
     Ok(())
@@ -932,6 +1100,31 @@ fn handle_session_request(
 #[cfg(test)]
 mod maintenance_tests {
     use super::*;
+
+    #[test]
+    fn service_image_identity_accepts_scm_quotes_but_not_arguments_or_other_paths() {
+        let expected = Path::new(r"D:\应用 程序\Mihomo Optimized\mihomo-desktop-service.exe");
+        for actual in [
+            r"d:\应用 程序\Mihomo Optimized\mihomo-desktop-service.exe",
+            r#""D:\应用 程序\Mihomo Optimized\mihomo-desktop-service.exe""#,
+            r#""\\?\D:\应用 程序\Mihomo Optimized\mihomo-desktop-service.exe""#,
+        ] {
+            assert!(
+                service_image_matches(Path::new(actual), expected),
+                "{actual}"
+            );
+        }
+        for actual in [
+            r#""D:\应用 程序\Mihomo Optimized\mihomo-desktop-service.exe" --foreign"#,
+            r"D:\Other\mihomo-desktop-service.exe",
+            r"D:\应用 程序\Mihomo Optimized\mihomo-desktop-service.exe --foreign",
+        ] {
+            assert!(
+                !service_image_matches(Path::new(actual), expected),
+                "{actual}"
+            );
+        }
+    }
 
     fn winapi_error(code: i32) -> windows_service::Error {
         windows_service::Error::Winapi(std::io::Error::from_raw_os_error(code))

@@ -32,7 +32,6 @@ const SOURCE_REF: &str = "refs/heads/clash-dashboard";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_INSTALLER: u64 = 512 * 1024 * 1024;
 const MAX_BUNDLE: u64 = 4 * 1024 * 1024;
-const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized";
 static BUSY: AtomicBool = AtomicBool::new(false);
 static CANDIDATE: OnceLock<Mutex<Option<Candidate>>> = OnceLock::new();
 
@@ -102,7 +101,6 @@ pub struct UpdateInfo {
 /// staging copy, so it supplies the original, process-identity-checked application
 /// path instead. Both paths must match the same administrator-owned NSIS record.
 fn installed_update_dir(original_application: Option<&Path>) -> Result<PathBuf> {
-    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
     let unavailable = || {
         AppError::new(
             "update_installation_required",
@@ -110,39 +108,11 @@ fn installed_update_dir(original_application: Option<&Path>) -> Result<PathBuf> 
         )
     };
     let directory = if let Some(application) = original_application {
-        crate::windows::reject_reparse_path(application)?;
-        crate::windows::require_admin_protected(application)?;
-        let directory = application.parent().ok_or_else(unavailable)?;
-        crate::windows::require_admin_protected(directory)?;
-        directory.canonicalize().map_err(|_| unavailable())?
+        crate::installation::directory_for_application(application)?.ok_or_else(unavailable)?
     } else {
-        crate::windows::protected_install_dir()?
+        crate::windows::installed_directory()?.ok_or_else(unavailable)?
     };
-    // Keep the existing NSIS upgrade identity: HKLM in the 64-bit view,
-    // the same application filename, and quoted or plain InstallLocation.
-    let key = winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(UNINSTALL_KEY, KEY_READ | KEY_WOW64_64KEY)
-        .map_err(|_| unavailable())?;
-    let location: String = key
-        .get_value("InstallLocation")
-        .map_err(|_| unavailable())?;
-    let binary: String = key.get_value("MainBinaryName").map_err(|_| unavailable())?;
-    if binary != "mihomo-optimized.exe" {
-        return Err(unavailable());
-    }
-    let location = location.trim();
-    let unquoted = location
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(location);
-    let registered = Path::new(unquoted);
-    if !registered.is_absolute() {
-        return Err(unavailable());
-    }
-    crate::windows::reject_reparse_path(registered)?;
-    if registered.canonicalize().map_err(|_| unavailable())? != directory {
-        return Err(unavailable());
-    }
+    crate::installation::validate_existing_directory(&directory)?;
     Ok(directory)
 }
 
@@ -989,12 +959,7 @@ pub fn desktop_install_update(
     cancellation.check()?;
     let _operation = Operation::acquire()?;
     let manager = &state.0;
-    if installed_update_dir(None).is_err() {
-        return Err(AppError::new(
-            "update_installation_required",
-            "便携版或未受保护的安装目录不能直接安装更新，请从可信发布页下载完整安装包并完成安装",
-        ));
-    }
+    installed_update_dir(None)?;
     let candidate = CANDIDATE
         .get_or_init(|| Mutex::new(None))
         .lock()
