@@ -1,110 +1,112 @@
-name: Windows registry API diagnosis
+name: Windows controller reader diagnosis
+
 on:
   push:
     branches: [diagnose/windows-installer]
+
 permissions:
   contents: read
+  actions: read
+
 jobs:
-  probe:
+  diagnose-controller-reader:
     runs-on: windows-2022
-    timeout-minutes: 5
+    timeout-minutes: 10
+    env:
+      PYTHONUTF8: '1'
+      PYTHONUNBUFFERED: '1'
     steps:
-      - name: Verify exact key creation and retained handle retirement
+      - name: Check out the exact diagnostic branch commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the fixed Windows test dependency
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311
+
+      - name: Download the already built candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: mihomo-desktop-windows-x64
+          run-id: 45634476951
+          github-token: ${{ github.token }}
+          path: candidate-artifact
+
+      - name: Extract and verify the identical core executable
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import zipfile
+
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          archives = list((root / 'candidate-artifact').rglob('mihomo-desktop-0.2.14-windows-x64-portable.zip'))
+          if len(archives) != 1:
+              raise RuntimeError('The exact candidate portable archive was not found')
+          output = root / 'artifacts' / 'controller-reader-diagnosis'
+          reports = root / 'artifacts' / 'verification'
+          output.mkdir(parents=True, exist_ok=True)
+          reports.mkdir(parents=True, exist_ok=True)
+          expected = 'c7247bd59a316e9f5bc74aa8c063e04c88bdc40c4fd427e32a0c46e90a18b38b'
+          with zipfile.ZipFile(archives[0]) as archive:
+              entries = [entry for entry in archive.infolist()
+                         if not entry.is_dir() and entry.filename.replace('\\', '/').split('/')[-1] == 'mihomo-core.exe']
+              if len(entries) != 1:
+                  raise RuntimeError('A unique core executable was not found in the portable archive')
+              data = archive.read(entries[0])
+              actual = hashlib.sha256(data).hexdigest()
+              if actual != expected:
+                  raise RuntimeError(f'Unexpected core SHA256: {actual}')
+              # Read one verified member into a fixed destination; no archive
+              # directory names or installer binaries are executed/extracted.
+              core = output / 'mihomo-core.exe'
+              core.write_bytes(data)
+          test = root / 'desktop' / 'tests' / 'controller_smoke.py'
+          if not test.is_file():
+              raise RuntimeError('The diagnostic controller test is missing from this commit')
+          provenance = {
+              'diagnosticCommit': os.environ['GITHUB_SHA'],
+              'sourceRunId': 45634476951,
+              'sourceArtifact': 'mihomo-desktop-windows-x64',
+              'portableArchive': archives[0].name,
+              'portableArchiveSha256': hashlib.sha256(archives[0].read_bytes()).hexdigest(),
+              'coreSha256': actual,
+              'controllerTestSha256': hashlib.sha256(test.read_bytes()).hexdigest(),
+          }
+          (reports / 'controller-reader-provenance.json').write_text(
+              json.dumps(provenance, ensure_ascii=True, indent=2) + '\n', encoding='utf-8')
+          print(json.dumps(provenance, ensure_ascii=True, indent=2), flush=True)
+
+      - name: Run all controller scenarios and the native reader sharing contract
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          @'
-          import ctypes, json, uuid, winreg
-          from ctypes import wintypes as W
-          A = ctypes.WinDLL('advapi32', use_last_error=True)
-          N = ctypes.WinDLL('ntdll', use_last_error=True)
-          K = ctypes.WinDLL('kernel32', use_last_error=True)
-          P = ctypes.c_void_p
-          class SA(ctypes.Structure):
-              _fields_ = [('length', W.DWORD), ('descriptor', P), ('inherit', W.BOOL)]
-          A.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [W.LPCWSTR,W.DWORD,ctypes.POINTER(P),ctypes.POINTER(W.DWORD)]
-          A.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = W.BOOL
-          A.RegCreateKeyExW.argtypes = [P,W.LPCWSTR,W.DWORD,W.LPWSTR,W.DWORD,W.DWORD,ctypes.POINTER(SA),ctypes.POINTER(P),ctypes.POINTER(W.DWORD)]
-          A.RegCreateKeyExW.restype = W.LONG
-          A.RegOpenKeyExW.argtypes = [P,W.LPCWSTR,W.DWORD,W.DWORD,ctypes.POINTER(P)]
-          A.RegOpenKeyExW.restype = W.LONG
-          A.RegSetValueExW.argtypes = [P,W.LPCWSTR,W.DWORD,W.DWORD,P,W.DWORD]
-          A.RegSetValueExW.restype = W.LONG
-          A.RegQueryValueExW.argtypes = [P,W.LPCWSTR,P,ctypes.POINTER(W.DWORD),P,ctypes.POINTER(W.DWORD)]
-          A.RegQueryValueExW.restype = W.LONG
-          A.RegCloseKey.argtypes = [P]
-          A.RegCloseKey.restype = W.LONG
-          N.NtDeleteKey.argtypes = [P]
-          N.NtDeleteKey.restype = W.LONG
-          K.LocalFree.argtypes = [P]
-          K.LocalFree.restype = P
-          sd = P()
-          assert A.ConvertStringSecurityDescriptorToSecurityDescriptorW('O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KR;;;BU)',1,ctypes.byref(sd),None)
-          sa = SA(ctypes.sizeof(SA),sd,False)
-          handles = []
-          children = []
-          root = None
-          owned_root = False
-          name = 'MihomoRegistryProbe-' + uuid.uuid4().hex
-          
-          def create(parent, child, flags):
-              handle, disposition = P(), W.DWORD()
-              error = A.RegCreateKeyExW(parent,child,0,None,flags,winreg.KEY_ALL_ACCESS|winreg.KEY_WOW64_64KEY,ctypes.byref(sa),ctypes.byref(handle),ctypes.byref(disposition))
-              if error: raise ctypes.WinError(error)
-              handles.append(handle)
-              return handle, disposition.value
-          
-          def put(handle, value, kind=winreg.REG_SZ):
-              data = value.encode('utf-16-le') + (b'\x00\x00' if kind==winreg.REG_SZ else b'')
-              buffer = ctypes.create_string_buffer(data)
-              return A.RegSetValueExW(handle,'SymbolicLinkValue' if kind==winreg.REG_LINK else 'InstallLocation',0,kind,buffer,len(data))
-          
-          def get(handle, field):
-              kind, size = W.DWORD(), W.DWORD(32768)
-              buffer = ctypes.create_string_buffer(size.value)
-              error = A.RegQueryValueExW(handle,field,None,ctypes.byref(kind),buffer,ctypes.byref(size))
-              if error: raise ctypes.WinError(error)
-              return kind.value, buffer.raw[:size.value].decode('utf-16-le').rstrip('\x00')
-          
-          try:
-              with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,'SOFTWARE',0,winreg.KEY_READ|winreg.KEY_CREATE_SUB_KEY|winreg.KEY_WOW64_64KEY) as software:
-                  root, disposition = create(int(software),name,0)
-              assert disposition==1, 'Refusing a pre-existing probe namespace'
-              owned_root = True
-              child, disposition = create(root,'created',8)
-              children.append(child)
-              assert disposition==1
-              print('REG_CREATE_OPEN_LINK_NEW=passed',flush=True)
-              link, disposition = create(root,'link',2)
-              children.append(link)
-              assert disposition==1
-              target = '\\Registry\\Machine\\SOFTWARE\\' + name + '\\target'
-              assert put(link,target,winreg.REG_LINK)==0
-              opened, disposition = create(root,'link',8)
-              assert disposition==2 and get(opened,'SymbolicLinkValue')==(winreg.REG_LINK,target)
-              absent = P()
-              assert A.RegOpenKeyExW(root,'target',8,winreg.KEY_READ,ctypes.byref(absent))==2
-              print('REG_CREATE_OPEN_LINK_DOES_NOT_FOLLOW=passed',flush=True)
-              old, disposition = create(root,'retired',8)
-              children.append(old)
-              assert disposition==1 and put(old,'original')==0
-              retained = P()
-              assert A.RegOpenKeyExW(root,'retired',8,winreg.KEY_SET_VALUE,ctypes.byref(retained))==0
-              handles.append(retained)
-              assert N.NtDeleteKey(old)==0
-              new, disposition = create(root,'retired',8)
-              children.append(new)
-              assert disposition==1 and put(new,'replacement')==0
-              error = put(retained,'stale writer')
-              assert error==1018 and get(new,'InstallLocation')==(winreg.REG_SZ,'replacement')
-              print(json.dumps({'NtDeleteKeyRetiresOpenHandles':True,'oldWriteWinError':error,'replacementCreatedWhileOldHandleOpen':True}),flush=True)
-          finally:
-              for handle in reversed(children):
-                  N.NtDeleteKey(handle)
-              if owned_root:
-                  N.NtDeleteKey(root)
-              for handle in reversed(handles):
-                  A.RegCloseKey(handle)
-              K.LocalFree(sd)
-          '@ | & python -
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $PSNativeCommandUseErrorActionPreference = $false
+          $core = Join-Path $env:GITHUB_WORKSPACE 'artifacts/controller-reader-diagnosis/mihomo-core.exe'
+          $report = Join-Path $env:GITHUB_WORKSPACE 'artifacts/verification/controller-discovery.json'
+          $log = Join-Path $env:GITHUB_WORKSPACE 'artifacts/verification/controller-discovery.log'
+          & python desktop/tests/controller_smoke.py --require-tun --core $core --report $report 2>&1 | Tee-Object -FilePath $log
+          $controllerExit = $LASTEXITCODE
+          Write-Output "CONTROLLER_TEST_EXIT=$controllerExit"
+          exit $controllerExit
+
+      - name: Retain controller diagnosis evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-controller-reader-diagnosis
+          path: |
+            artifacts/verification/controller-discovery.json
+            artifacts/verification/controller-discovery.log
+            artifacts/verification/controller-reader-provenance.json
+          if-no-files-found: warn
+          retention-days: 7
