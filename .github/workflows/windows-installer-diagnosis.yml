@@ -1,0 +1,130 @@
+name: Windows installer diagnosis
+on:
+  push:
+    branches: [diagnose/windows-installer]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  diagnose:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - name: Download the exact failed candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: mihomo-desktop-windows-x64
+          run-id: 45634476951
+          github-token: ${{ github.token }}
+          path: candidate-artifact
+      - name: Reproduce install and retain direct helper errors
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateRoot = Join-Path $env:GITHUB_WORKSPACE 'candidate-artifact'
+          $setup = @(Get-ChildItem -LiteralPath $candidateRoot -Recurse -File -Filter 'mihomo-desktop-0.2.14-windows-x64-setup.exe')
+          $portable = @(Get-ChildItem -LiteralPath $candidateRoot -Recurse -File -Filter 'mihomo-desktop-0.2.14-windows-x64-portable.zip')
+          if ($setup.Count -ne 1 -or $portable.Count -ne 1) { throw 'Exact candidate files were not found' }
+          $privateRoot = Join-Path $env:ProgramFiles ('MihomoInstallerDiagnosis-' + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $privateRoot | Out-Null
+          $acl = Get-Acl -LiteralPath $privateRoot
+          $acl.SetAccessRuleProtection($true, $false)
+          $adminSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+          $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+          $acl.SetOwner($adminSid)
+          foreach ($sid in @($adminSid, $systemSid)) {
+            $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+          }
+          Set-Acl -LiteralPath $privateRoot -AclObject $acl
+          Expand-Archive -LiteralPath $portable[0].FullName -DestinationPath $privateRoot
+          $helper = @(Get-ChildItem -LiteralPath $privateRoot -Recurse -File -Filter 'mihomo-desktop-service.exe')
+          if ($helper.Count -ne 1) { throw 'Exact fresh helper was not found' }
+          $installDirectory = Join-Path $env:ProgramFiles 'Mihomo Optimized'
+          if (Test-Path -LiteralPath $installDirectory) { throw 'Runner is not clean: target already exists' }
+          if (Get-Service -Name MihomoOptimizedService -ErrorAction SilentlyContinue) { throw 'Runner is not clean: service already exists' }
+          $env:DIAG_SETUP = $setup[0].FullName
+          $env:DIAG_HELPER = $helper[0].FullName
+          $env:DIAG_INSTALL = $installDirectory
+          @'
+          import hashlib, json, os, pathlib, subprocess
+          setup = pathlib.Path(os.environ['DIAG_SETUP'])
+          helper = pathlib.Path(os.environ['DIAG_HELPER'])
+          target = pathlib.Path(os.environ['DIAG_INSTALL'])
+          def sha(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+          assert sha(setup) == 'da138a63c160e4267ccd272352a509dc23b0932a41a645adcd2c586cbc44a29b', 'wrong setup artifact'
+          assert sha(helper) == '9fdeb4351473f1a2a6f3fb7f10f38d9e56f8839b6798ea6ce585a0ea25d807e8', 'wrong helper artifact'
+          def probe(name, executable, arguments, cwd, timeout=90):
+              print('\nPROBE ' + name, flush=True)
+              print(json.dumps({'executable': str(executable), 'arguments': arguments, 'cwd': str(cwd)}, ensure_ascii=False), flush=True)
+              try:
+                  result = subprocess.run(arguments, executable=str(executable), cwd=str(cwd), stdin=subprocess.DEVNULL,
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
+                      creationflags=subprocess.CREATE_NO_WINDOW)
+                  print('EXIT_CODE=' + str(result.returncode), flush=True)
+                  print('STDOUT:\n' + result.stdout.decode('utf-8', errors='replace'), flush=True)
+                  print('STDERR:\n' + result.stderr.decode('utf-8', errors='replace'), flush=True)
+              except Exception as error:
+                  print(type(error).__name__ + ': ' + str(error), flush=True)
+          raw = f'"{setup}" /S /D={target}'
+          probe('original_install', setup, raw, setup.parent, 180)
+          probe('validate_from_private_directory', helper, [str(helper), '--validate-directory', str(target)], helper.parent)
+          # On this fresh runner finalize can validate/reach SCM but cannot
+          # start a pre-existing service: assert absence immediately before it.
+          service = subprocess.run(['sc.exe', 'query', 'MihomoOptimizedService'], capture_output=True)
+          print('SCM_BEFORE_FINALIZE=' + str(service.returncode), flush=True)
+          print(service.stdout.decode('utf-8', errors='replace'), flush=True)
+          if service.returncode == 1060:
+              probe('finalize_from_private_directory', helper, [str(helper), '--installer-finalize', str(target)], helper.parent)
+              if target.is_dir():
+                  probe('finalize_with_target_cwd', helper, [str(helper), '--installer-finalize', str(target)], target)
+          else:
+              print('Finalization probe skipped: service absence was not proven', flush=True)
+          '@ | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'diagnose-installer.py') -Encoding utf8
+          & python (Join-Path $env:RUNNER_TEMP 'diagnose-installer.py')
+          $pythonExit = $LASTEXITCODE
+          Write-Output "PYTHON_EXIT=$pythonExit"
+          Write-Output "POWERSHELL_64BIT=$([Environment]::Is64BitProcess)"
+          $inspect = @(
+            $env:ProgramFiles,
+            $installDirectory,
+            (Join-Path $installDirectory 'resources'),
+            (Join-Path $installDirectory 'cs'),
+            (Join-Path $installDirectory 'mihomo-optimized.exe'),
+            (Join-Path $installDirectory 'mihomo-desktop-host.exe'),
+            (Join-Path $installDirectory 'mihomo-desktop-service.exe'),
+            (Join-Path $installDirectory 'mihomo-core.exe'),
+            (Join-Path $installDirectory 'uninstall.exe'),
+            (Join-Path $installDirectory 'mihomo-optimized.dll'),
+            (Join-Path $installDirectory 'coreclr.dll'),
+            (Join-Path $installDirectory 'hostpolicy.dll'),
+            (Join-Path $installDirectory 'mihomo-optimized.runtimeconfig.json'),
+            (Join-Path $installDirectory 'resources\build-info.json'),
+            (Join-Path $installDirectory 'cs\PresentationCore.resources.dll'),
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized'
+          )
+          foreach ($location in $inspect) {
+            try {
+              $item = Get-Item -LiteralPath $location -ErrorAction Stop
+              $permissions = Get-Acl -LiteralPath $location -ErrorAction Stop
+              [pscustomobject]@{Path=$location; Owner=$permissions.Owner; Sddl=$permissions.Sddl; Attributes=$item.Attributes; Length=$item.Length} | ConvertTo-Json -Compress
+            } catch { Write-Output "INSPECT_ERROR $location : $($_.Exception.Message)" }
+          }
+          foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
+            $key = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized')
+            try {
+              if ($null -eq $key) { Write-Output "REGISTRY_VIEW=$view ABSENT"; continue }
+              $values = @{}
+              foreach ($name in $key.GetValueNames()) { $values[$name] = $key.GetValue($name) }
+              [pscustomobject]@{RegistryView="$view"; Values=$values} | ConvertTo-Json -Depth 4 -Compress
+            } finally { if ($null -ne $key) { $key.Dispose() }; $base.Dispose() }
+          }
+          if (Test-Path -LiteralPath $installDirectory) {
+            Get-ChildItem -LiteralPath $installDirectory -Force | Select-Object Name, Mode, Length, Attributes | Format-Table -AutoSize
+            Write-Output "INSTALLED_FILE_COUNT=$(@(Get-ChildItem -LiteralPath $installDirectory -Recurse -File).Count)"
+          }
+          exit 0
