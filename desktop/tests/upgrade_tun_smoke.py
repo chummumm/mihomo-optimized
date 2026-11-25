@@ -1018,7 +1018,8 @@ class TunUpgradeAcceptance:
         self.capture_logs("same-product-forced-exit")
         self.finish_case()
 
-    def restarted_health(self, previous, intent_revision: int, deadline: float, record: dict) -> dict | None:
+    def restarted_health(self, previous, intent_revision: int, deadline: float, record: dict,
+                         *, expected_device: str = "utun") -> dict | None:
         status = self.status(timeout=min(5, self.remaining(deadline)))
         record["lastStatus"] = dict(self.evidence["lastStatus"])
         if status.get("statusStale") is True or status.get("intentRevision", 0) <= intent_revision:
@@ -1045,7 +1046,7 @@ class TunUpgradeAcceptance:
         record["lastHealth"]["tun"] = {key: tun.get(key) for key in ("enabled", "state", "device", "identity", "index")}
         if health.get("stale") is not False or tun.get("state") != "healthy":
             return None
-        require(tun.get("enabled") is True and tun.get("device") == "utun"
+        require(tun.get("enabled") is True and tun.get("device") == expected_device
                 and isinstance(tun.get("identity"), str) and re.fullmatch(r"[0-9a-f]{16}", tun["identity"]),
                 "upgrade_desktop_restart_tun_identity_invalid")
         return health
