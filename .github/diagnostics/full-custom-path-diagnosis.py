@@ -14,10 +14,10 @@ import uuid
 ROOT = Path(os.environ["GITHUB_WORKSPACE"])
 sys.path.insert(0, str(ROOT / "desktop" / "tests"))
 
-from custom_install_smoke import CustomInstallAcceptance, REQUIRED_CASES
+from custom_install_smoke import CustomInstallAcceptance, REQUIRED_CASES, remove_owned_tree, set_directory_security
 from upgrade_smoke import digest, failure_code
 from upgrade_tun_smoke import TunUpgradeAcceptance
-from windows_smoke import require
+from windows_smoke import RestrictedDesktop, require
 
 
 SOURCE = "882d416355513b55409a879547d33ed825441418"
@@ -101,6 +101,55 @@ def acl_row(path: Path) -> dict:
 
 
 class DiagnosticAcceptance(CustomInstallAcceptance):
+    def capture_forged_shortcut_primitive(self) -> None:
+        stage = self.stage
+        case = "forged_shortcut_replacement_rejected"
+        previous_case = self.report["tests"].get(case)
+        desktop = None
+        source_directory = self.fixture_root / "forged shortcut source"
+        source_owned = False
+        event = {"phase": "after_broken_custom_install", "partialDiagnostic": True, "passed": False}
+        self.report["forgedPrimitivePassed"] = False
+        try:
+            foreign = self.fixture_root / ("forged primitive foreign-" + uuid.uuid4().hex)
+            foreign.mkdir()
+            self.owned_data.append(foreign)
+            set_directory_security(foreign)
+            (foreign / "mihomo-optimized.exe").write_bytes(b"diagnostic sentinel; never execute\n")
+            require(not source_directory.exists(), "diagnostic_forged_source_preexists")
+            source_owned = True
+            protected_files = {path: digest(path) for directory in (self.install_dir, foreign)
+                               for path in directory.rglob("*") if path.is_file()}
+            desktop = RestrictedDesktop()
+            self.reject_forged_shortcut(foreign, desktop, protected_files)
+            event.update({"passed": True, "evidence": self.report["forgedShortcut"]})
+        except Exception as error:
+            event.update({"errorType": type(error).__name__, "message": str(error),
+                          "winError": getattr(error, "winerror", None), "traceback": failure_trace(error)})
+        finally:
+            if desktop is not None:
+                try:
+                    desktop.close()
+                except Exception as error:
+                    event.update({"passed": False, "tokenCleanupError": str(error)})
+            if source_owned:
+                try:
+                    # Permit the later original remove_broken_install scenario
+                    # to create its own source at the unchanged fixture path.
+                    remove_owned_tree(source_directory)
+                except Exception as error:
+                    event.update({"passed": False, "sourceCleanupError": str(error)})
+            self.stage = stage
+            # This early primitive check is separate from the full scenario.
+            if previous_case is None:
+                self.report["tests"].pop(case, None)
+            else:
+                self.report["tests"][case] = previous_case
+        self.report["forgedPrimitivePassed"] = event["passed"]
+        self.report["forgedShortcutPrimitive"] = event
+        self.write_report()
+        print("FORGED_SHORTCUT_PRIMITIVE " + json.dumps(event, ensure_ascii=True), flush=True)
+
     def capture_legacy_shortcut_stream(self) -> None:
         # Compatibility evidence only. This fixed path was just created by the
         # original broken_custom_install fixture; nothing is resolved or run.
@@ -238,6 +287,7 @@ class DiagnosticAcceptance(CustomInstallAcceptance):
                 self.capture_legacy_anchor_acl("after_" + name)
             if name == "broken_custom_install":
                 self.capture_legacy_shortcut_stream()
+                self.capture_forged_shortcut_primitive()
 
     def load_candidate(self) -> None:
         super().load_candidate()
