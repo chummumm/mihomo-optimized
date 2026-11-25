@@ -43,6 +43,7 @@ REQUIRED_CASES = {
     "default_never_service_uninstall", "same_volume_tun", "separate_volume_unicode_tun",
     "broken_0_2_13_reproduced", "broken_0_2_13_repaired", "missing_runtime_uninstall",
     "unsafe_parent_rejected_before_copy", "reparse_parent_rejected_before_copy",
+    "subst_mappings_rejected_before_copy",
     "failed_upgrade_preserves_running_install", "unsafe_install_can_uninstall",
     "foreign_service_preserved", "custom_core_update", "custom_desktop_update_identity",
     "broken_install_remove_mode", "retained_directory_authority_rejected",
@@ -333,6 +334,74 @@ class DisposableVolume:
         self.temp.cleanup()
 
 
+class OwnedSubstDrive:
+    """Own one previously unused DOS alias and remove only its exact mapping."""
+    def __init__(self, owner: "CustomInstallAcceptance", destination: Path, label: str) -> None:
+        from ctypes import wintypes
+
+        self.owner, self.destination, self.label = owner, destination.resolve(strict=True), label
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel.QueryDosDeviceW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        self.kernel.QueryDosDeviceW.restype = wintypes.DWORD
+        self.kernel.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+        self.kernel.GetDriveTypeW.restype = wintypes.UINT
+        self.kernel.DefineDosDeviceW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR]
+        self.kernel.DefineDosDeviceW.restype = wintypes.BOOL
+        self.drive = None
+        self.mapping = None
+        self.created = False
+
+    def query(self, drive: str) -> str | None:
+        target = ctypes.create_unicode_buffer(32768)
+        if self.kernel.QueryDosDeviceW(drive, target, len(target)):
+            return target.value
+        error = ctypes.get_last_error()
+        require(error in (2, 3), "fixture_subst_query_winerror_" + str(error))
+        return None
+
+    def available(self, drive: str) -> bool:
+        mask = self.kernel.GetLogicalDrives()
+        require(mask != 0, "fixture_subst_drive_inventory_failed")
+        return (not mask & (1 << (ord(drive[0]) - ord("A")))
+                and self.kernel.GetDriveTypeW(drive + "\\") == 1 and self.query(drive) is None)
+
+    def create(self) -> Path:
+        self.drive = next((letter + ":" for letter in "ZYXWVUTSRQPONMLKJIHGFE"
+                           if self.available(letter + ":")), None)
+        require(self.drive is not None and self.available(self.drive), "fixture_subst_no_unused_drive")
+        tool = Path(os.environ["SYSTEMROOT"]) / "System32/subst.exe"
+        result = self.owner.command(self.label + "_create_mapping", tool,
+                                    [self.drive, str(self.destination)], 15)
+        require(result["exitCode"] == 0, "fixture_subst_create_failed")
+        self.created = True
+        # The expected value also bounds cleanup if the following query fails.
+        self.mapping = "\\??\\" + str(self.destination)
+        actual = self.query(self.drive)
+        # SUBST encodes a volume-root target as \??\C: without its final slash.
+        root_encoding = (self.destination == Path(self.destination.anchor)
+                         and actual is not None and os.path.normcase(actual)
+                         == os.path.normcase("\\??\\" + self.destination.drive))
+        require(actual is not None and actual.startswith("\\??\\")
+                and (root_encoding or os.path.normcase(os.path.normpath(actual[4:]))
+                     == os.path.normcase(str(self.destination))), "fixture_subst_target_mismatch")
+        self.mapping = actual
+        root = Path(self.drive + "\\")
+        require(root.is_dir() and directory_identity(root) == directory_identity(self.destination),
+                "fixture_subst_not_the_requested_directory")
+        return root
+
+    def close(self) -> None:
+        if not self.created:
+            return
+        # RAW_TARGET_PATH | REMOVE_DEFINITION | EXACT_MATCH_ON_REMOVE |
+        # NO_BROADCAST_SYSTEM cannot remove a different mapping at this letter.
+        removed = self.kernel.DefineDosDeviceW(0xF, self.drive, self.mapping)
+        error = ctypes.get_last_error() if not removed else 0
+        require(removed, "fixture_subst_remove_winerror_" + str(error))
+        self.created = False
+        require(self.query(self.drive) is None, "fixture_subst_mapping_remains")
+
+
 class CustomInstallAcceptance(UpgradeAcceptance):
     def __init__(self, artifacts: Path) -> None:
         super().__init__(artifacts)
@@ -346,6 +415,7 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         self.redirect: Path | None = None
         self.foreign_helper: Path | None = None
         self.diagnostic_directory: Path | None = None
+        self.subst: OwnedSubstDrive | None = None
 
     def write_report(self) -> None:
         temporary = self.artifacts / "custom-install.json.tmp"
@@ -573,10 +643,13 @@ class CustomInstallAcceptance(UpgradeAcceptance):
 
     def missing_runtime(self, target: Path) -> None:
         self.install_at(target, "partial_custom_install")
-        self.install_service("partial_service")
+        service_identity = self.install_service("partial_service")
         require(self.command("partial_stop", self.helper, ["--stop-for-update"])["exitCode"] == 0,
                 "partial_service_stop_failed")
         wait_until(lambda: service_snapshot().get("state") == 1, "partial_service_not_stopped", 30)
+        # STOPPED is reported before the service finishes flushing its logs.
+        wait_until(lambda: self.processes.identity(service_identity.pid) != service_identity,
+                   "partial_service_process_not_exited", 30)
         for path in (self.helper, self.core, self.host):
             path.unlink()
         require(service_snapshot().get("installed") is True, "partial_scm_fixture_missing")
@@ -739,6 +812,56 @@ class CustomInstallAcceptance(UpgradeAcceptance):
             self.redirect.unlink()
             self.redirect = None
             set_directory_security(unsafe)
+        self.denied_subst_targets()
+
+    def denied_subst_targets(self) -> None:
+        require(registration() is None and registration(32) is None
+                and service_snapshot().get("winError") == 1060, "subst_fixture_identity_preexists")
+        destination = self.fixture_root / "subst protected directory"
+        destination.mkdir()
+        set_directory_security(destination)
+        (destination / "preserve.txt").write_bytes(b"SUBST rejection must preserve this file.\n")
+        system_root = Path(os.environ["SYSTEMDRIVE"] + "\\")
+        cases = (("directory", destination, destination / PRODUCT),
+                 ("volume_root", system_root, self.fixture_root / "subst root rejected"))
+        evidence = self.report["deniedSubstMappings"] = []
+
+        def snapshot() -> dict:
+            return {str(path.relative_to(self.fixture_root)):
+                    (directory_identity(path) if path.is_dir() else digest(path))
+                    for path in self.fixture_root.rglob("*")}
+
+        for kind, mapped_directory, real_target in cases:
+            self.stage = "subst_" + kind + "_rejected_before_copy"
+            require(not real_target.exists(), "fixture_subst_install_target_preexists")
+            before_files = snapshot()
+            before_registration = (registration(), registration(32))
+            before_service = service_snapshot()
+            mapping = self.subst = OwnedSubstDrive(self, mapped_directory, self.stage)
+            row = {"kind": kind, "mappedDirectory": str(mapped_directory), "realTarget": str(real_target)}
+            evidence.append(row)
+            try:
+                root = mapping.create()
+                target = root / real_target.relative_to(mapped_directory)
+                row["requestedTarget"] = str(target)
+                command = f'"{self.candidate}" /S /D={target}'
+                result = self.command(self.stage, self.candidate, command, 90)
+                row["installerExitCode"] = result["exitCode"]
+                require(result["exitCode"] != 0 and not target.exists() and not real_target.exists(),
+                        self.stage + "_failed")
+                require((registration(), registration(32)) == before_registration
+                        and service_snapshot() == before_service, "subst_install_changed_identity")
+                require(snapshot() == before_files, "subst_install_changed_fixture_files")
+                self.assert_marker()
+                row["rejectedBeforeCopy"] = True
+            finally:
+                mapping.close()
+                self.subst = None
+                row["mappingRemoved"] = True
+                self.write_report()
+        require(len(evidence) == 2 and all(row.get("rejectedBeforeCopy") and row.get("mappingRemoved")
+                                        for row in evidence), "subst_rejection_cases_incomplete")
+        self.mark("subst_mappings_rejected_before_copy")
 
     def unsafe_existing_install(self, target: Path) -> None:
         self.install_at(target, "existing_safe_custom_install")
@@ -868,6 +991,8 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         if self.redirect is not None:
             attempt("owned_redirect_remove", self.redirect.unlink)
             self.redirect = None
+        if self.subst is not None:
+            attempt("owned_subst_remove", self.subst.close)
         for child in list(self.active_children):
             attempt("exact_child_stop", lambda child=child: self.stop_child(child))
         if self.foreign_helper is not None:

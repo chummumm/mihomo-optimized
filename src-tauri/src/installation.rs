@@ -25,11 +25,12 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, FileDispositionInfo, GetDriveTypeW,
-        GetFileInformationByHandle, GetVolumeInformationW, QueryDosDeviceW,
+        GetFileInformationByHandle, GetFinalPathNameByHandleW, GetVolumeInformationW,
         SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, OPEN_EXISTING,
-        READ_CONTROL,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+        VOLUME_NAME_DOS,
     },
     System::Registry::{
         RegCreateKeyExW, RegOpenKeyExW, REG_CREATED_NEW_KEY, REG_OPTION_NON_VOLATILE,
@@ -260,19 +261,45 @@ fn require_supported_volume(directory: &Path) -> Result<()> {
     if flags & 8 == 0 {
         return Err(unsupported());
     }
-    // A per-user SUBST drive can look fixed but resolve differently to SYSTEM.
-    let mut device = vec![0u16; 32768];
-    if unsafe {
-        QueryDosDeviceW(
-            windows::wide(&text[..2]).as_ptr(),
-            device.as_mut_ptr(),
-            device.len() as u32,
+    // Query the filesystem root through a metadata handle: an ordinary user
+    // can read it even when the DOS-device namespace denies QueryDosDevice.
+    // SUBST roots resolve to another drive or a subdirectory and must never
+    // become a different installation identity for the SYSTEM service.
+    let raw = unsafe {
+        CreateFileW(
+            root.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
         )
-    } == 0
-    {
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(windows::last_error("无法打开安装磁盘根目录"));
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut final_root = vec![0u16; 32768];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            handle.as_raw_handle(),
+            final_root.as_mut_ptr(),
+            final_root.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if length == 0 {
         return Err(windows::last_error("无法检查安装磁盘映射"));
     }
-    if !unsafe { windows::read_wide(device.as_ptr()) }.starts_with(r"\Device\") {
+    if length as usize >= final_root.len() {
+        return Err(unsupported());
+    }
+    let final_root = String::from_utf16_lossy(&final_root[..length as usize]);
+    if !final_root
+        .strip_prefix(r"\\?\")
+        .is_some_and(|resolved| resolved.eq_ignore_ascii_case(&text[..3]))
+    {
         return Err(unsupported());
     }
     Ok(())

@@ -69,11 +69,12 @@ UIA_JSON_STAGES = frozenset({
 
 
 class SmokeFailure(Exception):
-    """An intentionally bounded diagnostic code, never a native error payload."""
+    """A bounded code with optional diagnostic metadata sanitized by its caller."""
 
-    def __init__(self, code: str, *, uia: dict | None = None) -> None:
+    def __init__(self, code: str, *, uia: dict | None = None, native: dict | None = None) -> None:
         super().__init__(code)
         self.uia = uia
+        self.native = native
 
 
 def require(condition: object, code: str) -> None:
@@ -861,8 +862,12 @@ class NativeDriver:
                     require(result.get("error", {}).get("code") in allowed,
                             "expected_native_error_" + allowed[0])
                     return None
-                require("error" not in result,
-                        "native_" + safe_code(result.get("error", {}).get("code")))
+                if "error" in result:
+                    error = result["error"]
+                    code = safe_code(error.get("code"))
+                    message = error.get("message")
+                    raise SmokeFailure("native_" + code, native={"command": safe_code(command), "code": code,
+                        "message": message[:2048] if isinstance(message, str) else ""})
                 require("result" in result, "native_response_result_missing")
                 return result["result"]
             available = win32pipe.PeekNamedPipe(self.pipe, 0)[1]
