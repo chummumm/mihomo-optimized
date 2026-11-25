@@ -13,11 +13,13 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 import zipfile
 
@@ -51,6 +53,51 @@ REQUIRED_CASES = {
     "legacy_registry_handle_retired", "weak_registry_foreign_target_rejected",
     "forged_shortcut_replacement_rejected", "final_cleanup",
 }
+
+
+def exception_diagnostic(stage: str, error: Exception) -> dict:
+    """Keep source locations and fixed fixture codes, never error payloads."""
+    chain = []
+    seen = set()
+    current, relation = error, None
+    while current is not None and len(chain) < 3 and id(current) not in seen:
+        seen.add(id(current))
+        chain.append((current, relation))
+        if current.__cause__ is not None:
+            current, relation = current.__cause__, "cause"
+        elif not current.__suppress_context__:
+            current, relation = current.__context__, "context"
+        else:
+            break
+
+    def identifier(value: str) -> str:
+        return value if re.fullmatch(r"[A-Za-z0-9_.<>-]{1,100}", value) else "unknown"
+
+    # At most two chained exceptions, with at most 12 frames across the entire
+    # diagnostic. Divide the budget so cleanup cannot hide the original site.
+    frame_limit = 12 // len(chain)
+    details = []
+    runtime_codes = {
+        "no_available_tcp_udp_fixture_port": "no_available_tcp_udp_fixture_port",
+        "upgrade_device_enumeration_limit": "upgrade_device_enumeration_limit",
+        "upgrade_tcp_owner_table_kept_growing": "upgrade_tcp_owner_table_kept_growing",
+        "can't start new thread": "thread_start_failed",
+    }
+    for failure, relationship in chain:
+        frames = traceback.extract_tb(failure.__traceback__, limit=-frame_limit)
+        detail = {"exceptionType": identifier(type(failure).__name__),
+                  "traceback": [{"file": identifier(Path(frame.filename).name), "line": frame.lineno,
+                                 "function": identifier(frame.name)} for frame in frames]}
+        if relationship is not None:
+            detail["relationship"] = relationship
+        if (isinstance(failure, RuntimeError) and len(failure.args) == 1
+                and isinstance(failure.args[0], str) and failure.args[0] in runtime_codes):
+            detail["runtimeCode"] = runtime_codes[failure.args[0]]
+        details.append(detail)
+    result = {"stage": stage, "code": failure_code(error), **details[0]}
+    if len(details) > 1:
+        result["chainedExceptions"] = details[1:]
+    return result
 
 
 def set_directory_security(path: Path, sddl: str = SAFE_DIRECTORY_SDDL) -> None:
@@ -684,7 +731,6 @@ class CustomInstallAcceptance(UpgradeAcceptance):
                               protected_files: dict[Path, str]) -> None:
         import pythoncom
         import win32security
-        from win32com.client import dynamic
         from win32com.shell import shell, shellcon
 
         self.stage = "forged_shortcut_replacement_rejected"
@@ -705,15 +751,16 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         original_hash = digest(shortcut)
         evidence = self.report["forgedShortcut"] = {"shortcut": str(shortcut), "originalSha256": original_hash,
             "originalOwner": original_owner, "source": str(source), "token": desktop.check_token(desktop.token)}
-        automation = link = None
+        link = persistent = None
         pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
         try:
-            automation = dynamic.Dispatch("WScript.Shell")
-            link = automation.CreateShortcut(str(source))
-            link.TargetPath = str(foreign / "mihomo-optimized.exe")
-            link.Save()
+            link = pythoncom.CoCreateInstance(
+                shell.CLSID_ShellLink, None, pythoncom.CLSCTX_INPROC_SERVER, shell.IID_IShellLink)
+            link.SetPath(str(foreign / "mihomo-optimized.exe"))
+            persistent = link.QueryInterface(pythoncom.IID_IPersistFile)
+            persistent.Save(str(source), True)
         finally:
-            link = automation = None
+            persistent = link = None
             pythoncom.CoUninitialize()
         writable = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
             "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + desktop.sid + ")", 1)
@@ -1124,13 +1171,13 @@ def main() -> int:
     except Exception as error:
         print("FAIL: custom_install_" + failure_code(error), file=sys.stderr, flush=True)
         if acceptance:
-            acceptance.report["diagnostics"].append({"stage": acceptance.stage, "code": failure_code(error)})
+            acceptance.report["diagnostics"].append(exception_diagnostic(acceptance.stage, error))
     finally:
         if acceptance:
             try:
                 acceptance.cleanup()
             except Exception as error:
-                acceptance.report["diagnostics"].append({"stage": "cleanup", "code": failure_code(error)})
+                acceptance.report["diagnostics"].append(exception_diagnostic("cleanup", error))
             acceptance.report["passed"] = (all(acceptance.report["tests"].get(name) is True for name in REQUIRED_CASES)
                                            and not acceptance.report["diagnostics"])
             acceptance.write_report()

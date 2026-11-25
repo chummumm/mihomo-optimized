@@ -46,7 +46,7 @@ jobs:
           github-token: ${{ github.token }}
           path: artifacts/desktop
 
-      - name: Recreate diagnostic metadata without changing production tests
+      - name: Overlay the reviewed fixture and recreate diagnostic metadata
         shell: python
         run: |
           import hashlib
@@ -55,6 +55,12 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ['GITHUB_WORKSPACE'])
+          test_path = Path('desktop/tests/custom_install_smoke.py')
+          test_target = root / test_path
+          test_original_sha = hashlib.sha256(test_target.read_bytes()).hexdigest()
+          test_overlay = (root / 'diagnostic-source' / test_path).read_bytes()
+          test_overlay_sha = hashlib.sha256(test_overlay).hexdigest()
+          test_target.write_bytes(test_overlay)
           distribution = root / 'artifacts' / 'desktop'
           info_path = distribution / 'build-info.json'
           info = json.loads(info_path.read_text(encoding='utf-8-sig'))
@@ -83,7 +89,11 @@ jobs:
               'candidateArtifactId': 15052215832,
               'candidateInstallerSha256': sha(setup),
               'diagnosticCommit': os.environ['GITHUB_SHA'],
-              'testOverlays': [],
+              'testOverlays': [{
+                  'path': test_path.as_posix(),
+                  'candidateSourceSha256': test_original_sha,
+                  'diagnosticSha256': test_overlay_sha,
+              }],
           }
           harness = root / 'diagnostic-source' / '.github' / 'diagnostics' / 'sixth-full-custom-path-diagnosis.py'
           provenance['harnessSha256'] = sha(harness)
