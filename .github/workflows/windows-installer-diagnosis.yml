@@ -144,7 +144,35 @@ jobs:
           Write-Output 'DIAGNOSIS_ONLY_PROTECT_FRESH_PRODUCT_REGISTRY'
           $freshKeyAcl = [System.Security.AccessControl.RegistrySecurity]::new()
           $freshKeyAcl.SetSecurityDescriptorSddlForm('O:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;BU)', ([System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Access))
-          Set-Acl -LiteralPath $nativeRegistry -AclObject $freshKeyAcl
+          @'
+          import ctypes, winreg
+          from ctypes import wintypes
+          advapi = ctypes.WinDLL('advapi32', use_last_error=True)
+          kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+          advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
+          advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+          advapi.GetSecurityDescriptorDacl.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)]
+          advapi.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+          advapi.SetSecurityInfo.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+          advapi.SetSecurityInfo.restype = wintypes.DWORD
+          kernel.LocalFree.argtypes = [ctypes.c_void_p]
+          kernel.LocalFree.restype = ctypes.c_void_p
+          sd = ctypes.c_void_p()
+          if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW('O:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;BU)', 1, ctypes.byref(sd), None):
+              raise ctypes.WinError(ctypes.get_last_error())
+          try:
+              present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+              if not advapi.GetSecurityDescriptorDacl(sd, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)) or not present or not dacl:
+                  raise RuntimeError('Invalid diagnostic DACL')
+              with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Mihomo Optimized', 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY | 0x40000) as key:
+                  error = advapi.SetSecurityInfo(int(key), 4, 4 | 0x80000000, None, None, dacl, None)
+                  if error:
+                      raise ctypes.WinError(error)
+              print('NATIVE_FRESH_KEY_DACL_SET=0')
+          finally:
+              kernel.LocalFree(sd)
+          '@ | & python -
+          if ($LASTEXITCODE -ne 0) { throw 'Native diagnostic key protection failed' }
           $protectedKeyAcl = Get-Acl -LiteralPath $nativeRegistry
           [pscustomobject]@{Path=$nativeRegistry; Owner=$protectedKeyAcl.Owner; Sddl=$protectedKeyAcl.Sddl} | ConvertTo-Json -Compress
           $env:DIAG_PHASE = 'after_registry_protection'
