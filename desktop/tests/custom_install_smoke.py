@@ -40,7 +40,7 @@ REQUIRED_CASES = {
     "reparse_parent_rejected_before_copy", "subst_mappings_rejected_before_copy",
     "failed_upgrade_preserves_running_install", "unsafe_install_can_uninstall",
     "foreign_service_preserved", "custom_core_update", "custom_desktop_update_identity",
-    "empty_unsafe_directory_recreated", "final_cleanup",
+    "empty_unsafe_directory_recreated", "desktop_tun_repeated_restart", "final_cleanup",
 }
 
 
@@ -544,6 +544,10 @@ class CustomInstallAcceptance(UpgradeAcceptance):
                 previous = current
             tun.close_gui()
             tun.unchanged_source(evidence, "after_stop")
+            if check_desktop_update:
+                # Keep the full 20-cycle TUN restart gate on the fresh cross-volume install.
+                tun.finish_case()
+                tun.desktop_restarts()
             # Restore the source marker before exercising actual product cleanup.
             self.config.write_bytes(tun.original_config)
             self.running_service()
