@@ -48,7 +48,8 @@ REQUIRED_CASES = {
     "foreign_service_preserved", "custom_core_update", "custom_desktop_update_identity",
     "broken_install_remove_mode", "retained_directory_authority_rejected",
     "unsafe_directory_removed_and_recreated", "empty_unsafe_directory_recreated",
-    "legacy_registry_handle_retired", "weak_registry_foreign_target_rejected", "final_cleanup",
+    "legacy_registry_handle_retired", "weak_registry_foreign_target_rejected",
+    "forged_shortcut_replacement_rejected", "final_cleanup",
 }
 
 
@@ -574,6 +575,7 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         self.stage = label
         self.install_service(label + "_service")
         tun = self.tun = TunUpgradeAcceptance(self, self.candidate, self.info["desktopVersion"], self.info["uiCommit"])
+        tun.evidence["oldCoreSource"] = self.info["coreCommit"]
         self.report.setdefault("tunByPath", {})[label] = tun.evidence
         try:
             tun.desktop = RestrictedDesktop()
@@ -595,14 +597,16 @@ class CustomInstallAcceptance(UpgradeAcceptance):
             for cycle in range(2):
                 deadline = time.monotonic() + 60
                 record = {}
+                evidence.setdefault("restarts", []).append(record)
+                tun.checkpoint()
                 tun.driver.invoke("desktop_restart", timeout=60)
-                wait_until(lambda: tun.restarted_health(previous, status["intentRevision"], deadline, record),
+                wait_until(lambda: tun.restarted_health(previous, status["intentRevision"], deadline, record,
+                                                       expected_device=name),
                            "custom_tun_restart_not_ready", tun.remaining(deadline))
                 status, current = tun.running(name)
                 record.update(tun.confirm_process_handoff(previous, current))
                 tun.capture(name, True, current)
                 tun.forwarding(record, "restarted")
-                evidence.setdefault("restarts", []).append(record)
                 previous = current
             tun.close_gui()
             tun.unchanged_source(evidence, "after_stop")
@@ -676,6 +680,87 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         self.uninstall_current("custom_core_update_uninstall")
         self.mark("custom_core_update")
 
+    def reject_forged_shortcut(self, foreign: Path, desktop: RestrictedDesktop,
+                              protected_files: dict[Path, str]) -> None:
+        import pythoncom
+        import win32security
+        from win32com.client import dynamic
+        from win32com.shell import shell, shellcon
+
+        self.stage = "forged_shortcut_replacement_rejected"
+        shortcut = Path(shell.SHGetFolderPath(0, shellcon.CSIDL_COMMON_PROGRAMS, None, 0)) / (PRODUCT + ".lnk")
+        source_directory = self.fixture_root / "forged shortcut source"
+        source_directory.mkdir()
+        set_directory_security(source_directory)
+        source = source_directory / (PRODUCT + ".lnk")
+        require(source.drive.casefold() == shortcut.drive.casefold(), "fixture_shortcut_cross_volume")
+        information = win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION
+        original_security = win32security.GetNamedSecurityInfo(str(shortcut), win32security.SE_FILE_OBJECT, information)
+        original_owner = win32security.ConvertSidToStringSid(original_security.GetSecurityDescriptorOwner())
+        metadata = shortcut.lstat()
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+                and not metadata.st_file_attributes & 0x400 and 0 < metadata.st_size <= 1024 * 1024
+                and original_owner == "S-1-5-32-544", "fixture_original_shortcut_invalid")
+        original_bytes = shortcut.read_bytes()
+        original_hash = digest(shortcut)
+        evidence = self.report["forgedShortcut"] = {"shortcut": str(shortcut), "originalSha256": original_hash,
+            "originalOwner": original_owner, "source": str(source), "token": desktop.check_token(desktop.token)}
+        automation = link = None
+        pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+        try:
+            automation = dynamic.Dispatch("WScript.Shell")
+            link = automation.CreateShortcut(str(source))
+            link.TargetPath = str(foreign / "mihomo-optimized.exe")
+            link.Save()
+        finally:
+            link = automation = None
+            pythoncom.CoUninitialize()
+        writable = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + desktop.sid + ")", 1)
+        win32security.SetFileSecurity(str(source), information | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+                                     writable)
+        payload = source.read_bytes()
+        require(0 < len(payload) <= 1024 * 1024, "fixture_forged_shortcut_size_invalid")
+        hardened = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)(A;;SD;;;" + desktop.sid + ")", 1)
+        win32security.ImpersonateLoggedOnUser(desktop.token)
+        try:
+            source.write_bytes(b"ordinary-user-controlled shortcut\n")
+            source.write_bytes(payload)
+            require(source.read_bytes() == payload, "fixture_shortcut_not_ordinary_user_controlled")
+            # The ordinary user seals an admin-owned object they controlled.
+            # Its current owner/DACL alone cannot authenticate its payload.
+            win32security.SetFileSecurity(str(source), win32security.DACL_SECURITY_INFORMATION
+                | win32security.PROTECTED_DACL_SECURITY_INFORMATION, hardened)
+        finally:
+            win32security.RevertToSelf()
+        source_security = win32security.GetNamedSecurityInfo(str(source), win32security.SE_FILE_OBJECT, information)
+        require(win32security.ConvertSidToStringSid(source_security.GetSecurityDescriptorOwner()) == original_owner,
+                "fixture_forged_shortcut_owner_changed")
+        evidence["sourceDacl"] = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(
+            source_security, 1, information)
+        evidence["sourceSha256"] = digest(source)
+        error_code = None
+        # No source/target handle remains open: denial must come from namespace
+        # permissions, not this fixture introducing a sharing violation.
+        win32security.ImpersonateLoggedOnUser(desktop.token)
+        try:
+            try:
+                os.replace(source, shortcut)
+            except OSError as error:
+                error_code = error.winerror
+        finally:
+            win32security.RevertToSelf()
+        evidence["replaceWinError"] = error_code
+        require(error_code == 5, "forged_shortcut_replacement_not_access_denied")
+        current_security = win32security.GetNamedSecurityInfo(str(shortcut), win32security.SE_FILE_OBJECT, information)
+        require(shortcut.read_bytes() == original_bytes and digest(shortcut) == original_hash
+                and win32security.ConvertSidToStringSid(current_security.GetSecurityDescriptorOwner()) == original_owner
+                and source.read_bytes() == payload, "forged_shortcut_replacement_changed_files")
+        require(all(path.is_file() and digest(path) == checksum for path, checksum in protected_files.items()),
+                "forged_shortcut_attempt_changed_product_or_foreign_files")
+        self.mark(self.stage)
+
     def remove_broken_install(self, target: Path) -> None:
         legacy = self.download_baseline(BROKEN_VERSION, BROKEN_URL, BROKEN_SHA256, 128 * 1024 * 1024)
         self.install_at(target, "broken_remove_install", installer=legacy)
@@ -689,6 +774,7 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         authority = RetainedRegistryAuthority()
         try:
             require(authority.write_location(str(foreign)) == 0, "fixture_weak_registration_not_writable")
+            self.reject_forged_shortcut(foreign, authority.desktop, protected_files)
             before = registration()
             self.stage = "weak_registry_foreign_target_rejected"
             self.select(foreign)

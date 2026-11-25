@@ -232,6 +232,14 @@ fn same_location(left: &Path, right: &Path) -> Result<bool> {
         .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy()))
 }
 
+/// Reuse the native volume identity check for independent maintenance evidence.
+/// A common shortcut on a network share or a user drive alias is not authority.
+pub(crate) fn supported_local_path(path: &Path) -> Result<PathBuf> {
+    let path = normalize_directory(path)?;
+    require_supported_volume(&path)?;
+    Ok(path)
+}
+
 fn require_supported_volume(directory: &Path) -> Result<()> {
     let text = directory.to_str().ok_or_else(registration_error)?;
     let root = windows::wide(&text[..3]);

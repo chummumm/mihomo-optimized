@@ -4,24 +4,25 @@
 
 use crate::{
     error::{AppError, Result},
-    windows,
+    installation, windows,
 };
 use std::{
     fs,
+    io::Read,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
 };
 use windows_api::{
-    core::{Interface, PCWSTR},
+    core::Interface,
     Win32::{
         Foundation::RPC_E_CHANGED_MODE,
         System::Com::{
-            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile,
-            CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, STGM_READ, STGM_SHARE_DENY_WRITE,
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistStream,
+            CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
         },
         UI::Shell::{
-            FOLDERID_CommonPrograms, IShellLinkW, SHGetKnownFolderPath, ShellLink, KF_FLAG_DEFAULT,
-            SLGP_RAWPATH,
+            FOLDERID_CommonPrograms, IShellLinkW, SHCreateMemStream, SHGetKnownFolderPath,
+            ShellLink, KF_FLAG_DEFAULT, SLGP_RAWPATH,
         },
     },
 };
@@ -34,18 +35,26 @@ use windows_sys::Win32::{
     Storage::FileSystem::{
         CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ,
-        OPEN_EXISTING, READ_CONTROL,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+        FILE_SHARE_READ, OPEN_EXISTING, READ_CONTROL,
     },
 };
 
 pub(super) fn require_anchor(directory: &Path) -> Result<()> {
-    if service_anchor(directory)? || shortcut_anchor(directory)? {
+    // An existing foreign or writable SCM service is a conflict, not absence.
+    if service_anchor(directory)? {
         return Ok(());
     }
+    let reason = match shortcut_anchor(directory) {
+        Ok(true) => return Ok(()),
+        Ok(false) => String::new(),
+        Err(error) => format!("（公共快捷方式检查：{error}）"),
+    };
+    // A missing or unusable optional shortcut still permits the caller to check
+    // its independent complete protected-layout and build-manifest evidence.
     Err(AppError::new(
         "service_legacy_identity_missing",
-        "无法从受保护的本产品服务或公共开始菜单快捷方式确认旧安装位置，未采用不安全的旧安装记录",
+        format!("无法从受保护的本产品服务或公共开始菜单快捷方式确认旧安装位置，未采用不安全的旧安装记录{reason}"),
     ))
 }
 
@@ -100,16 +109,32 @@ fn common_shortcut() -> Result<PathBuf> {
     }
 }
 
-fn pin_shortcut(shortcut: &Path) -> Result<Vec<OwnedHandle>> {
+const MAX_SHORTCUT_BYTES: u64 = 1024 * 1024;
+
+fn shortcut_error_at(error: AppError, path: &Path) -> AppError {
+    AppError::new(
+        &error.code,
+        format!("{}：{}", error.message, path.display()),
+    )
+}
+
+fn snapshot_shortcut(shortcut: &Path) -> Result<Vec<u8>> {
     let mut paths: Vec<_> = shortcut.ancestors().collect();
     paths.reverse();
     let mut handles = Vec::with_capacity(paths.len());
+    let mut parent_security: Option<windows::ShortcutSecurity> = None;
     for path in paths {
         let is_shortcut = path == shortcut;
         let raw = unsafe {
             CreateFileW(
                 windows::wide(path).as_ptr(),
-                FILE_READ_ATTRIBUTES | READ_CONTROL | if is_shortcut { FILE_READ_DATA } else { 0 },
+                FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | if is_shortcut {
+                        FILE_READ_DATA
+                    } else {
+                        FILE_LIST_DIRECTORY
+                    },
                 FILE_SHARE_READ,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -118,41 +143,76 @@ fn pin_shortcut(shortcut: &Path) -> Result<Vec<OwnedHandle>> {
             )
         };
         if raw == INVALID_HANDLE_VALUE {
-            return Err(windows::last_error("无法锁定旧安装快捷方式"));
+            return Err(shortcut_error_at(
+                windows::last_error("无法锁定旧安装快捷方式"),
+                path,
+            ));
         }
         let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
         let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &mut information) } == 0 {
-            return Err(windows::last_error("无法检查旧安装快捷方式"));
+            return Err(shortcut_error_at(
+                windows::last_error("无法检查旧安装快捷方式"),
+                path,
+            ));
         }
         let is_directory = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
         if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || is_directory == is_shortcut
             || (is_shortcut && information.nNumberOfLinks != 1)
         {
-            return Err(AppError::new(
-                "service_legacy_shortcut_unsafe",
-                "旧安装快捷方式及其目录不能使用链接或异常文件类型",
+            return Err(shortcut_error_at(
+                AppError::new(
+                    "service_legacy_shortcut_unsafe",
+                    "旧安装快捷方式及其目录不能使用链接或异常文件类型",
+                ),
+                path,
             ));
         }
+        let security = windows::shortcut_object_security(handle.as_raw_handle(), is_directory)
+            .map_err(|error| shortcut_error_at(error, path))?;
+        if let Some(parent) = parent_security {
+            parent
+                .require_child(security)
+                .map_err(|error| shortcut_error_at(error, path))?;
+        }
+        parent_security = Some(security);
         if is_shortcut {
-            windows::require_admin_protected(path)?;
-        } else {
-            windows::require_admin_parent(path)?;
+            let length =
+                ((information.nFileSizeHigh as u64) << 32) | information.nFileSizeLow as u64;
+            if length == 0 || length > MAX_SHORTCUT_BYTES {
+                return Err(AppError::new(
+                    "service_legacy_shortcut_unsafe",
+                    "旧安装快捷方式大小异常",
+                ));
+            }
+            let mut file = fs::File::from(handle);
+            let mut bytes = Vec::with_capacity(length as usize);
+            (&mut file)
+                .take(MAX_SHORTCUT_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| AppError::io("无法读取旧安装快捷方式内容", error))?;
+            if bytes.len() as u64 != length {
+                return Err(AppError::new(
+                    "service_legacy_shortcut_unsafe",
+                    "旧安装快捷方式读取长度不一致",
+                ));
+            }
+            // The checked data-read handle denies write/delete sharing. COM
+            // receives only this bounded snapshot and never reopens the path.
+            return Ok(bytes);
         }
         handles.push(handle);
     }
-    Ok(handles)
+    Err(AppError::new(
+        "service_legacy_shortcut_unsafe",
+        "旧安装快捷方式路径无效",
+    ))
 }
 
 fn shortcut_anchor(directory: &Path) -> Result<bool> {
-    let shortcut = common_shortcut()?;
-    match fs::symlink_metadata(&shortcut) {
-        Ok(_) => (),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(AppError::io("无法查找旧安装公共快捷方式", error)),
-    }
-    let _handles = pin_shortcut(&shortcut)?;
+    let shortcut = installation::supported_local_path(&common_shortcut()?)?;
+    let bytes = snapshot_shortcut(&shortcut)?;
     let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if initialized.is_err() && initialized != RPC_E_CHANGED_MODE {
         return Err(com_error(initialized.into()));
@@ -160,10 +220,14 @@ fn shortcut_anchor(directory: &Path) -> Result<bool> {
     let _apartment = ComApartment(initialized.is_ok());
     let link: IShellLinkW =
         unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.map_err(com_error)?;
-    let persistent: IPersistFile = link.cast().map_err(com_error)?;
-    let wide = windows::wide(&shortcut);
-    unsafe { persistent.Load(PCWSTR(wide.as_ptr()), STGM_READ | STGM_SHARE_DENY_WRITE) }
-        .map_err(com_error)?;
+    let persistent: IPersistStream = link.cast().map_err(com_error)?;
+    let stream = unsafe { SHCreateMemStream(Some(&bytes)) }.ok_or_else(|| {
+        AppError::new(
+            "service_legacy_shortcut_error",
+            "无法分配旧安装快捷方式读取缓冲区",
+        )
+    })?;
+    unsafe { persistent.Load(&stream) }.map_err(com_error)?;
     let mut target = vec![0_u16; 32768];
     // Never Resolve, launch, load an icon, or expand an arbitrary user location.
     // The stored target remains useful even when old program files are missing.

@@ -730,6 +730,140 @@ fn require_admin_object(
     }
 }
 
+/// A shortcut is evidence only while both its contents and its place in the
+/// common Start Menu are protected. Some Windows defaults permit deleting an
+/// entry without permitting another entry to be inserted in its place.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShortcutSecurity {
+    untrusted_access: u32,
+    directory: bool,
+}
+
+fn unsafe_shortcut() -> AppError {
+    AppError::new(
+        "service_legacy_shortcut_unsafe",
+        "公共快捷方式的内容或目录可被普通用户替换，不能作为旧安装凭据",
+    )
+}
+
+impl ShortcutSecurity {
+    pub(crate) fn require_child(self, child: Self) -> Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES,
+            FILE_WRITE_EA,
+        };
+        let insert = if child.directory {
+            FILE_ADD_SUBDIRECTORY
+        } else {
+            FILE_ADD_FILE
+        };
+        // Metadata access can turn an emptied parent into a reparse point, even
+        // when adding a new ordinary child is forbidden.
+        let can_replace =
+            self.untrusted_access & (insert | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA) != 0;
+        let can_remove =
+            self.untrusted_access & FILE_DELETE_CHILD != 0 || child.untrusted_access & DELETE != 0;
+        if !self.directory || (can_replace && can_remove) {
+            return Err(unsafe_shortcut());
+        }
+        Ok(())
+    }
+}
+
+unsafe fn shortcut_security(
+    owner: PSID,
+    dacl: *mut windows_sys::Win32::Security::ACL,
+    directory: bool,
+) -> Result<ShortcutSecurity> {
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_ALL, GENERIC_WRITE},
+        Security::{GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER, INHERIT_ONLY_ACE},
+        Storage::FileSystem::{
+            DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+            FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+        },
+    };
+    if !trusted_security_owner(&security_sid_text(owner)?)
+        || dacl.is_null()
+        || IsValidAcl(dacl) == 0
+    {
+        return Err(unsafe_shortcut());
+    }
+    let security_control = GENERIC_ALL | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER;
+    let content_write = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES;
+    let relevant = security_control | content_write | DELETE | FILE_DELETE_CHILD;
+    let mut untrusted_access = 0;
+    for index in 0..(*dacl).AceCount as u32 {
+        let mut raw = std::ptr::null_mut();
+        if GetAce(dacl, index, &mut raw) == 0 {
+            return Err(last_error("无法检查公共快捷方式权限项"));
+        }
+        let header = &*raw.cast::<ACE_HEADER>();
+        if header.AceFlags as u32 & INHERIT_ONLY_ACE != 0
+            || [1_u8, 6, 10, 12].contains(&header.AceType)
+        {
+            continue;
+        }
+        if header.AceSize < 8 {
+            return Err(unsafe_shortcut());
+        }
+        let ace = &*raw.cast::<ACCESS_ALLOWED_ACE>();
+        if ace.Mask & relevant == 0 {
+            continue;
+        }
+        if header.AceType != 0 {
+            return Err(unsafe_shortcut());
+        }
+        if !trusted_security_owner(&security_sid_text(
+            std::ptr::addr_of!(ace.SidStart).cast_mut().cast(),
+        )?) {
+            untrusted_access |= ace.Mask;
+        }
+    }
+    if untrusted_access & security_control != 0
+        || (!directory && untrusted_access & content_write != 0)
+    {
+        return Err(unsafe_shortcut());
+    }
+    Ok(ShortcutSecurity {
+        untrusted_access,
+        directory,
+    })
+}
+
+/// Inspect the object that the caller has already opened, never its pathname.
+/// Product executables and installation ancestors retain their stricter policy.
+pub(crate) fn shortcut_object_security(
+    handle: HANDLE,
+    directory: bool,
+) -> Result<ShortcutSecurity> {
+    use windows_sys::Win32::Security::{Authorization::SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION};
+    unsafe {
+        let mut owner = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        let error = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if error != 0 {
+            return Err(AppError::io(
+                "无法读取公共快捷方式对象权限",
+                std::io::Error::from_raw_os_error(error as i32),
+            ));
+        }
+        let result = shortcut_security(owner, dacl, directory);
+        LocalFree(descriptor);
+        result
+    }
+}
+
 pub fn secure_admin_tree(path: &Path, read_sid: Option<&str>) -> Result<()> {
     fn protect(path: &Path, read_sid: Option<&str>, depth: usize) -> Result<()> {
         if depth > 64 {
@@ -1329,7 +1463,10 @@ mod tests {
         assert_eq!(result.unwrap_err().code, "service_untrusted_permissions");
     }
 
-    fn check_security_descriptor(sddl: &str, boundary: SecurityBoundary) -> Result<()> {
+    fn with_security_descriptor<T>(
+        sddl: &str,
+        check: impl FnOnce(PSID, *mut windows_sys::Win32::Security::ACL) -> Result<T>,
+    ) -> Result<T> {
         use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, GetSecurityDescriptorOwner};
         unsafe {
             let mut descriptor = std::ptr::null_mut();
@@ -1354,10 +1491,88 @@ mod tests {
                 GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted),
                 0
             );
-            let result = verify_admin_security(owner, dacl, boundary);
+            let result = check(owner, dacl);
             LocalFree(descriptor);
             result
         }
+    }
+
+    fn check_security_descriptor(sddl: &str, boundary: SecurityBoundary) -> Result<()> {
+        with_security_descriptor(sddl, |owner, dacl| unsafe {
+            verify_admin_security(owner, dacl, boundary)
+        })
+    }
+
+    fn check_shortcut_descriptor(sddl: &str, directory: bool) -> Result<ShortcutSecurity> {
+        with_security_descriptor(sddl, |owner, dacl| unsafe {
+            shortcut_security(owner, dacl, directory)
+        })
+    }
+
+    #[test]
+    fn common_shortcut_accepts_metadata_and_delete_only_windows_defaults() {
+        let program_data =
+            check_shortcut_descriptor("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;CI;0x116;;;BU)", true)
+                .unwrap();
+        let microsoft =
+            check_shortcut_descriptor("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)", true)
+                .unwrap();
+        program_data.require_child(microsoft).unwrap();
+
+        // Programs and the real legacy .lnk can be deleted by a user, but the
+        // parent cannot accept a replacement entry or become a reparse point.
+        let programs =
+            check_shortcut_descriptor("O:SYD:AI(A;;FA;;;SY)(A;;FA;;;BA)(A;ID;0x10040;;;BU)", true)
+                .unwrap();
+        let link =
+            check_shortcut_descriptor("O:BAD:AI(A;;FA;;;SY)(A;;FA;;;BA)(A;ID;0x10040;;;BU)", false)
+                .unwrap();
+        microsoft.require_child(programs).unwrap();
+        programs.require_child(link).unwrap();
+    }
+
+    #[test]
+    fn shortcut_rejects_replacement_and_empty_parent_reparse_grants() {
+        for (parent_access, child_access, child_directory) in [
+            (0x2u32, 0x10000u32, false), // Add a replacement link after deleting it.
+            (0x4, 0x10000, true),        // Add a replacement directory.
+            (0x100, 0x10000, true),      // Empty parent, then set a reparse point.
+            (0x10, 0x10000, true),       // Conservatively refuse writable metadata.
+            (0x42, 0, false),            // Parent DELETE_CHILD bypasses child DELETE.
+        ] {
+            let parent = check_shortcut_descriptor(
+                &format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x{parent_access:x};;;BU)"),
+                true,
+            )
+            .unwrap();
+            let child = check_shortcut_descriptor(
+                &format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x{child_access:x};;;BU)"),
+                child_directory,
+            )
+            .unwrap();
+            assert_eq!(
+                parent.require_child(child).unwrap_err().code,
+                "service_legacy_shortcut_unsafe"
+            );
+        }
+    }
+
+    #[test]
+    fn shortcut_rejects_user_owned_or_writable_payloads() {
+        for access in [
+            0x2u32, 0x4, 0x10, 0x100, 0x40000, 0x80000, 0x10000000, 0x40000000,
+        ] {
+            let descriptor = format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x{access:x};;;BU)");
+            assert_eq!(
+                check_shortcut_descriptor(&descriptor, false)
+                    .unwrap_err()
+                    .code,
+                "service_legacy_shortcut_unsafe"
+            );
+        }
+        let user_owner = "O:S-1-5-21-1-2-3-1001D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)";
+        assert!(check_shortcut_descriptor(user_owner, false).is_err());
+        assert!(check_shortcut_descriptor(user_owner, true).is_err());
     }
 
     #[test]
