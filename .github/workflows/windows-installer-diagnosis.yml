@@ -1,4 +1,4 @@
-name: Windows controller reader diagnosis
+name: Windows custom-path TUN diagnosis
 
 on:
   push:
@@ -9,17 +9,24 @@ permissions:
   actions: read
 
 jobs:
-  diagnose-controller-reader:
+  diagnose-custom-tun:
     runs-on: windows-2022
     timeout-minutes: 10
     env:
       PYTHONUTF8: '1'
       PYTHONUNBUFFERED: '1'
     steps:
-      - name: Check out the exact diagnostic branch commit
+      - name: Check out the exact candidate source
+        uses: actions/checkout@v4
+        with:
+          ref: 31b974cd2cb7edc1f12d5b6d7cd0963ad121288e
+          persist-credentials: false
+
+      - name: Check out this diagnostic commit separately
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+          path: diagnostic-source
           persist-credentials: false
 
       - name: Install Python
@@ -31,82 +38,88 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311
 
-      - name: Download the already built candidate
+      - name: Download the exact third candidate
         uses: actions/download-artifact@v4
         with:
           name: mihomo-desktop-windows-x64
-          run-id: 45634476951
+          run-id: 45650772797
           github-token: ${{ github.token }}
-          path: candidate-artifact
+          path: artifacts/desktop
 
-      - name: Extract and verify the identical core executable
+      - name: Recreate diagnostic metadata and overlay only error reporting
         shell: python
         run: |
           import hashlib
           import json
           import os
           from pathlib import Path
-          import zipfile
+          import shutil
 
           root = Path(os.environ['GITHUB_WORKSPACE'])
-          archives = list((root / 'candidate-artifact').rglob('mihomo-desktop-0.2.14-windows-x64-portable.zip'))
-          if len(archives) != 1:
-              raise RuntimeError('The exact candidate portable archive was not found')
-          output = root / 'artifacts' / 'controller-reader-diagnosis'
-          reports = root / 'artifacts' / 'verification'
-          output.mkdir(parents=True, exist_ok=True)
-          reports.mkdir(parents=True, exist_ok=True)
-          expected = 'c7247bd59a316e9f5bc74aa8c063e04c88bdc40c4fd427e32a0c46e90a18b38b'
-          with zipfile.ZipFile(archives[0]) as archive:
-              entries = [entry for entry in archive.infolist()
-                         if not entry.is_dir() and entry.filename.replace('\\', '/').split('/')[-1] == 'mihomo-core.exe']
-              if len(entries) != 1:
-                  raise RuntimeError('A unique core executable was not found in the portable archive')
-              data = archive.read(entries[0])
-              actual = hashlib.sha256(data).hexdigest()
-              if actual != expected:
-                  raise RuntimeError(f'Unexpected core SHA256: {actual}')
-              # Read one verified member into a fixed destination; no archive
-              # directory names or installer binaries are executed/extracted.
-              core = output / 'mihomo-core.exe'
-              core.write_bytes(data)
-          test = root / 'desktop' / 'tests' / 'controller_smoke.py'
-          if not test.is_file():
-              raise RuntimeError('The diagnostic controller test is missing from this commit')
+          distribution = root / 'artifacts' / 'desktop'
+          info_path = distribution / 'build-info.json'
+          info = json.loads(info_path.read_text(encoding='utf-8-sig'))
+          source = '31b974cd2cb7edc1f12d5b6d7cd0963ad121288e'
+          setup = distribution / 'mihomo-desktop-0.2.14-windows-x64-setup.exe'
+          def sha(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+          if (info.get('uiCommit') != source or info.get('desktopVersion') != '0.2.14'
+                  or sha(setup) != 'd9ffb9a5062401c271ac8771a4261c3b44ab884d5185f0aceaf38f8ef087ee81'):
+              raise RuntimeError('Candidate source or installer bytes differ from the third CI run')
+          # Reproduce scripts/build-native-desktop.py's generated allowlist;
+          # metadata and package checksums are verified again by load_candidate.
+          generated = root / 'desktop' / 'generated'
+          generated.mkdir(parents=True, exist_ok=True)
+          names = sorted(set(info['runtimeFiles']) | {
+              'resources/build-info.json', 'uninstall.exe',
+              'mscordaccore_amd64_amd64_10.0.1426.52326.dll',
+          })
+          (generated / 'installer-files.json').write_text(
+              json.dumps({'files': names}, ensure_ascii=False) + '\n', encoding='utf-8')
           provenance = {
+              'partialDiagnostic': True,
+              'candidateSource': source,
+              'candidateRunId': 45650772797,
+              'candidateArtifactId': 15040982295,
+              'candidateInstallerSha256': sha(setup),
               'diagnosticCommit': os.environ['GITHUB_SHA'],
-              'sourceRunId': 45634476951,
-              'sourceArtifact': 'mihomo-desktop-windows-x64',
-              'portableArchive': archives[0].name,
-              'portableArchiveSha256': hashlib.sha256(archives[0].read_bytes()).hexdigest(),
-              'coreSha256': actual,
-              'controllerTestSha256': hashlib.sha256(test.read_bytes()).hexdigest(),
+              'testOverlays': [],
           }
-          (reports / 'controller-reader-provenance.json').write_text(
+          for name in ('windows_smoke.py', 'upgrade_tun_smoke.py'):
+              target = root / 'desktop' / 'tests' / name
+              diagnostic = root / 'diagnostic-source' / 'desktop' / 'tests' / name
+              before = sha(target)
+              shutil.copyfile(diagnostic, target)
+              provenance['testOverlays'].append({
+                  'path': 'desktop/tests/' + name, 'candidateSourceSha256': before,
+                  'diagnosticSha256': sha(target),
+              })
+          harness = root / 'diagnostic-source' / '.github' / 'diagnostics' / 'custom-tun-diagnosis.py'
+          provenance['harnessSha256'] = sha(harness)
+          reports = root / 'artifacts' / 'verification'
+          reports.mkdir(parents=True, exist_ok=True)
+          (reports / 'custom-tun-provenance.json').write_text(
               json.dumps(provenance, ensure_ascii=True, indent=2) + '\n', encoding='utf-8')
           print(json.dumps(provenance, ensure_ascii=True, indent=2), flush=True)
 
-      - name: Run all controller scenarios with the stale-record publication barrier
+      - name: Reproduce the original same-volume TUN lifecycle
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
-          $core = Join-Path $env:GITHUB_WORKSPACE 'artifacts/controller-reader-diagnosis/mihomo-core.exe'
-          $report = Join-Path $env:GITHUB_WORKSPACE 'artifacts/verification/controller-discovery.json'
-          $log = Join-Path $env:GITHUB_WORKSPACE 'artifacts/verification/controller-discovery.log'
-          & python desktop/tests/controller_smoke.py --require-tun --core $core --report $report 2>&1 | Tee-Object -FilePath $log
-          $controllerExit = $LASTEXITCODE
-          Write-Output "CONTROLLER_TEST_EXIT=$controllerExit"
-          exit $controllerExit
+          $harness = Join-Path $env:GITHUB_WORKSPACE 'diagnostic-source/.github/diagnostics/custom-tun-diagnosis.py'
+          $log = Join-Path $env:GITHUB_WORKSPACE 'artifacts/verification/custom-tun-console.log'
+          & python $harness 2>&1 | Tee-Object -FilePath $log
+          $diagnosticExit = $LASTEXITCODE
+          Write-Output "PARTIAL_CUSTOM_TUN_DIAGNOSTIC_EXIT=$diagnosticExit"
+          exit $diagnosticExit
 
-      - name: Retain controller diagnosis evidence
+      - name: Retain partial diagnosis evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-controller-reader-diagnosis
-          path: |
-            artifacts/verification/controller-discovery.json
-            artifacts/verification/controller-discovery.log
-            artifacts/verification/controller-reader-provenance.json
+          name: windows-custom-tun-diagnosis
+          path: artifacts/verification/
           if-no-files-found: warn
           retention-days: 7

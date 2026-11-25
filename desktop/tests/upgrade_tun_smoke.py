@@ -318,6 +318,26 @@ class TunUpgradeAcceptance:
                             "upgrade_tun_conflict_did_not_stop")
                     return status
                 time.sleep(min(.1, self.remaining(deadline)))
+        except SmokeFailure as error:
+            def sanitized(value) -> str:
+                text = value if isinstance(value, str) else ""
+                for secret in self.secrets:
+                    text = text.replace(secret, "[redacted]")
+                return "".join(char for char in text if char in "\n\t" or ord(char) >= 32)[:2048]
+
+            if error.native is not None:
+                record["nativeError"] = {"command": safe_code(error.native.get("command")),
+                    "code": safe_code(error.native.get("code")), "message": sanitized(error.native.get("message"))}
+                self.checkpoint()
+                print("NATIVE_START_FAILURE " + json.dumps(record["nativeError"], ensure_ascii=True), flush=True)
+            try:
+                failure = self.status(timeout=3)
+                record["failureStatus"] = {"phase": safe_code(failure.get("phase")),
+                    "errorCode": safe_code(failure.get("errorCode")), "lastError": sanitized(failure.get("lastError"))}
+            except Exception as capture_error:
+                record["failureStatusCaptureError"] = (safe_code(str(capture_error))
+                    if isinstance(capture_error, SmokeFailure) else type(capture_error).__name__)
+            raise
         finally:
             record["elapsedMilliseconds"] = round((time.monotonic() - started) * 1000)
             self.checkpoint()
