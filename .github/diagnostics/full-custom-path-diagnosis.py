@@ -3,6 +3,7 @@
 
 import ctypes
 from ctypes import wintypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -100,6 +101,94 @@ def acl_row(path: Path) -> dict:
 
 
 class DiagnosticAcceptance(CustomInstallAcceptance):
+    def capture_legacy_shortcut_stream(self) -> None:
+        # Compatibility evidence only. This fixed path was just created by the
+        # original broken_custom_install fixture; nothing is resolved or run.
+        event = {"phase": "after_broken_custom_install", "readOnly": True,
+                 "expectedTarget": str(self.install_dir / "mihomo-optimized.exe"),
+                 "streamCompatible": False, "operation": "locate_fixture_shortcut",
+                 "desiredAccess": "0x20081", "shareMode": "0x1",
+                 "createFlags": "0x2200000", "pinnedPaths": []}
+        initialized = False
+        handles = []
+        try:
+            import pythoncom
+            import win32file
+            from win32com.shell import shell
+
+            locations = common_programs_locations()
+            shortcut = Path(locations["FOLDERID_CommonPrograms"]) / "Mihomo Optimized.lnk"
+            event["shortcut"] = str(shortcut)
+            for path in reversed([shortcut, *shortcut.parents]):
+                event.update({"operation": "CreateFile_pin_path", "currentPath": str(path)})
+                handle = win32file.CreateFile(str(path), 0x20081, 1, None, 3, 0x2200000, None)
+                handles.append(handle)
+                event["operation"] = "GetFileInformationByHandle"
+                info = win32file.GetFileInformationByHandle(handle)
+                attributes, links = info[0], info[7]
+                length = (info[5] << 32) | info[6]
+                event["pinnedPaths"].append({"path": str(path), "attributes": attributes,
+                    "isDirectory": bool(attributes & 0x10), "isReparsePoint": bool(attributes & 0x400),
+                    "links": links, "length": length,
+                    "volumeSerial": info[4], "fileId": (info[8] << 32) | info[9]})
+                leaf = path == shortcut
+                if attributes & 0x400 or bool(attributes & 0x10) == leaf or (leaf and links != 1):
+                    raise ValueError("Fixture shortcut chain has an unexpected file type or link")
+            event["operation"] = "ReadFile_bounded_pinned_leaf"
+            maximum = 1024 * 1024
+            if not length or length > maximum:
+                raise ValueError("Fixture shortcut must be nonempty and at most 1 MiB")
+            status, contents = win32file.ReadFile(handles[-1], maximum + 1)
+            if status != 0 or len(contents) != length:
+                raise ValueError("Pinned fixture shortcut read must return its exact observed length")
+            event.update({"bytes": len(contents), "sha256": hashlib.sha256(contents).hexdigest()})
+            event["operation"] = "CoInitializeEx"
+            pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+            initialized = True
+            event["operation"] = "CreateStreamOnHGlobal_Write_Seek"
+            stream = pythoncom.CreateStreamOnHGlobal(None, True)
+            stream.Write(contents)
+            stream.Seek(0, 0)
+            event["operation"] = "CoCreateInstance_CLSID_ShellLink"
+            link = pythoncom.CoCreateInstance(
+                shell.CLSID_ShellLink, None, pythoncom.CLSCTX_INPROC_SERVER, shell.IID_IShellLink)
+            event["operation"] = "IPersistStream_Load"
+            persistent = link.QueryInterface(pythoncom.IID_IPersistStream)
+            persistent.Load(stream)
+            event["operation"] = "IShellLink_GetPath_SLGP_RAWPATH"
+            raw_target, _ = link.GetPath(0x4)  # SLGP_RAWPATH; never Resolve or inspect an icon.
+            event.update({"rawTarget": raw_target,
+                          "exactTargetMatch": raw_target == event["expectedTarget"],
+                          "streamCompatible": raw_target == event["expectedTarget"],
+                          "operation": "complete"})
+        except Exception as error:
+            event.update({"errorType": type(error).__name__, "message": str(error),
+                          "hresult": getattr(error, "hresult", None),
+                          "winError": getattr(error, "winerror", None)})
+        finally:
+            if initialized:
+                try:
+                    persistent = link = stream = None
+                    pythoncom.CoUninitialize()
+                except Exception as error:
+                    event["comCleanupError"] = str(error)
+            event["closedHandleCount"] = 0
+            for handle in reversed(handles):
+                try:
+                    handle.Close()
+                    event["closedHandleCount"] += 1
+                except Exception as error:
+                    event.setdefault("handleCleanupErrors", []).append(str(error))
+        # Do not let evidence persistence mask the original installer outcome.
+        try:
+            self.report.setdefault("legacyShortcutStreamProbes", []).append(event)
+            self.write_report()
+            (self.artifacts / "legacy-shortcut-stream.json").write_text(
+                json.dumps(event, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        except Exception as error:
+            event["evidenceWriteError"] = str(error)
+        print("LEGACY_SHORTCUT_STREAM " + json.dumps(event, ensure_ascii=True), flush=True)
+
     def capture_legacy_anchor_acl(self, phase: str) -> None:
         try:
             self._capture_legacy_anchor_acl(phase)
@@ -147,6 +236,8 @@ class DiagnosticAcceptance(CustomInstallAcceptance):
         finally:
             if name in ("broken_custom_install", "broken_custom_uninstall", "repair_broken_custom_install"):
                 self.capture_legacy_anchor_acl("after_" + name)
+            if name == "broken_custom_install":
+                self.capture_legacy_shortcut_stream()
 
     def load_candidate(self) -> None:
         super().load_candidate()
