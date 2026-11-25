@@ -35,6 +35,7 @@ import time
 RECORD = "desktop-controller.json"
 NONCE_ENV = "MIHOMO_DESKTOP_LAUNCH_NONCE"
 FIELDS = {"protocolVersion", "pid", "controller", "coreInstance", "launchNonce"}
+FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 
 
 class Failure(RuntimeError):
@@ -95,7 +96,7 @@ def shared_windows_record(path: Path):
     try:
         handle = win32file.CreateFile(str(path), win32con.GENERIC_READ,
             win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE | win32con.FILE_SHARE_DELETE,
-            None, win32con.OPEN_EXISTING, win32con.FILE_FLAG_OPEN_REPARSE_POINT, None)
+            None, win32con.OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, None)
         information = win32file.GetFileInformationByHandle(handle)
         require(win32file.GetFileType(handle) == 1 and not information[0] & (0x10 | 0x400),
                 "discovery record is not a regular file")
