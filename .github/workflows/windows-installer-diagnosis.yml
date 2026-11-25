@@ -1,4 +1,4 @@
-name: Windows custom-path TUN diagnosis
+name: Windows medium-token volume path probe
 
 on:
   push:
@@ -6,120 +6,47 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
-  diagnose-custom-tun:
+  native-volume-probe:
     runs-on: windows-2022
-    timeout-minutes: 10
+    timeout-minutes: 5
     env:
       PYTHONUTF8: '1'
       PYTHONUNBUFFERED: '1'
     steps:
-      - name: Check out the exact candidate source
+      - name: Check out the original token fixture
         uses: actions/checkout@v4
         with:
           ref: 31b974cd2cb7edc1f12d5b6d7cd0963ad121288e
           persist-credentials: false
-
-      - name: Check out this diagnostic commit separately
+      - name: Check out this diagnostic probe
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           path: diagnostic-source
           persist-credentials: false
-
-      - name: Install Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Install the fixed Windows test dependency
+      - name: Install the original Windows token bindings
         run: |
           python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311
-
-      - name: Download the exact third candidate
-        uses: actions/download-artifact@v4
-        with:
-          name: mihomo-desktop-windows-x64
-          run-id: 45650772797
-          github-token: ${{ github.token }}
-          path: artifacts/desktop
-
-      - name: Recreate diagnostic metadata and overlay only error reporting
-        shell: python
-        run: |
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import shutil
-
-          root = Path(os.environ['GITHUB_WORKSPACE'])
-          distribution = root / 'artifacts' / 'desktop'
-          info_path = distribution / 'build-info.json'
-          info = json.loads(info_path.read_text(encoding='utf-8-sig'))
-          source = '31b974cd2cb7edc1f12d5b6d7cd0963ad121288e'
-          setup = distribution / 'mihomo-desktop-0.2.14-windows-x64-setup.exe'
-          def sha(path):
-              with path.open('rb') as stream:
-                  return hashlib.file_digest(stream, 'sha256').hexdigest()
-          if (info.get('uiCommit') != source or info.get('desktopVersion') != '0.2.14'
-                  or sha(setup) != 'd9ffb9a5062401c271ac8771a4261c3b44ab884d5185f0aceaf38f8ef087ee81'):
-              raise RuntimeError('Candidate source or installer bytes differ from the third CI run')
-          # Reproduce scripts/build-native-desktop.py's generated allowlist;
-          # metadata and package checksums are verified again by load_candidate.
-          generated = root / 'desktop' / 'generated'
-          generated.mkdir(parents=True, exist_ok=True)
-          names = sorted(set(info['runtimeFiles']) | {
-              'resources/build-info.json', 'uninstall.exe',
-              'mscordaccore_amd64_amd64_10.0.1426.52326.dll',
-          })
-          (generated / 'installer-files.json').write_text(
-              json.dumps({'files': names}, ensure_ascii=False) + '\n', encoding='utf-8')
-          provenance = {
-              'partialDiagnostic': True,
-              'candidateSource': source,
-              'candidateRunId': 45650772797,
-              'candidateArtifactId': 15040982295,
-              'candidateInstallerSha256': sha(setup),
-              'diagnosticCommit': os.environ['GITHUB_SHA'],
-              'testOverlays': [],
-          }
-          for name in ('windows_smoke.py', 'upgrade_tun_smoke.py'):
-              target = root / 'desktop' / 'tests' / name
-              diagnostic = root / 'diagnostic-source' / 'desktop' / 'tests' / name
-              before = sha(target)
-              shutil.copyfile(diagnostic, target)
-              provenance['testOverlays'].append({
-                  'path': 'desktop/tests/' + name, 'candidateSourceSha256': before,
-                  'diagnosticSha256': sha(target),
-              })
-          harness = root / 'diagnostic-source' / '.github' / 'diagnostics' / 'custom-tun-diagnosis.py'
-          provenance['harnessSha256'] = sha(harness)
-          reports = root / 'artifacts' / 'verification'
-          reports.mkdir(parents=True, exist_ok=True)
-          (reports / 'custom-tun-provenance.json').write_text(
-              json.dumps(provenance, ensure_ascii=True, indent=2) + '\n', encoding='utf-8')
-          print(json.dumps(provenance, ensure_ascii=True, indent=2), flush=True)
-
-      - name: Reproduce the original same-volume TUN lifecycle
+      - name: Probe real roots and child-owned SUBST aliases
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
-          $harness = Join-Path $env:GITHUB_WORKSPACE 'diagnostic-source/.github/diagnostics/custom-tun-diagnosis.py'
-          $log = Join-Path $env:GITHUB_WORKSPACE 'artifacts/verification/custom-tun-console.log'
-          & python $harness 2>&1 | Tee-Object -FilePath $log
-          $diagnosticExit = $LASTEXITCODE
-          Write-Output "PARTIAL_CUSTOM_TUN_DIAGNOSTIC_EXIT=$diagnosticExit"
-          exit $diagnosticExit
-
-      - name: Retain partial diagnosis evidence
+          New-Item -ItemType Directory -Force -Path artifacts/verification | Out-Null
+          & python diagnostic-source/.github/diagnostics/volume-path-probe.py 2>&1 | Tee-Object -FilePath artifacts/verification/volume-native-probe.log
+          $probeExit = $LASTEXITCODE
+          Write-Output "NATIVE_VOLUME_PROBE_EXIT=$probeExit"
+          exit $probeExit
+      - name: Retain native token and API evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-custom-tun-diagnosis
+          name: windows-medium-volume-native-probe
           path: artifacts/verification/
           if-no-files-found: warn
           retention-days: 7
