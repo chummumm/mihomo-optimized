@@ -2,11 +2,13 @@
 """Original custom-path suite, with one explicitly unavailable baseline skipped."""
 
 import ctypes
+from ctypes import wintypes
 import json
 import os
 from pathlib import Path
 import sys
 import traceback
+import uuid
 
 ROOT = Path(os.environ["GITHUB_WORKSPACE"])
 sys.path.insert(0, str(ROOT / "desktop" / "tests"))
@@ -21,9 +23,131 @@ SOURCE = "882d416355513b55409a879547d33ed825441418"
 INSTALLER_SHA256 = "445cffd0ed5534a05c73008decb2e8f4e21b56d3c19669281312b277f4f8c14e"
 SKIPPED_CASE = "custom_core_update"
 SKIP_REASON = "The source-built core-update baseline was not uploaded with this candidate artifact."
+ANCESTOR_MASK = 0x500D0150  # windows.rs SecurityBoundary::Ancestor, evidence only.
+
+
+def common_programs_locations() -> dict:
+    from win32com.shell import shell, shellcon
+
+    locations = {}
+    try:
+        locations["CSIDL_COMMON_PROGRAMS"] = shell.SHGetFolderPath(
+            0, shellcon.CSIDL_COMMON_PROGRAMS, None, 0)
+    except Exception as error:
+        locations["csidlError"] = str(error)
+
+    class Guid(ctypes.Structure):
+        _fields_ = [("data1", wintypes.DWORD), ("data2", wintypes.WORD),
+                    ("data3", wintypes.WORD), ("data4", ctypes.c_ubyte * 8)]
+
+    known = Guid.from_buffer_copy(uuid.UUID("0139d44e-6afe-49f2-8690-3dafcae6ffb8").bytes_le)
+    api = ctypes.WinDLL("shell32")
+    api.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(Guid), wintypes.DWORD,
+                                        wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+    api.SHGetKnownFolderPath.restype = ctypes.c_long
+    memory = ctypes.WinDLL("ole32")
+    memory.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    memory.CoTaskMemFree.restype = None
+    value = ctypes.c_void_p()
+    result = api.SHGetKnownFolderPath(ctypes.byref(known), 0, None, ctypes.byref(value))
+    try:
+        if result < 0 or not value.value:
+            locations["knownFolderError"] = "HRESULT 0x%08X" % (result & 0xFFFFFFFF)
+        else:
+            locations["FOLDERID_CommonPrograms"] = ctypes.wstring_at(value)
+    finally:
+        if value.value:
+            memory.CoTaskMemFree(value)
+    return locations
+
+
+def acl_row(path: Path) -> dict:
+    import stat
+    import win32security
+
+    row = {"path": str(path), "aces": []}
+    try:
+        metadata = path.lstat()
+        row.update({"attributes": metadata.st_file_attributes,
+                    "isDirectory": stat.S_ISDIR(metadata.st_mode),
+                    "isFile": stat.S_ISREG(metadata.st_mode),
+                    "isReparsePoint": bool(metadata.st_file_attributes & 0x400),
+                    "links": metadata.st_nlink})
+        information = win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION
+        descriptor = win32security.GetNamedSecurityInfo(str(path), win32security.SE_FILE_OBJECT, information)
+        row["ownerSid"] = win32security.ConvertSidToStringSid(descriptor.GetSecurityDescriptorOwner())
+        row["sddl"] = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(descriptor, 1, information)
+        dacl = descriptor.GetSecurityDescriptorDacl()
+        row["nullDacl"] = dacl is None
+        if dacl is not None:
+            for index in range(dacl.GetAceCount()):
+                value = dacl.GetAce(index)
+                kind, flags = value[0]
+                mask = value[1] if isinstance(value[1], int) else None
+                ace = {"index": index, "type": kind, "flags": flags, "flagsHex": hex(flags),
+                       "mask": mask, "maskHex": hex(mask) if mask is not None else None,
+                       "inheritOnly": bool(flags & 0x8),
+                       "ancestorForbiddenMaskOverlap": hex(mask & ANCESTOR_MASK) if mask is not None else None}
+                try:
+                    ace["sid"] = win32security.ConvertSidToStringSid(value[-1])
+                except Exception as error:
+                    ace["sidDecodeError"] = type(error).__name__
+                row["aces"].append(ace)
+    except Exception as error:
+        row.update({"errorType": type(error).__name__, "error": str(error),
+                    "winError": getattr(error, "winerror", None)})
+    return row
 
 
 class DiagnosticAcceptance(CustomInstallAcceptance):
+    def capture_legacy_anchor_acl(self, phase: str) -> None:
+        try:
+            self._capture_legacy_anchor_acl(phase)
+        except Exception as error:
+            # Diagnostic collection must never replace an original assertion
+            # or change the success/failure of the installer command.
+            print("LEGACY_ANCHOR_ACL_CAPTURE_ERROR " + json.dumps(
+                {"phase": phase, "type": type(error).__name__, "message": str(error)},
+                ensure_ascii=True), flush=True)
+
+    def _capture_legacy_anchor_acl(self, phase: str) -> None:
+        event = {"phase": phase, "target": str(self.install_dir), "chains": [], "paths": [],
+                 "productionAncestorMask": hex(ANCESTOR_MASK),
+                 "productionTrustedOwnerSids": ["S-1-5-18", "S-1-5-32-544",
+                    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"]}
+        try:
+            locations = common_programs_locations()
+            event["commonProgramsLocations"] = locations
+            endpoints = [("installation_target", self.install_dir)]
+            endpoints.extend((source, Path(locations[source]) / "Mihomo Optimized.lnk")
+                             for source in ("CSIDL_COMMON_PROGRAMS", "FOLDERID_CommonPrograms")
+                             if source in locations)
+            paths = {}
+            for source, endpoint in endpoints:
+                chain = list(reversed([endpoint, *endpoint.parents]))
+                event["chains"].append({"source": source, "paths": [str(path) for path in chain]})
+                for path in chain:
+                    paths.setdefault(str(path).casefold(), path)
+            event["paths"] = [acl_row(path) for path in paths.values()]
+        except Exception as error:
+            event["snapshotError"] = str(error)
+        self.report.setdefault("legacyAnchorAclSnapshots", []).append(event)
+        self.write_report()
+        (self.artifacts / "legacy-anchor-acl.json").write_text(
+            json.dumps(self.report["legacyAnchorAclSnapshots"], ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8")
+        # This is observation, never a replacement gate or an ACL repair.
+        summary = {**event, "paths": [{key: value for key, value in row.items() if key != "aces"}
+                                      for row in event["paths"]]}
+        print("LEGACY_ANCHOR_ACL " + json.dumps(summary, ensure_ascii=True), flush=True)
+
+    def command(self, name: str, executable: Path, arguments, timeout: float = 90) -> dict:
+        try:
+            return super().command(name, executable, arguments, timeout)
+        finally:
+            if name in ("broken_custom_install", "broken_custom_uninstall", "repair_broken_custom_install"):
+                self.capture_legacy_anchor_acl("after_" + name)
+
     def load_candidate(self) -> None:
         super().load_candidate()
         require(self.info["uiCommit"] == SOURCE and self.info["desktopVersion"] == "0.2.14"
@@ -97,6 +221,7 @@ def main() -> int:
             "diagnosticCommit": os.environ["GITHUB_SHA"],
         })
         acceptance.write_report()
+        acceptance.capture_legacy_anchor_acl("before_run")
         # The original run method owns every preflight, path case, real
         # installer/service/TUN operation, repair and removal assertion.
         acceptance.run()
