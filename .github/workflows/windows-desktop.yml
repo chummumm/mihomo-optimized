@@ -100,7 +100,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --only-binary=:all: pywin32==311 pyflakes==3.4.0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pyflakes desktop/tests/windows_smoke.py desktop/tests/upgrade_smoke.py desktop/tests/custom_install_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_http_test.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/port_fixture.py desktop/tests/port_fixture_test.py desktop/tests/core_smoke.py
+          python -m pyflakes desktop/tests/windows_smoke.py desktop/tests/upgrade_smoke.py desktop/tests/custom_install_smoke.py desktop/tests/controller_smoke.py desktop/tests/upgrade_tun_native.py desktop/tests/upgrade_tun_smoke.py desktop/tests/upgrade_tun_http_test.py desktop/tests/core_update_smoke.py desktop/tests/core_update_fixture_test.py scripts/prepare-desktop.py scripts/prepare-core-update-baseline.py desktop/tests/port_fixture.py desktop/tests/port_fixture_test.py desktop/tests/core_smoke.py
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
       - name: Verify the unchanged web dashboard
@@ -175,7 +175,7 @@ jobs:
       - name: Build and stage fixed companion programs
         run: python scripts/prepare-desktop.py --core-dir core-src
       - name: Verify actual managed controller discovery and startup cleanup
-        run: python core-src/scripts/test-desktop-controller.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe --require-tun
+        run: python desktop/tests/controller_smoke.py --core src-tauri/binaries/mihomo-core-x86_64-pc-windows-msvc.exe --require-tun --report artifacts/verification/controller-discovery.json
       - name: Build explicit discovery-compatible core update baseline
         run: python scripts/prepare-core-update-baseline.py --core-dir core-src
       - name: Exercise native settings and update policies
