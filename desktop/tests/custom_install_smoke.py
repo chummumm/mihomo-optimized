@@ -34,7 +34,7 @@ from windows_smoke import RestrictedDesktop, SERVICE_NAME, SocksFixture, require
 
 SAFE_DIRECTORY_SDDL = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)"
 UNSAFE_DIRECTORY_SDDL = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BU)"
-MODIFY_VOLUME_SDDL = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;AU)"
+MODIFY_VOLUME_SDDL = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;AU)"
 REQUIRED_CASES = {
     "default_never_service_uninstall", "same_volume_tun", "separate_volume_unicode_tun",
     "missing_runtime_uninstall", "unsafe_parent_rejected_before_copy",
@@ -91,7 +91,7 @@ def exception_diagnostic(stage: str, error: Exception) -> dict:
     return result
 
 
-def set_directory_security(path: Path, sddl: str = SAFE_DIRECTORY_SDDL) -> None:
+def set_directory_security(path: Path, sddl: str = SAFE_DIRECTORY_SDDL, *, include_owner: bool = True) -> None:
     import win32security
 
     require(path.is_dir() and not path.is_symlink(), "fixture_security_target_invalid")
@@ -100,9 +100,10 @@ def set_directory_security(path: Path, sddl: str = SAFE_DIRECTORY_SDDL) -> None:
     inheritance = (win32security.PROTECTED_DACL_SECURITY_INFORMATION
                    if control & win32security.SE_DACL_PROTECTED
                    else win32security.UNPROTECTED_DACL_SECURITY_INFORMATION)
-    win32security.SetFileSecurity(str(path), win32security.OWNER_SECURITY_INFORMATION
-        | win32security.DACL_SECURITY_INFORMATION | inheritance,
-        descriptor)
+    information = win32security.DACL_SECURITY_INFORMATION | inheritance
+    if include_owner:
+        information |= win32security.OWNER_SECURITY_INFORMATION
+    win32security.SetFileSecurity(str(path), information, descriptor)
 
 
 def directory_security_sddl(path: Path) -> str:
@@ -670,7 +671,8 @@ class CustomInstallAcceptance(UpgradeAcceptance):
                     # This fixture owns the entire newly formatted VHD. Give
                     # authenticated users Modify, including DELETE on the root
                     # itself, but never DELETE_CHILD, WRITE_DAC or WRITE_OWNER.
-                    set_directory_security(root, replacement)
+                    # Preserve the formatter's owner; only the DACL is under test.
+                    set_directory_security(root, replacement, include_owner=False)
                 row["rootSddlBefore"] = directory_security_sddl(root)
                 self.install_at(root / ("程序 " + label), label)
                 self.install_service(label + "_service")
@@ -705,7 +707,7 @@ class CustomInstallAcceptance(UpgradeAcceptance):
                 self.mark(label)
             finally:
                 if replacement is not None:
-                    set_directory_security(root, original_sddl)
+                    set_directory_security(root, original_sddl, include_owner=False)
                     require(directory_security_sddl(root) == original_sddl, "fixture_volume_root_acl_not_restored")
                     row["formattedAclRestored"] = True
                 self.write_report()
