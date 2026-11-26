@@ -65,9 +65,8 @@ fn service_error(error: windows_service::Error) -> AppError {
     }
 }
 
-pub fn entry() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.as_slice() {
+pub fn entry(args: &[String]) -> Result<()> {
+    match args {
         [action, marker, sid] if action == "--install" && marker == "--owner-sid" => install(sid),
         [action] if action == "--uninstall" => uninstall(),
         [action, directory, manifest] if action == "--installer-check" => {

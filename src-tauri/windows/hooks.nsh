@@ -92,6 +92,7 @@ Function ${PREFIX}MihomoCleanupMaintenance
     SetOutPath "$PROGRAMFILES64"
     Delete "$MihomoMaintenanceDirectory\mihomo-maintenance.exe"
     Delete "$MihomoMaintenanceDirectory\installer-files.json"
+    Delete "$MihomoMaintenanceDirectory\maintenance-error.txt"
     RMDir "$MihomoMaintenanceDirectory"
     StrCpy $MihomoMaintenanceDirectory ""
   ${EndIf}
@@ -114,14 +115,46 @@ FunctionEnd
 !insertmacro DefineMaintenanceBootstrap ""
 !insertmacro DefineMaintenanceBootstrap "un."
 
-!macro MihomoRunMaintenance PREFIX COMMAND STAGE
+!macro MihomoRunMaintenance PREFIX ARGUMENTS STAGE
   System::Store "s"
   StrCpy $MihomoMaintenanceStage "${STAGE}"
-  nsExec::ExecToStack /TIMEOUT=240000 '${COMMAND}'
+  Delete "$MihomoMaintenanceDirectory\maintenance-error.txt"
+  ; Rust CLI stderr is UTF-8, but nsExec decodes narrow bytes using CP_ACP.
+  ; Read the helper's explicit UTF-16LE report instead of guessing pipe encoding.
+  ; Only ASCII report-I/O failures remain on the pipe; disable Unicode guessing.
+  nsExec::ExecToStack /MBCS /TIMEOUT=240000 '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --nsis-error-file "$MihomoMaintenanceDirectory\maintenance-error.txt" ${ARGUMENTS}'
   Pop $0
   Pop $1
   StrCpy $MihomoMaintenanceError $0
   StrCpy $MihomoMaintenanceDetails $1
+  ${If} $MihomoMaintenanceError != 0
+    ; A report-I/O failure on the pipe takes precedence over a partial file.
+    ${If} $MihomoMaintenanceDetails == ""
+      ClearErrors
+      FileOpen $2 "$MihomoMaintenanceDirectory\maintenance-error.txt" r
+      ${IfNot} ${Errors}
+        StrCpy $1 ""
+        IntOp $4 ${NSIS_MAX_STRLEN} - 1
+        ${Do}
+          ClearErrors
+          FileReadUTF16LE $2 $3
+          ${If} ${Errors}
+            ${ExitDo}
+          ${EndIf}
+          StrCpy $1 "$1$3"
+          StrLen $5 $1
+        ${LoopUntil} $5 >= $4
+        FileClose $2
+        ${If} $1 != ""
+          StrCpy $MihomoMaintenanceDetails $1
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+    ${If} $MihomoMaintenanceDetails == ""
+      StrCpy $MihomoMaintenanceDetails "无法读取维护程序的错误详情。Helper error report is unavailable."
+    ${EndIf}
+  ${EndIf}
+  Delete "$MihomoMaintenanceDirectory\maintenance-error.txt"
   System::Store "l"
   ${If} $MihomoMaintenanceError != 0
     DetailPrint "Mihomo maintenance failed: stage=$MihomoMaintenanceStage, helper=$MihomoMaintenanceError; $MihomoMaintenanceDetails"
@@ -138,32 +171,32 @@ FunctionEnd
 
 !macro NSIS_HOOK_CHECKINSTALL
   Call MihomoEnsureMaintenance
-  !insertmacro MihomoRunMaintenance "" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --installer-check "$INSTDIR" "$MihomoMaintenanceDirectory\installer-files.json"' "preflight"
+  !insertmacro MihomoRunMaintenance "" '--installer-check "$INSTDIR" "$MihomoMaintenanceDirectory\installer-files.json"' "preflight"
   Call MihomoValidateRuntime
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL
-  !insertmacro MihomoRunMaintenance "" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --installer-prepare "$INSTDIR" "$MihomoMaintenanceDirectory\installer-files.json"' "prepare_files"
+  !insertmacro MihomoRunMaintenance "" '--installer-prepare "$INSTDIR" "$MihomoMaintenanceDirectory\installer-files.json"' "prepare_files"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  !insertmacro MihomoRunMaintenance "" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --installer-finalize "$INSTDIR"' "finalize"
+  !insertmacro MihomoRunMaintenance "" '--installer-finalize "$INSTDIR"' "finalize"
 !macroend
 
 !macro NSIS_HOOK_REGISTERINSTALL
   ; The helper creates protected registration or validates its existing key.
   ; NSIS only fills metadata after the identity and ACL boundary already exist.
-  !insertmacro MihomoRunMaintenance "" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --installer-register "$INSTDIR"' "register_installation"
+  !insertmacro MihomoRunMaintenance "" '--installer-register "$INSTDIR"' "register_installation"
 !macroend
 
 !macro NSIS_HOOK_CHECKUNINSTALL PREFIX
   Call ${PREFIX}MihomoEnsureMaintenance
-  !insertmacro MihomoRunMaintenance "${PREFIX}" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --uninstall-check "$INSTDIR"' "uninstall_preflight"
+  !insertmacro MihomoRunMaintenance "${PREFIX}" '--uninstall-check "$INSTDIR"' "uninstall_preflight"
   Call ${PREFIX}MihomoValidateRuntime
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL PREFIX
   System::Call 'kernel32::GetCurrentProcessId() i .r0'
   StrCpy $MihomoMaintenanceDetails $0
-  !insertmacro MihomoRunMaintenance "${PREFIX}" '"$MihomoMaintenanceDirectory\mihomo-maintenance.exe" --remove-installation "$INSTDIR" "$MihomoMaintenanceDirectory\installer-files.json" $MihomoMaintenanceDetails' "remove_installation"
+  !insertmacro MihomoRunMaintenance "${PREFIX}" '--remove-installation "$INSTDIR" "$MihomoMaintenanceDirectory\installer-files.json" $MihomoMaintenanceDetails' "remove_installation"
 !macroend

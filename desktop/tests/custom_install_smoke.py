@@ -34,6 +34,7 @@ from windows_smoke import RestrictedDesktop, SERVICE_NAME, SocksFixture, require
 
 SAFE_DIRECTORY_SDDL = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)"
 UNSAFE_DIRECTORY_SDDL = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BU)"
+MODIFY_VOLUME_SDDL = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;AU)"
 REQUIRED_CASES = {
     "default_never_service_uninstall", "same_volume_tun", "separate_volume_unicode_tun",
     "missing_runtime_uninstall", "unsafe_parent_rejected_before_copy",
@@ -41,6 +42,7 @@ REQUIRED_CASES = {
     "failed_upgrade_preserves_running_install", "unsafe_install_can_uninstall",
     "foreign_service_preserved", "custom_core_update", "custom_desktop_update_identity",
     "empty_unsafe_directory_recreated", "desktop_tun_repeated_restart", "final_cleanup",
+    "formatted_volume_root_install", "modify_volume_root_install",
 }
 
 
@@ -94,9 +96,21 @@ def set_directory_security(path: Path, sddl: str = SAFE_DIRECTORY_SDDL) -> None:
 
     require(path.is_dir() and not path.is_symlink(), "fixture_security_target_invalid")
     descriptor = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(sddl, 1)
+    control, _revision = descriptor.GetSecurityDescriptorControl()
+    inheritance = (win32security.PROTECTED_DACL_SECURITY_INFORMATION
+                   if control & win32security.SE_DACL_PROTECTED
+                   else win32security.UNPROTECTED_DACL_SECURITY_INFORMATION)
     win32security.SetFileSecurity(str(path), win32security.OWNER_SECURITY_INFORMATION
-        | win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+        | win32security.DACL_SECURITY_INFORMATION | inheritance,
         descriptor)
+
+
+def directory_security_sddl(path: Path) -> str:
+    import win32security
+
+    flags = win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION
+    descriptor = win32security.GetFileSecurity(str(path), flags)
+    return win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(descriptor, 1, flags)
 
 
 def remove_owned_tree(path: Path) -> None:
@@ -258,9 +272,10 @@ class DisposableVolume:
                 and actual["filesystem"] == "NTFS" and actual["guid"] != system["guid"],
                 "fixture_not_a_separate_local_acl_volume")
         self.owner.report["secondVolume"] = {"kind": "expandable_vhd", "maximumMiB": 1024,
-                                             "root": str(self.root), **actual}
-        # This whole volume belongs to the fixture; never tighten a shared D:.
-        set_directory_security(self.root)
+                                             "root": str(self.root), **actual,
+                                             "formattedRootSddl": directory_security_sddl(self.root)}
+        # Keep the formatter's real permissions. Pre-hardening this root hid
+        # the ordinary data-volume ACLs that the installer must accept.
         return self.root
 
     def close(self) -> None:
@@ -638,6 +653,63 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         finally:
             authority.close()
 
+    def volume_root_permissions(self, root: Path) -> None:
+        import pywintypes
+        import win32file
+        import win32security
+
+        original_sddl = directory_security_sddl(root)
+        evidence = self.report["volumeRootPermissions"] = {"formattedSddl": original_sddl, "cases": []}
+        cases = (("formatted_volume_root_install", None),
+                 ("modify_volume_root_install", MODIFY_VOLUME_SDDL))
+        for label, replacement in cases:
+            row = {"case": label}
+            evidence["cases"].append(row)
+            try:
+                if replacement is not None:
+                    # This fixture owns the entire newly formatted VHD. Give
+                    # authenticated users Modify, including DELETE on the root
+                    # itself, but never DELETE_CHILD, WRITE_DAC or WRITE_OWNER.
+                    set_directory_security(root, replacement)
+                row["rootSddlBefore"] = directory_security_sddl(root)
+                self.install_at(root / ("程序 " + label), label)
+                self.install_service(label + "_service")
+                row["serviceRunningFromSelectedDirectory"] = True
+                denied = []
+                desktop = RestrictedDesktop()
+                try:
+                    require(desktop.sid == self.sid, "volume_acl_fixture_owner_changed")
+                    win32security.ImpersonateLoggedOnUser(desktop.token)
+                    try:
+                        for name, access in (("DELETE", 0x10000), ("WRITE_DAC", 0x40000),
+                                             ("FILE_ADD_FILE", 0x2), ("FILE_DELETE_CHILD", 0x40)):
+                            try:
+                                handle = win32file.CreateFile(str(self.install_dir), access, 7,
+                                    None, 3, 0x02000000 | 0x00200000, None)
+                            except pywintypes.error as error:
+                                require(error.winerror == 5, "volume_acl_access_check_failed")
+                                denied.append(name)
+                            else:
+                                handle.Close()
+                                require(False, "volume_acl_allows_product_" + name.lower())
+                    finally:
+                        win32security.RevertToSelf()
+                finally:
+                    desktop.close()
+                row["ordinaryProductAccessDenied"] = denied
+                self.uninstall_current(label + "_uninstall")
+                row["normalUninstallExitCode"] = 0
+                row["rootSddlAfter"] = directory_security_sddl(root)
+                require(row["rootSddlAfter"] == row["rootSddlBefore"], "installer_changed_volume_root_acl")
+                row["rootAclPreserved"] = True
+                self.mark(label)
+            finally:
+                if replacement is not None:
+                    set_directory_security(root, original_sddl)
+                    require(directory_security_sddl(root) == original_sddl, "fixture_volume_root_acl_not_restored")
+                    row["formattedAclRestored"] = True
+                self.write_report()
+
     def denied_targets(self) -> None:
         unsafe = self.fixture_root / "unsafe parent"
         unsafe.mkdir()
@@ -810,11 +882,17 @@ class CustomInstallAcceptance(UpgradeAcceptance):
         self.tun_lifecycle("same_volume_tun")
         self.volume = DisposableVolume(self)
         root = self.volume.create()
+        self.volume_root_permissions(root)
+        root_sddl = directory_security_sddl(root)
         parent = root / "应用 程序"
-        parent.mkdir()
-        set_directory_security(parent)
+        require(not parent.exists(), "fixture_unicode_parent_preexists")
+        # The installer must create the missing hierarchy with its own final
+        # permissions while leaving the native volume root ACL unchanged.
         self.install_at(parent / PRODUCT, "separate_volume_unicode_install")
         self.tun_lifecycle("separate_volume_unicode_tun", check_desktop_update=True)
+        require(directory_security_sddl(root) == root_sddl, "unicode_install_changed_volume_root_acl")
+        self.report["secondVolume"]["nativeRootAclPreserved"] = True
+        self.report["secondVolume"]["unicodeParentCreatedByInstaller"] = True
         self.custom_core_update(parent / "内核 更新")
         self.missing_runtime(parent / "配套 文件 缺失")
         self.empty_directory_authority(parent / "空目录 权限")

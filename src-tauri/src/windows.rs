@@ -525,14 +525,43 @@ pub fn require_admin_protected(path: &Path) -> Result<()> {
 
 /// Creating unrelated siblings is harmless; deleting, replacing, or changing
 /// the security of an ancestor would let a user replace the installed service.
+/// The caller has already verified the normalized path's real local volume.
 pub(crate) fn require_admin_parent(path: &Path) -> Result<()> {
-    require_admin_path_policy(path, SecurityBoundary::Ancestor)
+    let boundary = ancestor_security_boundary(path);
+    require_admin_path_policy(path, boundary).map_err(|error| {
+        if error.code == "service_untrusted_parent" {
+            AppError::new(
+                "service_untrusted_parent",
+                format!(
+                    "以下上级文件夹允许普通用户更改权限或替换程序路径：\r\n{}\r\n请选择新的本地安装目录，让安装器创建受保护的程序文件夹，或使用已受管理员保护的父目录。安装器不会修改现有共享父目录的权限。",
+                    path.display()
+                ),
+            )
+        } else {
+            error
+        }
+    })
+}
+
+fn ancestor_security_boundary(path: &Path) -> SecurityBoundary {
+    // Only the exact DOS root spelling produced by the verified installation
+    // chain gets root semantics; relative, UNC and device paths never do.
+    let is_volume_root = path.to_str().is_some_and(|text| {
+        let bytes = text.as_bytes();
+        bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && bytes[1..] == *b":\\"
+    });
+    if is_volume_root {
+        SecurityBoundary::VolumeRoot
+    } else {
+        SecurityBoundary::Ancestor
+    }
 }
 
 #[derive(Clone, Copy)]
 enum SecurityBoundary {
     Product,
     Ancestor,
+    VolumeRoot,
     Registry,
 }
 
@@ -546,18 +575,33 @@ impl SecurityBoundary {
             },
             System::Registry::{KEY_CREATE_LINK, KEY_CREATE_SUB_KEY, KEY_SET_VALUE},
         };
-        let control = GENERIC_ALL | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
+        let control = GENERIC_ALL | WRITE_DAC | WRITE_OWNER;
         match self {
             Self::Product => {
                 control
+                    | GENERIC_WRITE
+                    | DELETE
                     | FILE_WRITE_DATA
                     | FILE_APPEND_DATA
                     | FILE_WRITE_EA
                     | FILE_WRITE_ATTRIBUTES
                     | FILE_DELETE_CHILD
             }
-            Self::Ancestor => control | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD,
-            Self::Registry => control | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK,
+            // Metadata and sibling creation do not replace a protected child.
+            // Installation pins empty ancestors before creating that child;
+            // afterwards a nonempty ancestor cannot become a reparse point.
+            Self::Ancestor => control | DELETE | FILE_DELETE_CHILD,
+            // A real volume root cannot be renamed. Its DELETE permission is
+            // distinct from DELETE_CHILD, which can replace the installation.
+            Self::VolumeRoot => control | FILE_DELETE_CHILD,
+            Self::Registry => {
+                control
+                    | GENERIC_WRITE
+                    | DELETE
+                    | KEY_SET_VALUE
+                    | KEY_CREATE_SUB_KEY
+                    | KEY_CREATE_LINK
+            }
         }
     }
 
@@ -567,7 +611,7 @@ impl SecurityBoundary {
                 "service_untrusted_permissions",
                 "安装目录或程序可被普通用户修改，请运行完整安装包修复目录权限",
             ),
-            Self::Ancestor => AppError::new(
+            Self::Ancestor | Self::VolumeRoot => AppError::new(
                 "service_untrusted_parent",
                 "安装目录的上级文件夹可被普通用户替换，请选择受管理员保护的父目录；安装器不会更改共享父目录权限",
             ),
@@ -1361,13 +1405,7 @@ mod tests {
         assert!(check_security_descriptor(siblings, SecurityBoundary::Ancestor).is_ok());
         assert!(check_security_descriptor(siblings, SecurityBoundary::Product).is_err());
         assert!(check_security_descriptor(siblings, SecurityBoundary::Registry).is_err());
-        for replacement in [
-            0x00010000u32,
-            0x00000040,
-            0x00040000,
-            0x00080000,
-            0x00000100,
-        ] {
+        for replacement in [0x00010000u32, 0x00000040, 0x00040000, 0x00080000] {
             let descriptor =
                 format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x{replacement:08x};;;BU)");
             assert_eq!(
@@ -1380,10 +1418,69 @@ mod tests {
     }
 
     #[test]
+    fn installation_ancestors_allow_metadata_and_generic_write_without_replacement() {
+        // Directory GENERIC_WRITE maps to sibling creation, metadata and
+        // synchronization, not DELETE, DELETE_CHILD or security control.
+        for mask in [0x00000110u32, 0x40000000] {
+            let descriptor = format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x{mask:08x};;;BU)");
+            assert!(check_security_descriptor(&descriptor, SecurityBoundary::Ancestor).is_ok());
+            assert!(check_security_descriptor(&descriptor, SecurityBoundary::VolumeRoot).is_ok());
+            assert!(check_security_descriptor(&descriptor, SecurityBoundary::Product).is_err());
+        }
+    }
+
+    #[test]
+    fn installation_volume_root_modify_does_not_grant_child_replacement() {
+        // Data-volume Modify contains DELETE on the root itself, not
+        // FILE_DELETE_CHILD. A root cannot be renamed like an ordinary parent.
+        let modify = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x001301bf;;;AU)";
+        assert!(check_security_descriptor(modify, SecurityBoundary::VolumeRoot).is_ok());
+        assert!(check_security_descriptor(modify, SecurityBoundary::Ancestor).is_err());
+        assert!(check_security_descriptor(modify, SecurityBoundary::Product).is_err());
+        assert!(check_security_descriptor(modify, SecurityBoundary::Registry).is_err());
+        for replacement in [0x00000040u32, 0x00040000, 0x00080000, 0x10000000] {
+            let descriptor =
+                format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x{replacement:08x};;;AU)");
+            for boundary in [SecurityBoundary::VolumeRoot, SecurityBoundary::Ancestor] {
+                assert_eq!(
+                    check_security_descriptor(&descriptor, boundary)
+                        .unwrap_err()
+                        .code,
+                    "service_untrusted_parent"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn installation_root_policy_only_recognizes_absolute_dos_roots() {
+        for path in [r"C:\", r"d:\"] {
+            assert!(matches!(
+                ancestor_security_boundary(Path::new(path)),
+                SecurityBoundary::VolumeRoot
+            ));
+        }
+        for path in [
+            "D:",
+            r"D:\Apps",
+            r"D:\Apps\..",
+            r"\",
+            r"\\?\D:\",
+            r"\\server\share\",
+        ] {
+            assert!(matches!(
+                ancestor_security_boundary(Path::new(path)),
+                SecurityBoundary::Ancestor
+            ));
+        }
+    }
+
+    #[test]
     fn registration_and_parent_owners_cannot_regrant_untrusted_access() {
         let descriptor = "O:S-1-5-21-1-2-3-1001D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)";
         assert!(check_security_descriptor(descriptor, SecurityBoundary::Registry).is_err());
         assert!(check_security_descriptor(descriptor, SecurityBoundary::Ancestor).is_err());
+        assert!(check_security_descriptor(descriptor, SecurityBoundary::VolumeRoot).is_err());
         let inherited_only = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;OICIIO;FA;;;BU)";
         assert!(check_security_descriptor(inherited_only, SecurityBoundary::Ancestor).is_ok());
         assert!(

@@ -249,6 +249,9 @@ fn require_supported_volume(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+// Every caller first normalizes the directory and verifies its real local
+// volume. This permits the permission check to distinguish the exact DOS root
+// from ordinary ancestors without granting root semantics to path aliases.
 fn require_parent_chain(directory: &Path) -> Result<()> {
     for parent in directory.ancestors().skip(1) {
         match fs::symlink_metadata(parent) {
